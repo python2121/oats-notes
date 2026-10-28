@@ -1,0 +1,17 @@
+[package]
+name = "oats-engine-fluidaudio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The macOS speech engine: Parakeet TDT + Silero VAD on CoreML / the Neural Engine via FluidAudio. The one crate replaced on Linux."
+
+[lints]
+workspace = true
+
+[dependencies]
+oats-core = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fluidaudio-rs = { workspace = true }

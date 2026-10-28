@@ -1,0 +1,29 @@
+[package]
+name = "oats-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "egui front end (eframe): sidebar, transcript view, listen controls, theme, native menu"
+
+[lints]
+workspace = true
+
+[dependencies]
+oats-core = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true, features = ["wgpu", "persistence"] }
+craft-ui = { workspace = true }
+serde = { workspace = true }
+log = { workspace = true }
+chrono = { workspace = true }
+# Validates a system font before egui sees it (epaint panics on a font it can't parse). Same version
+# epaint itself uses, so nothing is built twice.
+skrifa = "=0.44.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { workspace = true, features = ["wgpu", "persistence", "x11", "wayland"] }
+
+# The native macOS menu bar (pure Rust over AppKit via objc2). macOS only.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.21", default-features = false }

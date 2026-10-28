@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# internal
+oats-core = { path = "crates/oats-core" }
+oats-audio = { path = "crates/oats-audio" }
+oats-engine-fluidaudio = { path = "crates/oats-engine-fluidaudio" }
+oats-ui = { path = "crates/oats-ui" }
+
+# foundation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+
+# storage
+rusqlite = { version = "0.41", features = ["bundled"] }
+
+# audio
+cpal = "0.18"
+
+# ui (the SwiftInvert shell's stack, same versions)
+egui = "0.36"
+eframe = { version = "0.36", default-features = false }
+egui_extras = { version = "0.36", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Shared egui kit from the Craft suite (MIT OR Apache-2.0): theme helpers, icon buttons.
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "d27646a5f7c8b4fc85d9dd3213b8c88b58e0088d" }
+
+# speech (macOS only — the one component that is swapped on Linux)
+fluidaudio-rs = "0.14.8"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = 0

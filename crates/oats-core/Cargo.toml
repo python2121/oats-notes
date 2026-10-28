@@ -1,0 +1,18 @@
+[package]
+name = "oats-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OatsNotes core: the speech-engine contract, speech segmentation, the transcript store, the listening pipeline. Platform-independent."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+rusqlite = { workspace = true }

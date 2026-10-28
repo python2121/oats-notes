@@ -1,0 +1,16 @@
+[package]
+name = "oats-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Microphone capture (cpal) delivered as 16 kHz mono f32 chunks"
+
+[lints]
+workspace = true
+
+[dependencies]
+oats-core = { workspace = true }
+cpal = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

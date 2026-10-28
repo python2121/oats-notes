@@ -1,0 +1,22 @@
+[package]
+name = "oats-notes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OatsNotes desktop app (eframe shell)"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+oats-core = { workspace = true }
+oats-audio = { workspace = true }
+oats-engine-fluidaudio = { workspace = true }
+oats-ui = { workspace = true }
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "persistence", "wayland", "x11"] }
+egui = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+image = { workspace = true }
