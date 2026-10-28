@@ -182,6 +182,15 @@ description, before/after JSON, `undone`). `View::Node(id)` means the subtree (r
 
 ## Roadmap (not yet built)
 
+### Offline resilience of the brain (required; big one)
+
+Listening and transcription must NEVER depend on `claude`. If the CLI is missing, not logged
+in, rate-limited, or the network is down, the app keeps listening and storing segments, and the
+brain catches up when the connection is back: periodic availability re-probe with backoff,
+"claude unavailable — N segments waiting" in the status strip, then the backlog is worked
+through oldest-first within the budget (hotword commands first, then rolling interpretation,
+with relative dates resolved against the segment's own timestamp, not the catch-up time).
+
 Brain: a month-grid calendar view, undo for node merges (recorded, not reversible yet),
 reminders that notify (they are only listed), prompt editing without a rebuild, per-tier
 budgets in the UI. Elsewhere: diarization (FluidAudio has it), system-audio capture for calls,
