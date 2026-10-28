@@ -26,4 +26,7 @@ pub use engine::{
 };
 pub use pipeline::{Pipeline, PipelineEvent, PipelineHandle, PipelineStatus};
 pub use segmenter::{Segment, Segmenter, SegmenterConfig};
-pub use store::{Category, Session, Store, StoreError, TranscriptRow, View};
+pub use store::{
+    ActionItem, BrainRun, Change, Episode, EpisodeContent, Event, NewEvent, NewReminder, Node,
+    NodeKind, Note, Origin, Reminder, RunOutcome, Session, Store, StoreError, TranscriptRow, View,
+};

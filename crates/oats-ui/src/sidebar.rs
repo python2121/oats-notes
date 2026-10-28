@@ -1,22 +1,29 @@
-//! The left sidebar: the "Views" group (Today, All transcripts) and the "Categories" group (the
-//! store's categories as 22 pt hover rows, a "+" header icon that reveals an inline field to add
-//! one, right-click → Rename / Delete with an inline rename).
+//! The left sidebar: the "Views" group (Today, All transcripts, Notes, Calendar) and the tree
+//! group — the store's categories as 22 pt hover rows, with the projects the brain created
+//! under them and topics under those, collapsible per node (a disclosure triangle on rows with
+//! children, indented SwiftInvert-style); a "+" header icon that reveals an inline field to add
+//! a category; right-click → Rename / Delete with an inline rename. Selecting a node shows
+//! everything filed under it or below it.
+
+use std::collections::HashSet;
 
 use egui::{Key, Rect, Sense, Stroke, pos2, vec2};
-use oats_core::{Category, View};
+use oats_core::{Node, View};
 
 use crate::app::{Command, with_shortcut};
 use crate::theme::Tokens;
 
-/// Inline editing state.
+/// Inline editing and collapse state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SidebarState {
     /// The "new category" field's text while it is open.
     pub adding: Option<String>,
-    /// The category being renamed and the field's text.
+    /// The node being renamed and the field's text.
     pub renaming: Option<(i64, String)>,
     /// Give the open field keyboard focus this frame.
     pub focus: bool,
+    /// Nodes whose children are hidden.
+    pub collapsed: HashSet<i64>,
 }
 
 /// What the user did in the sidebar this frame.
@@ -29,11 +36,42 @@ pub enum SidebarAction {
     ToggleSidebar,
 }
 
+/// The visible rows of the tree in order: `(node, depth)`; archived nodes and the children
+/// of collapsed nodes are left out.
+pub fn visible_rows<'a>(nodes: &'a [Node], collapsed: &HashSet<i64>) -> Vec<(&'a Node, usize)> {
+    fn walk<'a>(
+        nodes: &'a [Node],
+        parent: Option<i64>,
+        depth: usize,
+        collapsed: &HashSet<i64>,
+        out: &mut Vec<(&'a Node, usize)>,
+    ) {
+        let mut children: Vec<&Node> = nodes
+            .iter()
+            .filter(|n| n.parent_id == parent && !n.archived)
+            .collect();
+        children.sort_by_key(|n| (n.position, n.id));
+        for c in children {
+            out.push((c, depth));
+            if !collapsed.contains(&c.id) && depth < 8 {
+                walk(nodes, Some(c.id), depth + 1, collapsed, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(nodes, None, 0, collapsed, &mut out);
+    out
+}
+
+fn has_children(nodes: &[Node], id: i64) -> bool {
+    nodes.iter().any(|n| n.parent_id == Some(id) && !n.archived)
+}
+
 pub fn sidebar_panel(
     ui: &mut egui::Ui,
     state: &mut SidebarState,
     view: View,
-    categories: &[Category],
+    nodes: &[Node],
 ) -> Vec<SidebarAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
@@ -56,8 +94,13 @@ pub fn sidebar_panel(
             }
         });
     });
-    for (label, v) in [("Today", View::Today), ("All transcripts", View::All)] {
-        if hover_row(ui, &t, label, view == v).clicked() {
+    for (label, v) in [
+        ("Today", View::Today),
+        ("All transcripts", View::All),
+        ("Notes", View::Notes),
+        ("Calendar", View::Calendar),
+    ] {
+        if hover_row(ui, &t, label, view == v, 0, None).clicked() {
             actions.push(SidebarAction::Select(v));
         }
     }
@@ -88,15 +131,17 @@ pub fn sidebar_panel(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            for c in categories {
+            let rows = visible_rows(nodes, &state.collapsed);
+            let mut toggle: Option<i64> = None;
+            for (n, depth) in rows {
                 if let Some((id, text)) = &mut state.renaming
-                    && *id == c.id
+                    && *id == n.id
                 {
                     let id = *id;
                     match inline_field(ui, text, &mut state.focus) {
                         Field::Commit => {
                             let name = text.trim().to_owned();
-                            if !name.is_empty() && name != c.name {
+                            if !name.is_empty() && name != n.name {
                                 actions.push(SidebarAction::Rename(id, name));
                             }
                             state.renaming = None;
@@ -106,22 +151,55 @@ pub fn sidebar_panel(
                     }
                     continue;
                 }
-                let resp = hover_row(ui, &t, &c.name, view == View::Category(c.id));
+                let disclosure =
+                    has_children(nodes, n.id).then_some(!state.collapsed.contains(&n.id));
+                let resp = hover_row(ui, &t, &n.name, view == View::Node(n.id), depth, disclosure);
                 if resp.clicked() {
-                    actions.push(SidebarAction::Select(View::Category(c.id)));
+                    // a click on the triangle folds; anywhere else selects
+                    let on_triangle = disclosure.is_some()
+                        && resp.interact_pointer_pos().is_some_and(|p| {
+                            p.x < resp.rect.left() + 12.0 + depth as f32 * 14.0 + 14.0
+                        });
+                    if on_triangle {
+                        toggle = Some(n.id);
+                    } else {
+                        actions.push(SidebarAction::Select(View::Node(n.id)));
+                    }
+                }
+                if resp.double_clicked() && disclosure.is_some() {
+                    toggle = Some(n.id);
+                }
+                if !n.description.is_empty() {
+                    resp.clone().on_hover_text(&n.description);
                 }
                 resp.context_menu(|ui| {
                     if ui.button("Rename…").clicked() {
-                        state.renaming = Some((c.id, c.name.clone()));
+                        state.renaming = Some((n.id, n.name.clone()));
                         state.adding = None;
                         state.focus = true;
                         ui.close();
                     }
+                    if disclosure.is_some() {
+                        let label = if state.collapsed.contains(&n.id) {
+                            "Expand"
+                        } else {
+                            "Collapse"
+                        };
+                        if ui.button(label).clicked() {
+                            toggle = Some(n.id);
+                            ui.close();
+                        }
+                    }
                     if ui.button("Delete").clicked() {
-                        actions.push(SidebarAction::Delete(c.id));
+                        actions.push(SidebarAction::Delete(n.id));
                         ui.close();
                     }
                 });
+            }
+            if let Some(id) = toggle
+                && !state.collapsed.remove(&id)
+            {
+                state.collapsed.insert(id);
             }
             if let Some(text) = &mut state.adding {
                 match inline_field(ui, text, &mut state.focus) {
@@ -149,8 +227,16 @@ fn group_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {
     );
 }
 
-/// A 22 pt sidebar row: hover fill, the selected row in an accent-alpha fill.
-fn hover_row(ui: &mut egui::Ui, t: &Tokens, label: &str, selected: bool) -> egui::Response {
+/// A 22 pt sidebar row: hover fill, the selected row in an accent-alpha fill, indented by
+/// `depth`, with a disclosure triangle (`Some(open)`) for rows that have children.
+fn hover_row(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    label: &str,
+    selected: bool,
+    depth: usize,
+    disclosure: Option<bool>,
+) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::click());
     if !ui.is_rect_visible(rect) {
         return resp;
@@ -162,15 +248,44 @@ fn hover_row(ui: &mut egui::Ui, t: &Tokens, label: &str, selected: bool) -> egui
     } else if resp.hovered() || resp.context_menu_opened() {
         p.rect_filled(fill_rect, 4.0, t.hover);
     }
-    let galley = p.layout_no_wrap(label.to_owned(), t.font(12.5), t.text);
+    let indent = 12.0 + depth as f32 * 14.0;
+    let text_x = if depth > 0 || disclosure.is_some() {
+        indent + 12.0
+    } else {
+        indent
+    };
+    if let Some(open) = disclosure {
+        let c = pos2(rect.left() + indent + 4.0, rect.center().y);
+        let col = t.text_secondary;
+        let tri = if open {
+            [
+                pos2(c.x - 3.5, c.y - 2.0),
+                pos2(c.x + 3.5, c.y - 2.0),
+                pos2(c.x, c.y + 2.5),
+            ]
+        } else {
+            [
+                pos2(c.x - 2.0, c.y - 3.5),
+                pos2(c.x - 2.0, c.y + 3.5),
+                pos2(c.x + 2.5, c.y),
+            ]
+        };
+        p.add(egui::Shape::convex_polygon(tri.to_vec(), col, Stroke::NONE));
+    }
+    let size = if depth > 0 { 12.0 } else { 12.5 };
+    let color = if depth > 0 { t.text_secondary } else { t.text };
+    let galley = p.layout_no_wrap(label.to_owned(), t.font(size), color);
     let clip = Rect::from_min_max(
-        pos2(rect.left() + 12.0, rect.top()),
+        pos2(rect.left() + text_x, rect.top()),
         pos2(rect.right() - 6.0, rect.bottom()),
     );
     p.with_clip_rect(clip).galley(
-        pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0),
+        pos2(
+            rect.left() + text_x,
+            rect.center().y - galley.size().y / 2.0,
+        ),
         galley,
-        t.text,
+        color,
     );
     resp
 }
@@ -190,7 +305,7 @@ fn inline_field(ui: &mut egui::Ui, text: &mut String, focus: &mut bool) -> Field
         let resp = ui.add(
             egui::TextEdit::singleline(text)
                 .desired_width(ui.available_width() - 6.0)
-                .hint_text("Category name"),
+                .hint_text("Name"),
         );
         if *focus {
             resp.request_focus();
@@ -257,4 +372,53 @@ fn header_icon(ui: &mut egui::Ui, icon: HeaderIcon) -> egui::Response {
         }
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oats_core::{NodeKind, Origin};
+
+    fn node(id: i64, parent: Option<i64>, name: &str, position: i64, archived: bool) -> Node {
+        Node {
+            id,
+            parent_id: parent,
+            kind: if parent.is_none() {
+                NodeKind::Category
+            } else {
+                NodeKind::Project
+            },
+            name: name.into(),
+            description: String::new(),
+            created_by: Origin::User,
+            position,
+            archived,
+        }
+    }
+
+    #[test]
+    fn tree_rows_respect_order_collapse_and_archive() {
+        let nodes = vec![
+            node(2, None, "Admin", 1, false),
+            node(1, None, "Work", 0, false),
+            node(10, Some(1), "Exporter", 0, false),
+            node(11, Some(10), "CSV", 0, false),
+            node(12, Some(1), "Old", 1, true),
+            node(13, Some(2), "Apartment", 0, false),
+        ];
+        let rows = visible_rows(&nodes, &HashSet::new());
+        assert_eq!(
+            rows.iter().map(|(n, d)| (n.id, *d)).collect::<Vec<_>>(),
+            vec![(1, 0), (10, 1), (11, 2), (2, 0), (13, 1)]
+        );
+        let collapsed: HashSet<i64> = [1].into_iter().collect();
+        let rows = visible_rows(&nodes, &collapsed);
+        assert_eq!(
+            rows.iter().map(|(n, _)| n.id).collect::<Vec<_>>(),
+            vec![1, 2, 13]
+        );
+        assert!(has_children(&nodes, 1));
+        assert!(!has_children(&nodes, 13));
+        assert!(!has_children(&nodes, 12));
+    }
 }

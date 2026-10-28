@@ -1,0 +1,21 @@
+[package]
+name = "oats-brain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OatsNotes brain: the local `claude` CLI wrapper, episode cutting, interpretation prompts, hotword commands and the tiered scheduler. Platform-independent."
+
+[lints]
+workspace = true
+
+[dependencies]
+oats-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }

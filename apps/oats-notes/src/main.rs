@@ -17,9 +17,11 @@
 //! Environment: `OATS_ENGINE=null` (no model), `OATS_NO_NATIVE_MENU=1` (menus in the window),
 //! `OATS_NO_STATUS_ITEM=1` (no menu bar extra; closing the window then quits),
 //! `OATS_FONT=bundled` (Inter instead of the system font), `OATS_FONT_GRADE` (SF Pro grade),
-//! `OATS_DATA_DIR` (where the database lives), `RUST_LOG`.
+//! `OATS_DATA_DIR` (where the database lives), `RUST_LOG`; the brain's `OATS_BRAIN=off`,
+//! `OATS_CLAUDE_BIN`, `OATS_CLAUDE_MODEL`, `OATS_INTERPRET_EVERY_MIN`, `OATS_BRAIN_BUDGET_USD`,
+//! `OATS_HOTWORDS` (see `oats_brain::BrainConfig::from_env`).
 //!
-//! `--selftest <out.png> [--listening]` renders the whole window offscreen to a PNG (seeded
+//! `--selftest <out.png> [--listening|--notes|--calendar]` renders the whole window offscreen to a PNG (seeded
 //! demo content, the null engine, a throwaway database) — the shell verified without a window.
 
 use std::any::Any;
@@ -86,10 +88,12 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen]\n       oats-notes --selftest <out.png> [--listening]\n\n\
+        "usage: oats-notes [--listen]\n       oats-notes --selftest <out.png> [--listening|--notes|--calendar]\n\n\
          --listen     start listening as soon as the speech engine is ready\n\
          --selftest   render the window offscreen to a PNG (demo content, no microphone)\n\
-         --listening  with --selftest: show the Listening state with a fake input level"
+         --listening  with --selftest: show the Listening state with a fake input level\n\
+         --notes      with --selftest: the Notes view (a seeded interpreted episode)\n\
+         --calendar   with --selftest: the Calendar view (seeded events and a reminder)"
     );
     ExitCode::from(2)
 }
@@ -139,8 +143,19 @@ fn main() -> ExitCode {
             let ctx = cc.egui_ctx.clone();
             let pipeline = oats_core::Pipeline {
                 engine: engine_factory(),
-                store_path: db,
+                store_path: db.clone(),
                 segmenter: Default::default(),
+                wake: Box::new(move || ctx.request_repaint()),
+            }
+            .spawn();
+            // the brain: the local `claude` CLI, its own store connection, its own thread;
+            // OATS_BRAIN=off keeps the thread but runs nothing
+            let mut brain_config = oats_brain::BrainConfig::from_env();
+            brain_config.cli.work_dir = Some(oats_core::paths::data_dir());
+            let ctx = cc.egui_ctx.clone();
+            let brain = oats_brain::Brain {
+                config: brain_config,
+                store_path: db,
                 wake: Box::new(move || ctx.request_repaint()),
             }
             .spawn();
@@ -167,6 +182,7 @@ fn main() -> ExitCode {
                 store,
                 // created here: AppKit wants it on the main thread, after NSApp exists
                 status_item(&cc.egui_ctx),
+                Some(brain),
             );
             #[cfg(target_os = "macos")]
             if native_menu {
@@ -196,6 +212,8 @@ fn selftest_cli(args: &[String]) -> ExitCode {
     for a in args {
         match a.as_str() {
             "--listening" => options.listening = true,
+            "--notes" => options.notes = true,
+            "--calendar" => options.calendar = true,
             f if !f.starts_with("--") && out.is_none() => out = Some(f.into()),
             _ => return usage(),
         }

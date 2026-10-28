@@ -1,4 +1,5 @@
-//! OatsNotes' egui front end (eframe): the sidebar (views + categories), the transcript list,
+//! OatsNotes' egui front end (eframe): the sidebar (views + the category/project/topic tree),
+//! the transcript list, the Notes view (the brain's episodes), the Calendar view,
 //! the listen controls and status line, the theme (the SwiftInvert shell's dark charcoal tokens
 //! and the OS UI font) and, on macOS, the native menu bar.
 //!
@@ -7,9 +8,11 @@
 //! the status item (an `oats_status::StatusItem` built by the binary's chosen implementation).
 
 pub mod app;
+pub mod calendar;
 pub mod menu_events;
 #[cfg(target_os = "macos")]
 pub mod native_menu;
+pub mod notes;
 #[cfg(feature = "selftest")]
 pub mod selftest;
 pub mod sidebar;

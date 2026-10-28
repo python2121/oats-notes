@@ -16,11 +16,13 @@ selftest = ["dep:egui_kittest", "dep:image"]
 
 [dependencies]
 oats-core = { workspace = true }
+oats-brain = { workspace = true }
 oats-status = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true, features = ["wgpu", "persistence"] }
 craft-ui = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
 # Validates a system font before egui sees it (epaint panics on a font it can't parse). Same version

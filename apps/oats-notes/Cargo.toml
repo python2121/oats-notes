@@ -17,6 +17,7 @@ selftest = ["oats-ui/selftest"]
 
 [dependencies]
 oats-core = { workspace = true }
+oats-brain = { workspace = true }
 oats-audio = { workspace = true }
 oats-engine-fluidaudio = { workspace = true }
 oats-ui = { workspace = true }

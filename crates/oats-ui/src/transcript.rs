@@ -4,14 +4,16 @@
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use egui::{Align2, Rect, Sense, pos2, vec2};
-use oats_core::{Category, TranscriptRow};
+use oats_core::{Node, TranscriptRow};
+
+use crate::notes::node_path;
 
 use crate::theme::Tokens;
 
 /// What the user did in the list this frame.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TranscriptAction {
-    /// File a segment under a category (`None` = uncategorised).
+    /// File a segment under a node (`None` = unfiled).
     Move {
         segment: i64,
         category: Option<i64>,
@@ -91,7 +93,7 @@ pub fn day_breaks<Tz: TimeZone>(
 pub fn transcript_list(
     ui: &mut egui::Ui,
     rows: &[TranscriptRow],
-    categories: &[Category],
+    nodes: &[Node],
 ) -> Vec<TranscriptAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
@@ -134,7 +136,7 @@ pub fn transcript_list(
                     });
                     ui.add_space(4.0);
                 }
-                transcript_row(ui, &t, row, categories, &mut actions);
+                transcript_row(ui, &t, row, nodes, &mut actions);
             }
             ui.add_space(8.0);
         });
@@ -148,7 +150,7 @@ fn transcript_row(
     ui: &mut egui::Ui,
     t: &Tokens,
     row: &TranscriptRow,
-    categories: &[Category],
+    nodes: &[Node],
     actions: &mut Vec<TranscriptAction>,
 ) {
     // the hover fill goes UNDER the text: reserve its slot first, fill it once the row's height
@@ -201,13 +203,10 @@ fn transcript_row(
     }
     resp.context_menu(|ui| {
         ui.menu_button("Move to", |ui| {
-            for c in categories {
-                let here = row.category_id == Some(c.id);
-                let label = if here {
-                    format!("✔ {}", c.name)
-                } else {
-                    c.name.clone()
-                };
+            for c in nodes.iter().filter(|n| !n.archived) {
+                let here = row.node_id == Some(c.id);
+                let name = node_path(nodes, c.id);
+                let label = if here { format!("✔ {name}") } else { name };
                 if ui.add_enabled(!here, egui::Button::new(label)).clicked() {
                     actions.push(TranscriptAction::Move {
                         segment: row.id,
@@ -217,7 +216,7 @@ fn transcript_row(
                 }
             }
             ui.separator();
-            let none = row.category_id.is_none();
+            let none = row.node_id.is_none();
             if ui
                 .add_enabled(
                     !none,
@@ -258,7 +257,10 @@ mod tests {
             ended_at: started_at + 1000,
             text: format!("row {id}"),
             confidence: None,
-            category_id: None,
+            node_id: None,
+            episode_id: None,
+            interpreted_at: None,
+            categorised: false,
         }
     }
 

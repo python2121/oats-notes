@@ -10,12 +10,16 @@ use std::any::Any;
 use std::sync::mpsc;
 
 use egui::{Key, KeyboardShortcut, Modifiers, Rect, Sense, pos2, vec2};
+use oats_brain::{BrainCommand, BrainEvent, BrainHandle};
 use oats_core::{
-    Category, PipelineEvent, PipelineHandle, PipelineStatus, Store, TranscriptRow, View,
+    Change, Episode, Event, Node, PipelineEvent, PipelineHandle, PipelineStatus, Reminder, Store,
+    TranscriptRow, View,
 };
 use oats_status::{StatusAction, StatusItem, StatusState};
 
+use crate::calendar::{CalendarAction, CalendarState, calendar_view};
 use crate::menu_events::MenuEvents;
+use crate::notes::{BrainStatus, NotesAction, NotesState, notes_view};
 use crate::sidebar::{SidebarAction, SidebarState, sidebar_panel};
 use crate::theme::Tokens;
 use crate::transcript::{TranscriptAction, local_midnight_ms, transcript_list};
@@ -95,6 +99,14 @@ pub enum Command {
     ToggleSidebar,
     ShowToday,
     ShowAll,
+    ShowNotes,
+    ShowCalendar,
+    /// Run the brain's interpretation over whatever is new, now.
+    InterpretNow,
+    /// Run the coherence review of today's episodes, now.
+    ReviewNow,
+    /// Run the (expensive) reorganisation of the node tree, now.
+    Reorganise,
 }
 
 const fn sc(m: Modifiers, k: Key) -> KeyboardShortcut {
@@ -116,6 +128,9 @@ pub const SHORTCUTS: &[(KeyboardShortcut, Command)] = &[
     (sc(Modifiers::COMMAND, Key::N), Command::NewCategory),
     (sc(Modifiers::COMMAND, Key::Num1), Command::ShowToday),
     (sc(Modifiers::COMMAND, Key::Num2), Command::ShowAll),
+    (sc(Modifiers::COMMAND, Key::Num3), Command::ShowNotes),
+    (sc(Modifiers::COMMAND, Key::Num4), Command::ShowCalendar),
+    (sc(Modifiers::COMMAND, Key::I), Command::InterpretNow),
 ];
 
 /// The menu key equivalent of a command.
@@ -160,6 +175,8 @@ pub struct MenuState {
     pub status: PipelineStatus,
     pub sidebar_visible: bool,
     pub view: View,
+    /// The brain can take a job (claude answered, nothing running).
+    pub brain_ready: bool,
 }
 
 /// The menu bar as data, from `s` (pure; [`OatsApp::menu_model`] feeds it the app's state).
@@ -202,6 +219,17 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                 Separator,
                 check("Today", Command::ShowToday, s.view == View::Today),
                 check("All Transcripts", Command::ShowAll, s.view == View::All),
+                check("Notes", Command::ShowNotes, s.view == View::Notes),
+                check("Calendar", Command::ShowCalendar, s.view == View::Calendar),
+            ],
+        },
+        MenuSection {
+            title: "Notes",
+            entries: vec![
+                item("Interpret Now", Command::InterpretNow, s.brain_ready),
+                item("Review Now", Command::ReviewNow, s.brain_ready),
+                Separator,
+                item("Reorganise…", Command::Reorganise, s.brain_ready),
             ],
         },
     ]
@@ -222,9 +250,21 @@ pub struct OatsApp {
     /// Latest input level: RMS dBFS and whether a segment is open.
     level: Option<(f32, bool)>,
     rows: Vec<TranscriptRow>,
-    categories: Vec<Category>,
+    /// The whole category → project → topic tree.
+    nodes: Vec<Node>,
     today_count: i64,
     today_start: i64,
+    /// The brain's worker, if the binary wired one in.
+    brain: Option<BrainHandle>,
+    brain_status: BrainStatus,
+    /// The last executed voice command, for the status strip.
+    last_command: Option<String>,
+    episodes: Vec<Episode>,
+    events: Vec<Event>,
+    reminders: Vec<Reminder>,
+    changes: Vec<Change>,
+    notes_state: NotesState,
+    calendar_state: CalendarState,
     /// The last non-fatal problem (pipeline warning, store or microphone error).
     warning: Option<String>,
     /// Start listening as soon as the engine reports Idle (prefs said we were listening).
@@ -244,7 +284,8 @@ pub struct OatsApp {
 
 impl OatsApp {
     /// Build the app: theme, prefs, the first store read. `status` is the platform's status
-    /// item (built by the binary from its chosen `oats_status` implementation), `None` for none.
+    /// item (built by the binary from its chosen `oats_status` implementation), `None` for none;
+    /// `brain` the interpretation worker (`None` runs the app without it).
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         options: AppOptions,
@@ -252,6 +293,7 @@ impl OatsApp {
         audio: AudioStarter,
         store: Store,
         status: Option<Box<dyn StatusItem>>,
+        brain: Option<BrainHandle>,
     ) -> Self {
         let face = crate::theme::install_with(
             &cc.egui_ctx,
@@ -286,9 +328,18 @@ impl OatsApp {
             engine_name: String::new(),
             level: None,
             rows: Vec::new(),
-            categories: Vec::new(),
+            nodes: Vec::new(),
             today_count: 0,
             today_start: local_midnight_ms(),
+            brain,
+            brain_status: BrainStatus::default(),
+            last_command: None,
+            episodes: Vec::new(),
+            events: Vec::new(),
+            reminders: Vec::new(),
+            changes: Vec::new(),
+            notes_state: NotesState::default(),
+            calendar_state: CalendarState::default(),
             warning: None,
             sidebar: SidebarState::default(),
             data_dir: oats_core::paths::data_dir().display().to_string(),
@@ -428,7 +479,17 @@ impl OatsApp {
             status: self.status.clone(),
             sidebar_visible: self.prefs.sidebar_visible,
             view: self.prefs.view,
+            brain_ready: self.brain.is_some()
+                && self.brain_status.available()
+                && self.brain_status.running.is_none(),
         })
+    }
+
+    fn brain_send(&mut self, cmd: BrainCommand) {
+        match &self.brain {
+            Some(b) => b.send(cmd),
+            None => self.warning = Some("The brain is not running (OATS_BRAIN=off?)".to_owned()),
+        }
     }
 
     /// Run a menu / shortcut command.
@@ -452,6 +513,11 @@ impl OatsApp {
             Command::ToggleSidebar => self.prefs.sidebar_visible = !self.prefs.sidebar_visible,
             Command::ShowToday => self.set_view(View::Today),
             Command::ShowAll => self.set_view(View::All),
+            Command::ShowNotes => self.set_view(View::Notes),
+            Command::ShowCalendar => self.set_view(View::Calendar),
+            Command::InterpretNow => self.brain_send(BrainCommand::InterpretNow),
+            Command::ReviewNow => self.brain_send(BrainCommand::ReviewNow),
+            Command::Reorganise => self.brain_send(BrainCommand::ReorganiseNow),
         }
     }
 
@@ -497,20 +563,21 @@ impl OatsApp {
         }
     }
 
-    /// Re-read categories, the current view and today's count.
+    /// Re-read the tree, the current view, today's count and the brain's output.
     fn reload(&mut self) {
-        match self.store.categories() {
-            Ok(c) => self.categories = c,
+        match self.store.nodes() {
+            Ok(n) => self.nodes = n,
             Err(e) => self.store_error(e),
         }
-        // a deleted category can't stay the view
-        if let View::Category(id) = self.prefs.view
-            && !self.categories.iter().any(|c| c.id == id)
-            && !self.categories.is_empty()
+        // a deleted node can't stay the view
+        if let View::Node(id) = self.prefs.view
+            && !self.nodes.iter().any(|n| n.id == id)
+            && !self.nodes.is_empty()
         {
             self.prefs.view = View::Today;
         }
         self.reload_rows();
+        self.reload_brain_data();
     }
 
     fn reload_rows(&mut self) {
@@ -525,6 +592,56 @@ impl OatsApp {
         }
     }
 
+    /// Episodes (of the selected subtree in a Node view, else all), events, reminders, the
+    /// change log and the latest run.
+    fn reload_brain_data(&mut self) {
+        let episodes = match self.prefs.view {
+            View::Node(id) => self.store.episodes_under(id, 300),
+            _ => self.store.episodes(300),
+        };
+        match episodes {
+            Ok(e) => self.episodes = e,
+            Err(e) => self.store_error(e),
+        }
+        match self.store.events_from(i64::MIN, 500) {
+            Ok(e) => self.events = e,
+            Err(e) => self.store_error(e),
+        }
+        match self.store.reminders(false, 200) {
+            Ok(r) => self.reminders = r,
+            Err(e) => self.store_error(e),
+        }
+        match self.store.changes(50) {
+            Ok(c) => self.changes = c,
+            Err(e) => self.store_error(e),
+        }
+        if let Ok(runs) = self.store.runs(1) {
+            self.brain_status.last_run = runs.into_iter().next();
+        }
+        if let Ok(spent) = self.store.cost_since(self.today_start) {
+            self.brain_status.spend_today_usd = spent;
+        }
+    }
+
+    /// Whether `node` is `root` or below it.
+    fn in_subtree(&self, node: i64, root: i64) -> bool {
+        let mut cur = Some(node);
+        for _ in 0..16 {
+            match cur {
+                Some(id) if id == root => return true,
+                Some(id) => {
+                    cur = self
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .and_then(|n| n.parent_id)
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
     fn store_error(&mut self, e: oats_core::StoreError) {
         log::warn!("store: {e}");
         self.warning = Some(format!("Store: {e}"));
@@ -535,7 +652,45 @@ impl OatsApp {
         match self.prefs.view {
             View::Today => row.started_at >= self.today_start,
             View::All => true,
-            View::Category(id) => row.category_id == Some(id),
+            View::Node(id) => row.node_id.is_some_and(|n| self.in_subtree(n, id)),
+            View::Notes | View::Calendar => false,
+        }
+    }
+
+    /// Drain and apply the brain's events.
+    fn handle_brain_events(&mut self) {
+        let events: Vec<BrainEvent> = match &self.brain {
+            Some(b) => b.poll(),
+            None => return,
+        };
+        let mut reload = false;
+        for ev in events {
+            match ev {
+                BrainEvent::Availability(r) => {
+                    if let Err(e) = &r {
+                        log::warn!("brain unavailable: {e}");
+                    }
+                    self.brain_status.availability = Some(r);
+                }
+                BrainEvent::RunStarted { kind, .. } => self.brain_status.running = Some(kind),
+                BrainEvent::RunFinished(run) => {
+                    self.brain_status.running = None;
+                    self.brain_status.last_run = Some(run);
+                }
+                BrainEvent::Command { lines, .. } => {
+                    self.last_command = Some(lines.join(" · "));
+                    reload = true;
+                }
+                BrainEvent::Changed(_) => reload = true,
+                BrainEvent::Spend { today_usd } => self.brain_status.spend_today_usd = today_usd,
+                BrainEvent::Warning(w) => {
+                    log::warn!("brain: {w}");
+                    self.warning = Some(w);
+                }
+            }
+        }
+        if reload {
+            self.reload();
         }
     }
 
@@ -573,6 +728,9 @@ impl OatsApp {
                 PipelineEvent::Segment(row) => {
                     if row.started_at >= self.today_start {
                         self.today_count += 1;
+                    }
+                    if let Some(b) = &self.brain {
+                        b.segment_arrived(row.clone());
                     }
                     if self.in_view(&row) {
                         self.rows.push(row);
@@ -663,13 +821,13 @@ impl OatsApp {
                     Ok(_) => changed = true,
                     Err(e) => self.store_error(e),
                 },
-                SidebarAction::Rename(id, name) => match self.store.rename_category(id, &name) {
+                SidebarAction::Rename(id, name) => match self.store.rename_node(id, &name) {
                     Ok(()) => changed = true,
                     Err(e) => self.store_error(e),
                 },
-                SidebarAction::Delete(id) => match self.store.delete_category(id) {
+                SidebarAction::Delete(id) => match self.store.delete_node(id) {
                     Ok(()) => {
-                        if self.prefs.view == View::Category(id) {
+                        if self.prefs.view == View::Node(id) {
                             self.prefs.view = View::Today;
                         }
                         changed = true;
@@ -690,7 +848,7 @@ impl OatsApp {
         for a in actions {
             let r = match a {
                 TranscriptAction::Move { segment, category } => {
-                    self.store.set_segment_category(segment, category)
+                    self.store.set_segment_node(segment, category)
                 }
                 TranscriptAction::Delete { segment } => self.store.delete_segment(segment),
             };
@@ -699,6 +857,34 @@ impl OatsApp {
             }
         }
         self.reload_rows();
+    }
+
+    fn apply_notes(&mut self, actions: Vec<NotesAction>) {
+        for a in actions {
+            match a {
+                NotesAction::InterpretNow => self.run(Command::InterpretNow),
+                NotesAction::ReviewNow => self.run(Command::ReviewNow),
+                NotesAction::Reorganise => self.run(Command::Reorganise),
+                NotesAction::Reinterpret(id) => self.brain_send(BrainCommand::Reinterpret(id)),
+                NotesAction::Undo(id) => self.brain_send(BrainCommand::UndoChange(id)),
+            }
+        }
+    }
+
+    fn apply_calendar(&mut self, actions: Vec<CalendarAction>) {
+        if actions.is_empty() {
+            return;
+        }
+        for a in actions {
+            let r = match a {
+                CalendarAction::SetReminderDone(id, done) => self.store.set_reminder_done(id, done),
+                CalendarAction::DeleteEvent(id) => self.store.delete_event(id),
+            };
+            if let Err(e) = r {
+                self.store_error(e);
+            }
+        }
+        self.reload_brain_data();
     }
 
     fn state_label(&self) -> &'static str {
@@ -768,8 +954,16 @@ impl OatsApp {
             &self.engine_name
         };
         let n = self.today_count;
+        let brain = match (&self.brain, &self.brain_status.running) {
+            (None, _) => String::new(),
+            (Some(_), Some(job)) => format!(" · brain: {job}…"),
+            (Some(_), None) => match &self.brain_status.availability {
+                Some(Err(_)) => " · brain: unavailable".to_owned(),
+                _ => format!(" · brain ${:.2} today", self.brain_status.spend_today_usd),
+            },
+        };
         let left = format!(
-            "{engine} · {} · {n} segment{} today",
+            "{engine} · {} · {n} segment{} today{brain}",
             self.state_label(),
             if n == 1 { "" } else { "s" }
         );
@@ -783,9 +977,10 @@ impl OatsApp {
             left_galley,
             t.text_tertiary,
         );
-        let (right, col) = match &self.warning {
-            Some(w) => (w.as_str(), t.danger.gamma_multiply(0.9)),
-            None => (self.data_dir.as_str(), t.text_tertiary),
+        let (right, col) = match (&self.warning, &self.last_command) {
+            (Some(w), _) => (w.as_str(), t.danger.gamma_multiply(0.9)),
+            (None, Some(c)) => (c.as_str(), t.accent.gamma_multiply(0.9)),
+            (None, None) => (self.data_dir.as_str(), t.text_tertiary),
         };
         // the right text never runs over the left
         let room = rect.width() - left_w - 32.0;
@@ -894,6 +1089,7 @@ impl eframe::App for OatsApp {
     // everything the status item drives lives here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events();
+        self.handle_brain_events();
         self.route_menu_events();
         self.sync_status_item(ctx);
         self.handle_close(ctx);
@@ -934,7 +1130,7 @@ impl eframe::App for OatsApp {
                 )
                 .show(ui, |ui| {
                     sidebar_actions =
-                        sidebar_panel(ui, &mut self.sidebar, self.prefs.view, &self.categories);
+                        sidebar_panel(ui, &mut self.sidebar, self.prefs.view, &self.nodes);
                 });
             let w = resp.response.rect.width();
             if (w - self.prefs.sidebar_width).abs() > 0.5 {
@@ -943,6 +1139,8 @@ impl eframe::App for OatsApp {
         }
 
         let mut transcript_actions = Vec::new();
+        let mut notes_actions = Vec::new();
+        let mut calendar_actions = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.chrome))
             .show(ui, |ui| {
@@ -975,7 +1173,30 @@ impl eframe::App for OatsApp {
                 );
                 list_ui.painter().rect_filled(list_rect, 0.0, t.canvas);
                 list_ui.set_clip_rect(list_rect);
-                transcript_actions = transcript_list(&mut list_ui, &self.rows, &self.categories);
+                match self.prefs.view {
+                    View::Notes => {
+                        notes_actions = notes_view(
+                            &mut list_ui,
+                            &mut self.notes_state,
+                            &self.brain_status,
+                            &self.episodes,
+                            &self.nodes,
+                            &self.changes,
+                        );
+                    }
+                    View::Calendar => {
+                        calendar_actions = calendar_view(
+                            &mut list_ui,
+                            &mut self.calendar_state,
+                            &self.events,
+                            &self.reminders,
+                            &self.nodes,
+                        );
+                    }
+                    _ => {
+                        transcript_actions = transcript_list(&mut list_ui, &self.rows, &self.nodes);
+                    }
+                }
 
                 self.status_line(ui, &t, status_rect);
                 ui.painter().hline(
@@ -989,6 +1210,8 @@ impl eframe::App for OatsApp {
 
         self.apply_sidebar(sidebar_actions, &mut cmds);
         self.apply_transcript(transcript_actions);
+        self.apply_notes(notes_actions);
+        self.apply_calendar(calendar_actions);
         for c in cmds {
             self.run(c);
         }
@@ -1034,7 +1257,7 @@ mod tests {
         let prefs = AppPrefs {
             sidebar_visible: false,
             sidebar_width: 250.0,
-            view: View::Category(7),
+            view: View::Node(7),
             listening: true,
         };
         prefs.store(&mut s);
@@ -1058,9 +1281,16 @@ mod tests {
             Command::ToggleSidebar,
             Command::ShowToday,
             Command::ShowAll,
+            Command::ShowNotes,
+            Command::ShowCalendar,
+            Command::InterpretNow,
         ] {
             assert!(menu_shortcut(cmd).is_some(), "{cmd:?}");
         }
+        assert_eq!(
+            menu_shortcut(Command::InterpretNow),
+            Some(KeyboardShortcut::new(Modifiers::COMMAND, Key::I))
+        );
         assert_eq!(
             menu_shortcut(Command::ToggleListening),
             Some(KeyboardShortcut::new(Modifiers::COMMAND, Key::L))
@@ -1089,6 +1319,7 @@ mod tests {
             status: PipelineStatus::Loading("x".to_owned()),
             sidebar_visible: true,
             view: View::Today,
+            brain_ready: false,
         };
         assert_eq!(
             listen_item(&build_menu_model(&s)),
@@ -1112,7 +1343,24 @@ mod tests {
             Some(("Start Listening".to_owned(), false))
         );
         let titles: Vec<_> = build_menu_model(&s).iter().map(|m| m.title).collect();
-        assert_eq!(titles, ["File", "Listen", "View"]);
+        assert_eq!(titles, ["File", "Listen", "View", "Notes"]);
+        // the Notes menu follows the brain's readiness
+        let interpret = |model: &[MenuSection]| {
+            model
+                .iter()
+                .flat_map(|s| s.entries.iter())
+                .find_map(|e| match e {
+                    MenuEntry::Item {
+                        cmd: Command::InterpretNow,
+                        enabled,
+                        ..
+                    } => Some(*enabled),
+                    _ => None,
+                })
+        };
+        assert_eq!(interpret(&build_menu_model(&s)), Some(false));
+        s.brain_ready = true;
+        assert_eq!(interpret(&build_menu_model(&s)), Some(true));
     }
 
     /// Records what it was told to show; hands out whatever the test queued.
@@ -1177,8 +1425,13 @@ mod tests {
             audio,
             store,
             Some(Box::new(item)),
+            None,
         );
         assert!(app.has_status_item());
+        // without a brain, Interpret Now says so instead of doing nothing
+        app.run(Command::InterpretNow);
+        assert!(app.warning.as_deref().is_some_and(|w| w.contains("brain")));
+        app.warning = None;
         // the status item follows the app's state, and is only told about changes
         app.sync_status_item(&cc.egui_ctx);
         app.sync_status_item(&cc.egui_ctx);

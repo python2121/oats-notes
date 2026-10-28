@@ -24,6 +24,11 @@ pub struct SelftestOptions {
     /// Show the app in the Listening state with a fake input level (no audio is opened) and the
     /// All Transcripts view, so the pill, the meter and both day headings are in the capture.
     pub listening: bool,
+    /// Show the Notes view (a seeded interpreted episode with a project, action items and a
+    /// change-log line) instead of the transcript.
+    pub notes: bool,
+    /// Show the Calendar view (seeded events and a reminder).
+    pub calendar: bool,
 }
 
 /// [`run_with`] with the default options (Today view, not listening).
@@ -62,6 +67,7 @@ pub fn run_with(
                 audio,
                 store,
                 None,
+                None,
             )
         });
     harness
@@ -86,6 +92,11 @@ pub fn run_with(
         let app = harness.state_mut();
         app.run(Command::ShowAll);
         app.selftest_fake_listening(-22.0, true);
+    }
+    if options.notes {
+        harness.state_mut().run(Command::ShowNotes);
+    } else if options.calendar {
+        harness.state_mut().run(Command::ShowCalendar);
     }
     // settle: fonts, layout, the scroll area's stick-to-bottom
     harness.run_steps(4);
@@ -163,9 +174,113 @@ fn seed(store: &Store) -> Result<(), oats_core::StoreError> {
     if let Some(work) = store.categories()?.into_iter().find(|c| c.name == "Work") {
         for &i in [0usize, 4].iter() {
             if let Some(&id) = ids.get(i) {
-                store.set_segment_category(id, Some(work.id))?;
+                store.set_segment_node(id, Some(work.id))?;
             }
         }
+        // what the brain would have made of yesterday's meeting: a project under Work, the
+        // episode filed under it, an event it found, a reminder from a voice command
+        use oats_core::{ActionItem, EpisodeContent, NewEvent, NewReminder, NodeKind, Origin};
+        let project = store.add_node(
+            Some(work.id),
+            NodeKind::Project,
+            "Export rewrite",
+            "the Q4 export rewrite (CSV/Excel first, PDF later)",
+            Origin::Auto,
+        )?;
+        let now = today + 10 * H + 7 * M;
+        let episode = store.insert_episode(
+            yesterday + 14 * H + 2 * M,
+            yesterday + 14 * H + 12 * M,
+            &EpisodeContent {
+                title: "Q4 roadmap and the export rewrite".into(),
+                summary: "- The export rewrite still fits before the holidays if the **PDF templates** are dropped for now.\n- Priya sends the updated estimate by Thursday; Marco books the design review for early next week.\n- Scope is locked after the review.".into(),
+                node_id: Some(project.id),
+                decisions: vec!["Drop the PDF templates from the Q4 scope".into()],
+                action_items: vec![
+                    ActionItem { text: "Send the updated estimate".into(), owner: Some("Priya".into()), due: Some("Thursday".into()) },
+                    ActionItem { text: "Book the design review".into(), owner: Some("Marco".into()), due: Some("early next week".into()) },
+                ],
+                topics: vec!["export rewrite".into(), "Q4 roadmap".into()],
+                low_signal: false,
+                model: "claude-sonnet-4-5".into(),
+                cost_usd: Some(0.031),
+            },
+            now,
+        )?;
+        store.mark_segments_interpreted(&ids[..3], episode.id, now)?;
+        store.insert_episode(
+            yesterday + 15 * H + 40 * M,
+            yesterday + 15 * H + 41 * M,
+            &EpisodeContent {
+                title: "Television in the background".into(),
+                summary: "A few lines of a news programme.".into(),
+                low_signal: true,
+                model: "claude-sonnet-4-5".into(),
+                cost_usd: Some(0.004),
+                ..Default::default()
+            },
+            now,
+        )?;
+        store.upsert_event(
+            &NewEvent {
+                when_start: today + 2 * 24 * H + 10 * H,
+                all_day: false,
+                title: "Design review (export rewrite)".into(),
+                details: "Marco to book; scope locks afterwards".into(),
+                node_id: Some(project.id),
+                source: Some(Origin::Interpretation),
+                source_episode_id: Some(episode.id),
+                confidence: Some(0.8),
+                dedupe_key: Some("selftest:review".into()),
+                ..Default::default()
+            },
+            now,
+        )?;
+        let taxes = store.upsert_event(
+            &NewEvent {
+                when_start: today + 45 * 24 * H,
+                all_day: true,
+                title: "Property taxes due".into(),
+                source: Some(Origin::Hotword),
+                source_segment_id: ids.get(7).copied(),
+                confidence: Some(1.0),
+                dedupe_key: Some("selftest:taxes".into()),
+                ..Default::default()
+            },
+            now,
+        )?;
+        store.upsert_reminder(
+            &NewReminder {
+                event_id: Some(taxes.id),
+                due: today + 38 * 24 * H,
+                text: "Property taxes due in one week".into(),
+                source: Some(Origin::Hotword),
+                source_segment_id: ids.get(7).copied(),
+                dedupe_key: Some("selftest:taxes-reminder".into()),
+            },
+            now,
+        )?;
+        let run = store.begin_run(1, "interpret", "sonnet", now - 4_000)?;
+        store.finish_run(
+            run,
+            &oats_core::RunOutcome {
+                finished_at: now,
+                model: Some("claude-sonnet-4-5".into()),
+                cost_usd: Some(0.035),
+                duration_ms: Some(4_100),
+                ok: true,
+                error: None,
+                summary: "2 of 2 chunks".into(),
+            },
+        )?;
+        store.record_change(
+            Some(run),
+            "node_create",
+            "Created project 'Export rewrite'",
+            &serde_json::Value::Null,
+            &serde_json::json!({"id": project.id}),
+            now,
+        )?;
     }
     Ok(())
 }

@@ -14,6 +14,7 @@ oats-core = { path = "crates/oats-core" }
 oats-audio = { path = "crates/oats-audio" }
 oats-engine-fluidaudio = { path = "crates/oats-engine-fluidaudio" }
 oats-ui = { path = "crates/oats-ui" }
+oats-brain = { path = "crates/oats-brain" }
 oats-status = { path = "crates/oats-status" }
 oats-status-macos = { path = "crates/oats-status-macos" }
 
