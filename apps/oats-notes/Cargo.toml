@@ -10,6 +10,11 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = ["selftest"]
+# `--selftest out.png`: render the window offscreen (oats-ui's egui_kittest harness).
+selftest = ["oats-ui/selftest"]
+
 [dependencies]
 oats-core = { workspace = true }
 oats-audio = { workspace = true }

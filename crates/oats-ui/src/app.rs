@@ -751,6 +751,21 @@ fn level_meter(ui: &mut egui::Ui, t: &Tokens, level: Option<(f32, bool)>) {
     }
 }
 
+#[cfg(feature = "selftest")]
+impl OatsApp {
+    /// Selftest only: what the status line names as the data location.
+    pub(crate) fn selftest_set_data_dir(&mut self, label: String) {
+        self.data_dir = label;
+    }
+
+    /// Selftest only: show the Listening state with a fixed input level, no audio opened.
+    pub(crate) fn selftest_fake_listening(&mut self, rms_db: f32, in_speech: bool) {
+        self.capture = Some(Box::new(()));
+        self.status = PipelineStatus::Listening;
+        self.level = Some((rms_db, in_speech));
+    }
+}
+
 impl eframe::App for OatsApp {
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events();
@@ -835,6 +850,11 @@ impl eframe::App for OatsApp {
                 transcript_actions = transcript_list(&mut list_ui, &self.rows, &self.categories);
 
                 self.status_line(ui, &t, status_rect);
+                ui.painter().hline(
+                    full.x_range(),
+                    status_rect.top() - 0.5,
+                    egui::Stroke::new(1.0, t.divider),
+                );
                 // claim the whole panel so egui doesn't shrink it around the children
                 ui.advance_cursor_after_rect(full);
             });

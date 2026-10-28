@@ -8,6 +8,8 @@
 pub mod app;
 #[cfg(target_os = "macos")]
 pub mod native_menu;
+#[cfg(feature = "selftest")]
+pub mod selftest;
 pub mod sidebar;
 pub mod system_font;
 pub mod theme;

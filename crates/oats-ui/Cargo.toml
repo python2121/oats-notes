@@ -9,6 +9,11 @@ description = "egui front end (eframe): sidebar, transcript view, listen control
 [lints]
 workspace = true
 
+[features]
+default = ["selftest"]
+# `oats_ui::selftest`: render the whole window offscreen to a PNG (egui_kittest over wgpu).
+selftest = ["dep:egui_kittest", "dep:image"]
+
 [dependencies]
 oats-core = { workspace = true }
 egui = { workspace = true }
@@ -20,6 +25,8 @@ chrono = { workspace = true }
 # Validates a system font before egui sees it (epaint panics on a font it can't parse). Same version
 # epaint itself uses, so nothing is built twice.
 skrifa = "=0.44.0"
+egui_kittest = { workspace = true, optional = true, features = ["wgpu", "eframe"] }
+image = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { workspace = true, features = ["wgpu", "persistence", "x11", "wayland"] }

@@ -45,6 +45,7 @@ on the pipeline's own thread via an `EngineFactory`, so they need not be `Send`
 cargo run -p oats-notes                   # the app (first run downloads the Parakeet CoreML model, ~600 MB, into ~/Library/Application Support/FluidAudio)
 OATS_ENGINE=null cargo run -p oats-notes  # the app without a model (UI work; speech detected, not transcribed)
 cargo run -p oats-audio --example levels  # mic sanity check: prints input level for 5 s
+cargo run -p oats-notes -- --selftest out.png [--listening]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows — how the shell is verified without a window
 OATS_NO_NATIVE_MENU=1 …                   # in-window egui menu bar instead of the macOS menu bar
 OATS_FONT=bundled …                       # Inter instead of the system font
 OATS_DATA_DIR=/path …                     # database location override (default ~/Library/Application Support/OatsNotes/oats.sqlite)

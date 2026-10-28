@@ -13,6 +13,9 @@
 //! Environment: `OATS_ENGINE=null` (no model), `OATS_NO_NATIVE_MENU=1` (menus in the window),
 //! `OATS_FONT=bundled` (Inter instead of the system font), `OATS_FONT_GRADE` (SF Pro grade),
 //! `OATS_DATA_DIR` (where the database lives), `RUST_LOG`.
+//!
+//! `--selftest <out.png> [--listening]` renders the whole window offscreen to a PNG (seeded
+//! demo content, the null engine, a throwaway database) — the shell verified without a window.
 
 use std::any::Any;
 use std::process::ExitCode;
@@ -58,8 +61,27 @@ fn engine_factory() -> oats_core::EngineFactory {
     }
 }
 
+fn usage() -> ExitCode {
+    eprintln!(
+        "usage: oats-notes\n       oats-notes --selftest <out.png> [--listening]\n\n\
+         --selftest   render the window offscreen to a PNG (demo content, no microphone)\n\
+         --listening  with --selftest: show the Listening state with a fake input level"
+    );
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return usage();
+    }
+    if args.first().map(String::as_str) == Some("--selftest") {
+        return selftest_cli(&args[1..]);
+    }
+    if !args.is_empty() {
+        return usage();
+    }
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -134,4 +156,66 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `--selftest <out.png> [--listening]`: the null engine, a fresh database in `OATS_DATA_DIR`
+/// (else a temp dir), the window rendered offscreen.
+#[cfg(feature = "selftest")]
+fn selftest_cli(args: &[String]) -> ExitCode {
+    let mut out: Option<std::path::PathBuf> = None;
+    let mut options = oats_ui::selftest::SelftestOptions::default();
+    for a in args {
+        match a.as_str() {
+            "--listening" => options.listening = true,
+            f if !f.starts_with("--") && out.is_none() => out = Some(f.into()),
+            _ => return usage(),
+        }
+    }
+    let Some(out) = out else { return usage() };
+    let dir = std::env::var_os("OATS_DATA_DIR").map_or_else(
+        || std::env::temp_dir().join(format!("oatsnotes-selftest-{}", std::process::id())),
+        std::path::PathBuf::from,
+    );
+    let db = dir.join("selftest.sqlite");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let store = match oats_core::Store::open(&db) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("selftest failed: cannot open {}: {e}", db.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let pipeline = oats_core::Pipeline {
+        engine: Box::new(
+            || Ok(Box::new(oats_core::NullEngine) as Box<dyn oats_core::SpeechEngine>),
+        ),
+        store_path: db,
+        segmenter: Default::default(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    let audio: oats_ui::AudioStarter =
+        Box::new(|_tx| Err("the selftest never opens the microphone".to_owned()));
+    let result = oats_ui::selftest::run_with(&out, store, pipeline, audio, options);
+    if std::env::var_os("OATS_DATA_DIR").is_none() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    match result {
+        Ok([w, h]) => {
+            println!("selftest: wrote {} ({w}×{h})", out.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("selftest failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "selftest"))]
+fn selftest_cli(_args: &[String]) -> ExitCode {
+    eprintln!("oats-notes: built without the `selftest` feature");
+    ExitCode::FAILURE
 }
