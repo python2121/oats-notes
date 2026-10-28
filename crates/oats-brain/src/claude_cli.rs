@@ -18,6 +18,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Environment variable naming the `claude` binary (default: `~/.local/bin/claude` when it
@@ -36,6 +37,9 @@ pub enum CliError {
     RateLimited(String),
     #[error("claude did not finish within {0:?}")]
     Timeout(Duration),
+    /// The caller cancelled the request (the app is quitting); the child was killed.
+    #[error("the claude request was cancelled")]
+    Cancelled,
     #[error("claude exited with {code}: {stderr}")]
     Exit { code: i32, stderr: String },
     #[error("claude produced no usable JSON: {0}")]
@@ -266,7 +270,7 @@ impl ClaudeCli {
         let mut cmd = self.command();
         cmd.arg("--version").stdin(Stdio::null());
         let child = cmd.spawn().map_err(|e| self.spawn_err(e))?;
-        let out = wait_with_timeout(child, Duration::from_secs(20))?;
+        let out = wait_with_timeout(child, Duration::from_secs(20), None)?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         if out.code != 0 {
             return Err(CliError::Exit {
@@ -279,6 +283,17 @@ impl ClaudeCli {
 
     /// Run one request and parse the result.
     pub fn run(&self, req: &Request) -> Result<Response, CliError> {
+        self.run_cancellable(req, &AtomicBool::new(false))
+    }
+
+    /// [`Self::run`], but setting `cancel` (from another thread) kills the child and returns
+    /// [`CliError::Cancelled`] within a poll interval — so quitting the app never waits out a
+    /// long request (and never leaves an orphaned `claude` running).
+    pub fn run_cancellable(
+        &self,
+        req: &Request,
+        cancel: &AtomicBool,
+    ) -> Result<Response, CliError> {
         let mut cmd = self.command();
         cmd.arg("-p").args(["--output-format", "json"]);
         if let Some(model) = req.model.as_ref().or(self.model.as_ref()) {
@@ -313,7 +328,7 @@ impl ClaudeCli {
                 drop(stdin);
             });
         }
-        let out = wait_with_timeout(child, self.timeout)?;
+        let out = wait_with_timeout(child, self.timeout, Some(cancel))?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
         log::debug!(
@@ -366,7 +381,9 @@ impl ClaudeCli {
             } else {
                 resp.text.clone()
             };
-            return Err(classify(&msg, None).unwrap_or(CliError::Refused(msg)));
+            // not an error result: the text is the model's own words (which may well mention
+            // "authentication" or "rate limits"), so it is never classified as a CLI state
+            return Err(CliError::Refused(msg));
         }
         Ok(resp)
     }
@@ -378,10 +395,12 @@ struct Output {
     stderr: Vec<u8>,
 }
 
-/// Collect a child's output, killing it (and its process group) past `timeout`.
+/// Collect a child's output, killing it (and its process group) past `timeout` or once
+/// `cancel` is set.
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Output, CliError> {
     let stdout = child.stdout.take().map(drain);
     let stderr = child.stderr.take().map(drain);
@@ -393,6 +412,10 @@ fn wait_with_timeout(
         if Instant::now() >= deadline {
             kill_tree(&mut child);
             return Err(CliError::Timeout(timeout));
+        }
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            kill_tree(&mut child);
+            return Err(CliError::Cancelled);
         }
         std::thread::sleep(Duration::from_millis(25));
     };
@@ -569,6 +592,33 @@ mod tests {
         let t = Instant::now();
         assert!(matches!(cli.run(&request()), Err(CliError::Timeout(_))));
         assert!(t.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn cancel_kills_the_child_promptly() {
+        let (cli, _) = fake("cancel", "sleep 5; echo '{}'");
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let t = Instant::now();
+        assert!(matches!(
+            cli.run_cancellable(&request(), &cancel),
+            Err(CliError::Cancelled)
+        ));
+        assert!(t.elapsed() < Duration::from_secs(3));
+        let _ = setter.join();
+    }
+
+    #[test]
+    fn model_text_without_structured_output_is_never_an_auth_error() {
+        let (cli, _) = fake(
+            "authtext",
+            r#"echo '{"type":"result","is_error":false,"subtype":"error_max_turns","result":"We discussed the OAuth token authentication rework"}'"#,
+        );
+        assert!(matches!(cli.run(&request()), Err(CliError::Refused(_))));
     }
 
     #[test]

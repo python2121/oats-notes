@@ -603,11 +603,28 @@ impl OatsApp {
             Ok(e) => self.episodes = e,
             Err(e) => self.store_error(e),
         }
-        match self.store.events_from(i64::MIN, 500) {
+        // the most recent past and the nearest upcoming: a plain oldest-first window would,
+        // once 500 events piled up, never show anything upcoming again
+        let events = self
+            .store
+            .events_before(self.today_start, 200)
+            .and_then(|mut past| {
+                past.extend(self.store.events_from(self.today_start, 500)?);
+                Ok(past)
+            });
+        match events {
             Ok(e) => self.events = e,
             Err(e) => self.store_error(e),
         }
-        match self.store.reminders(false, 200) {
+        // every open reminder first (oldest-due-first with done ones mixed in would, past the
+        // limit, hide the newest open ones), then done ones for "show done"
+        let reminders = self.store.reminders(true, 300).and_then(|mut open| {
+            let done = self.store.reminders(false, 300)?;
+            open.extend(done.into_iter().filter(|r| r.done));
+            open.sort_by_key(|r| (r.due, r.id));
+            Ok(open)
+        });
+        match reminders {
             Ok(r) => self.reminders = r,
             Err(e) => self.store_error(e),
         }

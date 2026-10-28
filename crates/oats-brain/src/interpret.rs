@@ -970,6 +970,9 @@ pub fn apply_reorganisation(
                     || gone.contains(&from)
                     || gone.contains(&into)
                     || f.kind == NodeKind::Category
+                    // the store refuses (silently) to merge a node into its own subtree; don't
+                    // record a merge that didn't happen
+                    || store.subtree_ids(from)?.contains(&into)
                 {
                     continue;
                 }
@@ -1018,7 +1021,11 @@ pub fn apply_reorganisation(
                 let (Some(n), Some(p)) = (node(id), node(parent)) else {
                     continue;
                 };
-                if n.parent_id == Some(parent) || gone.contains(&id) || n.kind == NodeKind::Category
+                if n.parent_id == Some(parent)
+                    || gone.contains(&id)
+                    || n.kind == NodeKind::Category
+                    // a move under its own subtree is refused by the store: not a change
+                    || store.subtree_ids(id)?.contains(&parent)
                 {
                     continue;
                 }
@@ -1475,6 +1482,34 @@ mod tests {
             s.segment(chunk.segments[1].id).unwrap().unwrap().node_id,
             None
         );
+    }
+
+    #[test]
+    fn reorganise_does_not_record_moves_or_merges_into_a_nodes_own_subtree() {
+        let (s, _, _) = seeded();
+        let work = s.categories().unwrap()[0].id;
+        let p = s
+            .add_node(Some(work), NodeKind::Project, "Exporter", "", Origin::Auto)
+            .unwrap();
+        let t = s
+            .add_node(Some(p.id), NodeKind::Topic, "CSV", "", Origin::Auto)
+            .unwrap();
+        let tree = s.nodes().unwrap();
+        let action = |kind: &str| Action {
+            kind: kind.into(),
+            from: Some(p.id),
+            into: Some(t.id),
+            node_id: Some(p.id),
+            new_parent_id: Some(t.id),
+            ..Default::default()
+        };
+        let actions = Actions {
+            actions: vec![action("move_node"), action("merge_nodes")],
+        };
+        let lines = apply_reorganisation(&s, &tree, &actions, None, 1).unwrap();
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(s.changes(10).unwrap().is_empty());
+        assert_eq!(s.node(p.id).unwrap().unwrap().parent_id, Some(work));
     }
 
     #[test]

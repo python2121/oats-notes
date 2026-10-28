@@ -163,6 +163,58 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Maps a sample position of the session's audio to wall-clock Unix ms. Positions count
+/// samples, so the clock is exact while audio flows — but the machine can sleep mid-session
+/// (lid closed) and the audio simply stops, so the sample count falls behind the wall clock by
+/// the length of the nap. The monotonic clock (`Instant`) doesn't advance during sleep on
+/// macOS or Linux while the wall clock does, so their drift measures the sleep; when it grows
+/// by more than [`SampleClock::RESYNC_MS`], the gap is inserted before the chunk that arrived
+/// after the wake. (A processing stall moves both clocks alike and changes nothing.)
+#[derive(Clone, Copy, Debug)]
+struct SampleClock {
+    anchor_ms: i64,
+    anchor_sample: u64,
+    start_wall_ms: i64,
+    start_mono: Instant,
+    /// Sleep already accounted for.
+    slept_ms: i64,
+}
+
+impl SampleClock {
+    const RESYNC_MS: i64 = 2_000;
+
+    fn new(start_wall_ms: i64, start_mono: Instant) -> Self {
+        Self {
+            anchor_ms: start_wall_ms,
+            anchor_sample: 0,
+            start_wall_ms,
+            start_mono,
+            slept_ms: 0,
+        }
+    }
+
+    fn ms_at(&self, sample: u64) -> i64 {
+        let rate = i64::from(SAMPLE_RATE);
+        let delta = sample as i64 - self.anchor_sample as i64;
+        self.anchor_ms + delta * 1000 / rate
+    }
+
+    /// A chunk arrived at (`wall_ms`, `mono`); `before` samples had arrived before it.
+    fn observe(&mut self, before: u64, wall_ms: i64, mono: Instant) {
+        let mono_ms = mono.saturating_duration_since(self.start_mono).as_millis() as i64;
+        let slept = (wall_ms - self.start_wall_ms) - mono_ms;
+        let extra = slept - self.slept_ms;
+        if extra > Self::RESYNC_MS {
+            self.anchor_ms = self.ms_at(before) + extra;
+            self.anchor_sample = before;
+            self.slept_ms = slept;
+        } else if extra < -Self::RESYNC_MS {
+            // the wall clock was set back: re-baseline, keep the sample times
+            self.slept_ms = slept;
+        }
+    }
+}
+
 /// After a fatal error: keep draining commands (dropping audio channels) until shutdown, so
 /// the handle's `Drop` never hangs.
 fn idle_until_shutdown(cmd_rx: &Receiver<Command>) {
@@ -280,10 +332,14 @@ impl Session<'_> {
         let mut pending: Vec<f32> = Vec::new();
         let mut last_level: Option<Instant> = None;
         let mut vad_warned = false;
+        let mut clock = SampleClock::new(started_ms, Instant::now());
+        let mut received: u64 = 0;
 
         let after = loop {
             match audio_rx.recv_timeout(AUDIO_POLL) {
                 Ok(chunk) => {
+                    clock.observe(received, now_ms(), Instant::now());
+                    received += chunk.len() as u64;
                     pending.extend_from_slice(&chunk);
                     let mut offset = 0;
                     while pending.len() - offset >= frame_len {
@@ -303,7 +359,7 @@ impl Session<'_> {
                             },
                         };
                         if let Some(seg) = segmenter.push(frame, is_speech) {
-                            self.finish_segment(session_id, started_ms, &seg);
+                            self.finish_segment(session_id, &clock, &seg);
                         }
                     }
                     pending.drain(..offset);
@@ -330,7 +386,7 @@ impl Session<'_> {
         };
 
         if let Some(seg) = segmenter.flush() {
-            self.finish_segment(session_id, started_ms, &seg);
+            self.finish_segment(session_id, &clock, &seg);
         }
         if let Err(e) = self.store.end_session(session_id, now_ms()) {
             self.out.send(PipelineEvent::Warning(format!(
@@ -343,11 +399,9 @@ impl Session<'_> {
     }
 
     /// Transcribe a closed segment, store it and report it.
-    fn finish_segment(&mut self, session_id: i64, session_start_ms: i64, seg: &Segment) {
-        let rate = u64::from(SAMPLE_RATE);
-        let started_at = session_start_ms + (seg.start_sample * 1000 / rate) as i64;
-        let ended_at =
-            session_start_ms + ((seg.start_sample + seg.samples.len() as u64) * 1000 / rate) as i64;
+    fn finish_segment(&mut self, session_id: i64, clock: &SampleClock, seg: &Segment) {
+        let started_at = clock.ms_at(seg.start_sample);
+        let ended_at = clock.ms_at(seg.start_sample + seg.samples.len() as u64);
         match self.engine.transcribe(&seg.samples) {
             Ok(t) => {
                 let text = t.text.trim();
@@ -423,6 +477,28 @@ mod tests {
             }
         }
         unreachable!("timed out waiting for {what}");
+    }
+
+    #[test]
+    fn sample_clock_follows_audio_and_resyncs_after_a_sleep() {
+        let t0 = Instant::now();
+        let mut c = SampleClock::new(1_000_000, t0);
+        // 10 s of audio, delivered late by a 5 s processing stall: sample time stays exact
+        c.observe(160_000, 1_015_000, t0 + Duration::from_secs(15));
+        assert_eq!(c.ms_at(160_000), 1_010_000);
+        assert_eq!(c.ms_at(16_000), 1_001_000);
+        // the machine slept exactly an hour: the wall clock moved, the monotonic one didn't
+        let hour = 3_600_000;
+        c.observe(
+            161_600,
+            1_015_100 + hour,
+            t0 + Duration::from_millis(15_100),
+        );
+        // the chunk after the wake (samples 161 600…) is an hour later than without the nap
+        assert_eq!(c.ms_at(161_600), 1_010_100 + hour);
+        assert_eq!(c.ms_at(161_600 + 16_000), 1_011_100 + hour);
+        let woke = 1_010_100 + hour;
+        assert!(c.ms_at(160_000) < woke);
     }
 
     #[test]

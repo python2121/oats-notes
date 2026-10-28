@@ -322,10 +322,16 @@ impl eframe::App for NativeMenuApp {
             }
         }
         self.app.logic(ctx, frame);
+        // and once more after the app ran: what `logic` just changed (the engine became ready,
+        // the brain became available, listening stopped) must reach the menu bar now — no
+        // repaint may follow, and the window may be hidden (then only `logic` runs)
+        let _ = self.menu.update(&self.app, Vec::new());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.app.ui(ui, frame);
+        // commands run from the window (sidebar, pill, keys) likewise
+        let _ = self.menu.update(&self.app, Vec::new());
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

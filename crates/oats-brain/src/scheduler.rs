@@ -20,7 +20,9 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, TimeZone, Timelike};
@@ -226,6 +228,8 @@ pub struct BrainHandle {
     cmd_tx: Sender<BrainCommand>,
     events: Receiver<BrainEvent>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Set on drop: kills an in-flight `claude` call so shutdown never waits it out.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Brain {
@@ -238,9 +242,11 @@ impl Brain {
             wake,
         } = self;
         let out = Outbox { tx: event_tx, wake };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
         let thread = std::thread::Builder::new()
             .name("oats-brain".to_owned())
-            .spawn(move || worker(config, &store_path, cmd_rx, out));
+            .spawn(move || worker(config, &store_path, cmd_rx, out, worker_cancel));
         let thread = match thread {
             Ok(t) => Some(t),
             Err(e) => {
@@ -252,6 +258,7 @@ impl Brain {
             cmd_tx,
             events,
             thread,
+            cancel,
         }
     }
 }
@@ -278,6 +285,7 @@ impl BrainHandle {
 
 impl Drop for BrainHandle {
     fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(BrainCommand::Shutdown);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -296,6 +304,23 @@ impl Outbox {
             (self.wake)();
         }
     }
+}
+
+/// How long a job that failed (or hit a rate limit) waits before it is tried again.
+const FAILURE_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
+/// What one chunk of an interpretation run came to.
+enum ChunkStep {
+    /// Too short and still open: left for a later run.
+    Waiting,
+    /// Too short and closed: filed as a low-signal "Fragments" episode without a call.
+    Fragment,
+    RateLimited(String),
+    Interpreted {
+        resp: Box<crate::claude_cli::Response>,
+        applied: Box<interpret::Applied>,
+        revised: bool,
+    },
 }
 
 fn now_ms() -> i64 {
@@ -329,6 +354,22 @@ fn instant_at(target_ms: i64) -> Instant {
     Instant::now() + Duration::from_millis(delta)
 }
 
+/// A failed job: why, and what it had already spent (earlier calls of a multi-call job
+/// succeeded and were paid for; the daily budget must still see that).
+struct JobError {
+    msg: String,
+    cost_usd: Option<f64>,
+}
+
+impl From<String> for JobError {
+    fn from(msg: String) -> Self {
+        JobError {
+            msg,
+            cost_usd: None,
+        }
+    }
+}
+
 /// One job's result.
 struct JobOutput {
     summary: String,
@@ -356,6 +397,7 @@ struct Worker {
     reorganise_force: bool,
     episodes_since_review: usize,
     last_budget_warning: Option<Instant>,
+    cancel: Arc<AtomicBool>,
 }
 
 fn worker(
@@ -363,6 +405,7 @@ fn worker(
     store_path: &std::path::Path,
     cmd_rx: Receiver<BrainCommand>,
     out: Outbox,
+    cancel: Arc<AtomicBool>,
 ) {
     let store = match Store::open(store_path) {
         Ok(s) => s,
@@ -395,6 +438,7 @@ fn worker(
         reorganise_force: false,
         episodes_since_review: 0,
         last_budget_warning: None,
+        cancel,
     };
     if !w.cfg.enabled {
         w.out
@@ -481,6 +525,22 @@ impl Worker {
 
     fn run_loop(&mut self, cmd_rx: Receiver<BrainCommand>) {
         loop {
+            // take what arrived while the last job ran before picking the next one, so a
+            // Shutdown (or a hotword command) never waits behind a queue of due jobs
+            loop {
+                match cmd_rx.try_recv() {
+                    Ok(cmd) => {
+                        if !self.handle(cmd) {
+                            return;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            }
+            if self.cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let now = Instant::now();
             let due = |t: Option<Instant>| t.is_some_and(|t| t <= now);
             if let Some(seg) = self.pending_commands.pop_front() {
@@ -555,25 +615,33 @@ impl Worker {
                     Err(_) => return,
                 },
             };
-            match cmd {
-                BrainCommand::SegmentArrived(row) => self.on_segment(row),
-                BrainCommand::InterpretNow => {
-                    self.interpret_force = true;
-                    self.interpret_due = Some(Instant::now());
-                }
-                BrainCommand::ReviewNow => {
-                    self.review_force = true;
-                    self.review_due = Some(Instant::now());
-                }
-                BrainCommand::ReorganiseNow => {
-                    self.reorganise_force = true;
-                    self.reorganise_due = Some(Instant::now());
-                }
-                BrainCommand::Reinterpret(id) => self.reinterpret.push_back(id),
-                BrainCommand::UndoChange(id) => self.undo.push_back(id),
-                BrainCommand::Shutdown => return,
+            if !self.handle(cmd) {
+                return;
             }
         }
+    }
+
+    /// Apply one command; `false` = shut down.
+    fn handle(&mut self, cmd: BrainCommand) -> bool {
+        match cmd {
+            BrainCommand::SegmentArrived(row) => self.on_segment(row),
+            BrainCommand::InterpretNow => {
+                self.interpret_force = true;
+                self.interpret_due = Some(Instant::now());
+            }
+            BrainCommand::ReviewNow => {
+                self.review_force = true;
+                self.review_due = Some(Instant::now());
+            }
+            BrainCommand::ReorganiseNow => {
+                self.reorganise_force = true;
+                self.reorganise_due = Some(Instant::now());
+            }
+            BrainCommand::Reinterpret(id) => self.reinterpret.push_back(id),
+            BrainCommand::UndoChange(id) => self.undo.push_back(id),
+            BrainCommand::Shutdown => return false,
+        }
+        true
     }
 
     fn on_segment(&mut self, row: TranscriptRow) {
@@ -637,7 +705,7 @@ impl Worker {
 
     /// Run one CLI request; `NotFound`/`NotLoggedIn` flip the availability flag.
     fn call(&mut self, req: &Request) -> Result<crate::claude_cli::Response, CliError> {
-        let r = self.cfg.cli.run(req);
+        let r = self.cfg.cli.run_cancellable(req, &self.cancel);
         if let Err(e @ (CliError::NotFound(..) | CliError::NotLoggedIn(_))) = &r {
             self.cli_ok = false;
             self.out.send(BrainEvent::Availability(Err(e.to_string())));
@@ -645,20 +713,21 @@ impl Worker {
         r
     }
 
-    /// Bookkeeping around a job: the `brain_runs` row, events, spend.
+    /// Bookkeeping around a job: the `brain_runs` row, events, spend. `true` when the job
+    /// succeeded.
     fn run_job(
         &mut self,
         tier: Tier,
         kind: &str,
-        job: impl FnOnce(&mut Worker, i64) -> Result<JobOutput, String>,
-    ) {
+        job: impl FnOnce(&mut Worker, i64) -> Result<JobOutput, JobError>,
+    ) -> bool {
         let model = self.cfg.models.for_tier(tier).to_owned();
         let started = now_ms();
         let run_id = match self.store.begin_run(tier.number(), kind, &model, started) {
             Ok(id) => id,
             Err(e) => {
                 self.out.send(BrainEvent::Warning(format!("brain: {e}")));
-                return;
+                return false;
             }
         };
         self.out.send(BrainEvent::RunStarted {
@@ -680,10 +749,10 @@ impl Worker {
             Err(e) => RunOutcome {
                 finished_at: now_ms(),
                 model: None,
-                cost_usd: None,
+                cost_usd: e.cost_usd,
                 duration_ms: Some(t.elapsed().as_millis() as i64),
                 ok: false,
-                error: Some(e.clone()),
+                error: Some(e.msg.clone()),
                 summary: String::new(),
             },
         };
@@ -703,8 +772,9 @@ impl Worker {
                 }
             }
             Err(e) => {
-                log::warn!("brain {kind} failed: {e}");
-                self.out.send(BrainEvent::Warning(format!("{kind}: {e}")));
+                log::warn!("brain {kind} failed: {}", e.msg);
+                self.out
+                    .send(BrainEvent::Warning(format!("{kind}: {}", e.msg)));
             }
         }
         if let Ok(runs) = self.store.runs(1)
@@ -716,6 +786,7 @@ impl Worker {
         if let Ok(spent) = self.store.cost_since(midnight) {
             self.out.send(BrainEvent::Spend { today_usd: spent });
         }
+        result.is_ok()
     }
 
     // ---- tier 0: hotword command ----------------------------------------------------------
@@ -724,6 +795,13 @@ impl Worker {
         let Some(text) = hotword::detect(&seg.text, &self.cfg.hotword) else {
             return;
         };
+        // already executed (the segment arrived twice, or an interpret run re-queued it after
+        // it ran): notes and projects aren't deduplicated, so never run a command twice
+        if let Ok(Some(stored)) = self.store.segment(seg.id)
+            && stored.interpreted_at.is_some()
+        {
+            return;
+        }
         if !self.cli_ready() {
             self.out.send(BrainEvent::Warning(
                 "voice command ignored: claude CLI unavailable".into(),
@@ -782,7 +860,7 @@ impl Worker {
         }
         let model = self.cfg.models.reactive.clone();
         let more = batch.len() >= self.cfg.categorise_batch;
-        self.run_job(Tier::Reactive, "categorise", move |w, _| {
+        let ok = self.run_job(Tier::Reactive, "categorise", move |w, _| {
             let tree = w.store.nodes().map_err(|e| e.to_string())?;
             let req = interpret::categorise_request(&tree, &batch, &Local::now(), Some(model));
             let resp = w.call(&req).map_err(|e| e.to_string())?;
@@ -802,7 +880,11 @@ impl Worker {
                 changed: filed > 0,
             })
         });
-        if more {
+        if !ok {
+            // tier 0 has no budget guard: a failing batch (bad output, refusals) must not be
+            // retried — and paid for — every 20 s; try again after a pause
+            self.categorise_due = Some(Instant::now() + FAILURE_BACKOFF);
+        } else if more {
             self.categorise_due = Some(Instant::now() + Duration::from_secs(20));
         }
     }
@@ -837,141 +919,71 @@ impl Worker {
         }
         let chunks = cut(&rows, &self.cfg.episode_rule);
         let per_run = self.cfg.interpret_chunks_per_run;
-        let min_chars = self.cfg.min_chunk_chars;
-        let rule = self.cfg.episode_rule;
-        let max_new = self.cfg.max_new_nodes_per_run;
         let model = self.cfg.models.rolling.clone();
         let mut leftover = false;
+        let mut waiting = false;
+        let mut rate_limited = false;
         let mut episodes_touched = 0usize;
-        self.run_job(Tier::Rolling, "interpret", |w, run_id| {
+        let ok = self.run_job(Tier::Rolling, "interpret", |w, run_id| {
             let mut cost = 0.0;
             let mut any_cost = false;
             let mut duration = 0;
             let mut used_model = None;
             let mut lines = Vec::new();
             let mut done = 0usize;
-            let mut rate_limited = false;
+            let mut new_nodes = 0usize;
             for chunk in &chunks {
                 if done >= per_run || rate_limited {
                     leftover = true;
                     break;
                 }
-                let now = now_ms();
-                // an episode that ended within a gap before this chunk continues it: revise
-                let gap = rule.gap.as_millis() as i64;
-                let prior = w
-                    .store
-                    .episodes_between(chunk.started_at - gap, chunk.started_at + 1)
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .filter(|e| chunk.started_at - e.ended_at <= gap)
-                    .max_by_key(|e| e.ended_at);
-                let full = match &prior {
-                    Some(p) => {
-                        let mut segs = w
-                            .store
-                            .segments_of_episode(p.id)
-                            .map_err(|e| e.to_string())?;
-                        segs.extend(chunk.segments.iter().cloned());
-                        let keep = segs.len().saturating_sub(rule.max_segments);
-                        let segs: Vec<TranscriptRow> = segs.into_iter().skip(keep).collect();
-                        Chunk {
-                            started_at: segs
-                                .first()
-                                .map(|s| s.started_at)
-                                .unwrap_or(chunk.started_at),
-                            ended_at: chunk.ended_at,
-                            segments: segs,
-                        }
+                let step = w.interpret_chunk(chunk, force, run_id, &model, new_nodes);
+                let step = match step {
+                    Ok(s) => s,
+                    Err(msg) => {
+                        // what the earlier chunks cost was spent all the same
+                        return Err(JobError {
+                            msg,
+                            cost_usd: any_cost.then_some(cost),
+                        });
                     }
-                    None => chunk.clone(),
                 };
-                // tiny closed fragments aren't worth a call: file them as low-signal
-                if prior.is_none()
-                    && full.text_len() < min_chars
-                    && (!chunk.is_open(now, &rule) || force)
-                {
-                    let content = EpisodeContent {
-                        title: "Fragments".into(),
-                        summary: "A few words, too short to interpret.".into(),
-                        low_signal: true,
-                        model: "none".into(),
-                        ..Default::default()
-                    };
-                    let ep = w
-                        .store
-                        .insert_episode(chunk.started_at, chunk.ended_at, &content, now)
-                        .map_err(|e| e.to_string())?;
-                    w.store
-                        .mark_segments_interpreted(&chunk.segment_ids(), ep.id, now)
-                        .map_err(|e| e.to_string())?;
-                    done += 1;
-                    continue;
-                }
-                let tree = w.store.nodes().map_err(|e| e.to_string())?;
-                let req = interpret::interpret_request(
-                    &tree,
-                    &full,
-                    prior.as_ref(),
-                    &Local::now(),
-                    Some(model.clone()),
-                );
-                let resp = match w.call(&req) {
-                    Ok(r) => r,
-                    Err(CliError::RateLimited(m)) => {
+                match step {
+                    ChunkStep::Waiting => waiting = true,
+                    ChunkStep::Fragment => done += 1,
+                    ChunkStep::RateLimited(m) => {
                         rate_limited = true;
                         lines.push(format!("rate limited: {m}"));
-                        continue;
                     }
-                    Err(e) => return Err(e.to_string()),
-                };
-                let interp = resp
-                    .structured
-                    .as_ref()
-                    .ok_or_else(|| "no structured output".to_owned())
-                    .and_then(|v| interpret::parse_interpretation(v).map_err(|e| e.to_string()))?;
-                let model_name = resp.model.clone().unwrap_or_else(|| model.clone());
-                let applied = interpret::apply_interpretation(
-                    &w.store,
-                    &tree,
-                    &full,
-                    &interp,
-                    prior.as_ref(),
-                    &model_name,
-                    resp.cost_usd,
-                    Some(run_id),
-                    max_new,
-                    now,
-                )
-                .map_err(|e| e.to_string())?;
-                if let Some(c) = resp.cost_usd {
-                    cost += c;
-                    any_cost = true;
-                }
-                duration += resp.duration_ms.unwrap_or(0);
-                used_model = resp.model.or(used_model);
-                lines.push(format!(
-                    "{} '{}'{}",
-                    if prior.is_some() {
-                        "Revised"
-                    } else {
-                        "Interpreted"
-                    },
-                    applied.episode.title,
-                    if applied.episode.low_signal {
-                        " (low signal)"
-                    } else {
-                        ""
+                    ChunkStep::Interpreted {
+                        resp,
+                        applied,
+                        revised,
+                    } => {
+                        if let Some(c) = resp.cost_usd {
+                            cost += c;
+                            any_cost = true;
+                        }
+                        duration += resp.duration_ms.unwrap_or(0);
+                        used_model = resp.model.or(used_model);
+                        lines.push(format!(
+                            "{} '{}'{}",
+                            if revised { "Revised" } else { "Interpreted" },
+                            applied.episode.title,
+                            if applied.episode.low_signal {
+                                " (low signal)"
+                            } else {
+                                ""
+                            }
+                        ));
+                        for n in &applied.new_nodes {
+                            lines.push(format!("New {} '{}'", n.kind.as_str(), n.name));
+                        }
+                        new_nodes += applied.new_nodes.len();
+                        episodes_touched += 1;
+                        done += 1;
                     }
-                ));
-                for n in &applied.new_nodes {
-                    lines.push(format!("New {} '{}'", n.kind.as_str(), n.name));
                 }
-                episodes_touched += 1;
-                done += 1;
-            }
-            if rate_limited {
-                leftover = true;
             }
             Ok(JobOutput {
                 summary: format!("{done} of {} chunks", chunks.len()),
@@ -983,12 +995,130 @@ impl Worker {
             })
         });
         self.episodes_since_review += episodes_touched;
-        if leftover {
+        if !ok || rate_limited {
+            // don't hammer a failing or rate-limited CLI; the segments stay uninterpreted
+            self.interpret_due = Some(Instant::now() + FAILURE_BACKOFF);
+        } else if leftover {
             self.interpret_due = Some(Instant::now() + Duration::from_secs(60));
+        } else if waiting && self.interpret_due.is_none() {
+            // a short chunk still in progress was left for later: make sure "later" comes
+            // even if no new speech arrives to schedule it
+            self.interpret_due = Some(Instant::now() + self.cfg.interpret_every);
         }
         if episodes_touched > 0 && self.episodes_since_review >= self.cfg.review_after_episodes {
             self.review_due = Some(Instant::now() + Duration::from_secs(60));
         }
+    }
+
+    /// Interpret one chunk of an interpretation run: file a tiny closed fragment without a
+    /// call, leave a tiny open one for later, else call the model (revising the episode the
+    /// chunk continues, when that episode still has room) and apply the result.
+    fn interpret_chunk(
+        &mut self,
+        chunk: &Chunk,
+        force: bool,
+        run_id: i64,
+        model: &str,
+        new_nodes_so_far: usize,
+    ) -> Result<ChunkStep, String> {
+        let rule = self.cfg.episode_rule;
+        let now = now_ms();
+        // an episode that ended within a gap before this chunk continues it: revise — unless
+        // it is already at the episode caps (the chunk was split off by a cap, not by a gap):
+        // revising then would slide the window and overwrite the earlier part's summary
+        let gap = rule.gap.as_millis() as i64;
+        let max_len = rule.max_len.as_millis() as i64;
+        let candidate = self
+            .store
+            .episodes_between(chunk.started_at - gap, chunk.started_at + 1)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|e| chunk.started_at - e.ended_at <= gap)
+            .max_by_key(|e| e.ended_at);
+        let mut prior = None;
+        let mut full = chunk.clone();
+        if let Some(p) = candidate {
+            let mut segs = self
+                .store
+                .segments_of_episode(p.id)
+                .map_err(|e| e.to_string())?;
+            if segs.len() + chunk.segments.len() <= rule.max_segments
+                && chunk.ended_at - p.started_at.min(chunk.started_at) <= max_len
+            {
+                segs.extend(chunk.segments.iter().cloned());
+                full = Chunk {
+                    started_at: segs
+                        .first()
+                        .map(|s| s.started_at)
+                        .unwrap_or(chunk.started_at),
+                    ended_at: chunk.ended_at,
+                    segments: segs,
+                };
+                prior = Some(p);
+            }
+        }
+        // tiny fragments aren't worth a call: a closed one is filed as low-signal, an open one
+        // waits for more speech (or for a forced run)
+        if prior.is_none() && full.text_len() < self.cfg.min_chunk_chars {
+            if chunk.is_open(now, &rule) && !force {
+                return Ok(ChunkStep::Waiting);
+            }
+            let content = EpisodeContent {
+                title: "Fragments".into(),
+                summary: "A few words, too short to interpret.".into(),
+                low_signal: true,
+                model: "none".into(),
+                ..Default::default()
+            };
+            let ep = self
+                .store
+                .insert_episode(chunk.started_at, chunk.ended_at, &content, now)
+                .map_err(|e| e.to_string())?;
+            self.store
+                .mark_segments_interpreted(&chunk.segment_ids(), ep.id, now)
+                .map_err(|e| e.to_string())?;
+            return Ok(ChunkStep::Fragment);
+        }
+        let tree = self.store.nodes().map_err(|e| e.to_string())?;
+        let req = interpret::interpret_request(
+            &tree,
+            &full,
+            prior.as_ref(),
+            &Local::now(),
+            Some(model.to_owned()),
+        );
+        let resp = match self.call(&req) {
+            Ok(r) => r,
+            Err(CliError::RateLimited(m)) => return Ok(ChunkStep::RateLimited(m)),
+            Err(e) => return Err(e.to_string()),
+        };
+        let interp = resp
+            .structured
+            .as_ref()
+            .ok_or_else(|| "no structured output".to_owned())
+            .and_then(|v| interpret::parse_interpretation(v).map_err(|e| e.to_string()))?;
+        let model_name = resp.model.clone().unwrap_or_else(|| model.to_owned());
+        let applied = interpret::apply_interpretation(
+            &self.store,
+            &tree,
+            &full,
+            &interp,
+            prior.as_ref(),
+            &model_name,
+            resp.cost_usd,
+            Some(run_id),
+            // the cap is per run, not per chunk
+            self.cfg
+                .max_new_nodes_per_run
+                .saturating_sub(new_nodes_so_far),
+            now,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(ChunkStep::Interpreted {
+            resp: Box::new(resp),
+            applied: Box::new(applied),
+            revised: prior.is_some(),
+        })
     }
 
     // ---- tier 2: coherence review -----------------------------------------------------------
@@ -1048,7 +1178,13 @@ impl Worker {
     // ---- tier 3: reorganisation -------------------------------------------------------------
 
     fn run_reorganise(&mut self, force: bool) {
-        self.schedule_reorganise();
+        // the next attempt is a full period from THIS one, whatever happens below. (Scheduling
+        // from the last recorded run, as at startup, would find no newer run when this one is
+        // skipped — no projects yet, budget, CLI — and make it due again at once: a busy loop
+        // through the whole idle window; and when it does run, a second run right after.)
+        let every = chrono::Duration::milliseconds(self.cfg.reorganise_every.as_millis() as i64);
+        let next = next_window_start(&(Local::now() + every), self.cfg.reorganise_window);
+        self.reorganise_due = Some(instant_at(next.timestamp_millis()));
         let nodes = self.store.nodes().unwrap_or_default();
         let has_projects = nodes.iter().any(|n| n.parent_id.is_some());
         if !has_projects && !force {
@@ -1271,6 +1407,240 @@ esac
             "the command segment joins no episode"
         );
         assert!(s.runs(10).unwrap().iter().all(|r| r.ok));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oats-brain-sched-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// A fake `claude` from a shell body (`--version` always answers).
+    fn script_cli(dir: &std::path::Path, body: &str) -> ClaudeCli {
+        let script = dir.join("claude");
+        let _ = std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.312 (Claude Code)'; exit 0;; esac\ncat > /dev/null\n{body}\n"
+            ),
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        ClaudeCli {
+            binary: script,
+            model: None,
+            timeout: Duration::from_secs(20),
+            max_budget_usd: None,
+            work_dir: Some(dir.join("work")),
+            isolate: true,
+        }
+    }
+
+    /// A worker on an in-memory store, outside any thread (its events are dropped).
+    fn bare_worker(cli: ClaudeCli) -> Worker {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Worker {
+            cfg: BrainConfig {
+                cli,
+                ..BrainConfig::default()
+            },
+            store: Store::open_in_memory().unwrap(),
+            out: Outbox {
+                tx,
+                wake: Box::new(|| {}),
+            },
+            cli_ok: true,
+            pending_commands: VecDeque::new(),
+            reinterpret: VecDeque::new(),
+            undo: VecDeque::new(),
+            categorise_due: None,
+            interpret_due: None,
+            interpret_force: false,
+            review_due: None,
+            review_force: false,
+            reorganise_due: None,
+            reorganise_force: false,
+            episodes_since_review: 0,
+            last_budget_warning: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    const LONG_TEXT: &str =
+        "let's ship the exporter on Friday, Sam writes the tests and we review on Monday morning";
+
+    #[test]
+    fn a_skipped_reorganisation_is_not_due_again_at_once() {
+        let dir = temp_dir("reorg");
+        let mut w = bare_worker(script_cli(&dir, "exit 9"));
+        // only the default categories: nothing to reorganise, the run is skipped
+        let before = Instant::now();
+        w.run_reorganise(false);
+        assert!(
+            w.reorganise_due
+                .is_some_and(|d| d >= before + w.cfg.reorganise_every - Duration::from_secs(5)),
+            "{:?}",
+            w.reorganise_due
+                .map(|d| d.saturating_duration_since(before))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_open_short_chunk_waits_without_a_call() {
+        let dir = temp_dir("wait");
+        // any model call fails the run
+        let mut w = bare_worker(script_cli(&dir, "exit 9"));
+        let sid = w.store.begin_session(0, "e").unwrap();
+        let t = now_ms() - 60_000;
+        w.store
+            .insert_segment(sid, t, t + 2_000, "uh huh", None)
+            .unwrap();
+        w.run_interpret(false);
+        let runs = w.store.runs(10).unwrap();
+        assert!(runs.iter().all(|r| r.ok), "{runs:?}");
+        assert_eq!(w.store.uninterpreted_count().unwrap(), 1);
+        assert!(w.interpret_due.is_some(), "a later run must be scheduled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_run_keeps_what_earlier_chunks_cost_and_backs_off() {
+        let dir = temp_dir("partial");
+        let counter = dir.join("n");
+        // first call succeeds ($0.011), every later call fails
+        let ok = r#"{"type":"result","is_error":false,"result":"","total_cost_usd":0.011,"structured_output":{"title":"A","summary":"s","low_signal":false,"node_id":null,"new_project":null,"new_topic":null,"decisions":[],"action_items":[],"topics":[],"events":[]}}"#;
+        let body = format!(
+            "if [ -f '{c}' ]; then echo boom >&2; exit 3; fi\ntouch '{c}'\necho '{ok}'",
+            c = counter.display()
+        );
+        let mut w = bare_worker(script_cli(&dir, &body));
+        let sid = w.store.begin_session(0, "e").unwrap();
+        // two chunks a day apart, both closed and long enough to need a call
+        let t = now_ms() - 2 * 86_400_000;
+        w.store
+            .insert_segment(sid, t, t + 5_000, LONG_TEXT, None)
+            .unwrap();
+        w.store
+            .insert_segment(sid, t + 86_400_000, t + 86_405_000, LONG_TEXT, None)
+            .unwrap();
+        let before = Instant::now();
+        w.run_interpret(false);
+        let runs = w.store.runs(10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].ok);
+        assert!(
+            (runs[0].cost_usd.unwrap_or(0.0) - 0.011).abs() < 1e-9,
+            "{runs:?}"
+        );
+        assert!(
+            w.interpret_due
+                .is_some_and(|d| d >= before + FAILURE_BACKOFF - Duration::from_secs(1))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_categorisation_is_not_retried_every_20_seconds() {
+        let dir = temp_dir("catfail");
+        let mut w = bare_worker(script_cli(&dir, "echo 'not json'"));
+        w.cfg.categorise_batch = 2;
+        let sid = w.store.begin_session(0, "e").unwrap();
+        for i in 0..3 {
+            w.store
+                .insert_segment(sid, i * 1000, i * 1000 + 500, LONG_TEXT, None)
+                .unwrap();
+        }
+        let before = Instant::now();
+        w.run_categorise();
+        assert!(
+            w.categorise_due
+                .is_some_and(|d| d >= before + FAILURE_BACKOFF - Duration::from_secs(1))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_episode_at_the_segment_cap_is_not_revised_by_its_continuation() {
+        let dir = temp_dir("cap");
+        let ok = r#"{"type":"result","is_error":false,"result":"","total_cost_usd":0.01,"structured_output":{"title":"Next part","summary":"s","low_signal":false,"node_id":null,"new_project":null,"new_topic":null,"decisions":[],"action_items":[],"topics":[],"events":[]}}"#;
+        let mut w = bare_worker(script_cli(&dir, &format!("echo '{ok}'")));
+        w.cfg.episode_rule.max_segments = 2;
+        let sid = w.store.begin_session(0, "e").unwrap();
+        let t = now_ms() - 86_400_000;
+        let a = w
+            .store
+            .insert_segment(sid, t, t + 5_000, LONG_TEXT, None)
+            .unwrap();
+        let b = w
+            .store
+            .insert_segment(sid, t + 6_000, t + 11_000, LONG_TEXT, None)
+            .unwrap();
+        let first = w
+            .store
+            .insert_episode(
+                t,
+                t + 11_000,
+                &EpisodeContent {
+                    title: "First part".into(),
+                    ..Default::default()
+                },
+                t,
+            )
+            .unwrap();
+        w.store
+            .mark_segments_interpreted(&[a.id, b.id], first.id, t)
+            .unwrap();
+        w.store
+            .insert_segment(sid, t + 12_000, t + 17_000, LONG_TEXT, None)
+            .unwrap();
+        w.run_interpret(false);
+        assert_eq!(
+            w.store.episode(first.id).unwrap().unwrap().title,
+            "First part"
+        );
+        assert_eq!(w.store.episodes(10).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_the_handle_cancels_an_in_flight_call() {
+        let dir = temp_dir("cancel");
+        let db = dir.join("oats.sqlite");
+        {
+            let s = Store::open(&db).unwrap();
+            let sid = s.begin_session(0, "e").unwrap();
+            let t = now_ms() - 86_400_000;
+            s.insert_segment(sid, t, t + 5_000, LONG_TEXT, None)
+                .unwrap();
+        }
+        let mut cli = script_cli(&dir, "sleep 30");
+        cli.timeout = Duration::from_secs(60);
+        let h = Brain {
+            config: BrainConfig {
+                cli,
+                ..BrainConfig::default()
+            },
+            store_path: db,
+            wake: Box::new(|| {}),
+        }
+        .spawn();
+        h.send(BrainCommand::InterpretNow);
+        wait_for(&h, "run start", |e| {
+            matches!(e, BrainEvent::RunStarted { .. })
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let t = Instant::now();
+        drop(h);
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

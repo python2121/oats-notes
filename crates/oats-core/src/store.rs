@@ -619,11 +619,23 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = rusqlite::Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;",
-        )?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        // switching a fresh file to WAL needs an exclusive lock and SQLite answers SQLITE_BUSY
+        // at once (no busy handler) while another connection is opening it too
+        let mut tries = 0;
+        loop {
+            match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy && tries < 100 =>
+                {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         Self::init(conn)
     }
 
@@ -637,24 +649,33 @@ impl Store {
         // the rebuild of `segments` must run with foreign keys off (the pragma is a no-op
         // inside a transaction, so it is set here, before anything else)
         conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
-        let version = Self::schema_version(&conn)?;
-        match version {
+        // the UI, the pipeline and the brain each open their own connection, at about the same
+        // moment: the version check, the migration and the seeding of the default categories
+        // run under one write lock, so two openers can't both migrate or both seed
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let store = Self { conn };
+        if let Err(e) = store.init_locked() {
+            let _ = store.conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
+        store.conn.execute_batch("COMMIT;")?;
+        store.conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Ok(store)
+    }
+
+    /// [`Self::init`]'s body, inside its transaction.
+    fn init_locked(&self) -> Result<(), StoreError> {
+        let conn = &self.conn;
+        match Self::schema_version(conn)? {
             None => {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
             Some(1) => {
                 log::info!("migrating the database from schema 1 to 2");
-                conn.execute_batch("BEGIN;")?;
-                let done = conn
-                    .execute_batch(SCHEMA)
-                    .and_then(|()| conn.execute_batch(MIGRATE_V1_TO_V2))
-                    .and_then(|()| conn.execute_batch(SCHEMA_REST));
-                if let Err(e) = done {
-                    let _ = conn.execute_batch("ROLLBACK;");
-                    return Err(e.into());
-                }
-                conn.execute_batch("COMMIT;")?;
+                conn.execute_batch(SCHEMA)?;
+                conn.execute_batch(MIGRATE_V1_TO_V2)?;
+                conn.execute_batch(SCHEMA_REST)?;
             }
             Some(v) if v == SCHEMA_VERSION => {
                 conn.execute_batch(SCHEMA)?;
@@ -666,19 +687,17 @@ impl Store {
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
         )?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        let store = Self { conn };
-        let count: i64 = store.conn.query_row(
+        let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE parent_id IS NULL",
             [],
             |r| r.get(0),
         )?;
         if count == 0 {
             for name in DEFAULT_CATEGORIES {
-                store.add_category(name)?;
+                self.add_category(name)?;
             }
         }
-        Ok(store)
+        Ok(())
     }
 
     /// `None` for a fresh database (no `meta` table or no version row).
@@ -2130,6 +2149,31 @@ mod tests {
         s.set_meta("tier1_last", "42")?;
         assert_eq!(s.meta("tier1_last")?.as_deref(), Some("42"));
         assert_eq!(s.meta("nope")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_opens_seed_the_default_categories_once() -> R {
+        let dir = std::env::temp_dir().join(format!(
+            "oats-store-race-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let path = dir.join("oats.sqlite");
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Store::open(&path).map(|_| ()))
+            })
+            .collect();
+        for t in threads {
+            if let Ok(r) = t.join() {
+                r?;
+            }
+        }
+        let s = Store::open(&path)?;
+        assert_eq!(s.categories()?.len(), DEFAULT_CATEGORIES.len());
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 

@@ -27,13 +27,17 @@ pub fn parse_time(s: &str) -> Option<NaiveTime> {
 }
 
 /// A date (+ optional time) in `tz` → Unix ms. Without a time: local midnight (an all-day
-/// event). A midnight that doesn't exist locally (DST) resolves to the earliest valid instant.
+/// event). A wall time that doesn't exist locally (skipped by a DST jump, e.g. a midnight in a
+/// zone that springs forward at 00:00) resolves to the first valid instant after the gap.
 pub fn to_ms<Tz: TimeZone>(date: NaiveDate, time: Option<NaiveTime>, tz: &Tz) -> Option<i64> {
     let t = time.unwrap_or(NaiveTime::MIN);
     let naive = date.and_time(t);
-    tz.from_local_datetime(&naive)
-        .earliest()
-        .map(|d| d.timestamp_millis())
+    // DST gaps are at most a couple of hours: step forward a quarter hour at a time
+    (0..=12).find_map(|i| {
+        tz.from_local_datetime(&(naive + chrono::Duration::minutes(15 * i)))
+            .earliest()
+            .map(|d| d.timestamp_millis())
+    })
 }
 
 /// The local calendar date `days` days from `at` (negative = earlier), at the same clock time.
@@ -87,6 +91,56 @@ mod tests {
         assert_eq!(parse_time("2:05 PM"), NaiveTime::from_hms_opt(14, 5, 0));
         assert_eq!(parse_time("9 am"), NaiveTime::from_hms_opt(9, 0, 0));
         assert_eq!(parse_time(""), None);
+    }
+
+    /// A zone whose clocks jump from 00:00 straight to 01:00 on 2026-03-01 (as e.g.
+    /// America/Santiago and Asia/Beirut do at local midnight).
+    #[derive(Clone, Copy, Debug)]
+    struct MidnightDst;
+
+    impl TimeZone for MidnightDst {
+        type Offset = FixedOffset;
+        fn from_offset(_: &FixedOffset) -> Self {
+            MidnightDst
+        }
+        fn offset_from_local_date(&self, _: &NaiveDate) -> chrono::LocalResult<FixedOffset> {
+            chrono::LocalResult::None
+        }
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::LocalResult<FixedOffset> {
+            let switch = NaiveDate::from_ymd_opt(2026, 3, 1).and_then(|d| d.and_hms_opt(0, 0, 0));
+            let Some(switch) = switch else {
+                return chrono::LocalResult::None;
+            };
+            let gap_end = switch + chrono::Duration::hours(1);
+            match FixedOffset::east_opt(if *local < switch { 0 } else { 3600 }) {
+                Some(_) if *local >= switch && *local < gap_end => chrono::LocalResult::None,
+                Some(o) => chrono::LocalResult::Single(o),
+                None => chrono::LocalResult::None,
+            }
+        }
+        fn offset_from_utc_date(&self, _: &NaiveDate) -> FixedOffset {
+            FixedOffset::east_opt(0).unwrap()
+        }
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> FixedOffset {
+            let switch = NaiveDate::from_ymd_opt(2026, 3, 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .unwrap();
+            FixedOffset::east_opt(if *utc < switch { 0 } else { 3600 }).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_skipped_midnight_resolves_to_the_end_of_the_gap() {
+        let d = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        // 01:00 local (+01:00) = 00:00Z, the first instant of the day
+        let ms = to_ms(d, None, &MidnightDst).unwrap();
+        assert_eq!(
+            ms,
+            d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis()
+        );
     }
 
     #[test]
