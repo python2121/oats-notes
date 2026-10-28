@@ -1,0 +1,12 @@
+[package]
+name = "oats-status"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The status-bar item contract (macOS menu bar extra, KDE StatusNotifierItem, …): state in, actions out. No platform code."
+
+[lints]
+workspace = true
+
+[dependencies]

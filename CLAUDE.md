@@ -10,20 +10,49 @@ it heard into user-defined categories (Work / Admin / Personal by default) with 
 `claude` CLI pass. Rust + egui (eframe/wgpu). Primary target: an M2 MacBook Air, running in the
 background all day — efficiency is a design goal, not a nicety.
 
-## Design rule: the whole app is portable, the model is not
+## Design rule: the whole app is portable, two components are swappable
 
-The on-device speech stack is the ONE platform-specific component. Everything else (audio
-capture, segmentation, store, pipeline, UI) is shared and must stay free of macOS-only code.
-Moving to Linux means writing one new engine crate against `oats_core::SpeechEngine` and
-nothing else.
+Exactly two components are platform-specific, and each sits behind a platform-neutral contract
+with one implementation crate per platform, picked by the binary:
+
+- the on-device speech engine — `oats_core::SpeechEngine` / `EngineFactory`
+  (`oats-engine-fluidaudio` on macOS);
+- the status-bar item (menu bar extra) — `oats_status::StatusItem` / `StatusItemFactory`
+  (`oats-status-macos`; a KDE/Linux crate would speak StatusNotifierItem, e.g. via `ksni`).
+
+Everything else (audio capture, segmentation, store, pipeline, UI) is shared and must stay
+free of platform-only code (the native macOS menu bar in `oats-ui` is the one cfg-gated
+exception, with the in-window egui bar as its portable twin). Moving to Linux means writing
+one engine crate and one status crate against those contracts, and nothing else — the UI
+never changes.
 
 ```
 crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, paths  (no platform code)
 crates/oats-audio              cpal microphone capture → 16 kHz mono f32 chunks + own FIR resampler
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD on CoreML/ANE via fluidaudio-rs (THE swappable crate)
+crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
+crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
 crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar, transcript view
-apps/oats-notes                the binary: wires engine + audio + store + UI
+apps/oats-notes                the binary: wires engine + audio + store + status item + UI
 ```
+
+## The status item (`crates/oats-status/src/lib.rs`)
+
+`StatusItem`: `update(&StatusState)` (listening, enabled, tooltip; called only on change),
+`poll() -> Vec<StatusAction>` (ToggleListening / ShowWindow / Quit), and
+`handle_menu_id(id) -> bool` for platforms where menu events come through a stream shared with
+the host. Built on the UI thread inside eframe's creator closure (AppKit needs NSApp) from a
+`StatusItemFactory`, which gets a `wake` callback for platforms that deliver events on another
+thread. On macOS both `muda` menus (menu bar + status item) share muda's ONE global event
+handler: `oats-ui::menu_events` installs it once, and each frame routes ids — `status.*` to
+the status item, the rest to the native menu bar. Nothing else may call
+`muda::MenuEvent::set_event_handler`.
+
+Window behaviour: while a status item exists, closing the window only hides it (listening
+carries on; "Show OatsNotes" brings it back); Quit (⌘Q or the status item's Quit) goes through
+`OatsApp::request_quit` and really quits. eframe runs `App::logic` (not `ui`) while the window
+is hidden, so everything the status item drives lives in `logic`. Without a status item
+(`OATS_NO_STATUS_ITEM=1`, or none on the platform) closing the window quits.
 
 Data flow: `oats-audio` (cpal callback, resample) → mpsc `Vec<f32>` → `oats-core::pipeline`
 worker thread (owns the engine; VAD every frame, the model only on closed speech segments) →
@@ -46,7 +75,9 @@ cargo run -p oats-notes                   # the app (first run downloads the Par
 OATS_ENGINE=null cargo run -p oats-notes  # the app without a model (UI work; speech detected, not transcribed)
 cargo run -p oats-audio --example levels  # mic sanity check: prints input level for 5 s
 cargo run -p oats-notes -- --selftest out.png [--listening]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows — how the shell is verified without a window
+cargo run -p oats-notes -- --listen      # start listening as soon as the engine is ready (doesn't change the remembered pref)
 OATS_NO_NATIVE_MENU=1 …                   # in-window egui menu bar instead of the macOS menu bar
+OATS_NO_STATUS_ITEM=1 …                   # no menu bar extra (closing the window then quits)
 OATS_FONT=bundled …                       # Inter instead of the system font
 OATS_DATA_DIR=/path …                     # database location override (default ~/Library/Application Support/OatsNotes/oats.sqlite)
 swift scripts/generate_icon.swift         # regenerate assets/icon_1024.png
@@ -72,11 +103,12 @@ the UI formats local time). Tables: `sessions`, `segments` (indexed on `started_
   `craft-ui` theme helpers, SF Pro read from the system with `opsz`/`GRAD` tweaks, `muda` native
   menu generated from the same `menu_model()` as the in-window fallback). Keep that parity.
 - Never request continuous repaints; the app must idle at ~0 % CPU. The pipeline's `wake`
-  callback is the only thing that wakes the UI.
+  callback and menu clicks (the shared muda handler) are the only things that wake the UI.
 - Commit independently as features land; don't add AI co-author lines.
 
 ## Roadmap (not yet built)
 
 Categorisation pass through the local `claude` CLI (rules on how to file transcripts into
 categories), summaries, diarization (FluidAudio has it), system-audio capture for calls,
-a menu-bar (status item) toggle, .app packaging with Info.plist, the Linux engine crate.
+.app packaging with Info.plist (then `LSUIElement`-style options, Dock reopen), the Linux engine
+and status-item crates.

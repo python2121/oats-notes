@@ -16,6 +16,7 @@ selftest = ["dep:egui_kittest", "dep:image"]
 
 [dependencies]
 oats-core = { workspace = true }
+oats-status = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true, features = ["wgpu", "persistence"] }
 craft-ui = { workspace = true }

@@ -13,7 +13,9 @@ use egui::{Key, KeyboardShortcut, Modifiers, Rect, Sense, pos2, vec2};
 use oats_core::{
     Category, PipelineEvent, PipelineHandle, PipelineStatus, Store, TranscriptRow, View,
 };
+use oats_status::{StatusAction, StatusItem, StatusState};
 
+use crate::menu_events::MenuEvents;
 use crate::sidebar::{SidebarAction, SidebarState, sidebar_panel};
 use crate::theme::Tokens;
 use crate::transcript::{TranscriptAction, local_midnight_ms, transcript_list};
@@ -65,6 +67,8 @@ pub struct AppOptions {
     pub system_font: bool,
     /// Read/write eframe storage.
     pub persist: bool,
+    /// Start listening as soon as the engine is ready, whatever the prefs say (`--listen`).
+    pub start_listening: bool,
 }
 
 impl Default for AppOptions {
@@ -73,6 +77,7 @@ impl Default for AppOptions {
             native_menu: cfg!(target_os = "macos"),
             system_font: true,
             persist: true,
+            start_listening: false,
         }
     }
 }
@@ -226,16 +231,27 @@ pub struct OatsApp {
     auto_listen: bool,
     sidebar: SidebarState,
     data_dir: String,
+    /// The status-bar item (menu bar extra), if the platform has one. While it exists, closing
+    /// the window only hides it; Quit quits.
+    status_item: Option<Box<dyn StatusItem>>,
+    /// What the status item was last told to show.
+    status_shown: Option<StatusState>,
+    /// The shared menu event stream (native menu bar + status item); macOS only.
+    menu_events: Option<MenuEvents>,
+    /// Quit was asked for (⌘Q, the status item's Quit): let the window close for real.
+    quit_requested: bool,
 }
 
 impl OatsApp {
-    /// Build the app: theme, prefs, the first store read.
+    /// Build the app: theme, prefs, the first store read. `status` is the platform's status
+    /// item (built by the binary from its chosen `oats_status` implementation), `None` for none.
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         options: AppOptions,
         pipeline: PipelineHandle,
         audio: AudioStarter,
         store: Store,
+        status: Option<Box<dyn StatusItem>>,
     ) -> Self {
         let face = crate::theme::install_with(
             &cc.egui_ctx,
@@ -251,12 +267,18 @@ impl OatsApp {
         } else {
             AppPrefs::default()
         };
+        // one muda event handler for every menu the app has (see `menu_events`)
+        #[cfg(target_os = "macos")]
+        let menu_events =
+            (status.is_some() || options.native_menu).then(|| MenuEvents::install(&cc.egui_ctx));
+        #[cfg(not(target_os = "macos"))]
+        let menu_events = None;
         let mut app = OatsApp {
             pipeline,
             audio,
             capture: None,
             store,
-            auto_listen: prefs.listening,
+            auto_listen: prefs.listening || options.start_listening,
             prefs,
             persist: options.persist,
             native_menu: cfg!(target_os = "macos") && options.native_menu,
@@ -270,6 +292,10 @@ impl OatsApp {
             warning: None,
             sidebar: SidebarState::default(),
             data_dir: oats_core::paths::data_dir().display().to_string(),
+            status_item: status,
+            status_shown: None,
+            menu_events,
+            quit_requested: false,
         };
         app.reload();
         app
@@ -283,6 +309,102 @@ impl OatsApp {
     /// Hand the menus back to the window (the native menu failed to install) or take them.
     pub fn set_native_menu(&mut self, on: bool) {
         self.native_menu = cfg!(target_os = "macos") && on;
+    }
+
+    /// Quit for real: close the window without the status item's hide-instead (⌘Q, Quit).
+    pub fn request_quit(&mut self, ctx: &egui::Context) {
+        self.quit_requested = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Whether a status item is installed (closing the window then hides it).
+    pub fn has_status_item(&self) -> bool {
+        self.status_item.is_some()
+    }
+
+    /// Drain the shared menu event stream: the status item's ids go to it, the rest are kept
+    /// for the native menu bar. Returns those (empty when the menus are in the window).
+    pub fn take_native_menu_ids(&mut self) -> Vec<String> {
+        self.route_menu_events();
+        self.menu_events
+            .as_mut()
+            .map(MenuEvents::take_native)
+            .unwrap_or_default()
+    }
+
+    fn route_menu_events(&mut self) {
+        let keep = self.native_menu;
+        if let Some(ev) = &mut self.menu_events {
+            ev.route(self.status_item.as_deref_mut(), keep);
+        }
+    }
+
+    /// What the status item should show now.
+    pub fn status_item_state(&self) -> StatusState {
+        let listening = self.is_listening();
+        let n = self.today_count;
+        let tooltip = match &self.status {
+            PipelineStatus::Listening if listening => format!(
+                "OatsNotes — Listening · {n} segment{} today",
+                if n == 1 { "" } else { "s" }
+            ),
+            PipelineStatus::Idle | PipelineStatus::Listening => "OatsNotes — Idle".to_owned(),
+            PipelineStatus::Loading(_) => "OatsNotes — Loading…".to_owned(),
+            PipelineStatus::Failed(_) => "OatsNotes — Speech engine failed".to_owned(),
+        };
+        StatusState {
+            listening,
+            enabled: matches!(
+                self.status,
+                PipelineStatus::Idle | PipelineStatus::Listening
+            ),
+            tooltip,
+        }
+    }
+
+    /// Push the state to the status item (when it changed) and run what was picked there.
+    fn sync_status_item(&mut self, ctx: &egui::Context) {
+        if self.status_item.is_none() {
+            return;
+        }
+        let state = self.status_item_state();
+        let actions = match self.status_item.as_mut() {
+            Some(item) => {
+                if self.status_shown.as_ref() != Some(&state) {
+                    item.update(&state);
+                    self.status_shown = Some(state);
+                }
+                item.poll()
+            }
+            None => Vec::new(),
+        };
+        if !actions.is_empty() {
+            // the menu was used: the next frame shows its effect (e.g. the toggle's new label)
+            ctx.request_repaint();
+        }
+        for a in actions {
+            match a {
+                StatusAction::ToggleListening => self.run(Command::ToggleListening),
+                StatusAction::ShowWindow => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                StatusAction::Quit => self.request_quit(ctx),
+            }
+        }
+    }
+
+    /// With a status item, closing the window hides it (listening carries on in the
+    /// background; the status item brings it back); Quit really quits.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if self.status_item.is_some()
+            && !self.quit_requested
+            && ctx.input(|i| i.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            log::info!("window hidden; still running in the status item (Quit to exit)");
+        }
     }
 
     /// Whether listening is on (the microphone is open and the pipeline is fed).
@@ -465,6 +587,7 @@ impl OatsApp {
         }
         if self.auto_listen && self.status == PipelineStatus::Idle {
             self.auto_listen = false;
+            // (also `--listen`, which leaves the remembered pref as it was)
             if !self.start_listening() {
                 self.prefs.listening = false;
             }
@@ -767,8 +890,13 @@ impl OatsApp {
 }
 
 impl eframe::App for OatsApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // Runs every frame, and also while the window is hidden (eframe then runs no ui pass), so
+    // everything the status item drives lives here.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events();
+        self.route_menu_events();
+        self.sync_status_item(ctx);
+        self.handle_close(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -987,6 +1115,22 @@ mod tests {
         assert_eq!(titles, ["File", "Listen", "View"]);
     }
 
+    /// Records what it was told to show; hands out whatever the test queued.
+    #[derive(Default)]
+    struct FakeStatusItem {
+        shown: std::rc::Rc<std::cell::RefCell<Vec<StatusState>>>,
+        queue: std::rc::Rc<std::cell::RefCell<Vec<StatusAction>>>,
+    }
+
+    impl StatusItem for FakeStatusItem {
+        fn update(&mut self, state: &StatusState) {
+            self.shown.borrow_mut().push(state.clone());
+        }
+        fn poll(&mut self) -> Vec<StatusAction> {
+            std::mem::take(&mut *self.queue.borrow_mut())
+        }
+    }
+
     #[test]
     fn level_maps_minus_60_to_0_dbfs() {
         assert_eq!(level_fraction(-100.0), 0.0);
@@ -1018,17 +1162,49 @@ mod tests {
         }
         .spawn();
         let audio: AudioStarter = Box::new(|_tx| Err("no microphone in tests".to_owned()));
+        let item = FakeStatusItem::default();
+        let shown = item.shown.clone();
+        let queue = item.queue.clone();
         let mut app = OatsApp::new(
             &cc,
             AppOptions {
                 native_menu: false,
                 system_font: false,
                 persist: false,
+                start_listening: false,
             },
             pipeline,
             audio,
             store,
+            Some(Box::new(item)),
         );
+        assert!(app.has_status_item());
+        // the status item follows the app's state, and is only told about changes
+        app.sync_status_item(&cc.egui_ctx);
+        app.sync_status_item(&cc.egui_ctx);
+        assert_eq!(
+            *shown.borrow(),
+            [StatusState {
+                listening: false,
+                enabled: false,
+                tooltip: "OatsNotes — Loading…".to_owned(),
+            }]
+        );
+        app.status = PipelineStatus::Idle;
+        app.sync_status_item(&cc.egui_ctx);
+        assert_eq!(
+            shown
+                .borrow()
+                .last()
+                .map(|s| (s.enabled, s.tooltip.as_str())),
+            Some((true, "OatsNotes — Idle"))
+        );
+        // its Quit really quits (closing the window would only hide it)
+        queue.borrow_mut().push(StatusAction::Quit);
+        assert!(!app.quit_requested);
+        app.sync_status_item(&cc.egui_ctx);
+        assert!(app.quit_requested);
+        app.status = PipelineStatus::Loading("Starting…".to_owned());
         assert!(listen_item(&app.menu_model()).is_some());
         assert!(!app.is_listening());
         // the toggle refuses while the engine is still loading, and a failing microphone

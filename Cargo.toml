@@ -14,6 +14,8 @@ oats-core = { path = "crates/oats-core" }
 oats-audio = { path = "crates/oats-audio" }
 oats-engine-fluidaudio = { path = "crates/oats-engine-fluidaudio" }
 oats-ui = { path = "crates/oats-ui" }
+oats-status = { path = "crates/oats-status" }
+oats-status-macos = { path = "crates/oats-status-macos" }
 
 # foundation
 serde = { version = "1", features = ["derive"] }
@@ -39,6 +41,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 egui_kittest = "0.36"
 # Shared egui kit from the Craft suite (MIT OR Apache-2.0): theme helpers, icon buttons.
 craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "d27646a5f7c8b4fc85d9dd3213b8c88b58e0088d" }
+
+# status item (menu bar extra; macOS only). Pure Rust over AppKit; depends on muda 0.21, the
+# same version the native menu bar (oats-ui) uses, so both share one menu event stream.
+tray-icon = "0.26"
 
 # speech (macOS only — the one component that is swapped on Linux)
 fluidaudio-rs = "0.14.8"

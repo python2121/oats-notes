@@ -5,18 +5,21 @@
 //! Key handling: AppKit offers a key press to the menu bar only when it carries ⌘ (or ⌃, or is a
 //! function key). Every menu key equivalent here is a ⌘-chord, so while this menu is installed
 //! the app's own key monitor skips them (`OatsApp::has_native_menu`) and nothing fires twice.
-//! Quit goes through the window close (so prefs save and listening stops cleanly), not
+//! Quit goes through [`OatsApp::request_quit`] and the window close (so prefs save and listening
+//! stops cleanly, and the status item's close-hides-the-window doesn't apply), not
 //! `NSApp terminate`.
+//!
+//! Clicks arrive through the app's single `muda` event handler ([`crate::menu_events`]), which
+//! the status item's menu shares; [`OatsApp::take_native_menu_ids`] hands this menu its ids.
 //!
 //! The AppKit menu is `!Send` (`Rc` inside `muda`), so it lives in [`NativeMenuApp`], a thin
 //! eframe wrapper around [`OatsApp`], rather than inside the app state.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, channel};
 
 use egui::{Key, KeyboardShortcut};
 use muda::accelerator::{Accelerator, Code, Modifiers};
-use muda::{AboutMetadata, CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{AboutMetadata, CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 
 use crate::app::{Command, MenuEntry, OatsApp, menu_shortcut};
 
@@ -41,7 +44,6 @@ pub struct NativeMenu {
     _menu: Menu,
     items: Vec<Item>,
     ids: HashMap<String, usize>,
-    rx: Receiver<String>,
 }
 
 /// What the user picked in the menu bar since the last frame.
@@ -119,15 +121,7 @@ pub fn accelerator(s: &KeyboardShortcut) -> Option<Accelerator> {
 impl NativeMenu {
     /// Build the menu bar from the app's model and install it as the NSApp main menu.
     /// `None` (logged) when AppKit refuses — the window then keeps its own egui menu bar.
-    pub fn install(app: &OatsApp, ctx: &egui::Context) -> Option<Self> {
-        let (tx, rx) = channel::<String>();
-        let repaint = ctx.clone();
-        MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-            let _ = tx.send(e.id.0);
-            // a menu click doesn't wake egui by itself
-            repaint.request_repaint();
-        }));
-
+    pub fn install(app: &OatsApp) -> Option<Self> {
         let menu = Menu::new();
         let mut items = Vec::new();
         let mut ids = HashMap::new();
@@ -231,15 +225,14 @@ impl NativeMenu {
             _menu: menu,
             items,
             ids,
-            rx,
         })
     }
 
     /// Bring labels and enabled/checked state up to date with the app, and return what was
-    /// picked since the last frame.
-    pub fn update(&mut self, app: &OatsApp) -> Vec<Picked> {
+    /// picked: `clicked` are the menu event ids routed to this menu since the last frame.
+    pub fn update(&mut self, app: &OatsApp, clicked: Vec<String>) -> Vec<Picked> {
         let mut picked = Vec::new();
-        while let Ok(id) = self.rx.try_recv() {
+        for id in clicked {
             if id == QUIT_ID {
                 picked.push(Picked::Quit);
             } else if let Some(item) = self.ids.get(&id).and_then(|&i| self.items.get(i)) {
@@ -305,8 +298,8 @@ pub struct NativeMenuApp {
 impl NativeMenuApp {
     /// Install the native menu for `app`; hands the app back (with its in-window menu bar
     /// restored) when AppKit refuses.
-    pub fn new(mut app: OatsApp, ctx: &egui::Context) -> Result<Self, Box<OatsApp>> {
-        match NativeMenu::install(&app, ctx) {
+    pub fn new(mut app: OatsApp) -> Result<Self, Box<OatsApp>> {
+        match NativeMenu::install(&app) {
             Some(menu) => {
                 app.set_native_menu(true);
                 Ok(Self { app, menu })
@@ -321,10 +314,11 @@ impl NativeMenuApp {
 
 impl eframe::App for NativeMenuApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        for p in self.menu.update(&self.app) {
+        let clicked = self.app.take_native_menu_ids();
+        for p in self.menu.update(&self.app, clicked) {
             match p {
                 Picked::Command(c) => self.app.run(c),
-                Picked::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Picked::Quit => self.app.request_quit(ctx),
             }
         }
         self.app.logic(ctx, frame);

@@ -2,10 +2,12 @@
 //! the listen controls and status line, the theme (the SwiftInvert shell's dark charcoal tokens
 //! and the OS UI font) and, on macOS, the native menu bar.
 //!
-//! This crate depends on `oats-core` only. The binary wires in the speech engine (through the
-//! [`oats_core::Pipeline`] it hands over) and the microphone (through an [`AudioStarter`]).
+//! This crate depends on `oats-core` and the platform-neutral `oats-status` contract only. The binary wires in the speech engine (through the
+//! [`oats_core::Pipeline`] it hands over) and the microphone (through an [`AudioStarter`]) and
+//! the status item (an `oats_status::StatusItem` built by the binary's chosen implementation).
 
 pub mod app;
+pub mod menu_events;
 #[cfg(target_os = "macos")]
 pub mod native_menu;
 #[cfg(feature = "selftest")]

@@ -20,6 +20,8 @@ oats-core = { workspace = true }
 oats-audio = { workspace = true }
 oats-engine-fluidaudio = { workspace = true }
 oats-ui = { workspace = true }
+oats-status = { workspace = true }
+oats-status-macos = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "persistence", "wayland", "x11"] }
 egui = { workspace = true }
 log = { workspace = true }

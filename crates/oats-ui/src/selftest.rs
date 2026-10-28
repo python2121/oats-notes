@@ -56,10 +56,12 @@ pub fn run_with(
                     native_menu: false,
                     system_font: false,
                     persist: false,
+                    start_listening: false,
                 },
                 pipeline,
                 audio,
                 store,
+                None,
             )
         });
     harness

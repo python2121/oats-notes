@@ -1,0 +1,18 @@
+[package]
+name = "oats-status-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The macOS status item (menu bar extra) via tray-icon: template waveform icon, listen toggle, Show, Quit. Swappable like the engine crate."
+
+[lints]
+workspace = true
+
+[dependencies]
+oats-status = { workspace = true }
+log = { workspace = true }
+
+# pure Rust over AppKit (objc2); its `muda` is the same 0.21 the native menu bar uses
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { workspace = true }
