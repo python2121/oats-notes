@@ -19,7 +19,8 @@
 //! `OATS_FONT=bundled` (Inter instead of the system font), `OATS_FONT_GRADE` (SF Pro grade),
 //! `OATS_DATA_DIR` (where the database lives), `RUST_LOG`; the brain's `OATS_BRAIN=off`,
 //! `OATS_CLAUDE_BIN`, `OATS_CLAUDE_MODEL`, `OATS_INTERPRET_EVERY_MIN`, `OATS_BRAIN_BUDGET_USD`,
-//! `OATS_HOTWORDS` (see `oats_brain::BrainConfig::from_env`).
+//! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
+//! `oats_brain::BrainConfig::from_env`).
 //!
 //! `--selftest <out.png> [--listening|--notes|--calendar]` renders the whole window offscreen to a PNG (seeded
 //! demo content, the null engine, a throwaway database) — the shell verified without a window.
@@ -131,6 +132,11 @@ fn main() -> ExitCode {
         APP_NAME,
         options,
         Box::new(move |cc| {
+            // owner-only data directory (0700; tightened if an older build made it 0755);
+            // the store creates the database file 0600
+            if let Err(e) = oats_core::paths::secure_data_dir() {
+                log::warn!("data directory: {e}");
+            }
             let db = oats_core::paths::database_path();
             let store = match oats_core::Store::open(&db) {
                 Ok(s) => s,
@@ -151,7 +157,8 @@ fn main() -> ExitCode {
             // the brain: the local `claude` CLI, its own store connection, its own thread;
             // OATS_BRAIN=off keeps the thread but runs nothing
             let mut brain_config = oats_brain::BrainConfig::from_env();
-            brain_config.cli.work_dir = Some(oats_core::paths::data_dir());
+            // an empty directory of its own, never the data dir (which holds the database)
+            brain_config.cli.work_dir = Some(oats_core::paths::claude_work_dir());
             let ctx = cc.egui_ctx.clone();
             let brain = oats_brain::Brain {
                 config: brain_config,

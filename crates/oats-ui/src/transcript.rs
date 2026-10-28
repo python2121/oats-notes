@@ -46,6 +46,31 @@ pub fn local_midnight_ms() -> i64 {
     midnight_ms(&Local::now())
 }
 
+/// Milliseconds from `now` until just after the next midnight in its zone (a second past, so
+/// a repaint then sees the new day). At least one second; DST-safe (the next day's first
+/// instant, which may be 01:00 where midnight is skipped).
+pub fn ms_until_next_midnight<Tz: TimeZone>(now: &DateTime<Tz>) -> i64 {
+    let tz = now.timezone();
+    let next = now
+        .date_naive()
+        .succ_opt()
+        .and_then(|d| {
+            (0..=8).find_map(|q| {
+                d.and_hms_opt(0, 0, 0)
+                    .map(|m| m + chrono::Duration::minutes(15 * q))
+                    .and_then(|m| tz.from_local_datetime(&m).earliest())
+            })
+        })
+        .map(|m| m.timestamp_millis())
+        .unwrap_or_else(|| now.timestamp_millis() + 86_400_000);
+    (next - now.timestamp_millis() + 1_000).max(1_000)
+}
+
+/// [`ms_until_next_midnight`] from the local now, as a `Duration`.
+pub fn until_local_midnight() -> std::time::Duration {
+    std::time::Duration::from_millis(ms_until_next_midnight(&Local::now()) as u64)
+}
+
 /// The local calendar day of a row.
 pub fn day_of<Tz: TimeZone>(ms: i64, tz: &Tz) -> Option<NaiveDate> {
     at(ms, tz).map(|d| d.date_naive())
@@ -248,6 +273,18 @@ fn transcript_row(
 mod tests {
     use super::*;
     use chrono::FixedOffset;
+
+    #[test]
+    fn the_next_midnight_is_a_second_after_the_day_ends() {
+        let tz = FixedOffset::east_opt(3600).unwrap();
+        let now = tz
+            .with_ymd_and_hms(2026, 10, 28, 23, 59, 0)
+            .single()
+            .unwrap();
+        assert_eq!(ms_until_next_midnight(&now), 61_000);
+        let morning = tz.with_ymd_and_hms(2026, 10, 28, 6, 0, 0).single().unwrap();
+        assert_eq!(ms_until_next_midnight(&morning), 18 * 3_600_000 + 1_000);
+    }
 
     fn row(id: i64, started_at: i64) -> TranscriptRow {
         TranscriptRow {

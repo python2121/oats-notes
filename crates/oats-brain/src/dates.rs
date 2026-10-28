@@ -40,15 +40,22 @@ pub fn to_ms<Tz: TimeZone>(date: NaiveDate, time: Option<NaiveTime>, tz: &Tz) ->
     })
 }
 
+/// The largest day offset any model-supplied date math accepts (a year either way); larger
+/// values are clamped, never passed to chrono's panicking constructors.
+pub const MAX_OFFSET_DAYS: i64 = 366;
+
 /// The local calendar date `days` days from `at` (negative = earlier), at the same clock time.
+/// `days` is clamped to ±[`MAX_OFFSET_DAYS`]. A clock time that doesn't exist on the target
+/// day (a DST gap) resolves forward to the first valid instant, as [`to_ms`] does.
 pub fn shift_days<Tz: TimeZone>(at: &DateTime<Tz>, days: i64) -> Option<DateTime<Tz>> {
+    let days = days.clamp(-MAX_OFFSET_DAYS, MAX_OFFSET_DAYS);
     let date = at
         .date_naive()
-        .checked_add_signed(chrono::Duration::days(days))?;
+        .checked_add_signed(chrono::TimeDelta::try_days(days)?)?;
     let time = NaiveTime::from_hms_opt(at.hour(), at.minute(), at.second())?;
-    at.timezone()
-        .from_local_datetime(&date.and_time(time))
-        .earliest()
+    let tz = at.timezone();
+    let ms = to_ms(date, Some(time), &tz)?;
+    tz.timestamp_millis_opt(ms).single()
 }
 
 /// "2026-10-28 (Wednesday) 14:05, Europe/Oslo"-style context line for the prompts.
@@ -159,5 +166,35 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 12, 5).unwrap()
         );
         assert_eq!(week_before.hour(), 9);
+    }
+
+    #[test]
+    fn huge_offsets_are_clamped_not_a_panic() {
+        let tz = FixedOffset::east_opt(0).unwrap();
+        let at = tz.with_ymd_and_hms(2026, 10, 28, 9, 0, 0).single().unwrap();
+        let far = shift_days(&at, i64::MAX).unwrap();
+        assert_eq!(
+            far.date_naive(),
+            NaiveDate::from_ymd_opt(2027, 10, 29).unwrap()
+        );
+        let back = shift_days(&at, i64::MIN).unwrap();
+        assert_eq!(
+            back.date_naive(),
+            NaiveDate::from_ymd_opt(2025, 10, 27).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_shift_into_a_dst_gap_moves_forward() {
+        // 2026-03-08 00:30 doesn't exist in MidnightDst on 03-01; shift 7 days back from 03-08
+        let d = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        let ms = to_ms(d, NaiveTime::from_hms_opt(0, 30, 0), &MidnightDst).unwrap();
+        let at = MidnightDst.timestamp_millis_opt(ms).single().unwrap();
+        let back = shift_days(&at, -7).expect("a gap time still resolves");
+        assert_eq!(
+            back.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()
+        );
+        assert_eq!((back.hour(), back.minute()), (1, 0), "the end of the gap");
     }
 }

@@ -338,7 +338,7 @@ CREATE TABLE IF NOT EXISTS nodes (
 );
 CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent_id);
 CREATE TABLE IF NOT EXISTS episodes (
-    id                INTEGER PRIMARY KEY,
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at        INTEGER NOT NULL,
     ended_at          INTEGER NOT NULL,
     title             TEXT NOT NULL,
@@ -609,17 +609,109 @@ pub fn name_key(name: &str) -> String {
 const SUBTREE_CTE: &str = "WITH RECURSIVE sub(id) AS (
         SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN sub ON n.parent_id = sub.id)";
 
+/// A nested write transaction: the outermost level is `BEGIN IMMEDIATE` (it takes the write
+/// lock up front, waiting under the busy timeout, so a read-then-write body can't fail with
+/// `SQLITE_BUSY_SNAPSHOT` when another connection wrote in between); inner levels are
+/// `SAVEPOINT`s. Rolled back on drop unless [`Savepoint::commit`] ran, so a body that fails
+/// half-way leaves nothing behind.
+struct Savepoint<'a> {
+    conn: &'a rusqlite::Connection,
+    outer: bool,
+    done: bool,
+}
+
+impl<'a> Savepoint<'a> {
+    fn begin(conn: &'a rusqlite::Connection) -> Result<Self, StoreError> {
+        let outer = conn.is_autocommit();
+        conn.execute_batch(if outer {
+            "BEGIN IMMEDIATE;"
+        } else {
+            "SAVEPOINT oats_sp;"
+        })?;
+        Ok(Self {
+            conn,
+            outer,
+            done: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<(), StoreError> {
+        self.done = true;
+        self.conn.execute_batch(if self.outer {
+            "COMMIT;"
+        } else {
+            "RELEASE oats_sp;"
+        })?;
+        Ok(())
+    }
+}
+
+impl Drop for Savepoint<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.conn.execute_batch(if self.outer {
+                "ROLLBACK;"
+            } else {
+                "ROLLBACK TO oats_sp; RELEASE oats_sp;"
+            });
+        }
+    }
+}
+
+impl std::ops::Deref for Savepoint<'_> {
+    type Target = rusqlite::Connection;
+    fn deref(&self) -> &rusqlite::Connection {
+        self.conn
+    }
+}
+
+/// Owner-only permissions for the database: the directory is created 0700 when missing, the
+/// file (and an existing `-wal` / `-shm`, which SQLite otherwise creates with the main file's
+/// mode) 0600 — before SQLite opens it, so it never exists world-readable. Unix only.
+#[cfg(unix)]
+fn secure_db_path(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    for suffix in ["", "-wal", "-shm"] {
+        let p = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+        if p.exists() {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_db_path(path: &Path) -> Result<(), StoreError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open (creating the file, its parent directory and the schema as needed; migrating an
-    /// older schema).
+    /// older schema). The directory is created 0700 and the file 0600 (unix), and deleted
+    /// content is overwritten (`secure_delete`).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
+        secure_db_path(path)?;
         let conn = rusqlite::Connection::open(path)?;
-        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;")?;
         // switching a fresh file to WAL needs an exclusive lock and SQLite answers SQLITE_BUSY
         // at once (no busy handler) while another connection is opening it too
         let mut tries = 0;
@@ -683,6 +775,7 @@ impl Store {
             }
             Some(v) => return Err(StoreError::SchemaTooNew(v)),
         }
+        Self::episode_ids_never_reused(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -697,6 +790,43 @@ impl Store {
                 self.add_category(name)?;
             }
         }
+        Ok(())
+    }
+
+    /// Episode ids are referenced loosely (`events.source_episode_id`, dedupe keys
+    /// `ep:<id>:…`), so a deleted episode's id must never come back: a database created before
+    /// `episodes` was `AUTOINCREMENT` has the table rebuilt in place (same columns, same ids;
+    /// still schema version 2, which older builds read unchanged), and the id sequence starts
+    /// above every id anything still points at. Runs inside `init`'s transaction with foreign
+    /// keys off.
+    fn episode_ids_never_reused(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'episodes'",
+            [],
+            |r| r.get(0),
+        )?;
+        if sql.to_uppercase().contains("AUTOINCREMENT") {
+            return Ok(());
+        }
+        log::info!("upgrading the episodes table to never reuse ids");
+        let create = SCHEMA
+            .split("CREATE TABLE IF NOT EXISTS episodes")
+            .nth(1)
+            .and_then(|rest| rest.split(");").next())
+            .map(|cols| format!("CREATE TABLE episodes_new{cols});"))
+            .ok_or_else(|| StoreError::Io(std::io::Error::other("episodes schema not found")))?;
+        conn.execute_batch(&create)?;
+        conn.execute_batch(
+            "INSERT INTO episodes_new SELECT * FROM episodes;
+             DROP TABLE episodes;
+             ALTER TABLE episodes_new RENAME TO episodes;
+             CREATE INDEX IF NOT EXISTS episodes_started_at ON episodes(started_at);
+             DELETE FROM sqlite_sequence WHERE name = 'episodes';
+             INSERT INTO sqlite_sequence(name, seq) VALUES ('episodes', (SELECT MAX(m) FROM (
+                 SELECT COALESCE(MAX(id), 0) AS m FROM episodes
+                 UNION ALL SELECT COALESCE(MAX(source_episode_id), 0) FROM events
+                 UNION ALL SELECT COALESCE(MAX(episode_id), 0) FROM segments)));",
+        )?;
         Ok(())
     }
 
@@ -913,7 +1043,7 @@ impl Store {
     /// The automatic categorisation pass's result for a batch: `(segment_id, node_id)`.
     /// Segments the user already filed are left as they are.
     pub fn apply_categorisation(&self, filed: &[(i64, Option<i64>)]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Savepoint::begin(&self.conn)?;
         for (segment_id, node_id) in filed {
             tx.execute(
                 "UPDATE segments SET node_id = ?2, categorised = 1 WHERE id = ?1 AND categorised = 0",
@@ -931,7 +1061,7 @@ impl Store {
         episode_id: i64,
         at: i64,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Savepoint::begin(&self.conn)?;
         for id in segment_ids {
             tx.execute(
                 "UPDATE segments SET episode_id = ?2, interpreted_at = ?3 WHERE id = ?1",
@@ -942,10 +1072,37 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a segment (the user's own delete): the text is overwritten in the file
+    /// (`secure_delete`) and the WAL is checkpointed and truncated so no copy lingers there.
     pub fn delete_segment(&self, segment_id: i64) -> Result<(), StoreError> {
         self.conn
             .execute("DELETE FROM segments WHERE id = ?1", [segment_id])?;
+        self.checkpoint();
         Ok(())
+    }
+
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` after a user-initiated delete, so the deleted text
+    /// doesn't survive in the WAL. Best effort (a no-op inside a transaction or while another
+    /// connection is mid-read; the next checkpoint catches up).
+    pub fn checkpoint(&self) {
+        if !self.conn.is_autocommit() {
+            return;
+        }
+        if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            log::debug!("wal checkpoint: {e}");
+        }
+    }
+
+    /// Run `f` as one transaction (nested calls become savepoints): if it returns an error,
+    /// everything it wrote is rolled back.
+    pub fn with_savepoint<R>(
+        &self,
+        f: impl FnOnce(&Self) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let sp = Savepoint::begin(&self.conn)?;
+        let r = f(self)?;
+        sp.commit()?;
+        Ok(r)
     }
 
     /// Count of segments whose `started_at` ≥ `since` (the status line's "N today").
@@ -1134,7 +1291,7 @@ impl Store {
         if from == into || self.subtree_ids(from)?.contains(&into) {
             return Ok(());
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Savepoint::begin(&self.conn)?;
         for table in ["segments", "episodes", "events", "notes"] {
             tx.execute(
                 &format!("UPDATE {table} SET node_id = ?2 WHERE node_id = ?1"),
@@ -1153,7 +1310,7 @@ impl Store {
     /// Delete a node and its subtree; whatever was filed there goes back to unfiled.
     pub fn delete_node(&self, id: i64) -> Result<(), StoreError> {
         let ids = self.subtree_ids(id)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Savepoint::begin(&self.conn)?;
         for nid in ids.iter().rev() {
             for table in ["segments", "episodes", "events", "notes"] {
                 tx.execute(
@@ -1339,11 +1496,12 @@ impl Store {
     /// Forget an episode's interpretation: its segments become uninterpreted again (the
     /// next run re-cuts and re-interprets them) and the row goes; the events it produced stay.
     pub fn reset_episode(&self, id: i64) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Savepoint::begin(&self.conn)?;
         tx.execute(
             "UPDATE segments SET episode_id = NULL, interpreted_at = NULL WHERE episode_id = ?1",
             [id],
         )?;
+        // the events keep pointing at the old id, which (AUTOINCREMENT) no later episode gets
         tx.execute("DELETE FROM episodes WHERE id = ?1", [id])?;
         tx.commit()?;
         Ok(())
@@ -1354,7 +1512,7 @@ impl Store {
         if from == into {
             return Ok(());
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Savepoint::begin(&self.conn)?;
         tx.execute(
             "UPDATE segments SET episode_id = ?2 WHERE episode_id = ?1",
             [from, into],
@@ -1484,7 +1642,7 @@ impl Store {
     }
 
     pub fn delete_event(&self, id: i64) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Savepoint::begin(&self.conn)?;
         tx.execute(
             "UPDATE reminders SET event_id = NULL WHERE event_id = ?1",
             [id],
@@ -1678,6 +1836,15 @@ impl Store {
         Ok(self.conn.query_row(
             "SELECT COALESCE(SUM(cost_usd), 0) FROM brain_runs WHERE started_at >= ?1",
             [since],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Runs of one tier started at or after `since` (tier 0's own hourly cap).
+    pub fn run_count_of_tier_since(&self, tier: i64, since: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM brain_runs WHERE tier = ?1 AND started_at >= ?2",
+            [tier, since],
             |r| r.get(0),
         )?)
     }
@@ -2195,6 +2362,144 @@ mod tests {
         assert_eq!(s.categories()?.len(), 3);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_and_new_directory_are_owner_only() -> R {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "oats-store-perm-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let data = dir.join("data");
+        let path = data.join("oats.sqlite");
+        {
+            let s = Store::open(&path)?;
+            let sid = s.begin_session(0, "e")?;
+            s.insert_segment(sid, 1, 2, "secret", None)?;
+        }
+        let mode = |p: &Path| -> Result<u32, StoreError> {
+            Ok(std::fs::metadata(p)?.permissions().mode() & 0o777)
+        };
+        assert_eq!(mode(&data)?, 0o700);
+        assert_eq!(mode(&path)?, 0o600);
+        // an existing file with a loose mode is tightened on open
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        let s = Store::open(&path)?;
+        assert_eq!(mode(&path)?, 0o600);
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        if wal.exists() {
+            assert_eq!(mode(&wal)?, 0o600);
+        }
+        let secure: i64 = s.conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+        assert_eq!(secure, 1);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn with_savepoint_rolls_back_everything_on_error_and_nests() -> R {
+        let s = Store::open_in_memory()?;
+        let sid = s.begin_session(0, "e")?;
+        let r: Result<(), StoreError> = s.with_savepoint(|s| {
+            s.insert_segment(sid, 1, 2, "half", None)?;
+            // a nested transaction-using call commits only its savepoint
+            s.apply_categorisation(&[(1, None)])?;
+            Err(StoreError::Io(std::io::Error::other("fail mid-way")))
+        });
+        assert!(r.is_err());
+        assert!(s.segments(View::All, 0)?.is_empty(), "nothing half-applied");
+        assert!(s.conn.is_autocommit(), "no transaction left open");
+        s.with_savepoint(|s| {
+            s.insert_segment(sid, 1, 2, "kept", None)?;
+            let inner: Result<(), StoreError> = s.with_savepoint(|s| {
+                s.insert_segment(sid, 3, 4, "inner, rolled back", None)?;
+                Err(StoreError::Io(std::io::Error::other("inner fails")))
+            });
+            assert!(inner.is_err());
+            Ok(())
+        })?;
+        let rows = s.segments(View::All, 0)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "kept");
+        Ok(())
+    }
+
+    /// A database whose `episodes` table predates AUTOINCREMENT is rebuilt in place on open
+    /// (same rows, same schema version) and never hands out an id something still points at.
+    #[test]
+    fn an_old_episodes_table_is_upgraded_so_ids_are_never_reused() -> R {
+        let dir = std::env::temp_dir().join(format!(
+            "oats-store-autoinc-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let path = dir.join("oats.sqlite");
+        let content = EpisodeContent {
+            title: "t".into(),
+            ..Default::default()
+        };
+        {
+            let s = Store::open(&path)?;
+            let a = s.insert_episode(0, 10, &content, 1)?;
+            let b = s.insert_episode(20, 30, &content, 1)?;
+            s.upsert_event(
+                &NewEvent {
+                    when_start: 5,
+                    title: "from b".into(),
+                    source_episode_id: Some(b.id),
+                    ..Default::default()
+                },
+                1,
+            )?;
+            // simulate the old table: plain INTEGER PRIMARY KEY, b's row gone
+            s.conn.execute_batch(&format!(
+                "PRAGMA foreign_keys=OFF;
+                 CREATE TABLE old AS SELECT * FROM episodes WHERE id = {};
+                 DROP TABLE episodes;
+                 CREATE TABLE episodes (id INTEGER PRIMARY KEY, started_at INTEGER NOT NULL,
+                    ended_at INTEGER NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
+                    node_id INTEGER, decisions_json TEXT NOT NULL DEFAULT '[]',
+                    action_items_json TEXT NOT NULL DEFAULT '[]',
+                    topics_json TEXT NOT NULL DEFAULT '[]', low_signal INTEGER NOT NULL DEFAULT 0,
+                    model TEXT NOT NULL DEFAULT '', cost_usd REAL,
+                    revision INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+                    last_revised_at INTEGER NOT NULL);
+                 INSERT INTO episodes SELECT * FROM old;
+                 DROP TABLE old;
+                 DELETE FROM sqlite_sequence WHERE name = 'episodes';",
+                a.id
+            ))?;
+        }
+        let s = Store::open(&path)?;
+        assert_eq!(version(&s)?, "2");
+        assert_eq!(s.episodes(10)?.len(), 1, "rows survive the rebuild");
+        let c = s.insert_episode(40, 50, &content, 2)?;
+        let events = s.events_from(i64::MIN, 10)?;
+        assert!(
+            events.iter().all(|e| e.source_episode_id != Some(c.id)),
+            "new episode {} adopted {events:?}",
+            c.id
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn counts_runs_per_tier() -> R {
+        let s = Store::open_in_memory()?;
+        s.begin_run(0, "command", "haiku", 100)?;
+        s.begin_run(0, "categorise", "haiku", 200)?;
+        s.begin_run(1, "interpret", "sonnet", 300)?;
+        assert_eq!(s.run_count_of_tier_since(0, 0)?, 2);
+        assert_eq!(s.run_count_of_tier_since(0, 150)?, 1);
+        assert_eq!(s.run_count_of_tier_since(1, 0)?, 1);
+        assert_eq!(s.run_count_since(0)?, 3);
         Ok(())
     }
 }

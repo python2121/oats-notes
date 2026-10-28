@@ -10,11 +10,17 @@
 //! ```
 //!
 //! The user prompt (which carries the transcript) goes over **stdin** (no argv limits, no
-//! quoting); stdout is one JSON `result` object; `CLAUDECODE` is removed from the environment
-//! so the CLI never thinks it is nested inside another Claude Code session; the working
-//! directory is a neutral one (the data dir) so no project CLAUDE.md or `.mcp.json` is loaded.
-//! A timeout kills the child (and its process group).
+//! quoting); stdout is one JSON `result` object. The child gets an **allowlisted
+//! environment** ([`child_env`]): `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_ALL` /
+//! `LC_CTYPE`, `TZ`, `CLAUDE_CONFIG_DIR` (when set), a fixed `PATH`, and the CLI's own
+//! telemetry / error-reporting / auto-update switches turned off — nothing else of the app's
+//! environment (so no `ANTHROPIC_BASE_URL` or proxy redirects the transcript, no parent
+//! Claude Code session variables leak in; proxies only with `OATS_CLAUDE_PASS_PROXY=1`). The
+//! working directory is an empty one (`<data dir>/claude-work`) so no project CLAUDE.md or
+//! `.mcp.json` is loaded and nothing of the app's data is within reach. A timeout kills the
+//! child (and its process group).
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,6 +32,105 @@ use std::time::{Duration, Instant};
 pub const BIN_ENV: &str = "OATS_CLAUDE_BIN";
 /// Environment variable overriding the model alias for every tier (`haiku`, `sonnet`, …).
 pub const MODEL_ENV: &str = "OATS_CLAUDE_MODEL";
+/// `OATS_CLAUDE_PASS_PROXY=1` passes [`PROXY_VARS`] through to the child (off by default).
+pub const PASS_PROXY_ENV: &str = "OATS_CLAUDE_PASS_PROXY";
+
+/// The app's environment variables the child may see (when set).
+pub const PASS_VARS: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "CLAUDE_CONFIG_DIR",
+];
+/// Passed only with `OATS_CLAUDE_PASS_PROXY=1`: anything that changes where requests go.
+pub const PROXY_VARS: &[&str] = &[
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+    "ANTHROPIC_BASE_URL",
+    "NODE_EXTRA_CA_CERTS",
+];
+/// The child's `PATH`, before the claude binary's own directory.
+pub const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin";
+/// Set on every child: no telemetry, no error reports (which could carry prompt fragments),
+/// no non-essential traffic, no self-update from inside the app.
+pub const CHILD_FIXED_ENV: &[(&str, &str)] = &[
+    ("CLAUDE_CODE_ENTRYPOINT", "oats-notes"),
+    ("DISABLE_TELEMETRY", "1"),
+    ("DISABLE_ERROR_REPORTING", "1"),
+    ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+    ("DISABLE_AUTOUPDATER", "1"),
+];
+
+/// The complete environment of a `claude` child, from `get` (the app's environment) and the
+/// resolved binary: the allowlist, the proxy variables only when `OATS_CLAUDE_PASS_PROXY=1`,
+/// a fixed `PATH` plus the binary's directory, and [`CHILD_FIXED_ENV`]. Pure, so it is
+/// testable without touching the process environment.
+pub fn child_env(get: &dyn Fn(&str) -> Option<OsString>, binary: &Path) -> Vec<(String, OsString)> {
+    let mut env: Vec<(String, OsString)> = Vec::new();
+    for k in PASS_VARS {
+        if let Some(v) = get(k) {
+            env.push(((*k).to_owned(), v));
+        }
+    }
+    if get(PASS_PROXY_ENV).is_some_and(|v| v == "1") {
+        for k in PROXY_VARS {
+            if let Some(v) = get(k) {
+                env.push(((*k).to_owned(), v));
+            }
+        }
+    }
+    let mut path = OsString::from(CHILD_PATH);
+    if let Some(dir) = binary.parent().filter(|d| d.is_absolute()) {
+        path.push(":");
+        path.push(dir.as_os_str());
+    }
+    env.push(("PATH".to_owned(), path));
+    for (k, v) in CHILD_FIXED_ENV {
+        env.push(((*k).to_owned(), OsString::from(v)));
+    }
+    env
+}
+
+/// Resolve the configured binary to an absolute, canonical path: an absolute path is
+/// canonicalised (symlinks followed); a bare name (`claude`) is looked up on `PATH`; any other
+/// relative path is refused (it would depend on the working directory).
+pub fn resolve_binary(configured: &Path) -> Result<PathBuf, CliError> {
+    let not_found = |why: &str| {
+        CliError::NotFound(
+            configured.to_path_buf(),
+            std::io::Error::new(std::io::ErrorKind::NotFound, why.to_owned()),
+        )
+    };
+    let candidate = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else if configured.components().count() == 1 {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path)
+            .filter(|d| d.is_absolute())
+            .map(|d| d.join(configured))
+            .find(|p| p.is_file())
+            .ok_or_else(|| not_found("not found on PATH"))?
+    } else {
+        return Err(not_found(
+            "a relative path is refused; give an absolute one",
+        ));
+    };
+    let canonical = std::fs::canonicalize(&candidate)
+        .map_err(|e| CliError::NotFound(configured.to_path_buf(), e))?;
+    if !canonical.is_file() {
+        return Err(not_found("not a file"));
+    }
+    Ok(canonical)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -35,6 +140,9 @@ pub enum CliError {
     NotLoggedIn(String),
     #[error("claude is rate limited: {0}")]
     RateLimited(String),
+    /// The CLI could not reach the service (no network, DNS, connection refused/reset).
+    #[error("claude cannot reach the service (offline?): {0}")]
+    Offline(String),
     #[error("claude did not finish within {0:?}")]
     Timeout(Duration),
     /// The caller cancelled the request (the app is quitting); the child was killed.
@@ -48,6 +156,37 @@ pub enum CliError {
     Refused(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+}
+
+impl CliError {
+    /// Why claude as a whole can't be used right now — not this request's fault: missing,
+    /// logged out, offline or rate limited. `None` for errors specific to one request.
+    pub fn unavailable_reason(&self) -> Option<&'static str> {
+        match self {
+            CliError::NotFound(..) => Some("not installed"),
+            CliError::NotLoggedIn(_) => Some("not logged in"),
+            CliError::Offline(_) => Some("offline"),
+            CliError::RateLimited(_) => Some("rate limited"),
+            _ => None,
+        }
+    }
+
+    /// The variant's name, for logs that must not carry CLI output (which can echo model
+    /// output derived from the transcript).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            CliError::NotFound(..) => "not found",
+            CliError::NotLoggedIn(_) => "not logged in",
+            CliError::RateLimited(_) => "rate limited",
+            CliError::Offline(_) => "offline",
+            CliError::Timeout(_) => "timeout",
+            CliError::Cancelled => "cancelled",
+            CliError::Exit { .. } => "non-zero exit",
+            CliError::BadOutput(_) => "bad output",
+            CliError::Refused(_) => "refused",
+            CliError::Io(_) => "io",
+        }
+    }
 }
 
 /// A one-shot request.
@@ -170,6 +309,26 @@ fn classify(msg: &str, status: Option<i64>) -> Option<CliError> {
     if limited {
         return Some(CliError::RateLimited(msg.trim().to_owned()));
     }
+    let offline = [
+        "econnrefused",
+        "enotfound",
+        "etimedout",
+        "econnreset",
+        "eai_again",
+        "enetunreach",
+        "getaddrinfo",
+        "fetch failed",
+        "unable to connect",
+        "connection error",
+        "network error",
+        "socket hang up",
+        "you appear to be offline",
+    ]
+    .iter()
+    .any(|p| lower.contains(p));
+    if offline {
+        return Some(CliError::Offline(msg.trim().to_owned()));
+    }
     None
 }
 
@@ -240,13 +399,15 @@ fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>>
 impl ClaudeCli {
     fn command(&self) -> Command {
         let mut cmd = Command::new(&self.binary);
-        cmd.env_remove("CLAUDECODE")
-            .env("CLAUDE_CODE_ENTRYPOINT", "oats-notes")
+        cmd.env_clear()
+            .envs(child_env(&|k| std::env::var_os(k), &self.binary))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(dir) = &self.work_dir {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = oats_core::paths::secure_dir(dir) {
+                log::warn!("claude work dir {}: {e}", dir.display());
+            }
             cmd.current_dir(dir);
         }
         #[cfg(unix)]
@@ -432,7 +593,7 @@ fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         // the child is its own process group (see `command`): signal the whole group
-        let _ = Command::new("kill")
+        let _ = Command::new("/bin/kill")
             .args(["-TERM", "--", &format!("-{}", child.id())])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -636,5 +797,172 @@ mod tests {
             missing.run(&request()),
             Err(CliError::NotFound(..))
         ));
+    }
+
+    #[test]
+    fn child_env_is_an_allowlist() {
+        let parent: std::collections::HashMap<&str, &str> = [
+            ("HOME", "/Users/me"),
+            ("USER", "me"),
+            ("LANG", "en_GB.UTF-8"),
+            ("PATH", "/evil/bin:/usr/bin"),
+            ("ANTHROPIC_BASE_URL", "https://elsewhere.example"),
+            ("ANTHROPIC_API_KEY", "sk-not-mine"),
+            ("HTTPS_PROXY", "http://proxy:8080"),
+            ("CLAUDE_CODE_SESSION_ID", "parent-session"),
+            ("CLAUDECODE", "1"),
+            ("NODE_OPTIONS", "--require /tmp/x.js"),
+            ("CLAUDE_CONFIG_DIR", "/Users/me/.claude-alt"),
+        ]
+        .into_iter()
+        .collect();
+        let bin = Path::new("/Users/me/.local/share/claude/versions/2.1.312");
+        let env_of = |extra: Option<(&str, &str)>| {
+            let get = |k: &str| -> Option<OsString> {
+                match extra {
+                    Some((ek, ev)) if ek == k => Some(OsString::from(ev)),
+                    _ => parent.get(k).map(OsString::from),
+                }
+            };
+            child_env(&get, bin)
+        };
+        let env = env_of(None);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        for k in &keys {
+            assert!(
+                PASS_VARS.contains(k)
+                    || *k == "PATH"
+                    || CHILD_FIXED_ENV.iter().any(|(f, _)| f == k),
+                "{k} must not reach the child"
+            );
+        }
+        for absent in [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "HTTPS_PROXY",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDECODE",
+            "NODE_OPTIONS",
+        ] {
+            assert!(!keys.contains(&absent), "{absent}");
+        }
+        let get = |k: &str| env.iter().find(|(e, _)| e == k).map(|(_, v)| v.clone());
+        assert_eq!(get("HOME"), Some(OsString::from("/Users/me")));
+        assert_eq!(
+            get("CLAUDE_CONFIG_DIR"),
+            Some(OsString::from("/Users/me/.claude-alt"))
+        );
+        assert_eq!(
+            get("PATH"),
+            Some(OsString::from(format!(
+                "{CHILD_PATH}:/Users/me/.local/share/claude/versions"
+            )))
+        );
+        assert_eq!(get("DISABLE_TELEMETRY"), Some(OsString::from("1")));
+        assert_eq!(get("DISABLE_AUTOUPDATER"), Some(OsString::from("1")));
+        // opt-in proxy pass-through
+        let env = env_of(Some((PASS_PROXY_ENV, "1")));
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"HTTPS_PROXY") && keys.contains(&"ANTHROPIC_BASE_URL"));
+        assert!(!keys.contains(&"ANTHROPIC_API_KEY") && !keys.contains(&"NODE_OPTIONS"));
+    }
+
+    /// The real child sees only the allowlist. The variables that must NOT pass are set on a
+    /// re-run of this very test (setting them in-process would need `unsafe`).
+    #[test]
+    fn the_child_process_gets_only_the_allowlisted_environment() {
+        const INNER: &str = "OATS_TEST_ENV_INNER";
+        if std::env::var_os(INNER).is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let out = Command::new(exe)
+                .args([
+                    "claude_cli::tests::the_child_process_gets_only_the_allowlisted_environment",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(INNER, "1")
+                .env("ANTHROPIC_BASE_URL", "https://elsewhere.example")
+                .env("HTTPS_PROXY", "http://proxy.example:8080")
+                .env("CLAUDE_CODE_SESSION_ID", "parent-session")
+                .env("CLAUDECODE", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+        // the script dumps its environment next to itself ("$0.env")
+        let (cli, _) = fake(
+            "env",
+            r#"/usr/bin/env > "$0.env"; echo '{"type":"result","is_error":false,"result":"ok","structured_output":{}}'"#,
+        );
+        cli.run(&request()).unwrap();
+        let env = std::fs::read_to_string(cli.binary.with_extension("env")).unwrap();
+        let keys: Vec<&str> = env.lines().filter_map(|l| l.split('=').next()).collect();
+        for k in &keys {
+            assert!(
+                PASS_VARS.contains(k)
+                    || *k == "PATH"
+                    || *k == "PWD"
+                    || *k == "SHLVL"
+                    || *k == "_"
+                    || CHILD_FIXED_ENV.iter().any(|(f, _)| f == k),
+                "{k} reached the child: {env}"
+            );
+        }
+        assert!(!env.contains("elsewhere.example") && !env.contains("proxy.example"));
+        assert!(!keys.contains(&"CLAUDE_CODE_SESSION_ID") && !keys.contains(&"CLAUDECODE"));
+        assert!(env.contains("DISABLE_ERROR_REPORTING=1"));
+        assert!(env.contains("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"));
+        assert!(env.contains("CLAUDE_CODE_ENTRYPOINT=oats-notes"));
+    }
+
+    #[test]
+    fn binaries_resolve_to_absolute_canonical_paths() {
+        let (cli, _) = fake("resolve", "true");
+        let resolved = resolve_binary(&cli.binary).unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, std::fs::canonicalize(&cli.binary).unwrap());
+        assert!(matches!(
+            resolve_binary(Path::new("./claude")),
+            Err(CliError::NotFound(..))
+        ));
+        assert!(matches!(
+            resolve_binary(Path::new("bin/claude")),
+            Err(CliError::NotFound(..))
+        ));
+        // a bare name is looked up on PATH (`sh` is everywhere)
+        let sh = resolve_binary(Path::new("sh")).unwrap();
+        assert!(sh.is_absolute(), "{}", sh.display());
+        assert!(matches!(
+            resolve_binary(Path::new("/nonexistent/claude")),
+            Err(CliError::NotFound(..))
+        ));
+    }
+
+    #[test]
+    fn network_failures_are_classified_offline() {
+        let (cli, _) = fake(
+            "offline",
+            "echo 'API Error: Connection error. (getaddrinfo ENOTFOUND api.anthropic.com)' >&2; exit 1",
+        );
+        let e = cli.run(&request()).unwrap_err();
+        assert!(matches!(e, CliError::Offline(_)), "{e:?}");
+        assert_eq!(e.unavailable_reason(), Some("offline"));
+        assert_eq!(CliError::Refused("x".into()).unavailable_reason(), None);
+        assert_eq!(
+            CliError::Exit {
+                code: 1,
+                stderr: "secret transcript".into()
+            }
+            .kind(),
+            "non-zero exit"
+        );
     }
 }

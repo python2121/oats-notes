@@ -31,6 +31,8 @@ pub struct BrainStatus {
     pub running: Option<String>,
     pub last_run: Option<BrainRun>,
     pub spend_today_usd: f64,
+    /// The latest `BrainEvent::Backlog`: segments and voice commands waiting for claude.
+    pub backlog: Option<(i64, usize)>,
 }
 
 impl BrainStatus {
@@ -63,6 +65,28 @@ impl BrainStatus {
 
     pub fn available(&self) -> bool {
         matches!(self.availability, Some(Ok(_)))
+    }
+
+    /// "claude unavailable (not logged in) — 42 segments waiting" while claude can't be
+    /// used, "catching up — 12 segments waiting" while the backlog is worked off, else
+    /// `None`.
+    pub fn backlog_line(&self) -> Option<String> {
+        let (segments, commands) = self.backlog.unwrap_or((0, 0));
+        let mut waiting = format!(
+            "{segments} segment{} waiting",
+            if segments == 1 { "" } else { "s" }
+        );
+        if commands > 0 {
+            waiting.push_str(&format!(
+                ", {commands} voice command{}",
+                if commands == 1 { "" } else { "s" }
+            ));
+        }
+        match &self.availability {
+            Some(Err(why)) => Some(format!("claude unavailable ({why}) — {waiting}")),
+            Some(Ok(_)) if segments > 0 || commands > 0 => Some(format!("catching up — {waiting}")),
+            _ => None,
+        }
     }
 }
 
@@ -235,10 +259,15 @@ fn brain_strip(
             actions.push(NotesAction::Reorganise);
         }
         let line = match (&status.running, &status.availability) {
-            (Some(job), _) => format!("running: {job}…"),
-            (None, Some(Err(e))) => format!("claude unavailable: {e}"),
+            (Some(job), _) => match status.backlog_line() {
+                Some(b) => format!("running: {job}… · {b}"),
+                None => format!("running: {job}…"),
+            },
+            (None, Some(Err(_))) => status.backlog_line().unwrap_or_default(),
             (None, None) => "checking claude…".to_owned(),
-            (None, Some(Ok(_))) => status.last_run_line(),
+            (None, Some(Ok(_))) => status
+                .backlog_line()
+                .unwrap_or_else(|| status.last_run_line()),
         };
         ui.add(egui::Label::new(RichText::new(line).color(t.text_secondary).size(11.0)).truncate());
     });
@@ -585,5 +614,36 @@ mod tests {
         );
         s.availability = Some(Ok("2.1.312".into()));
         assert!(s.available());
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    #[test]
+    fn the_backlog_line_names_why_and_how_much_is_waiting() {
+        let mut s = BrainStatus {
+            availability: Some(Err("not logged in".into())),
+            backlog: Some((42, 1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.backlog_line().as_deref(),
+            Some("claude unavailable (not logged in) — 42 segments waiting, 1 voice command")
+        );
+        s.backlog = None;
+        assert_eq!(
+            s.backlog_line().as_deref(),
+            Some("claude unavailable (not logged in) — 0 segments waiting")
+        );
+        s.availability = Some(Ok("2.1.312".into()));
+        s.backlog = Some((1, 0));
+        assert_eq!(
+            s.backlog_line().as_deref(),
+            Some("catching up — 1 segment waiting")
+        );
+        s.backlog = Some((0, 0));
+        assert_eq!(s.backlog_line(), None);
     }
 }

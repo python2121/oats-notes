@@ -14,11 +14,25 @@
 //! | 2 review | coherence review of the day | sonnet | every 4 h, or after N new episodes, or on demand |
 //! | 3 reorganise | tidy the node tree | opus | once a day in the idle window (02:00–05:00 local), or on demand |
 //!
-//! Budget: a daily USD cap summed from `brain_runs` (tiers 1–3 skip when hit; tier 0 never
-//! skips), a max-runs-per-hour guard, and `--max-budget-usd` on every CLI call. Every run is
-//! recorded with model, cost and duration; structural changes land in `changes`.
+//! Budget: a daily USD cap summed from `brain_runs` (tiers 1–3 skip when hit), a
+//! max-runs-per-hour guard for tiers 1–3, and `--max-budget-usd` on every CLI call. Tier 0
+//! (commands, categorisation) counts toward the daily total but has its own limits so voice
+//! commands keep working while interpretation pauses: at most `tier0_per_hour` runs an hour
+//! and a hard ceiling of twice the daily budget. Every run is recorded with model, cost and
+//! duration; structural changes land in `changes`.
+//!
+//! Offline resilience: listening never depends on any of this. When `claude` is missing, not
+//! logged in, offline or rate limited, the brain marks itself unavailable, keeps every new
+//! segment and command waiting (reporting [`BrainEvent::Backlog`]), and re-probes with
+//! backoff (1 min, doubling to 15 min) with `claude --version` only — free; the first real
+//! call afterwards is the probe for login and rate limits. When it is back, the backlog is
+//! worked oldest-first: queued hotword commands first (dated from when they were spoken),
+//! then the rolling interpretation in chronological chunks within the budget, pausing
+//! between chunks. A panic inside a job is caught, recorded as a failed run and backed off;
+//! the thread itself restarts after a pause if anything outside a job panics.
 
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +42,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, TimeZone, Timelike};
 use oats_core::{BrainRun, EpisodeContent, RunOutcome, Store, TranscriptRow};
 
-use crate::claude_cli::{ClaudeCli, CliError, Request};
+use crate::claude_cli::{ClaudeCli, CliError, Request, resolve_binary};
 use crate::episodes::{Chunk, EpisodeRule, cut};
 use crate::hotword::{self, HotwordConfig};
 use crate::interpret;
@@ -86,7 +100,8 @@ impl TierModels {
 
 /// Everything configurable. Environment overrides (see [`BrainConfig::from_env`]):
 /// `OATS_BRAIN=off`, `OATS_CLAUDE_BIN`, `OATS_CLAUDE_MODEL` (every tier), `OATS_BRAIN_MODEL_0..3`
-/// (per tier), `OATS_INTERPRET_EVERY_MIN`, `OATS_BRAIN_BUDGET_USD`, `OATS_HOTWORDS`.
+/// (per tier), `OATS_INTERPRET_EVERY_MIN`, `OATS_BRAIN_BUDGET_USD`,
+/// `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_HOTWORDS`.
 #[derive(Clone, Debug)]
 pub struct BrainConfig {
     pub enabled: bool,
@@ -108,10 +123,25 @@ pub struct BrainConfig {
     /// Local hours `[start, end)` of the idle window for reorganisation.
     pub reorganise_window: (u32, u32),
     pub daily_budget_usd: f64,
+    /// Runs per rolling hour (all tiers counted) above which tiers 1–3 wait.
     pub max_runs_per_hour: i64,
+    /// Tier 0 runs (commands + categorisation) per rolling hour; tier 0 is otherwise only
+    /// stopped by the hard ceiling of twice `daily_budget_usd`.
+    pub tier0_per_hour: i64,
     pub episode_rule: EpisodeRule,
     pub hotword: HotwordConfig,
     pub max_new_nodes_per_run: usize,
+    /// Re-probe delay after `claude` became unavailable; doubles per failed probe up to
+    /// `probe_backoff_max`, and resets after a successful call.
+    pub probe_backoff_min: Duration,
+    pub probe_backoff_max: Duration,
+    /// Pause between interpreted chunks while working off a backlog.
+    pub catchup_pause: Duration,
+    /// Tries of one hotword command (failures other than unavailability) before it is given
+    /// up and recorded as a warning in the change log.
+    pub command_tries: u32,
+    /// Delay before a failed command's first retry (doubles per try).
+    pub command_retry: Duration,
 }
 
 impl Default for BrainConfig {
@@ -131,9 +161,15 @@ impl Default for BrainConfig {
             reorganise_window: (2, 5),
             daily_budget_usd: 2.0,
             max_runs_per_hour: 20,
+            tier0_per_hour: 30,
             episode_rule: EpisodeRule::default(),
             hotword: HotwordConfig::default(),
-            max_new_nodes_per_run: 3,
+            max_new_nodes_per_run: interpret::DEFAULT_MAX_NEW_NODES,
+            probe_backoff_min: Duration::from_secs(60),
+            probe_backoff_max: Duration::from_secs(15 * 60),
+            catchup_pause: Duration::from_secs(2),
+            command_tries: 3,
+            command_retry: Duration::from_secs(60),
         }
     }
 }
@@ -172,6 +208,9 @@ impl BrainConfig {
         if let Some(b) = env("OATS_BRAIN_BUDGET_USD").and_then(|v| v.parse::<f64>().ok()) {
             c.daily_budget_usd = b.max(0.0);
         }
+        if let Some(n) = env("OATS_BRAIN_TIER0_PER_HOUR").and_then(|v| v.parse::<i64>().ok()) {
+            c.tier0_per_hour = n.max(0);
+        }
         c.hotword = HotwordConfig::from_env();
         c
     }
@@ -194,8 +233,16 @@ pub enum BrainCommand {
 /// What the brain reports.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BrainEvent {
-    /// The CLI's version, or why it can't be used.
+    /// The CLI's version, or why it can't be used right now ("not installed", "not logged
+    /// in", "offline", "rate limited", "not working"); the brain re-probes by itself.
     Availability(Result<String, String>),
+    /// What is waiting for `claude`: uninterpreted segments and queued voice commands. Sent
+    /// while it is unavailable (as the counts change) and while the backlog is worked off
+    /// afterwards; `0, 0` when the catch-up is done.
+    Backlog {
+        waiting_segments: i64,
+        waiting_commands: usize,
+    },
     RunStarted {
         tier: Tier,
         kind: String,
@@ -241,12 +288,15 @@ impl Brain {
             store_path,
             wake,
         } = self;
-        let out = Outbox { tx: event_tx, wake };
+        let out = Outbox {
+            tx: event_tx,
+            wake: Arc::from(wake),
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let thread = std::thread::Builder::new()
             .name("oats-brain".to_owned())
-            .spawn(move || worker(config, &store_path, cmd_rx, out, worker_cancel));
+            .spawn(move || supervise(config, &store_path, &cmd_rx, &out, &worker_cancel));
         let thread = match thread {
             Ok(t) => Some(t),
             Err(e) => {
@@ -293,9 +343,10 @@ impl Drop for BrainHandle {
     }
 }
 
+#[derive(Clone)]
 struct Outbox {
     tx: Sender<BrainEvent>,
-    wake: Box<dyn Fn() + Send + Sync>,
+    wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Outbox {
@@ -308,6 +359,10 @@ impl Outbox {
 
 /// How long a job that failed (or hit a rate limit) waits before it is tried again.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(15 * 60);
+/// How long a command or categorisation held back by tier 0's own limits waits.
+const TIER0_WAIT: Duration = Duration::from_secs(5 * 60);
+/// How long the thread waits before restarting after a panic outside a job.
+const RESTART_PAUSE: Duration = Duration::from_secs(60);
 
 /// What one chunk of an interpretation run came to.
 enum ChunkStep {
@@ -354,11 +409,24 @@ fn instant_at(target_ms: i64) -> Instant {
     Instant::now() + Duration::from_millis(delta)
 }
 
+/// A local `DateTime` for a stored timestamp (a segment's), else now.
+fn local_at(ms: i64) -> DateTime<Local> {
+    Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Local::now)
+}
+
 /// A failed job: why, and what it had already spent (earlier calls of a multi-call job
 /// succeeded and were paid for; the daily budget must still see that).
 struct JobError {
     msg: String,
     cost_usd: Option<f64>,
+    /// A short class for logs that must not carry CLI output or model text.
+    class: &'static str,
+    /// The failure was `claude` being unavailable (not this job's fault): retry when it is
+    /// back, don't count it against the job.
+    unavailable: bool,
 }
 
 impl From<String> for JobError {
@@ -366,6 +434,19 @@ impl From<String> for JobError {
         JobError {
             msg,
             cost_usd: None,
+            class: "error",
+            unavailable: false,
+        }
+    }
+}
+
+impl From<CliError> for JobError {
+    fn from(e: CliError) -> Self {
+        JobError {
+            msg: e.to_string(),
+            cost_usd: None,
+            class: e.kind(),
+            unavailable: e.unavailable_reason().is_some(),
         }
     }
 }
@@ -380,12 +461,44 @@ struct JobOutput {
     changed: bool,
 }
 
+/// Whether `claude` can be used.
+#[derive(Clone, Debug, PartialEq)]
+enum Avail {
+    /// Not probed yet.
+    Unknown,
+    Up,
+    /// Unavailable for `reason`; probed again at `retry_at`.
+    Down {
+        reason: String,
+        retry_at: Instant,
+    },
+}
+
+/// A hotword segment waiting to be run as a command.
+#[derive(Clone, Debug)]
+struct PendingCommand {
+    row: TranscriptRow,
+    /// Failed tries so far (unavailability doesn't count).
+    tries: u32,
+    /// Not before this (a retry's backoff, tier 0's limits).
+    not_before: Option<Instant>,
+}
+
 struct Worker {
     cfg: BrainConfig,
     store: Store,
     out: Outbox,
-    cli_ok: bool,
-    pending_commands: VecDeque<TranscriptRow>,
+    avail: Avail,
+    /// The configured binary (`OATS_CLAUDE_BIN` or the default), re-resolved on every probe;
+    /// `cfg.cli.binary` holds the resolved absolute path.
+    configured_binary: PathBuf,
+    /// The next re-probe delay.
+    probe_backoff: Duration,
+    /// Working off a backlog after `claude` came back.
+    catching_up: bool,
+    /// The last [`BrainEvent::Backlog`] sent.
+    last_backlog: Option<(i64, usize)>,
+    pending_commands: VecDeque<PendingCommand>,
     reinterpret: VecDeque<i64>,
     undo: VecDeque<i64>,
     categorise_due: Option<Instant>,
@@ -400,78 +513,216 @@ struct Worker {
     cancel: Arc<AtomicBool>,
 }
 
+/// The thread body: the worker, restarted after a pause if it ever panics outside a job (a
+/// job's own panic is caught in [`Worker::run_job`]). The brain thread never dies silently.
+fn supervise(
+    cfg: BrainConfig,
+    store_path: &std::path::Path,
+    cmd_rx: &Receiver<BrainCommand>,
+    out: &Outbox,
+    cancel: &Arc<AtomicBool>,
+) {
+    loop {
+        let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            worker(cfg.clone(), store_path, cmd_rx, out, cancel.clone())
+        }));
+        let Err(panic) = run else { return };
+        let what = panic_message(panic.as_ref());
+        log::error!("the brain thread panicked ({what}); restarting in {RESTART_PAUSE:?}");
+        out.send(BrainEvent::Warning(format!(
+            "brain: internal error ({what}); restarting in a minute"
+        )));
+        let deadline = Instant::now() + RESTART_PAUSE;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match cmd_rx.recv_timeout(left) {
+                Ok(BrainCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+    }
+}
+
+/// The text of a panic payload.
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".to_owned())
+}
+
 fn worker(
     cfg: BrainConfig,
     store_path: &std::path::Path,
-    cmd_rx: Receiver<BrainCommand>,
-    out: Outbox,
+    cmd_rx: &Receiver<BrainCommand>,
+    out: &Outbox,
     cancel: Arc<AtomicBool>,
 ) {
+    let wait_for_shutdown = || {
+        while let Ok(cmd) = cmd_rx.recv() {
+            if matches!(cmd, BrainCommand::Shutdown) {
+                return;
+            }
+        }
+    };
     let store = match Store::open(store_path) {
         Ok(s) => s,
         Err(e) => {
             out.send(BrainEvent::Warning(format!(
                 "brain: could not open the store: {e}"
             )));
-            while let Ok(cmd) = cmd_rx.recv() {
-                if matches!(cmd, BrainCommand::Shutdown) {
-                    return;
-                }
-            }
-            return;
+            return wait_for_shutdown();
         }
     };
-    let mut w = Worker {
-        cfg,
-        store,
-        out,
-        cli_ok: false,
-        pending_commands: VecDeque::new(),
-        reinterpret: VecDeque::new(),
-        undo: VecDeque::new(),
-        categorise_due: None,
-        interpret_due: None,
-        interpret_force: false,
-        review_due: None,
-        review_force: false,
-        reorganise_due: None,
-        reorganise_force: false,
-        episodes_since_review: 0,
-        last_budget_warning: None,
-        cancel,
-    };
-    if !w.cfg.enabled {
-        w.out
-            .send(BrainEvent::Availability(Err("OATS_BRAIN=off".into())));
-        while let Ok(cmd) = cmd_rx.recv() {
-            if matches!(cmd, BrainCommand::Shutdown) {
-                return;
-            }
-        }
-        return;
+    if !cfg.enabled {
+        out.send(BrainEvent::Availability(Err("OATS_BRAIN=off".into())));
+        return wait_for_shutdown();
     }
-    w.check_cli();
+    let mut w = Worker::new(cfg, store, out.clone(), cancel);
+    w.probe();
     w.schedule_initial();
     w.run_loop(cmd_rx);
 }
 
 impl Worker {
-    fn check_cli(&mut self) -> bool {
-        match self.cfg.cli.available() {
+    fn new(cfg: BrainConfig, store: Store, out: Outbox, cancel: Arc<AtomicBool>) -> Self {
+        Worker {
+            configured_binary: cfg.cli.binary.clone(),
+            probe_backoff: cfg.probe_backoff_min,
+            cfg,
+            store,
+            out,
+            avail: Avail::Unknown,
+            catching_up: false,
+            last_backlog: None,
+            pending_commands: VecDeque::new(),
+            reinterpret: VecDeque::new(),
+            undo: VecDeque::new(),
+            categorise_due: None,
+            interpret_due: None,
+            interpret_force: false,
+            review_due: None,
+            review_force: false,
+            reorganise_due: None,
+            reorganise_force: false,
+            episodes_since_review: 0,
+            last_budget_warning: None,
+            cancel,
+        }
+    }
+
+    // ---- availability -----------------------------------------------------------------------
+
+    /// Resolve the binary (absolute, canonical) and run `claude --version` — free; login and
+    /// rate limits only show on a real call, which is the next probe. `true` when it answered.
+    fn probe(&mut self) -> bool {
+        let checked = resolve_binary(&self.configured_binary).and_then(|bin| {
+            if bin != self.cfg.cli.binary || self.avail == Avail::Unknown {
+                log::info!("claude CLI resolved to {}", bin.display());
+                self.cfg.cli.binary = bin;
+            }
+            self.cfg.cli.available()
+        });
+        match checked {
             Ok(v) => {
-                if !self.cli_ok {
-                    log::info!("claude CLI {} at {}", v.raw, self.cfg.cli.binary.display());
-                    self.out.send(BrainEvent::Availability(Ok(v.raw)));
-                }
-                self.cli_ok = true;
+                self.mark_up(&v.raw);
+                true
             }
             Err(e) => {
-                log::warn!("claude CLI unavailable: {e}");
-                self.out.send(BrainEvent::Availability(Err(e.to_string())));
-                self.cli_ok = false;
+                self.mark_down(&e);
+                false
             }
         }
-        self.cli_ok
+    }
+
+    fn cli_ready(&self) -> bool {
+        self.avail == Avail::Up
+    }
+
+    /// When the next probe is due (only while unavailable).
+    fn probe_due(&self) -> Option<Instant> {
+        match &self.avail {
+            Avail::Down { retry_at, .. } => Some(*retry_at),
+            _ => None,
+        }
+    }
+
+    fn mark_up(&mut self, version: &str) {
+        let was = std::mem::replace(&mut self.avail, Avail::Up);
+        if was == Avail::Up {
+            return;
+        }
+        log::info!("claude CLI {version} available");
+        self.out
+            .send(BrainEvent::Availability(Ok(version.to_owned())));
+        if matches!(was, Avail::Down { .. }) {
+            // back after an outage: work the backlog off, commands first (the loop runs them
+            // before any job), then interpretation, oldest first
+            self.catching_up = true;
+            let now = Instant::now();
+            if self.store.uninterpreted_count().unwrap_or(0) > 0 {
+                self.interpret_due = Some(now);
+            }
+            if self
+                .store
+                .uncategorised_segments(1)
+                .is_ok_and(|v| !v.is_empty())
+            {
+                let at = now + self.cfg.categorise_after;
+                self.categorise_due = Some(self.categorise_due.map_or(at, |d| d.min(at)));
+            }
+            self.report_backlog();
+        }
+    }
+
+    fn mark_down(&mut self, e: &CliError) {
+        let reason = e.unavailable_reason().unwrap_or("not working").to_owned();
+        let wait = self.probe_backoff;
+        self.probe_backoff = (wait * 2).min(self.cfg.probe_backoff_max);
+        let changed = !matches!(&self.avail, Avail::Down { reason: r, .. } if *r == reason);
+        self.avail = Avail::Down {
+            reason: reason.clone(),
+            retry_at: Instant::now() + wait,
+        };
+        if changed {
+            log::warn!("claude unavailable ({reason}); listening continues, the brain waits");
+            self.out.send(BrainEvent::Availability(Err(reason)));
+        }
+        log::info!("claude: next availability check in {} s", wait.as_secs());
+        log::debug!("claude unavailable: {e}");
+        self.report_backlog();
+    }
+
+    /// Send [`BrainEvent::Backlog`] when the counts changed — only while unavailable or
+    /// catching up (in normal operation segments wait for the next rolling run by design).
+    fn report_backlog(&mut self) {
+        if self.cli_ready() && !self.catching_up {
+            return;
+        }
+        let commands = self.pending_commands.len();
+        let segments = (self.store.uninterpreted_count().unwrap_or(0) - commands as i64).max(0);
+        self.send_backlog(segments, commands);
+    }
+
+    fn send_backlog(&mut self, segments: i64, commands: usize) {
+        if self.last_backlog != Some((segments, commands)) {
+            self.last_backlog = Some((segments, commands));
+            self.out.send(BrainEvent::Backlog {
+                waiting_segments: segments,
+                waiting_commands: commands,
+            });
+        }
+    }
+
+    /// The catch-up ran dry (or only open fragments are left, waiting as usual).
+    fn finish_catch_up(&mut self) {
+        if self.catching_up && self.pending_commands.is_empty() {
+            self.catching_up = false;
+            log::info!("brain: backlog worked off");
+            self.send_backlog(0, 0);
+        }
     }
 
     /// Work left from before (uninterpreted segments, a reorganisation due) is scheduled at
@@ -523,7 +774,7 @@ impl Worker {
         }
     }
 
-    fn run_loop(&mut self, cmd_rx: Receiver<BrainCommand>) {
+    fn run_loop(&mut self, cmd_rx: &Receiver<BrainCommand>) {
         loop {
             // take what arrived while the last job ran before picking the next one, so a
             // Shutdown (or a hotword command) never waits behind a queue of due jobs
@@ -543,8 +794,15 @@ impl Worker {
             }
             let now = Instant::now();
             let due = |t: Option<Instant>| t.is_some_and(|t| t <= now);
-            if let Some(seg) = self.pending_commands.pop_front() {
-                self.run_command(seg);
+            let up = self.cli_ready();
+            if up
+                && let Some(i) = self
+                    .pending_commands
+                    .iter()
+                    .position(|p| p.not_before.is_none_or(|t| t <= now))
+                && let Some(cmd) = self.pending_commands.remove(i)
+            {
+                self.run_command(cmd);
                 continue;
             }
             if let Some(id) = self.undo.pop_front() {
@@ -572,38 +830,51 @@ impl Worker {
                 }
                 continue;
             }
-            if due(self.categorise_due) {
-                self.categorise_due = None;
-                self.run_categorise();
-                continue;
+            if !up {
+                // unavailable: nothing runs but the (free) re-probe; due jobs simply wait
+                if due(self.probe_due()) {
+                    self.probe();
+                    continue;
+                }
+            } else {
+                if due(self.categorise_due) {
+                    self.categorise_due = None;
+                    self.run_categorise();
+                    continue;
+                }
+                if due(self.interpret_due) {
+                    self.interpret_due = None;
+                    let force = std::mem::take(&mut self.interpret_force);
+                    self.run_interpret(force);
+                    continue;
+                }
+                if due(self.review_due) {
+                    self.review_due = None;
+                    let force = std::mem::take(&mut self.review_force);
+                    self.run_review(force);
+                    continue;
+                }
+                if due(self.reorganise_due) {
+                    self.reorganise_due = None;
+                    let force = std::mem::take(&mut self.reorganise_force);
+                    self.run_reorganise(force);
+                    continue;
+                }
             }
-            if due(self.interpret_due) {
-                self.interpret_due = None;
-                let force = std::mem::take(&mut self.interpret_force);
-                self.run_interpret(force);
-                continue;
-            }
-            if due(self.review_due) {
-                self.review_due = None;
-                let force = std::mem::take(&mut self.review_force);
-                self.run_review(force);
-                continue;
-            }
-            if due(self.reorganise_due) {
-                self.reorganise_due = None;
-                let force = std::mem::take(&mut self.reorganise_force);
-                self.run_reorganise(force);
-                continue;
-            }
-            let next = [
-                self.categorise_due,
-                self.interpret_due,
-                self.review_due,
-                self.reorganise_due,
-            ]
-            .into_iter()
-            .flatten()
-            .min();
+            let next = if up {
+                [
+                    self.categorise_due,
+                    self.interpret_due,
+                    self.review_due,
+                    self.reorganise_due,
+                ]
+                .into_iter()
+                .chain(self.pending_commands.iter().map(|p| p.not_before))
+                .flatten()
+                .min()
+            } else {
+                self.probe_due()
+            };
             let cmd = match next {
                 Some(t) => match cmd_rx.recv_timeout(t.saturating_duration_since(Instant::now())) {
                     Ok(c) => c,
@@ -644,11 +915,23 @@ impl Worker {
         true
     }
 
+    /// Queue a hotword segment as a command (once).
+    fn queue_command(&mut self, row: TranscriptRow) -> bool {
+        if self.pending_commands.iter().any(|p| p.row.id == row.id) {
+            return false;
+        }
+        self.pending_commands.push_back(PendingCommand {
+            row,
+            tries: 0,
+            not_before: None,
+        });
+        true
+    }
+
     fn on_segment(&mut self, row: TranscriptRow) {
         if hotword::detect(&row.text, &self.cfg.hotword).is_some() {
-            if !self.pending_commands.iter().any(|p| p.id == row.id) {
-                self.pending_commands.push_back(row);
-            }
+            self.queue_command(row);
+            self.report_backlog();
             return;
         }
         let now = Instant::now();
@@ -658,30 +941,44 @@ impl Worker {
         if self.interpret_due.is_none() {
             self.interpret_due = Some(now + self.cfg.interpret_every);
         }
+        self.report_backlog();
     }
 
     // ---- guards ---------------------------------------------------------------------------
 
-    /// `false` (with a warning, at most hourly) when the daily cap or the hourly run cap is hit.
+    /// `false` (with a warning, at most hourly) when a budget guard says wait. Tiers 1–3: the
+    /// daily cap or the hourly run cap. Tier 0: its own hourly cap, or the hard ceiling of
+    /// twice the daily budget (so commands keep working while interpretation pauses).
     fn within_budget(&mut self, tier: Tier) -> bool {
-        if tier == Tier::Reactive {
-            return true;
-        }
         let midnight = crate::dates::local_midnight_ms(now_ms());
         let spent = self.store.cost_since(midnight).unwrap_or(0.0);
-        let runs = self
-            .store
-            .run_count_since(now_ms() - 3_600_000)
-            .unwrap_or(0);
-        let over = if spent >= self.cfg.daily_budget_usd {
-            Some(format!(
-                "daily brain budget reached (${spent:.2} of ${:.2}); tiers 1–3 paused until midnight",
-                self.cfg.daily_budget_usd
-            ))
-        } else if runs >= self.cfg.max_runs_per_hour {
-            Some(format!("{runs} brain runs in the last hour; waiting"))
+        let hour_ago = now_ms() - 3_600_000;
+        let over = if tier == Tier::Reactive {
+            let ceiling = 2.0 * self.cfg.daily_budget_usd;
+            let tier0 = self.store.run_count_of_tier_since(0, hour_ago).unwrap_or(0);
+            if spent >= ceiling {
+                Some(format!(
+                    "brain spend ${spent:.2} reached the hard ceiling (${ceiling:.2}, twice the daily budget); voice commands paused until midnight"
+                ))
+            } else if tier0 >= self.cfg.tier0_per_hour {
+                Some(format!(
+                    "{tier0} voice commands / categorisations in the last hour; waiting"
+                ))
+            } else {
+                None
+            }
         } else {
-            None
+            let runs = self.store.run_count_since(hour_ago).unwrap_or(0);
+            if spent >= self.cfg.daily_budget_usd {
+                Some(format!(
+                    "daily brain budget reached (${spent:.2} of ${:.2}); tiers 1–3 paused until midnight",
+                    self.cfg.daily_budget_usd
+                ))
+            } else if runs >= self.cfg.max_runs_per_hour {
+                Some(format!("{runs} brain runs in the last hour; waiting"))
+            } else {
+                None
+            }
         };
         match over {
             None => true,
@@ -699,35 +996,33 @@ impl Worker {
         }
     }
 
-    fn cli_ready(&mut self) -> bool {
-        self.cli_ok || self.check_cli()
-    }
-
-    /// Run one CLI request; `NotFound`/`NotLoggedIn` flip the availability flag.
+    /// Run one CLI request. Unavailability (missing, logged out, offline, rate limited) marks
+    /// the brain unavailable and starts the re-probe backoff; a success resets the backoff.
     fn call(&mut self, req: &Request) -> Result<crate::claude_cli::Response, CliError> {
         let r = self.cfg.cli.run_cancellable(req, &self.cancel);
-        if let Err(e @ (CliError::NotFound(..) | CliError::NotLoggedIn(_))) = &r {
-            self.cli_ok = false;
-            self.out.send(BrainEvent::Availability(Err(e.to_string())));
+        match &r {
+            Ok(_) => self.probe_backoff = self.cfg.probe_backoff_min,
+            Err(e) if e.unavailable_reason().is_some() => self.mark_down(e),
+            Err(_) => {}
         }
         r
     }
 
-    /// Bookkeeping around a job: the `brain_runs` row, events, spend. `true` when the job
-    /// succeeded.
+    /// Bookkeeping around a job: the `brain_runs` row, events, spend. A panic inside the job
+    /// is caught and recorded as a failed run (the caller backs off as for any failure).
     fn run_job(
         &mut self,
         tier: Tier,
         kind: &str,
         job: impl FnOnce(&mut Worker, i64) -> Result<JobOutput, JobError>,
-    ) -> bool {
+    ) -> Result<(), JobError> {
         let model = self.cfg.models.for_tier(tier).to_owned();
         let started = now_ms();
         let run_id = match self.store.begin_run(tier.number(), kind, &model, started) {
             Ok(id) => id,
             Err(e) => {
                 self.out.send(BrainEvent::Warning(format!("brain: {e}")));
-                return false;
+                return Err(JobError::from(e.to_string()));
             }
         };
         self.out.send(BrainEvent::RunStarted {
@@ -735,7 +1030,19 @@ impl Worker {
             kind: kind.to_owned(),
         });
         let t = Instant::now();
-        let result = job(self, run_id);
+        let result = match std::panic::catch_unwind(AssertUnwindSafe(|| job(self, run_id))) {
+            Ok(r) => r,
+            Err(panic) => {
+                let what = panic_message(panic.as_ref());
+                log::error!("brain {kind} panicked: {what}");
+                Err(JobError {
+                    msg: format!("internal error (panic): {what}"),
+                    cost_usd: None,
+                    class: "panic",
+                    unavailable: false,
+                })
+            }
+        };
         let outcome = match &result {
             Ok(o) => RunOutcome {
                 finished_at: now_ms(),
@@ -759,20 +1066,24 @@ impl Worker {
         if let Err(e) = self.store.finish_run(run_id, &outcome) {
             log::warn!("brain: could not record the run: {e}");
         }
+        // info carries counts and costs only; summaries (dictated text, titles, node names)
+        // and CLI output stay at debug — the full detail is in `brain_runs`
         match &result {
             Ok(o) => {
                 log::info!(
-                    "brain {kind} ({model}): {} — ${:.4}, {} ms",
-                    o.summary,
+                    "brain {kind} ({model}): ok, {} change line(s) — ${:.4}, {} ms",
+                    o.lines.len(),
                     o.cost_usd.unwrap_or(0.0),
                     outcome.duration_ms.unwrap_or(0)
                 );
+                log::debug!("brain {kind}: {}", o.summary);
                 if o.changed {
                     self.out.send(BrainEvent::Changed(o.lines.clone()));
                 }
             }
             Err(e) => {
-                log::warn!("brain {kind} failed: {}", e.msg);
+                log::warn!("brain {kind} failed ({})", e.class);
+                log::debug!("brain {kind} failed: {}", e.msg);
                 self.out
                     .send(BrainEvent::Warning(format!("{kind}: {}", e.msg)));
             }
@@ -786,12 +1097,13 @@ impl Worker {
         if let Ok(spent) = self.store.cost_since(midnight) {
             self.out.send(BrainEvent::Spend { today_usd: spent });
         }
-        result.is_ok()
+        result.map(|_| ())
     }
 
     // ---- tier 0: hotword command ----------------------------------------------------------
 
-    fn run_command(&mut self, seg: TranscriptRow) {
+    fn run_command(&mut self, mut cmd: PendingCommand) {
+        let seg = cmd.row.clone();
         let Some(text) = hotword::detect(&seg.text, &self.cfg.hotword) else {
             return;
         };
@@ -802,25 +1114,50 @@ impl Worker {
         {
             return;
         }
-        if !self.cli_ready() {
-            self.out.send(BrainEvent::Warning(
-                "voice command ignored: claude CLI unavailable".into(),
-            ));
+        if !self.within_budget(Tier::Reactive) {
+            cmd.not_before = Some(Instant::now() + TIER0_WAIT);
+            self.pending_commands.push_back(cmd);
             return;
         }
         let model = self.cfg.models.reactive.clone();
-        self.run_job(Tier::Reactive, "command", move |w, _run_id| {
+        // relative dates ("tomorrow") resolve against when the command was SPOKEN — which,
+        // after an outage, can be long before this run
+        let spoken = local_at(seg.started_at);
+        let max_new_nodes = self.cfg.max_new_nodes_per_run;
+        let job_seg = seg.clone();
+        let r = self.run_job(Tier::Reactive, "command", move |w, _run_id| {
+            let seg = job_seg;
             let tree = w.store.nodes().map_err(|e| e.to_string())?;
-            let req = hotword::command_request(&tree, &text, &Local::now(), Some(model));
-            let resp = w.call(&req).map_err(|e| e.to_string())?;
+            let req = hotword::command_request(&tree, &text, &spoken, Some(model));
+            let resp = w.call(&req).map_err(JobError::from)?;
             let result = resp
                 .structured
                 .as_ref()
                 .ok_or_else(|| "no structured output".to_owned())
-                .and_then(|v| hotword::parse_command(v).map_err(|e| e.to_string()))?;
-            let done = hotword::execute(&w.store, &tree, &seg, &result, now_ms(), &Local)
-                .map_err(|e| e.to_string())?;
-            let _ = w.store.mark_segment_consumed(seg.id, now_ms());
+                .and_then(|v| hotword::parse_command(v).map_err(|e| e.to_string()))
+                .map_err(|msg| JobError {
+                    cost_usd: resp.cost_usd,
+                    ..JobError::from(msg)
+                })?;
+            let done = w
+                .store
+                .with_savepoint(|s| {
+                    let done = hotword::execute_capped(
+                        s,
+                        &tree,
+                        &seg,
+                        &result,
+                        now_ms(),
+                        &Local,
+                        max_new_nodes,
+                    )?;
+                    s.mark_segment_consumed(seg.id, now_ms())?;
+                    Ok(done)
+                })
+                .map_err(|e| JobError {
+                    cost_usd: resp.cost_usd,
+                    ..JobError::from(e.to_string())
+                })?;
             let lines: Vec<String> = done.iter().map(|d| d.describe(&Local)).collect();
             w.out.send(BrainEvent::Command {
                 segment_id: seg.id,
@@ -835,6 +1172,48 @@ impl Worker {
                 changed: true,
             })
         });
+        match r {
+            Ok(()) => {}
+            // claude went away: the command waits for it, untried
+            Err(e) if e.unavailable => self.pending_commands.push_front(cmd),
+            Err(e) => {
+                cmd.tries += 1;
+                if cmd.tries >= self.cfg.command_tries {
+                    self.give_up_command(&seg, cmd.tries, e.class);
+                } else {
+                    let wait = self.cfg.command_retry * 2u32.saturating_pow(cmd.tries - 1);
+                    cmd.not_before = Some(Instant::now() + wait);
+                    self.pending_commands.push_back(cmd);
+                }
+            }
+        }
+        self.report_backlog();
+    }
+
+    /// A command that kept failing: consumed (no later pass retries it, and it never joins
+    /// an episode), recorded as a warning in the change log.
+    fn give_up_command(&mut self, seg: &TranscriptRow, tries: u32, class: &str) {
+        let at = now_ms();
+        let msg = format!("Voice command not carried out after {tries} tries ({class})");
+        let recorded = self.store.with_savepoint(|s| {
+            s.mark_segment_consumed(seg.id, at)?;
+            s.record_change(
+                None,
+                "command_failed",
+                &format!("Warning: {msg}"),
+                &serde_json::json!({"segment_id": seg.id, "spoken_at": seg.started_at}),
+                &serde_json::Value::Null,
+                at,
+            )
+        });
+        if let Err(e) = recorded {
+            log::warn!("brain: could not record the failed command: {e}");
+        }
+        log::warn!("brain: {msg}");
+        self.out.send(BrainEvent::Warning(msg));
+        self.out.send(BrainEvent::Changed(vec![
+            "A voice command failed".to_owned(),
+        ]));
     }
 
     // ---- tier 0: categorisation -----------------------------------------------------------
@@ -858,28 +1237,34 @@ impl Worker {
             self.categorise_due = Some(Instant::now() + Duration::from_secs(30 * 60));
             return;
         }
+        if !self.within_budget(Tier::Reactive) {
+            self.categorise_due = Some(Instant::now() + TIER0_WAIT);
+            return;
+        }
         let model = self.cfg.models.reactive.clone();
         let more = batch.len() >= self.cfg.categorise_batch;
-        let ok = self.run_job(Tier::Reactive, "categorise", move |w, _| {
-            let tree = w.store.nodes().map_err(|e| e.to_string())?;
-            let req = interpret::categorise_request(&tree, &batch, &Local::now(), Some(model));
-            let resp = w.call(&req).map_err(|e| e.to_string())?;
-            let cat: interpret::Categorisation = resp
-                .structured
-                .as_ref()
-                .ok_or_else(|| "no structured output".to_owned())
-                .and_then(|v| serde_json::from_value(v.clone()).map_err(|e| e.to_string()))?;
-            let filed = interpret::apply_categorisation(&w.store, &tree, &batch, &cat)
-                .map_err(|e| e.to_string())?;
-            Ok(JobOutput {
-                summary: format!("{filed} of {} segments filed", batch.len()),
-                cost_usd: resp.cost_usd,
-                duration_ms: resp.duration_ms,
-                model: resp.model,
-                lines: Vec::new(),
-                changed: filed > 0,
+        let ok = self
+            .run_job(Tier::Reactive, "categorise", move |w, _| {
+                let tree = w.store.nodes().map_err(|e| e.to_string())?;
+                let req = interpret::categorise_request(&tree, &batch, &Local::now(), Some(model));
+                let resp = w.call(&req).map_err(JobError::from)?;
+                let cat: interpret::Categorisation = resp
+                    .structured
+                    .as_ref()
+                    .ok_or_else(|| "no structured output".to_owned())
+                    .and_then(|v| serde_json::from_value(v.clone()).map_err(|e| e.to_string()))?;
+                let filed = interpret::apply_categorisation(&w.store, &tree, &batch, &cat)
+                    .map_err(|e| e.to_string())?;
+                Ok(JobOutput {
+                    summary: format!("{filed} of {} segments filed", batch.len()),
+                    cost_usd: resp.cost_usd,
+                    duration_ms: resp.duration_ms,
+                    model: resp.model,
+                    lines: Vec::new(),
+                    changed: filed > 0,
+                })
             })
-        });
+            .is_ok();
         if !ok {
             // tier 0 has no budget guard: a failing batch (bad output, refusals) must not be
             // retried — and paid for — every 20 s; try again after a pause
@@ -905,12 +1290,22 @@ impl Worker {
         let (commands, rows): (Vec<TranscriptRow>, Vec<TranscriptRow>) = rows
             .into_iter()
             .partition(|r| hotword::detect(&r.text, &self.cfg.hotword).is_some());
+        let mut queued = 0usize;
         for c in commands {
-            if !self.pending_commands.iter().any(|p| p.id == c.id) {
-                self.pending_commands.push_back(c);
+            if self.queue_command(c) {
+                queued += 1;
             }
         }
+        if queued > 0 {
+            // commands found in the backlog go first (the loop runs them before any job):
+            // come back to the interpretation right after them
+            self.interpret_force |= force;
+            self.interpret_due = Some(Instant::now());
+            self.report_backlog();
+            return;
+        }
         if rows.is_empty() {
+            self.finish_catch_up();
             return;
         }
         if !self.cli_ready() || !self.within_budget(Tier::Rolling) {
@@ -924,86 +1319,106 @@ impl Worker {
         let mut waiting = false;
         let mut rate_limited = false;
         let mut episodes_touched = 0usize;
-        let ok = self.run_job(Tier::Rolling, "interpret", |w, run_id| {
-            let mut cost = 0.0;
-            let mut any_cost = false;
-            let mut duration = 0;
-            let mut used_model = None;
-            let mut lines = Vec::new();
-            let mut done = 0usize;
-            let mut new_nodes = 0usize;
-            for chunk in &chunks {
-                if done >= per_run || rate_limited {
-                    leftover = true;
-                    break;
-                }
-                let step = w.interpret_chunk(chunk, force, run_id, &model, new_nodes);
-                let step = match step {
-                    Ok(s) => s,
-                    Err(msg) => {
-                        // what the earlier chunks cost was spent all the same
-                        return Err(JobError {
-                            msg,
-                            cost_usd: any_cost.then_some(cost),
-                        });
+        let catching_up = self.catching_up;
+        let pause = self.cfg.catchup_pause;
+        let ok = self
+            .run_job(Tier::Rolling, "interpret", |w, run_id| {
+                let mut cost = 0.0;
+                let mut any_cost = false;
+                let mut duration = 0;
+                let mut used_model = None;
+                let mut lines = Vec::new();
+                let mut done = 0usize;
+                let mut new_nodes = 0usize;
+                for chunk in &chunks {
+                    if done >= per_run || rate_limited {
+                        leftover = true;
+                        break;
                     }
-                };
-                match step {
-                    ChunkStep::Waiting => waiting = true,
-                    ChunkStep::Fragment => done += 1,
-                    ChunkStep::RateLimited(m) => {
-                        rate_limited = true;
-                        lines.push(format!("rate limited: {m}"));
-                    }
-                    ChunkStep::Interpreted {
-                        resp,
-                        applied,
-                        revised,
-                    } => {
-                        if let Some(c) = resp.cost_usd {
-                            cost += c;
-                            any_cost = true;
+                    let step = w.interpret_chunk(chunk, force, run_id, &model, new_nodes);
+                    let step = match step {
+                        Ok(s) => s,
+                        Err(mut e) => {
+                            // what the earlier chunks cost was spent all the same
+                            e.cost_usd = any_cost.then_some(cost);
+                            return Err(e);
                         }
-                        duration += resp.duration_ms.unwrap_or(0);
-                        used_model = resp.model.or(used_model);
-                        lines.push(format!(
-                            "{} '{}'{}",
-                            if revised { "Revised" } else { "Interpreted" },
-                            applied.episode.title,
-                            if applied.episode.low_signal {
-                                " (low signal)"
-                            } else {
-                                ""
+                    };
+                    match step {
+                        ChunkStep::Waiting => waiting = true,
+                        ChunkStep::Fragment => done += 1,
+                        ChunkStep::RateLimited(m) => {
+                            rate_limited = true;
+                            lines.push(format!("rate limited: {m}"));
+                        }
+                        ChunkStep::Interpreted {
+                            resp,
+                            applied,
+                            revised,
+                        } => {
+                            if let Some(c) = resp.cost_usd {
+                                cost += c;
+                                any_cost = true;
                             }
-                        ));
-                        for n in &applied.new_nodes {
-                            lines.push(format!("New {} '{}'", n.kind.as_str(), n.name));
+                            duration += resp.duration_ms.unwrap_or(0);
+                            used_model = resp.model.or(used_model);
+                            lines.push(format!(
+                                "{} '{}'{}",
+                                if revised { "Revised" } else { "Interpreted" },
+                                applied.episode.title,
+                                if applied.episode.low_signal {
+                                    " (low signal)"
+                                } else {
+                                    ""
+                                }
+                            ));
+                            for n in &applied.new_nodes {
+                                lines.push(format!("New {} '{}'", n.kind.as_str(), n.name));
+                            }
+                            new_nodes += applied.new_nodes.len();
+                            episodes_touched += 1;
+                            done += 1;
+                            if catching_up {
+                                // working off a backlog: show each chunk as it lands, then
+                                // breathe before the next call
+                                w.out.send(BrainEvent::Changed(Vec::new()));
+                                w.report_backlog();
+                                w.pause(pause);
+                            }
                         }
-                        new_nodes += applied.new_nodes.len();
-                        episodes_touched += 1;
-                        done += 1;
                     }
                 }
-            }
-            Ok(JobOutput {
-                summary: format!("{done} of {} chunks", chunks.len()),
-                cost_usd: any_cost.then_some(cost),
-                duration_ms: Some(duration),
-                model: used_model,
-                changed: done > 0,
-                lines,
+                Ok(JobOutput {
+                    summary: format!("{done} of {} chunks", chunks.len()),
+                    cost_usd: any_cost.then_some(cost),
+                    duration_ms: Some(duration),
+                    model: used_model,
+                    changed: done > 0,
+                    lines,
+                })
             })
-        });
+            .is_ok();
         self.episodes_since_review += episodes_touched;
         if !ok || rate_limited {
             // don't hammer a failing or rate-limited CLI; the segments stay uninterpreted
+            // (after an outage, its end schedules the catch-up at once)
             self.interpret_due = Some(Instant::now() + FAILURE_BACKOFF);
         } else if leftover {
-            self.interpret_due = Some(Instant::now() + Duration::from_secs(60));
-        } else if waiting && self.interpret_due.is_none() {
-            // a short chunk still in progress was left for later: make sure "later" comes
-            // even if no new speech arrives to schedule it
-            self.interpret_due = Some(Instant::now() + self.cfg.interpret_every);
+            self.interpret_due = Some(
+                Instant::now()
+                    + if self.catching_up {
+                        self.cfg.catchup_pause
+                    } else {
+                        Duration::from_secs(60)
+                    },
+            );
+        } else {
+            self.finish_catch_up();
+            if waiting && self.interpret_due.is_none() {
+                // a short chunk still in progress was left for later: make sure "later"
+                // comes even if no new speech arrives to schedule it
+                self.interpret_due = Some(Instant::now() + self.cfg.interpret_every);
+            }
         }
         if episodes_touched > 0 && self.episodes_since_review >= self.cfg.review_after_episodes {
             self.review_due = Some(Instant::now() + Duration::from_secs(60));
@@ -1020,7 +1435,7 @@ impl Worker {
         run_id: i64,
         model: &str,
         new_nodes_so_far: usize,
-    ) -> Result<ChunkStep, String> {
+    ) -> Result<ChunkStep, JobError> {
         let rule = self.cfg.episode_rule;
         let now = now_ms();
         // an episode that ended within a gap before this chunk continues it: revise — unless
@@ -1090,7 +1505,7 @@ impl Worker {
         let resp = match self.call(&req) {
             Ok(r) => r,
             Err(CliError::RateLimited(m)) => return Ok(ChunkStep::RateLimited(m)),
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(JobError::from(e)),
         };
         let interp = resp
             .structured
@@ -1121,6 +1536,17 @@ impl Worker {
         })
     }
 
+    /// Sleep `d` in short slices, giving up early when the app quits.
+    fn pause(&self, d: Duration) {
+        let deadline = Instant::now() + d;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if self.cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(50)));
+        }
+    }
+
     // ---- tier 2: coherence review -----------------------------------------------------------
 
     fn run_review(&mut self, force: bool) {
@@ -1141,7 +1567,7 @@ impl Worker {
         }
         self.episodes_since_review = 0;
         let model = self.cfg.models.review.clone();
-        self.run_job(Tier::Review, "review", move |w, run_id| {
+        let _ = self.run_job(Tier::Review, "review", move |w, run_id| {
             let tree = w.store.nodes().map_err(|e| e.to_string())?;
             let events = w
                 .store
@@ -1149,7 +1575,7 @@ impl Worker {
                 .map_err(|e| e.to_string())?;
             let req =
                 interpret::review_request(&tree, &episodes, &events, &Local::now(), Some(model));
-            let resp = w.call(&req).map_err(|e| e.to_string())?;
+            let resp = w.call(&req).map_err(JobError::from)?;
             let actions: interpret::Actions = resp
                 .structured
                 .as_ref()
@@ -1194,7 +1620,7 @@ impl Worker {
             return;
         }
         let model = self.cfg.models.reorganise.clone();
-        self.run_job(Tier::Reorganise, "reorganise", move |w, run_id| {
+        let _ = self.run_job(Tier::Reorganise, "reorganise", move |w, run_id| {
             let usage = w.store.node_usage().map_err(|e| e.to_string())?;
             let episodes = w.store.episodes(60).map_err(|e| e.to_string())?;
             let req = interpret::reorganise_request(
@@ -1204,7 +1630,7 @@ impl Worker {
                 &Local::now(),
                 Some(model),
             );
-            let resp = w.call(&req).map_err(|e| e.to_string())?;
+            let resp = w.call(&req).map_err(JobError::from)?;
             let actions: interpret::Actions = resp
                 .structured
                 .as_ref()
@@ -1232,7 +1658,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oats_core::View;
+    use oats_core::{RunOutcome, View};
 
     #[test]
     fn idle_window_is_today_or_tomorrow() {
@@ -1346,25 +1772,48 @@ esac
             matches!(e, BrainEvent::Availability(Ok(_)))
         });
 
+        // the hotword segment was in the store already: the interpret run routes it to tier 0
+        // by itself, and the command runs BEFORE the interpretation goes on
         h.send(BrainCommand::InterpretNow);
-        let fin = wait_for(
-            &h,
-            "interpret run",
-            |e| matches!(e, BrainEvent::RunFinished(r) if r.kind == "interpret"),
-        );
-        let BrainEvent::RunFinished(run) = fin else {
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !seen
+            .iter()
+            .any(|e| matches!(e, BrainEvent::RunFinished(r) if r.kind == "interpret"))
+        {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            match h.recv_timeout(left) {
+                Some(ev) => seen.push(ev),
+                None => unreachable!("timed out: {seen:?}"),
+            }
+        }
+        let kinds: Vec<&str> = seen
+            .iter()
+            .filter_map(|e| match e {
+                BrainEvent::RunFinished(r) => Some(r.kind.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec!["command", "interpret"]);
+        let Some(BrainEvent::RunFinished(run)) = seen
+            .iter()
+            .find(|e| matches!(e, BrainEvent::RunFinished(r) if r.kind == "interpret"))
+        else {
             unreachable!()
         };
         assert!(run.ok, "{run:?}");
         assert_eq!(run.tier, 1);
         assert!((run.cost_usd.unwrap_or(0.0) - 0.011).abs() < 1e-9);
-
-        // the hotword segment was in the store already: the interpret run routes it to tier 0
-        // by itself; a second arrival of the same segment must not run it twice
+        // a second arrival of the same segment must not run it twice
         h.segment_arrived(seg_hot.clone());
-        let cmd = wait_for(&h, "command", |e| matches!(e, BrainEvent::Command { .. }));
-        let BrainEvent::Command { segment_id, lines } = cmd else {
-            unreachable!()
+        let Some(BrainEvent::Command { segment_id, lines }) = seen
+            .iter()
+            .find(|e| matches!(e, BrainEvent::Command { .. }))
+            .cloned()
+        else {
+            unreachable!("{seen:?}")
         };
         assert_eq!(segment_id, seg_hot.id);
         assert_eq!(lines.len(), 2, "{lines:?}");
@@ -1375,6 +1824,7 @@ esac
             "spend",
             |e| matches!(e, BrainEvent::Spend { today_usd } if *today_usd > 0.012),
         );
+        std::thread::sleep(Duration::from_millis(300));
         drop(h);
 
         let s = Store::open(&db).unwrap();
@@ -1446,32 +1896,26 @@ esac
 
     /// A worker on an in-memory store, outside any thread (its events are dropped).
     fn bare_worker(cli: ClaudeCli) -> Worker {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        Worker {
-            cfg: BrainConfig {
+        bare_worker_with_events(cli).0
+    }
+
+    /// [`bare_worker`], keeping its events.
+    fn bare_worker_with_events(cli: ClaudeCli) -> (Worker, Receiver<BrainEvent>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut w = Worker::new(
+            BrainConfig {
                 cli,
                 ..BrainConfig::default()
             },
-            store: Store::open_in_memory().unwrap(),
-            out: Outbox {
+            Store::open_in_memory().unwrap(),
+            Outbox {
                 tx,
-                wake: Box::new(|| {}),
+                wake: Arc::new(|| {}),
             },
-            cli_ok: true,
-            pending_commands: VecDeque::new(),
-            reinterpret: VecDeque::new(),
-            undo: VecDeque::new(),
-            categorise_due: None,
-            interpret_due: None,
-            interpret_force: false,
-            review_due: None,
-            review_force: false,
-            reorganise_due: None,
-            reorganise_force: false,
-            episodes_since_review: 0,
-            last_budget_warning: None,
-            cancel: Arc::new(AtomicBool::new(false)),
-        }
+            Arc::new(AtomicBool::new(false)),
+        );
+        w.avail = Avail::Up;
+        (w, rx)
     }
 
     const LONG_TEXT: &str =
@@ -1641,6 +2085,322 @@ esac
         let t = Instant::now();
         drop(h);
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_script(path: &std::path::Path, body: &str) {
+        // written next to it and renamed over it: a running copy is never half-written
+        let tmp = path.with_extension("new");
+        std::fs::write(&tmp, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    /// The roadmap's offline scenario end to end: claude answers `--version` but every real
+    /// call fails as when logged out; segments and a voice command arrive and wait; then
+    /// claude works again and the backlog drains in order — the command first (its "tomorrow"
+    /// resolved against the day it was spoken, three days ago), then the conversation, oldest
+    /// chunk first.
+    #[test]
+    fn a_logged_out_cli_queues_everything_and_the_backlog_drains_in_order_when_it_returns() {
+        let dir = temp_dir("offline");
+        let db = dir.join("oats.sqlite");
+        let calls = dir.join("calls");
+        let script = dir.join("claude");
+        write_script(
+            &script,
+            "#!/bin/sh\ncase \"$*\" in *--version*) echo '2.1.312 (Claude Code)'; exit 0;; esac\ncat > /dev/null\necho 'Not logged in · Please run /login' >&2\nexit 1\n",
+        );
+        let working = format!(
+            r#"#!/bin/sh
+case "$*" in *--version*) echo '2.1.312 (Claude Code)'; exit 0;; esac
+IN=$(cat)
+case "$*" in
+  *intent*)
+    D=$(printf '%s\n' "$IN" | sed -n 's/^Now (when the command was spoken): \([0-9-]*\).*/\1/p' | head -n 1)
+    echo "command $D" >> '{calls}'
+    echo '{{"type":"result","is_error":false,"result":"","total_cost_usd":0.001,"structured_output":{{"actions":[{{"intent":"add_event","title":"Dentist","date":"'"$D"'","time":null,"all_day":true,"relative_to_event":false,"offset_days":null,"text":null,"details":"","node_name":null,"category_name":null}}]}}}}';;
+  *low_signal*)
+    C=$(printf '%s' "$IN" | grep -o 'chunk-[0-9]*' | head -n 1)
+    echo "interpret $C" >> '{calls}'
+    echo '{{"type":"result","is_error":false,"result":"","total_cost_usd":0.01,"structured_output":{{"title":"'"$C"'","summary":"s","low_signal":false,"node_id":null,"new_project":null,"new_topic":null,"decisions":[],"action_items":[],"topics":[],"events":[]}}}}';;
+  *) echo '{{"type":"result","is_error":true,"result":"unexpected request"}}';;
+esac
+"#,
+            calls = calls.display()
+        );
+        // three days ago at noon, local: two conversations two hours apart, a command between
+        let day = (Local::now() - chrono::Duration::days(3)).date_naive();
+        let noon = day
+            .and_hms_opt(12, 0, 0)
+            .and_then(|t| Local.from_local_datetime(&t).earliest())
+            .unwrap()
+            .timestamp_millis();
+        let rows = {
+            let s = Store::open(&db).unwrap();
+            let sid = s.begin_session(noon, "e").unwrap();
+            let talk = |n: u32| {
+                format!("chunk-{n}: {LONG_TEXT}, and then we went through the open questions")
+            };
+            vec![
+                s.insert_segment(sid, noon, noon + 5_000, &talk(1), None)
+                    .unwrap(),
+                s.insert_segment(
+                    sid,
+                    noon + 1_800_000,
+                    noon + 1_805_000,
+                    "hey computer the dentist is tomorrow",
+                    None,
+                )
+                .unwrap(),
+                s.insert_segment(sid, noon + 7_200_000, noon + 7_205_000, &talk(2), None)
+                    .unwrap(),
+            ]
+        };
+        let cli = ClaudeCli {
+            binary: script.clone(),
+            model: None,
+            timeout: Duration::from_secs(20),
+            max_budget_usd: None,
+            work_dir: Some(dir.join("work")),
+            isolate: true,
+        };
+        let h = Brain {
+            config: BrainConfig {
+                cli,
+                probe_backoff_min: Duration::from_millis(100),
+                probe_backoff_max: Duration::from_millis(300),
+                catchup_pause: Duration::from_millis(10),
+                ..BrainConfig::default()
+            },
+            store_path: db.clone(),
+            wake: Box::new(|| {}),
+        }
+        .spawn();
+        wait_for(&h, "startup probe", |e| {
+            matches!(e, BrainEvent::Availability(Ok(_)))
+        });
+        for r in &rows {
+            h.segment_arrived(r.clone());
+        }
+        wait_for(
+            &h,
+            "unavailable",
+            |e| matches!(e, BrainEvent::Availability(Err(r)) if r == "not logged in"),
+        );
+        wait_for(&h, "the backlog", |e| {
+            matches!(
+                e,
+                BrainEvent::Backlog {
+                    waiting_segments: 2,
+                    waiting_commands: 1
+                }
+            )
+        });
+        // a few failed re-probes (each a free `--version`, then the real call fails again)
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!calls.exists(), "nothing ran while logged out");
+        write_script(&script, &working);
+        wait_for(&h, "the catch-up done", |e| {
+            matches!(
+                e,
+                BrainEvent::Backlog {
+                    waiting_segments: 0,
+                    waiting_commands: 0
+                }
+            )
+        });
+        drop(h);
+        let log = std::fs::read_to_string(&calls).unwrap();
+        let log: Vec<&str> = log.lines().collect();
+        let spoken = day.format("%Y-%m-%d").to_string();
+        assert_eq!(
+            log,
+            vec![
+                format!("command {spoken}").as_str(),
+                "interpret chunk-1",
+                "interpret chunk-2"
+            ]
+        );
+        let s = Store::open(&db).unwrap();
+        let events = s.events_from(i64::MIN, 10).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let when = Local
+            .timestamp_millis_opt(events[0].when_start)
+            .single()
+            .unwrap();
+        assert_eq!(
+            when.date_naive(),
+            day,
+            "dated from the segment, not from today"
+        );
+        assert_eq!(s.uninterpreted_count().unwrap(), 0);
+        let titles: Vec<String> = s
+            .episodes(10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.title)
+            .collect();
+        assert_eq!(titles.len(), 2, "{titles:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_reprobe_backs_off_and_caps() {
+        let dir = temp_dir("backoff");
+        let (mut w, _rx) = bare_worker_with_events(ClaudeCli {
+            binary: dir.join("missing-claude"),
+            ..script_cli(&dir, "")
+        });
+        w.configured_binary = dir.join("missing-claude");
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            let before = Instant::now();
+            assert!(!w.probe());
+            let Some(at) = w.probe_due() else {
+                unreachable!("{:?}", w.avail)
+            };
+            waits.push(at.saturating_duration_since(before).as_secs());
+        }
+        // 1 min, 2, 4, 8, then 15 (the cap)
+        let mins: Vec<u64> = waits.iter().map(|s| (s + 30) / 60).collect();
+        assert_eq!(mins, vec![1, 2, 4, 8, 15, 15, 15]);
+        assert!(matches!(&w.avail, Avail::Down { reason, .. } if reason == "not installed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tier0_has_its_own_hourly_cap_and_a_hard_ceiling() {
+        let dir = temp_dir("tier0");
+        let mut w = bare_worker(script_cli(&dir, "exit 9"));
+        w.cfg.tier0_per_hour = 2;
+        w.cfg.daily_budget_usd = 1.0;
+        let paid = |w: &Worker, tier: i64, cost: f64| {
+            let id = w.store.begin_run(tier, "x", "m", now_ms() - 1_000).unwrap();
+            w.store
+                .finish_run(
+                    id,
+                    &RunOutcome {
+                        finished_at: now_ms(),
+                        model: None,
+                        cost_usd: Some(cost),
+                        duration_ms: None,
+                        ok: true,
+                        error: None,
+                        summary: String::new(),
+                    },
+                )
+                .unwrap();
+        };
+        // over the daily budget: tiers 1–3 stop, tier 0 goes on (ceiling is $2)
+        paid(&w, 1, 1.5);
+        assert!(!w.within_budget(Tier::Rolling));
+        assert!(w.within_budget(Tier::Reactive));
+        // tier 0's own hourly cap
+        paid(&w, 0, 0.0);
+        paid(&w, 0, 0.0);
+        assert!(!w.within_budget(Tier::Reactive));
+        // the hard ceiling, whatever the hourly count
+        w.cfg.tier0_per_hour = 100;
+        assert!(w.within_budget(Tier::Reactive));
+        paid(&w, 1, 0.6);
+        assert!(!w.within_budget(Tier::Reactive));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_panicking_job_is_recorded_and_the_worker_lives_on() {
+        let dir = temp_dir("panic");
+        let (mut w, rx) = bare_worker_with_events(script_cli(&dir, "exit 9"));
+        let r = w.run_job(Tier::Rolling, "interpret", |_, _| {
+            let v: Vec<i64> = Vec::new();
+            // the kind of model-driven bug the review found: an index (or a chrono
+            // constructor) out of range
+            let i = v.len() + 3;
+            Ok(JobOutput {
+                summary: v[i].to_string(),
+                cost_usd: None,
+                duration_ms: None,
+                model: None,
+                lines: Vec::new(),
+                changed: false,
+            })
+        });
+        let e = r.err().unwrap();
+        assert_eq!(e.class, "panic");
+        let runs = w.store.runs(5).unwrap();
+        assert!(!runs[0].ok);
+        assert!(
+            runs[0]
+                .error
+                .as_deref()
+                .is_some_and(|m| m.contains("panic"))
+        );
+        assert!(
+            rx.try_iter()
+                .any(|e| matches!(e, BrainEvent::Warning(m) if m.contains("panic")))
+        );
+        // and the worker still works
+        assert!(
+            w.run_job(Tier::Rolling, "x", |_, _| Ok(JobOutput {
+                summary: String::new(),
+                cost_usd: None,
+                duration_ms: None,
+                model: None,
+                lines: Vec::new(),
+                changed: false,
+            }))
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_command_is_retried_with_backoff_then_given_up() {
+        let dir = temp_dir("cmdfail");
+        // every call returns garbage: a failure of the command, not of claude's availability
+        let mut w = bare_worker(script_cli(&dir, "echo 'not json'"));
+        let sid = w.store.begin_session(0, "e").unwrap();
+        let t = now_ms() - 60_000;
+        let seg = w
+            .store
+            .insert_segment(sid, t, t + 1_000, "hey computer note the milk", None)
+            .unwrap();
+        w.queue_command(seg.clone());
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let Some(cmd) = w.pending_commands.pop_front() else {
+                unreachable!("given up too early")
+            };
+            let before = Instant::now();
+            w.run_command(cmd);
+            if let Some(p) = w.pending_commands.front() {
+                waits.push(
+                    p.not_before
+                        .map(|t| t.saturating_duration_since(before).as_secs())
+                        .unwrap_or(0),
+                );
+            }
+        }
+        assert_eq!(waits, vec![60, 120], "one minute, then two");
+        assert!(w.pending_commands.is_empty(), "given up after 3 tries");
+        let stored = w.store.segment(seg.id).unwrap().unwrap();
+        assert!(
+            stored.interpreted_at.is_some(),
+            "consumed: no pass retries it"
+        );
+        let changes = w.store.changes(10).unwrap();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.kind == "command_failed" && c.description.starts_with("Warning")),
+            "{changes:?}"
+        );
+        assert_eq!(w.store.runs(10).unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

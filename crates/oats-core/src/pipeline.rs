@@ -10,6 +10,8 @@
 //! - Level events are rate-limited to ~10 Hz; the UI repaints only when an event arrives
 //!   (`wake` is called after each event is queued).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +23,9 @@ use crate::store::{Store, TranscriptRow};
 const AUDIO_POLL: Duration = Duration::from_millis(100);
 /// Minimum spacing of `Level` events (~10 Hz).
 const LEVEL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long dropping the handle waits for the worker before detaching it (a model load can
+/// take minutes and can't be interrupted; quitting must not wait for it).
+const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Coarse state for the status line and the Listen toggle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +55,9 @@ pub enum PipelineEvent {
     /// A new session row was opened / closed.
     SessionStarted(i64),
     SessionEnded(i64),
+    /// `start` could not begin a session (the store refused the session row): listening did
+    /// not start, and the audio channel was dropped. A `Status(Idle)` follows.
+    ListenFailed(String),
     /// A non-fatal problem (one transcription failed, the store refused a write).
     Warning(String),
 }
@@ -59,6 +67,8 @@ pub struct PipelineHandle {
     cmd_tx: Sender<Command>,
     events: Receiver<PipelineEvent>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Set on drop: the worker gives up between engine-load steps.
+    cancel: Arc<AtomicBool>,
 }
 
 pub(crate) enum Command {
@@ -92,9 +102,20 @@ impl Pipeline {
             wake,
         } = self;
         let out = Outbox { tx: event_tx, wake };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
         let thread = std::thread::Builder::new()
             .name("oats-pipeline".to_owned())
-            .spawn(move || worker(engine, &store_path, segmenter, &cmd_rx, &out));
+            .spawn(move || {
+                worker(
+                    engine,
+                    &store_path,
+                    segmenter,
+                    &cmd_rx,
+                    &out,
+                    &worker_cancel,
+                )
+            });
         let thread = match thread {
             Ok(t) => Some(t),
             Err(e) => {
@@ -106,6 +127,7 @@ impl Pipeline {
             cmd_tx,
             events,
             thread,
+            cancel,
         }
     }
 }
@@ -134,10 +156,27 @@ impl PipelineHandle {
 }
 
 impl Drop for PipelineHandle {
+    /// Shut the worker down: a bounded join. Normally the worker is back on its command
+    /// channel within a poll interval; while the engine is still loading (which can't be
+    /// interrupted) it is detached after [`JOIN_TIMEOUT`] and exits by itself at the next
+    /// load step, so quitting never hangs on a model download.
     fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(Command::Shutdown);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let deadline = Instant::now() + JOIN_TIMEOUT;
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            } else {
+                log::warn!(
+                    "the pipeline worker is still busy (loading the speech engine?) after {:?}; \
+                     not waiting for it",
+                    JOIN_TIMEOUT
+                );
+            }
         }
     }
 }
@@ -231,7 +270,15 @@ fn worker(
     config: SegmenterConfig,
     cmd_rx: &Receiver<Command>,
     out: &Outbox,
+    cancel: &AtomicBool,
 ) {
+    let cancelled = || {
+        let c = cancel.load(Ordering::Relaxed);
+        if c {
+            log::info!("pipeline: shut down while loading");
+        }
+        c
+    };
     let store = match Store::open(store_path) {
         Ok(s) => s,
         Err(e) => {
@@ -242,15 +289,25 @@ fn worker(
         }
     };
 
+    if cancelled() {
+        return;
+    }
     out.send(PipelineEvent::Status(PipelineStatus::Loading(
         "Loading speech engine…".to_owned(),
     )));
-    let loaded = factory().and_then(|mut engine| {
+    let built = factory();
+    if cancelled() {
+        return;
+    }
+    let loaded = built.and_then(|mut engine| {
         engine.load(&mut |line| {
             out.send(PipelineEvent::Status(PipelineStatus::Loading(line)));
         })?;
         Ok(engine)
     });
+    if cancelled() {
+        return;
+    }
     let mut engine = match loaded {
         Ok(e) => e,
         Err(e) => {
@@ -314,7 +371,8 @@ impl Session<'_> {
         let session_id = match self.store.begin_session(started_ms, self.engine_name) {
             Ok(id) => id,
             Err(e) => {
-                self.out.send(PipelineEvent::Warning(format!(
+                log::warn!("could not start a listening session: {e}");
+                self.out.send(PipelineEvent::ListenFailed(format!(
                     "could not start a session: {e}"
                 )));
                 self.out.send(PipelineEvent::Status(PipelineStatus::Idle));
@@ -584,6 +642,58 @@ mod tests {
         if let Some(dir) = path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// An engine whose load blocks far longer than any quit may wait.
+    struct SlowLoad;
+
+    impl SpeechEngine for SlowLoad {
+        fn name(&self) -> String {
+            "slow".into()
+        }
+        fn load(&mut self, _status: &mut dyn FnMut(String)) -> Result<(), crate::EngineError> {
+            std::thread::sleep(Duration::from_secs(8));
+            Ok(())
+        }
+        fn vad_frame_len(&self) -> Option<usize> {
+            None
+        }
+        fn vad(&mut self, _samples: &[f32]) -> Result<Vec<crate::VadFrame>, crate::EngineError> {
+            Ok(Vec::new())
+        }
+        fn transcribe(
+            &mut self,
+            _samples: &[f32],
+        ) -> Result<crate::Transcription, crate::EngineError> {
+            Ok(crate::Transcription {
+                text: String::new(),
+                confidence: None,
+                processing_ms: 0.0,
+            })
+        }
+    }
+
+    #[test]
+    fn dropping_the_handle_while_the_engine_loads_does_not_hang() {
+        let path = temp_db("slowload");
+        let h = Pipeline {
+            engine: Box::new(|| Ok(Box::new(SlowLoad) as Box<dyn SpeechEngine>)),
+            store_path: path.clone(),
+            segmenter: SegmenterConfig::default(),
+            wake: Box::new(|| {}),
+        }
+        .spawn();
+        wait_for(&h, "loading", |e| {
+            matches!(e, PipelineEvent::Status(PipelineStatus::Loading(_)))
+        });
+        let t = Instant::now();
+        drop(h);
+        let took = t.elapsed();
+        assert!(
+            took >= JOIN_TIMEOUT - Duration::from_millis(100),
+            "{took:?}"
+        );
+        assert!(took < JOIN_TIMEOUT + Duration::from_secs(2), "{took:?}");
     }
 
     #[test]

@@ -173,7 +173,6 @@ fn hotword_variants() {
 }
 
 #[test]
-#[ignore = "bug: with two different hotwords in one utterance the phrase listed first in the config wins, not the one spoken first, so the earlier command is dropped"]
 fn the_first_spoken_hotword_wins() {
     let cfg = HotwordConfig::default(); // ["hey computer", "hey oats"]
     assert_eq!(
@@ -476,7 +475,6 @@ fn a_missing_midnight_resolves_to_the_first_instant_of_the_day() {
 }
 
 #[test]
-#[ignore = "bug: a relative reminder whose shifted clock time falls in a DST gap is refused as 'reminder without a date' instead of moving to the next valid time"]
 fn a_relative_reminder_landing_in_the_dst_gap_still_gets_a_date() {
     let z = eastern();
     let (_, done) = run(

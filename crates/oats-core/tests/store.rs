@@ -1177,7 +1177,6 @@ fn store_open_creates_nested_directories_and_wal() -> R {
 }
 
 #[test]
-#[ignore = "bug: reset_episode leaves the episode's events pointing at its id and SQLite reuses the highest rowid, so the next, unrelated episode adopts those events (and its interpretation then reconciles them away)"]
 fn events_of_a_reset_episode_are_not_adopted_by_the_next_episode() -> R {
     let s = Store::open_in_memory()?;
     let content = |title: &str| EpisodeContent {

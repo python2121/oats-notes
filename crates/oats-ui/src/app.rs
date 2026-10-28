@@ -22,7 +22,9 @@ use crate::menu_events::MenuEvents;
 use crate::notes::{BrainStatus, NotesAction, NotesState, notes_view};
 use crate::sidebar::{SidebarAction, SidebarState, sidebar_panel};
 use crate::theme::Tokens;
-use crate::transcript::{TranscriptAction, local_midnight_ms, transcript_list};
+use crate::transcript::{
+    TranscriptAction, local_midnight_ms, transcript_list, until_local_midnight,
+};
 
 /// eframe storage key for [`AppPrefs`] (RON).
 pub const PREFS_KEY: &str = "oatsnotes.prefs";
@@ -685,9 +687,17 @@ impl OatsApp {
             match ev {
                 BrainEvent::Availability(r) => {
                     if let Err(e) = &r {
-                        log::warn!("brain unavailable: {e}");
+                        log::info!("brain unavailable: {e}");
                     }
                     self.brain_status.availability = Some(r);
+                }
+                BrainEvent::Backlog {
+                    waiting_segments,
+                    waiting_commands,
+                } => {
+                    self.brain_status.backlog = Some((waiting_segments, waiting_commands));
+                    // each chunk worked off the backlog lands in the views
+                    reload = true;
                 }
                 BrainEvent::RunStarted { kind, .. } => self.brain_status.running = Some(kind),
                 BrainEvent::RunFinished(run) => {
@@ -701,7 +711,9 @@ impl OatsApp {
                 BrainEvent::Changed(_) => reload = true,
                 BrainEvent::Spend { today_usd } => self.brain_status.spend_today_usd = today_usd,
                 BrainEvent::Warning(w) => {
-                    log::warn!("brain: {w}");
+                    // the text can quote claude's output: details at debug level only
+                    log::info!("brain: warning shown in the status strip");
+                    log::debug!("brain: {w}");
                     self.warning = Some(w);
                 }
             }
@@ -724,10 +736,15 @@ impl OatsApp {
                         && self.status == PipelineStatus::Listening
                         && self.capture.is_some()
                     {
-                        // the audio stream ended under us (device gone)
+                        // the audio stream ended under us (the device went away: the capture's
+                        // error callback closed the channel)
                         self.capture = None;
                         self.level = None;
-                        self.warning = Some("Listening stopped: the audio input closed".to_owned());
+                        log::warn!("listening stopped: the audio input closed");
+                        self.warning = Some(
+                            "Listening stopped: the audio input closed (microphone disconnected?)"
+                                .to_owned(),
+                        );
                     }
                     if let PipelineStatus::Failed(msg) = &s {
                         log::error!("engine failed: {msg}");
@@ -752,6 +769,14 @@ impl OatsApp {
                     if self.in_view(&row) {
                         self.rows.push(row);
                     }
+                }
+                PipelineEvent::ListenFailed(why) => {
+                    // the pipeline dropped the audio channel: close the microphone too, so
+                    // nothing pretends to listen
+                    self.capture = None;
+                    self.level = None;
+                    self.prefs.listening = false;
+                    self.warning = Some(format!("Listening did not start: {why}"));
                 }
                 PipelineEvent::SessionStarted(_) | PipelineEvent::SessionEnded(_) => {}
                 PipelineEvent::Warning(w) => {
@@ -895,7 +920,10 @@ impl OatsApp {
         for a in actions {
             let r = match a {
                 CalendarAction::SetReminderDone(id, done) => self.store.set_reminder_done(id, done),
-                CalendarAction::DeleteEvent(id) => self.store.delete_event(id),
+                CalendarAction::DeleteEvent(id) => self.store.delete_event(id).map(|()| {
+                    // the user's own delete: leave no copy in the WAL
+                    self.store.checkpoint();
+                }),
             };
             if let Err(e) = r {
                 self.store_error(e);
@@ -973,10 +1001,13 @@ impl OatsApp {
         let n = self.today_count;
         let brain = match (&self.brain, &self.brain_status.running) {
             (None, _) => String::new(),
-            (Some(_), Some(job)) => format!(" · brain: {job}…"),
-            (Some(_), None) => match &self.brain_status.availability {
-                Some(Err(_)) => " · brain: unavailable".to_owned(),
-                _ => format!(" · brain ${:.2} today", self.brain_status.spend_today_usd),
+            (Some(_), running) => match (self.brain_status.backlog_line(), running) {
+                // "claude unavailable (not logged in) — 42 segments waiting"
+                (Some(line), _) => format!(" · {line}"),
+                (None, Some(job)) => format!(" · brain: {job}…"),
+                (None, None) => {
+                    format!(" · brain ${:.2} today", self.brain_status.spend_today_usd)
+                }
             },
         };
         let left = format!(
@@ -1110,6 +1141,9 @@ impl eframe::App for OatsApp {
         self.route_menu_events();
         self.sync_status_item(ctx);
         self.handle_close(ctx);
+        // "Today" rolls over at local midnight even when nothing else wakes the UI: one
+        // repaint scheduled for then (not a continuous one)
+        ctx.request_repaint_after(until_local_midnight());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
