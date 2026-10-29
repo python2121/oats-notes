@@ -2,7 +2,8 @@
 //! pipeline writes segments, the brain writes interpretations, the UI reads). Times are Unix
 //! milliseconds (UTC); the UI formats them in local time.
 //!
-//! Schema version 4 (`meta.schema_version`; v1, v2 and v3 databases are migrated on open):
+//! Schema version 5 (`meta.schema_version`; v1 to v4 databases are migrated on open; v5 added
+//! `episodes.user_edited_at`, the time the user last edited a note by hand):
 //! - `sessions(id, started_at, ended_at NULL, engine)` — one per listen start/stop.
 //! - `nodes(id, parent_id NULL, kind, name, description, created_by, position, archived,
 //!   created_at)` — ONE tree: the user's top-level categories (`kind = category`, seeded
@@ -187,6 +188,9 @@ pub struct Episode {
     pub revision: i64,
     pub created_at: i64,
     pub last_revised_at: i64,
+    /// Set when the user edited the note by hand ([`Store::update_episode_content`]); the
+    /// brain then never rewrites its text.
+    pub user_edited_at: Option<i64>,
 }
 
 /// The interpreted content of an episode (what a revision writes).
@@ -381,7 +385,7 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// The v2 schema, first half (meta, sessions, nodes, episodes); every statement is idempotent so
 /// it doubles as the "make sure everything exists" step.
@@ -423,7 +427,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     cost_usd          REAL,
     revision          INTEGER NOT NULL DEFAULT 1,
     created_at        INTEGER NOT NULL,
-    last_revised_at   INTEGER NOT NULL
+    last_revised_at   INTEGER NOT NULL,
+    user_edited_at    INTEGER
 );
 CREATE INDEX IF NOT EXISTS episodes_started_at ON episodes(started_at);
 ";
@@ -577,7 +582,8 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
 }
 
 const EPISODE_COLUMNS: &str = "id, started_at, ended_at, title, summary, node_id, decisions_json, \
-     action_items_json, topics_json, low_signal, model, cost_usd, revision, created_at, last_revised_at";
+     action_items_json, topics_json, low_signal, model, cost_usd, revision, created_at, \
+     last_revised_at, user_edited_at";
 
 fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Episode> {
     let json = |i: usize| -> rusqlite::Result<String> { row.get(i) };
@@ -600,6 +606,7 @@ fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Episode> {
         revision: row.get(12)?,
         created_at: row.get(13)?,
         last_revised_at: row.get(14)?,
+        user_edited_at: row.get(15)?,
     })
 }
 
@@ -882,12 +889,20 @@ impl Store {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
+            Some(4) => {
+                // v4 → v5 is `episodes.user_edited_at`, added by `ensure_episode_edit_column`
+                log::info!("migrating the database from schema 4 to {SCHEMA_VERSION}");
+                conn.execute_batch(SCHEMA)?;
+                conn.execute_batch(SCHEMA_REST)?;
+            }
             Some(v) if v == SCHEMA_VERSION => {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
             Some(v) => return Err(StoreError::SchemaTooNew(v)),
         }
+        // before the AUTOINCREMENT rebuild, which copies `SELECT *` into the current layout
+        Self::ensure_episode_edit_column(conn)?;
         Self::episode_ids_never_reused(conn)?;
         Self::ensure_todos_table(conn)?;
         conn.execute(
@@ -903,6 +918,20 @@ impl Store {
             for name in DEFAULT_CATEGORIES {
                 self.add_category(name)?;
             }
+        }
+        Ok(())
+    }
+
+    /// `episodes.user_edited_at` (v5): added in place to an older table (last column, so the
+    /// rebuild in [`Self::episode_ids_never_reused`] still lines up).
+    fn ensure_episode_edit_column(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+        let has: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('episodes') WHERE name = 'user_edited_at'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has == 0 {
+            conn.execute_batch("ALTER TABLE episodes ADD COLUMN user_edited_at INTEGER;")?;
         }
         Ok(())
     }
@@ -1652,6 +1681,35 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// The user's own edit of a note: replaces title, summary, decisions, action items and
+    /// topics (not the node, low-signal flag, model or cost), stamps `user_edited_at = now`
+    /// and leaves `revision` alone. One transaction. The brain never content-revises an
+    /// episode with `user_edited_at` set.
+    pub fn update_episode_content(
+        &self,
+        id: i64,
+        content: &EpisodeContent,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.with_savepoint(|s| {
+            s.conn.execute(
+                "UPDATE episodes SET title = ?2, summary = ?3, decisions_json = ?4,
+                     action_items_json = ?5, topics_json = ?6, user_edited_at = ?7
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    content.title,
+                    content.summary,
+                    serde_json::to_string(&content.decisions)?,
+                    serde_json::to_string(&content.action_items)?,
+                    serde_json::to_string(&content.topics)?,
+                    now
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn set_episode_low_signal(&self, id: i64, low_signal: bool) -> Result<(), StoreError> {
@@ -2496,7 +2554,7 @@ mod tests {
         let s = Store::open_in_memory()?;
         let names: Vec<String> = s.categories()?.into_iter().map(|c| c.name).collect();
         assert_eq!(names, DEFAULT_CATEGORIES);
-        assert_eq!(version(&s)?, "4");
+        assert_eq!(version(&s)?, "5");
         assert!(s.categories()?.iter().all(|c| c.kind == NodeKind::Category));
         Ok(())
     }
@@ -2525,7 +2583,7 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory()?;
         conn.execute_batch(V1)?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "4");
+        assert_eq!(version(&s)?, "5");
         let cats = s.categories()?;
         assert_eq!(
             cats.iter()
@@ -2582,7 +2640,7 @@ mod tests {
              INSERT INTO segments VALUES (2, 1, 4000, 5000, 'loose', NULL, NULL, NULL, NULL, 0);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "4");
+        assert_eq!(version(&s)?, "5");
         let rows = s.segments(View::All, 0)?;
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -2995,7 +3053,7 @@ mod tests {
             INSERT INTO reminders VALUES (8, NULL, 600, 'old one', 1, 'hotword', NULL, NULL, 20);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "4");
+        assert_eq!(version(&s)?, "5");
         let all = s.todos(TodoFilter::All)?;
         assert_eq!(all.len(), 2);
         let open = &all[0];
@@ -3025,6 +3083,63 @@ mod tests {
         assert_eq!(t.source, Origin::User);
         s.init_locked()?;
         assert_eq!(s.todos(TodoFilter::All)?.len(), 3);
+        Ok(())
+    }
+
+    /// A v4 database (no `episodes.user_edited_at`) gains the column in place, keeps its rows,
+    /// and the edit method stamps it without touching `revision`.
+    #[test]
+    fn migrates_v4_to_v5_and_edits_stamp_user_edited_at() -> R {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(SCHEMA_REST)?;
+        conn.execute_batch(
+            "ALTER TABLE episodes DROP COLUMN user_edited_at;
+             INSERT INTO meta VALUES ('schema_version', '4');
+             INSERT INTO episodes(id, started_at, ended_at, title, summary, revision, created_at,
+                 last_revised_at) VALUES (3, 10, 20, 'Old note', 'old summary', 2, 5, 6);",
+        )?;
+        let s = Store::init(conn)?;
+        assert_eq!(version(&s)?, "5");
+        let e = s.episode(3)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        assert_eq!(
+            (e.title.as_str(), e.revision, e.user_edited_at),
+            ("Old note", 2, None)
+        );
+        s.update_episode_content(
+            3,
+            &EpisodeContent {
+                title: "Mine".into(),
+                summary: "- fixed".into(),
+                decisions: vec!["d".into()],
+                action_items: vec![ActionItem {
+                    text: "a".into(),
+                    owner: Some("Me".into()),
+                    due: None,
+                }],
+                topics: vec!["t".into()],
+                node_id: Some(999),
+                low_signal: true,
+                ..Default::default()
+            },
+            777,
+        )?;
+        let e = s.episode(3)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        assert_eq!((e.title.as_str(), e.summary.as_str()), ("Mine", "- fixed"));
+        assert_eq!((e.user_edited_at, e.revision), (Some(777), 2));
+        assert_eq!(
+            (e.node_id, e.low_signal),
+            (None, false),
+            "structure untouched"
+        );
+        assert_eq!(e.action_items[0].owner.as_deref(), Some("Me"));
+        s.init_locked()?;
+        assert_eq!(
+            s.episode(3)?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+                .user_edited_at,
+            Some(777)
+        );
         Ok(())
     }
 
@@ -3351,14 +3466,16 @@ mod tests {
                     model TEXT NOT NULL DEFAULT '', cost_usd REAL,
                     revision INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
                     last_revised_at INTEGER NOT NULL);
-                 INSERT INTO episodes SELECT * FROM old;
+                 INSERT INTO episodes SELECT id, started_at, ended_at, title, summary, node_id,
+                    decisions_json, action_items_json, topics_json, low_signal, model, cost_usd,
+                    revision, created_at, last_revised_at FROM old;
                  DROP TABLE old;
                  DELETE FROM sqlite_sequence WHERE name = 'episodes';",
                 a.id
             ))?;
         }
         let s = Store::open(&path)?;
-        assert_eq!(version(&s)?, "4");
+        assert_eq!(version(&s)?, "5");
         assert_eq!(s.episodes(10)?.len(), 1, "rows survive the rebuild");
         let c = s.insert_episode(40, 50, &content, 2)?;
         let events = s.events_from(i64::MIN, 10)?;

@@ -29,6 +29,11 @@ pub struct SelftestOptions {
     pub notes: bool,
     /// Show the Work category's view (its projects, their notes, the transcript toggle).
     pub work: bool,
+    /// Show the project landing page of "Export rewrite" (next steps, collapsed notes) with its
+    /// sidebar layer open.
+    pub project: bool,
+    /// With `project`: every note expanded.
+    pub expanded: bool,
     /// Show the Calendar view (the month grid with seeded events and todos, today selected).
     pub calendar: bool,
     /// Show the Todos view (open, snoozed, undated and completed todos).
@@ -112,6 +117,15 @@ pub fn run_with(
         let app = harness.state_mut();
         if !app.selftest_show_node("Work") {
             return Err("no Work category in the seeded store".to_owned());
+        }
+    } else if options.project {
+        let app = harness.state_mut();
+        app.selftest_open_project_layer("Export rewrite");
+        if !app.selftest_show_node("Export rewrite") {
+            return Err("no Export rewrite project in the seeded store".to_owned());
+        }
+        if options.expanded {
+            app.selftest_expand_notes();
         }
     } else if options.calendar {
         harness.state_mut().run(Command::ShowCalendar);
@@ -278,6 +292,26 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
                 model: "claude-sonnet-4-5".into(),
                 cost_usd: Some(0.004),
                 ..Default::default()
+            },
+            now,
+        )?;
+        // a later note of the same project, with more action items (the project page's next steps)
+        store.insert_episode(
+            yesterday + 17 * H,
+            yesterday + 17 * H + 25 * M,
+            &EpisodeContent {
+                title: "Export rewrite: format check-in".into(),
+                summary: "- CSV and Excel exports are ready for review.\n- Dates need an ISO 8601 option before the finance team can use the files.".into(),
+                node_id: Some(project.id),
+                decisions: vec!["Ship CSV first, Excel a week later".into()],
+                action_items: vec![
+                    ActionItem { text: "Add an ISO 8601 date option to the exporter".into(), owner: Some("Sam".into()), due: Some("Friday".into()) },
+                    ActionItem { text: "Share sample files with finance".into(), owner: None, due: None },
+                ],
+                topics: vec!["export rewrite".into(), "finance".into()],
+                low_signal: false,
+                model: "claude-sonnet-4-5".into(),
+                cost_usd: Some(0.02),
             },
             now,
         )?;

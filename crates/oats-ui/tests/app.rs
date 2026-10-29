@@ -141,7 +141,10 @@ impl Rig {
     }
 
     fn shows(&self, label: &str) -> bool {
-        self.harness.query_by_label_contains(label).is_some()
+        self.harness
+            .query_all_by_label_contains(label)
+            .next()
+            .is_some()
     }
 
     fn click_at(&mut self, pos: egui::Pos2) {
@@ -937,4 +940,189 @@ fn a_calendar_item_jumps_to_where_it_was_said() {
     rig.harness.run_steps(2);
     assert_eq!(rig.app().prefs().view, View::Calendar);
     assert_eq!(rig.app().warning(), Some("No transcript for this item"));
+}
+
+// ---- project landing page, sidebar notes layer, single-note view, editing -----------------------
+
+/// Two notes under the "Commerce project", the older with two action items, the newer with one.
+fn seed_project_notes(db: &Path) -> (i64, i64, i64) {
+    use oats_core::{ActionItem, EpisodeContent};
+    let (_work, commerce, _lease) = seed_projects(db);
+    let s = Store::open(db).unwrap();
+    let t = now_ms() - 7_200_000;
+    let mut ids = Vec::new();
+    for (i, (title, summary, items)) in [
+        (
+            "Pricing sync",
+            "- pricing detail alpha",
+            vec![
+                ("Draft the price table", Some("Ana")),
+                ("Check VAT rules", None),
+            ],
+        ),
+        (
+            "Launch review",
+            "- launch detail beta",
+            vec![("Book the launch room", Some("Joe"))],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = t + i as i64 * 1_800_000;
+        let e = s
+            .insert_episode(
+                at,
+                at + 60_000,
+                &EpisodeContent {
+                    title: title.into(),
+                    summary: summary.into(),
+                    node_id: Some(commerce),
+                    action_items: items
+                        .into_iter()
+                        .map(|(text, owner)| ActionItem {
+                            text: text.into(),
+                            owner: owner.map(str::to_owned),
+                            due: None,
+                        })
+                        .collect(),
+                    model: "m".into(),
+                    ..Default::default()
+                },
+                at + 120_000,
+            )
+            .unwrap();
+        ids.push(e.id);
+    }
+    (commerce, ids[0], ids[1])
+}
+
+#[test]
+fn the_project_page_lists_next_steps_over_collapsed_notes_and_links_back_to_them() {
+    let dir = TempDir::new("project-page");
+    let (commerce, pricing, launch) = seed_project_notes(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Next steps"));
+    assert!(rig.shows("Draft the price table"));
+    assert!(rig.shows("Book the launch room"));
+    assert!(rig.shows("Check VAT rules"));
+    assert!(rig.shows("Note: Pricing sync") && rig.shows("Note: Launch review"));
+    assert!(!rig.shows("pricing detail alpha"), "notes start collapsed");
+    assert!(rig.app().open_notes().is_empty());
+    // a row expands its note inline
+    rig.harness.get_by_label("Note: Pricing sync").click();
+    rig.harness.run_steps(3);
+    assert!(rig.shows("pricing detail alpha"));
+    assert!(rig.app().open_notes().contains(&pricing));
+    assert!(!rig.shows("launch detail beta"));
+    // collapse all, then a next step's source link lands on the expanded note
+    rig.harness.get_by_label("Collapse all").click();
+    rig.harness.run_steps(3);
+    assert!(!rig.shows("pricing detail alpha"));
+    let links = rig
+        .harness
+        .query_all_by_label_contains("from Launch review")
+        .count();
+    assert_eq!(links, 1);
+    rig.harness
+        .get_by_label_contains("from Launch review")
+        .click();
+    rig.harness.run_steps(4);
+    assert_eq!(rig.app().pending_focus(), None, "focus consumed");
+    assert!(rig.app().open_notes().contains(&launch));
+    assert!(rig.shows("launch detail beta"));
+    assert!(!rig.shows("pricing detail alpha"));
+}
+
+#[test]
+fn a_project_with_no_action_items_says_so() {
+    let dir = TempDir::new("project-empty");
+    let (_work, commerce, _lease) = seed_projects(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(3);
+    assert!(rig.shows("No next steps yet"));
+}
+
+#[test]
+fn the_sidebar_lists_a_projects_notes_and_one_opens_alone_until_escape() {
+    let dir = TempDir::new("sidebar-notes");
+    let (commerce, _pricing, launch) = seed_project_notes(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    assert!(!rig.shows("Note: Launch review"), "the layer starts closed");
+    rig.app().open_project_layer(commerce);
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Note: Launch review") && rig.shows("Note: Pricing sync"));
+    rig.harness.get_by_label("Note: Launch review").click();
+    rig.harness.run_steps(3);
+    assert_eq!(rig.app().prefs().view, View::Node(commerce));
+    assert_eq!(rig.app().focus_episode(), Some(launch));
+    assert!(rig.shows("launch detail beta"), "the full card");
+    assert!(!rig.shows("Next steps"), "not the project page");
+    rig.harness.key_press(egui::Key::Escape);
+    rig.harness.run_steps(3);
+    assert_eq!(rig.app().focus_episode(), None);
+    assert!(rig.shows("Next steps"));
+}
+
+#[test]
+fn editing_a_note_saves_to_the_store_and_cancel_discards() {
+    let dir = TempDir::new("edit-note");
+    let (commerce, pricing, _launch) = seed_project_notes(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Note: Pricing sync").click();
+    rig.harness.run_steps(2);
+    // cancel first: nothing is written
+    rig.harness.get_all_by_label("Edit").next().unwrap().click();
+    rig.harness.run_steps(2);
+    let inputs: Vec<_> = rig
+        .harness
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .collect();
+    inputs[0].focus();
+    rig.harness.run_steps(1);
+    rig.harness
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .next()
+        .unwrap()
+        .type_text(" DISCARDED");
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Cancel").click();
+    rig.harness.run_steps(2);
+    let s = Store::open(&dir.db()).unwrap();
+    assert_eq!(s.episode(pricing).unwrap().unwrap().title, "Pricing sync");
+    assert!(
+        s.episode(pricing)
+            .unwrap()
+            .unwrap()
+            .user_edited_at
+            .is_none()
+    );
+    // now edit and save
+    rig.harness.get_all_by_label("Edit").next().unwrap().click();
+    rig.harness.run_steps(2);
+    let summary = rig
+        .harness
+        .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+        .next()
+        .unwrap();
+    summary.focus();
+    rig.harness.run_steps(1);
+    rig.harness
+        .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+        .next()
+        .unwrap()
+        .type_text("\n- my added line");
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Save").click();
+    rig.harness.run_steps(3);
+    let e = s.episode(pricing).unwrap().unwrap();
+    assert!(e.summary.contains("my added line"), "{:?}", e.summary);
+    assert!(e.summary.contains("pricing detail alpha"));
+    assert!(e.user_edited_at.is_some());
+    assert!(rig.shows("my added line"), "read-only card re-rendered");
 }

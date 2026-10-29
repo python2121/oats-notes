@@ -32,7 +32,7 @@
 //! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
 //! `oats_brain::BrainConfig::from_env`).
 //!
-//! `--selftest <out.png> [--listening|--notes|--work|--calendar|--todos|--toast] [--no-sidebar] [--search <text>] [--topic <text>]` renders the whole window offscreen to a PNG (seeded
+//! `--selftest <out.png> [--listening|--notes|--work|--project [--expanded]|--calendar|--todos|--toast] [--no-sidebar] [--search <text>] [--topic <text>]` renders the whole window offscreen to a PNG (seeded
 //! demo content, the null engine, a throwaway database) — the shell verified without a window.
 
 use std::any::Any;
@@ -182,7 +182,7 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--work|--calendar|--todos|--toast] [--no-sidebar] [--search <text>] [--topic <text>]\n\n\
+        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--work|--project [--expanded]|--calendar|--todos|--toast] [--no-sidebar] [--search <text>] [--topic <text>]\n\n\
          --listen       start listening as soon as the speech engine is ready\n\
          --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
          \x20              paced in real time; listening stops when the file ends\n\
@@ -193,6 +193,7 @@ fn usage() -> ExitCode {
          --listening    with --selftest: show the Listening state with a fake input level\n\
          --notes        with --selftest: the Notes view (a seeded interpreted episode)\n\
          --work         with --selftest: the Work category view (projects and their notes)\n\
+         --project      with --selftest: the Export rewrite project page (next steps, collapsed notes); --expanded opens every note
          --calendar     with --selftest: the month Calendar (seeded events and todos)\n\
          --todos        with --selftest: the Todos view (open, snoozed, undated, completed)\n\
          --toast        with --selftest: a due reminder and a voice-command confirmation pop-up\n\
@@ -386,6 +387,8 @@ fn selftest_cli(args: &[String]) -> ExitCode {
             "--todos" => options.todos = true,
             "--toast" => options.toast = true,
             "--work" => options.work = true,
+            "--project" => options.project = true,
+            "--expanded" => options.expanded = true,
             "--no-sidebar" => options.no_sidebar = true,
             f if !f.starts_with("--") && out.is_none() => out = Some(f.into()),
             _ => return usage(),

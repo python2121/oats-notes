@@ -6,8 +6,8 @@
 //! reorganisation passes did, with Undo where possible) at the top.
 
 use chrono::Local;
-use egui::{Align2, RichText, Sense, vec2};
-use oats_core::{BrainRun, Change, Episode, Node, TranscriptRow};
+use egui::{Align2, Rect, RichText, Sense, vec2};
+use oats_core::{ActionItem, BrainRun, Change, Episode, EpisodeContent, Node, TranscriptRow};
 
 use crate::theme::Tokens;
 use crate::transcript::{TranscriptAction, clock, day_heading, day_of, transcript_rows};
@@ -24,6 +24,11 @@ pub enum NotesAction {
     SelectNode(i64),
     /// A topic chip was clicked: show everything tagged with it.
     OpenTopic(String),
+    /// The user saved an edited note (title, summary, decisions, action items, topics).
+    SaveEdit(i64, EpisodeContent),
+    /// Scroll to this note in the page being viewed and flash it (a next step's source link);
+    /// leaves any single-note view.
+    GoToNote(i64),
 }
 
 /// What the strip shows about the brain.
@@ -104,9 +109,109 @@ pub struct NotesState {
     pub show_transcript: bool,
     /// Scroll to this episode's card and flash it when a list lays it out (consumed there).
     pub pending_focus: Option<i64>,
+    /// The note being edited by hand and its draft text.
+    pub editing: Option<EditDraft>,
+    /// A hand-edited note whose "Re-interpret" awaits the "Replace your edits?" answer.
+    pub confirm_reinterpret: Option<i64>,
+    /// Notes expanded on a project page (collapsed by default; not persisted).
+    pub open_notes: std::collections::HashSet<i64>,
+    /// The project page lists every next step, not just the first [`NEXT_STEPS_CAP`].
+    pub show_all_steps: bool,
     /// The card flashing right now and the egui time the flash started.
     pub flash: Option<(i64, f64)>,
 }
+
+/// The text fields of a note being edited. Decisions: one per line. Action items: one per
+/// line as `text | owner | due`. Topics: comma separated.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EditDraft {
+    pub episode_id: i64,
+    pub title: String,
+    pub summary: String,
+    pub decisions: String,
+    pub action_items: String,
+    pub topics: String,
+    focus: bool,
+}
+
+impl EditDraft {
+    pub fn from_episode(e: &Episode) -> Self {
+        Self {
+            episode_id: e.id,
+            title: e.title.clone(),
+            summary: e.summary.clone(),
+            decisions: e.decisions.join("\n"),
+            action_items: e
+                .action_items
+                .iter()
+                .map(format_action_item)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            topics: e.topics.join(", "),
+            focus: true,
+        }
+    }
+
+    /// The content to store: trimmed, blank lines dropped, an empty title becomes "Untitled".
+    pub fn to_content(&self) -> EpisodeContent {
+        let lines = |s: &str| -> Vec<String> {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let title = self.title.trim();
+        EpisodeContent {
+            title: if title.is_empty() {
+                "Untitled".to_owned()
+            } else {
+                title.to_owned()
+            },
+            summary: self.summary.trim().to_owned(),
+            decisions: lines(&self.decisions),
+            action_items: self
+                .action_items
+                .lines()
+                .filter_map(parse_action_item)
+                .collect(),
+            topics: self
+                .topics
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            ..Default::default()
+        }
+    }
+}
+
+/// `text`, `text | owner`, `text | | due` or `text | owner | due`.
+pub fn format_action_item(a: &ActionItem) -> String {
+    match (&a.owner, &a.due) {
+        (None, None) => a.text.clone(),
+        (Some(o), None) => format!("{} | {o}", a.text),
+        (None, Some(d)) => format!("{} | | {d}", a.text),
+        (Some(o), Some(d)) => format!("{} | {o} | {d}", a.text),
+    }
+}
+
+/// Lenient inverse of [`format_action_item`]: blank lines give `None`; missing or empty
+/// owner / due parts are `None`; extra `|` parts are folded into the due text.
+pub fn parse_action_item(line: &str) -> Option<ActionItem> {
+    let mut parts = line.splitn(3, '|').map(str::trim);
+    let text = parts.next().filter(|t| !t.is_empty())?;
+    let some = |p: Option<&str>| p.filter(|x| !x.is_empty()).map(str::to_owned);
+    Some(ActionItem {
+        text: text.to_owned(),
+        owner: some(parts.next()),
+        due: some(parts.next()),
+    })
+}
+
+/// Next steps shown on a project page before "Show all".
+pub const NEXT_STEPS_CAP: usize = 12;
 
 /// How long a jumped-to card flashes.
 const FLASH_SECS: f64 = 1.5;
@@ -223,7 +328,7 @@ fn summary_block(ui: &mut egui::Ui, t: &Tokens, summary: &str, hl: &str) {
 }
 
 /// A small rounded chip.
-pub fn chip(ui: &mut egui::Ui, t: &Tokens, text: &str, accent: bool) {
+pub fn chip(ui: &mut egui::Ui, t: &Tokens, text: &str, accent: bool) -> egui::Response {
     let font = t.font(10.5);
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
@@ -231,7 +336,7 @@ pub fn chip(ui: &mut egui::Ui, t: &Tokens, text: &str, accent: bool) {
         if accent { t.accent } else { t.text_secondary },
     );
     let size = vec2(galley.size().x + 12.0, 16.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
         let fill = if accent {
             t.accent_alpha(0.18)
@@ -245,6 +350,7 @@ pub fn chip(ui: &mut egui::Ui, t: &Tokens, text: &str, accent: bool) {
             if accent { t.accent } else { t.text_secondary },
         );
     }
+    resp
 }
 
 /// A topic chip you can click (hover fill, pointer cursor).
@@ -392,6 +498,9 @@ pub(crate) fn episode_card(
     hl: &str,
     open: Option<&mut Option<i64>>,
 ) -> egui::Rect {
+    if state.editing.as_ref().is_some_and(|d| d.episode_id == e.id) {
+        return edit_card(ui, t, state, e, actions);
+    }
     let collapsed = e.low_signal && !state.expanded.contains(&e.id);
     let fill = ui.painter().add(egui::Shape::Noop);
     let left = ui.max_rect().left();
@@ -449,8 +558,31 @@ pub(crate) fn episode_card(
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
-                    if small_button(ui, "Re-interpret", true) {
-                        actions.push(NotesAction::Reinterpret(e.id));
+                    if state.confirm_reinterpret == Some(e.id) {
+                        // right to left: No, Yes, then the question
+                        if small_button(ui, "No", true) {
+                            state.confirm_reinterpret = None;
+                        }
+                        if small_button(ui, "Yes", true) {
+                            state.confirm_reinterpret = None;
+                            actions.push(NotesAction::Reinterpret(e.id));
+                        }
+                        ui.label(
+                            RichText::new("Replace your edits?")
+                                .color(t.text_secondary)
+                                .size(11.5),
+                        );
+                    } else {
+                        if small_button(ui, "Re-interpret", true) {
+                            if e.user_edited_at.is_some() {
+                                state.confirm_reinterpret = Some(e.id);
+                            } else {
+                                actions.push(NotesAction::Reinterpret(e.id));
+                            }
+                        }
+                        if small_button(ui, "Edit", true) {
+                            state.editing = Some(EditDraft::from_episode(e));
+                        }
                     }
                 });
             });
@@ -470,6 +602,14 @@ pub(crate) fn episode_card(
                 }
                 if e.revision > 1 {
                     chip(ui, t, &format!("rev {}", e.revision), false);
+                }
+                if let Some(at) = e.user_edited_at {
+                    let when = crate::transcript::at(at, &Local)
+                        .map(|d| d.format("%b %-d, %H:%M").to_string())
+                        .unwrap_or_default();
+                    chip(ui, t, "edited", false).on_hover_text(format!(
+                        "Edited by you, {when}. The brain leaves its text alone."
+                    ));
                 }
                 for topic in e.topics.iter().take(5) {
                     if topic_chip(ui, t, topic)
@@ -541,6 +681,125 @@ pub(crate) fn episode_card(
             6.0,
             t.inset.gamma_multiply(if e.low_signal { 0.5 } else { 1.0 }),
         ),
+    );
+    focus_card(ui, t, state, e.id, rect);
+    ui.add_space(6.0);
+    rect
+}
+
+/// The edit form of a card: title, summary (markdown source), decisions, action items,
+/// topics, with Save (accent; also ⌘S) and Cancel (also Escape).
+fn edit_card(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    state: &mut NotesState,
+    e: &Episode,
+    actions: &mut Vec<NotesAction>,
+) -> egui::Rect {
+    let fill = ui.painter().add(egui::Shape::Noop);
+    let left = ui.max_rect().left();
+    let right = ui.max_rect().right();
+    let mut save = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
+    let mut cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let inner = ui
+        .vertical(|ui| {
+            ui.add_space(6.0);
+            let Some(d) = state.editing.as_mut() else {
+                return;
+            };
+            let field_label = |ui: &mut egui::Ui, text: &str| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(text)
+                        .font(crate::theme::font_medium(ui.ctx(), 12.0))
+                        .color(t.text_secondary),
+                );
+            };
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                let w = ui.available_width() - 12.0;
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut d.title)
+                        .desired_width(w)
+                        .hint_text("Title")
+                        .font(crate::theme::font_medium(ui.ctx(), 13.5)),
+                );
+                if d.focus {
+                    r.request_focus();
+                    d.focus = false;
+                }
+            });
+            ui.horizontal_top(|ui| {
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    let w = (ui.available_width() - 12.0).max(80.0);
+                    ui.set_width(w);
+                    field_label(ui, "Summary (markdown: - bullets, **bold**, # headings)");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut d.summary)
+                            .desired_width(w)
+                            .desired_rows(6)
+                            .font(t.font(12.5)),
+                    );
+                    field_label(ui, "Decisions (one per line)");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut d.decisions)
+                            .desired_width(w)
+                            .desired_rows(2)
+                            .font(t.font(12.5)),
+                    );
+                    field_label(ui, "Action items (one per line: text | owner | due)");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut d.action_items)
+                            .desired_width(w)
+                            .desired_rows(3)
+                            .font(t.font(12.5)),
+                    );
+                    field_label(ui, "Topics (comma separated)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.topics)
+                            .desired_width(w)
+                            .font(t.font(12.5)),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let save_btn = egui::Button::new(
+                            RichText::new("Save").size(11.5).color(egui::Color32::WHITE),
+                        )
+                        .fill(t.accent);
+                        if ui.add(save_btn).clicked() {
+                            save = true;
+                        }
+                        if small_button(ui, "Cancel", true) {
+                            cancel = true;
+                        }
+                        ui.label(
+                            RichText::new("⌘S saves · Esc cancels")
+                                .color(t.text_tertiary)
+                                .size(11.0),
+                        );
+                    });
+                });
+            });
+            ui.add_space(6.0);
+        })
+        .response;
+    if save && let Some(d) = state.editing.take() {
+        actions.push(NotesAction::SaveEdit(e.id, d.to_content()));
+    } else if cancel {
+        state.editing = None;
+    }
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(left + 6.0, inner.rect.top()),
+        egui::pos2(right - 6.0, inner.rect.bottom()),
+    );
+    ui.painter()
+        .set(fill, egui::Shape::rect_filled(rect, 6.0, t.inset));
+    ui.painter().rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, t.accent_alpha(0.6)),
+        egui::StrokeKind::Inside,
     );
     focus_card(ui, t, state, e.id, rect);
     ui.add_space(6.0);
@@ -731,90 +990,14 @@ pub fn node_view(
                 });
             }
             ui.add_space(8.0);
-            let heading = if node.kind == oats_core::NodeKind::Topic {
-                None
-            } else if node.kind == oats_core::NodeKind::Category {
-                Some((
-                    "Projects",
-                    "No projects yet. The brain creates one when it files notes.",
-                ))
+            let is_project = node.kind == oats_core::NodeKind::Project;
+            if is_project {
+                next_steps(ui, &t, state, episodes, &mut out.notes);
+                project_notes(ui, &t, state, episodes, nodes, &mut out.notes);
+                children_section(ui, &t, node, &children, &mut out);
             } else {
-                Some(("Topics", ""))
-            };
-            if let Some((title, empty)) = heading
-                && (!children.is_empty() || !empty.is_empty())
-            {
-                section_label(ui, &t, title);
-                if children.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        ui.label(RichText::new(empty).color(t.text_tertiary).size(12.0));
-                    });
-                }
-                for c in &children {
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        let resp = ui.add(
-                            egui::Label::new(
-                                RichText::new(&c.name)
-                                    .font(crate::theme::font_medium(ui.ctx(), 13.0))
-                                    .color(t.accent),
-                            )
-                            .sense(Sense::click()),
-                        );
-                        if resp.clicked() {
-                            out.notes.push(NotesAction::SelectNode(c.id));
-                        }
-                        let last = c
-                            .last_activity
-                            .and_then(|ms| crate::transcript::at(ms, &Local))
-                            .map(|d| format!(" · last {}", d.format("%b %-d, %H:%M")))
-                            .unwrap_or_default();
-                        ui.label(
-                            RichText::new(format!(
-                                "{} note{}{last}",
-                                c.episodes,
-                                if c.episodes == 1 { "" } else { "s" }
-                            ))
-                            .color(t.text_tertiary)
-                            .size(11.0),
-                        );
-                    });
-                    ui.add_space(2.0);
-                }
-                ui.add_space(8.0);
-            }
-            section_label(ui, &t, "Notes");
-            if episodes.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(14.0);
-                    ui.label(
-                        RichText::new("No notes here yet.")
-                            .color(t.text_tertiary)
-                            .size(12.0),
-                    );
-                });
-            }
-            ui.add_space(4.0);
-            let mut last_day = None;
-            for e in episodes {
-                let day = day_of(e.started_at, &Local);
-                if last_day != Some(day) {
-                    last_day = Some(day);
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        ui.label(
-                            RichText::new(
-                                day.map(|d| day_heading(d, this_year))
-                                    .unwrap_or_else(|| "Unknown date".to_owned()),
-                            )
-                            .font(crate::theme::font_medium(ui.ctx(), 12.5))
-                            .color(t.text_secondary),
-                        );
-                    });
-                    ui.add_space(4.0);
-                }
-                episode_card(ui, &t, state, e, nodes, &mut out.notes, "", None);
+                children_section(ui, &t, node, &children, &mut out);
+                flat_notes(ui, &t, state, episodes, nodes, this_year, &mut out);
             }
             ui.add_space(8.0);
             let label = format!(
@@ -842,6 +1025,474 @@ pub fn node_view(
             ui.add_space(12.0);
         });
     out
+}
+
+fn children_section(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    node: &Node,
+    children: &[ChildSummary],
+    out: &mut NodeViewOut,
+) {
+    let heading = if node.kind == oats_core::NodeKind::Topic {
+        None
+    } else if node.kind == oats_core::NodeKind::Category {
+        Some((
+            "Projects",
+            "No projects yet. The brain creates one when it files notes.",
+        ))
+    } else {
+        Some(("Topics", ""))
+    };
+    if let Some((title, empty)) = heading
+        && (!children.is_empty() || !empty.is_empty())
+    {
+        section_label(ui, t, title);
+        if children.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.label(RichText::new(empty).color(t.text_tertiary).size(12.0));
+            });
+        }
+        for c in children {
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                let resp = ui.add(
+                    egui::Label::new(
+                        RichText::new(&c.name)
+                            .font(crate::theme::font_medium(ui.ctx(), 13.0))
+                            .color(t.accent),
+                    )
+                    .sense(Sense::click()),
+                );
+                if resp.clicked() {
+                    out.notes.push(NotesAction::SelectNode(c.id));
+                }
+                let last = c
+                    .last_activity
+                    .and_then(|ms| crate::transcript::at(ms, &Local))
+                    .map(|d| format!(" · last {}", d.format("%b %-d, %H:%M")))
+                    .unwrap_or_default();
+                ui.label(
+                    RichText::new(format!(
+                        "{} note{}{last}",
+                        c.episodes,
+                        if c.episodes == 1 { "" } else { "s" }
+                    ))
+                    .color(t.text_tertiary)
+                    .size(11.0),
+                );
+            });
+            ui.add_space(2.0);
+        }
+        ui.add_space(8.0);
+    }
+}
+
+fn flat_notes(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    state: &mut NotesState,
+    episodes: &[Episode],
+    nodes: &[Node],
+    this_year: i32,
+    out: &mut NodeViewOut,
+) {
+    section_label(ui, t, "Notes");
+    if episodes.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new("No notes here yet.")
+                    .color(t.text_tertiary)
+                    .size(12.0),
+            );
+        });
+    }
+    ui.add_space(4.0);
+    let mut last_day = None;
+    for e in episodes {
+        let day = day_of(e.started_at, &Local);
+        if last_day != Some(day) {
+            last_day = Some(day);
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new(
+                        day.map(|d| day_heading(d, this_year))
+                            .unwrap_or_else(|| "Unknown date".to_owned()),
+                    )
+                    .font(crate::theme::font_medium(ui.ctx(), 12.5))
+                    .color(t.text_secondary),
+                );
+            });
+            ui.add_space(4.0);
+        }
+        episode_card(ui, t, state, e, nodes, &mut out.notes, "", None);
+    }
+}
+
+/// "29 Oct" in local time.
+pub fn short_date(ms: i64) -> String {
+    crate::transcript::at(ms, &Local)
+        .map(|d| d.format("%-d %b").to_string())
+        .unwrap_or_default()
+}
+
+/// A next step on a project page: the action item and the note it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NextStep {
+    pub text: String,
+    pub owner: Option<String>,
+    pub due: Option<String>,
+    pub episode_id: i64,
+    pub episode_title: String,
+    pub started_at: i64,
+}
+
+/// The action items of `episodes` (newest first, as given; low-signal notes left out), each
+/// tagged with its source note.
+pub fn collect_next_steps(episodes: &[Episode]) -> Vec<NextStep> {
+    episodes
+        .iter()
+        .filter(|e| !e.low_signal)
+        .flat_map(|e| {
+            e.action_items.iter().map(|a| NextStep {
+                text: a.text.clone(),
+                owner: a.owner.clone(),
+                due: a.due.clone(),
+                episode_id: e.id,
+                episode_title: e.title.clone(),
+                started_at: e.started_at,
+            })
+        })
+        .collect()
+}
+
+/// A text link (accent colour, pointing hand).
+fn link(ui: &mut egui::Ui, t: &Tokens, text: &str, size: f32) -> egui::Response {
+    ui.add(egui::Label::new(RichText::new(text).color(t.accent).size(size)).sense(Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The project page's "Next steps": action items across its notes, each linking to its source.
+fn next_steps(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    state: &mut NotesState,
+    episodes: &[Episode],
+    actions: &mut Vec<NotesAction>,
+) {
+    let steps = collect_next_steps(episodes);
+    section_label(ui, t, "Next steps");
+    if steps.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new("No next steps yet")
+                    .color(t.text_tertiary)
+                    .size(12.0),
+            );
+        });
+        ui.add_space(8.0);
+        return;
+    }
+    let shown = if state.show_all_steps {
+        steps.len()
+    } else {
+        steps.len().min(NEXT_STEPS_CAP)
+    };
+    for s in &steps[..shown] {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(14.0);
+            ui.label(RichText::new("☐").color(t.text_secondary).size(12.5));
+            let mut text = s.text.clone();
+            if let Some(o) = &s.owner {
+                text.push_str(&format!(" — **{o}**"));
+            }
+            if let Some(d) = &s.due {
+                text.push_str(&format!(" (due {d})"));
+            }
+            let mut job = egui::text::LayoutJob::default();
+            for (span, bold) in bold_spans(&text) {
+                job.append(
+                    &span,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: if bold {
+                            crate::theme::font_medium(ui.ctx(), 12.5)
+                        } else {
+                            t.font(12.5)
+                        },
+                        color: t.text,
+                        ..Default::default()
+                    },
+                );
+            }
+            ui.add(egui::Label::new(job).selectable(false));
+            let src = format!("from {} · {}", s.episode_title, short_date(s.started_at));
+            if link(ui, t, &src, 11.0)
+                .on_hover_text("Show this note")
+                .clicked()
+            {
+                actions.push(NotesAction::GoToNote(s.episode_id));
+            }
+        });
+        ui.add_space(2.0);
+    }
+    if steps.len() > NEXT_STEPS_CAP {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            let label = if state.show_all_steps {
+                "Show fewer".to_owned()
+            } else {
+                format!("Show all {}", steps.len())
+            };
+            if link(ui, t, &label, 11.5).clicked() {
+                state.show_all_steps = !state.show_all_steps;
+            }
+        });
+    }
+    ui.add_space(8.0);
+}
+
+/// Mark a note open on the project page (a low-signal note also leaves its own collapse).
+fn open_note(state: &mut NotesState, e: &Episode) {
+    state.open_notes.insert(e.id);
+    if e.low_signal && !state.expanded.contains(&e.id) {
+        state.expanded.push(e.id);
+    }
+}
+
+/// The project page's "Notes": every note newest first, one dense row each (disclosure
+/// triangle, date, time range, title, topic chips); a click opens the full card inline.
+fn project_notes(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    state: &mut NotesState,
+    episodes: &[Episode],
+    nodes: &[Node],
+    actions: &mut Vec<NotesAction>,
+) {
+    // a jump to a collapsed note opens it before it is laid out
+    if let Some(f) = state.pending_focus
+        && let Some(e) = episodes.iter().find(|e| e.id == f)
+    {
+        open_note(state, e);
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        ui.label(
+            RichText::new("Notes")
+                .font(crate::theme::font_medium(ui.ctx(), 11.0))
+                .color(t.text_tertiary),
+        );
+        if !episodes.is_empty() {
+            ui.add_space(6.0);
+            if link(ui, t, "Expand all", 11.0).clicked() {
+                for e in episodes {
+                    open_note(state, e);
+                }
+            }
+            ui.label(RichText::new("·").color(t.text_tertiary).size(11.0));
+            if link(ui, t, "Collapse all", 11.0).clicked() {
+                state.open_notes.clear();
+            }
+        }
+    });
+    if episodes.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new("No notes here yet.")
+                    .color(t.text_tertiary)
+                    .size(12.0),
+            );
+        });
+    }
+    ui.add_space(2.0);
+    for e in episodes {
+        let open = state.open_notes.contains(&e.id);
+        if note_row(ui, t, e, open, actions) {
+            if open {
+                state.open_notes.remove(&e.id);
+            } else {
+                open_note(state, e);
+            }
+        }
+        if open {
+            episode_card(ui, t, state, e, nodes, actions, "", None);
+        }
+    }
+    ui.add_space(8.0);
+}
+
+/// One collapsed-note row (24 pt). `true` when the row (not a chip) was clicked.
+fn note_row(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    e: &Episode,
+    open: bool,
+    actions: &mut Vec<NotesAction>,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Note: {}", e.title))
+    });
+    if !ui.is_rect_visible(rect) {
+        return resp.clicked();
+    }
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect.shrink2(vec2(6.0, 1.0)), 4.0, t.hover);
+    }
+    let cy = rect.center().y;
+    let c = egui::pos2(rect.left() + 18.0, cy);
+    let tri = if open {
+        [
+            egui::pos2(c.x - 3.5, c.y - 2.0),
+            egui::pos2(c.x + 3.5, c.y - 2.0),
+            egui::pos2(c.x, c.y + 2.5),
+        ]
+    } else {
+        [
+            egui::pos2(c.x - 2.0, c.y - 3.5),
+            egui::pos2(c.x - 2.0, c.y + 3.5),
+            egui::pos2(c.x + 2.5, c.y),
+        ]
+    };
+    p.add(egui::Shape::convex_polygon(
+        tri.to_vec(),
+        t.text_secondary,
+        egui::Stroke::NONE,
+    ));
+    let mut x = rect.left() + 30.0;
+    let date = p.layout_no_wrap(short_date(e.started_at), t.mono(10.5), t.text_tertiary);
+    let w = date.size().x;
+    p.galley(
+        egui::pos2(x, cy - date.size().y / 2.0),
+        date,
+        t.text_tertiary,
+    );
+    x += 46.0_f32.max(w + 6.0);
+    let range = format!(
+        "{}–{}",
+        clock(e.started_at, &Local),
+        clock(e.ended_at, &Local)
+    );
+    let range = p.layout_no_wrap(range, t.mono(10.5), t.text_tertiary);
+    let w = range.size().x;
+    p.galley(
+        egui::pos2(x, cy - range.size().y / 2.0),
+        range,
+        t.text_tertiary,
+    );
+    x += w + 10.0;
+    // chips from the right edge, as many as fit in a third of the row
+    let topics: Vec<&String> = e.topics.iter().take(3).collect();
+    let budget = (rect.width() / 3.0).max(60.0);
+    let mut chips_w = 0.0_f32;
+    let mut fit = 0;
+    for tp in &topics {
+        let w = p
+            .layout_no_wrap((*tp).clone(), t.font(10.5), t.text_secondary)
+            .size()
+            .x
+            + 12.0
+            + 4.0;
+        if chips_w + w > budget {
+            break;
+        }
+        chips_w += w;
+        fit += 1;
+    }
+    let chips_left = rect.right() - 14.0 - chips_w;
+    let title_col = if e.low_signal {
+        t.text_tertiary
+    } else {
+        t.text
+    };
+    let title = p.layout_no_wrap(
+        e.title.clone(),
+        crate::theme::font_medium(ui.ctx(), 12.5),
+        title_col,
+    );
+    let clip = Rect::from_min_max(
+        egui::pos2(x, rect.top()),
+        egui::pos2((chips_left - 8.0).max(x), rect.bottom()),
+    );
+    p.with_clip_rect(clip)
+        .galley(egui::pos2(x, cy - title.size().y / 2.0), title, title_col);
+    if fit > 0 {
+        let chips_rect = Rect::from_min_max(
+            egui::pos2(chips_left, rect.top()),
+            egui::pos2(rect.right() - 14.0, rect.bottom()),
+        );
+        let mut cui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(chips_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        cui.spacing_mut().item_spacing.x = 4.0;
+        for tp in topics.into_iter().take(fit) {
+            if topic_chip(&mut cui, t, tp)
+                .on_hover_text(format!("Show everything tagged “{tp}”"))
+                .clicked()
+            {
+                actions.push(NotesAction::OpenTopic(tp.clone()));
+            }
+        }
+    }
+    resp.clicked()
+}
+
+/// The single-note view: a breadcrumb ("Work › Commerce project › 29 Oct", the node names
+/// clickable) over the note's full card.
+pub fn episode_view(
+    ui: &mut egui::Ui,
+    state: &mut NotesState,
+    e: &Episode,
+    nodes: &[Node],
+) -> Vec<NotesAction> {
+    let t = Tokens::get(ui.ctx());
+    let mut actions = Vec::new();
+    let mut chain = Vec::new();
+    let mut cur = e.node_id.and_then(|n| nodes.iter().find(|x| x.id == n));
+    while let Some(n) = cur {
+        chain.push((n.id, n.name.clone()));
+        cur = n.parent_id.and_then(|p| nodes.iter().find(|x| x.id == p));
+        if chain.len() > 8 {
+            break;
+        }
+    }
+    chain.reverse();
+    egui::ScrollArea::vertical()
+        .id_salt("episode-scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(14.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (id, name) in &chain {
+                    if link(ui, &t, name, 12.5).clicked() {
+                        actions.push(NotesAction::SelectNode(*id));
+                    }
+                    ui.label(RichText::new("›").color(t.text_tertiary).size(12.5));
+                }
+                ui.label(
+                    RichText::new(short_date(e.started_at))
+                        .color(t.text_secondary)
+                        .size(12.5),
+                );
+            });
+            ui.add_space(8.0);
+            episode_card(ui, &t, state, e, nodes, &mut actions, "", None);
+            ui.add_space(12.0);
+        });
+    actions
 }
 
 fn section_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {

@@ -7,6 +7,7 @@
 //! ~0 % CPU.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::mpsc;
 
 use egui::{Key, KeyboardShortcut, Modifiers, Rect, Sense, pos2, vec2};
@@ -20,9 +21,12 @@ use oats_status::{StatusAction, StatusItem, StatusState};
 
 use crate::calendar::{CalendarAction, CalendarState, calendar_view};
 use crate::menu_events::MenuEvents;
-use crate::notes::{BrainStatus, NotesAction, NotesState, node_view, notes_view};
+use crate::notes::{BrainStatus, NotesAction, NotesState, episode_view, node_view, notes_view};
 use crate::search::{BAR_H, SEARCH_LIMIT, SearchAction, SearchState, search_bar, search_results};
-use crate::sidebar::{HeaderIcon, SidebarAction, SidebarState, header_icon, sidebar_panel};
+use crate::sidebar::{
+    HeaderIcon, SIDEBAR_EPISODES, SidebarAction, SidebarEpisode, SidebarState, header_icon,
+    sidebar_panel,
+};
 use crate::theme::Tokens;
 use crate::toast::{Confirmation, ToastAction, ToastState, toasts};
 use crate::todos::{TodoAction, TodosState, todos_view};
@@ -50,6 +54,8 @@ pub struct AppPrefs {
     pub capture_system: bool,
     /// Play a short ding when a voice command created something.
     pub command_sound: bool,
+    /// Projects whose sidebar layer (recent notes) is open; closed by default.
+    pub sidebar_episodes_open: Vec<i64>,
 }
 
 impl Default for AppPrefs {
@@ -61,6 +67,7 @@ impl Default for AppPrefs {
             listening: false,
             capture_system: true,
             command_sound: true,
+            sidebar_episodes_open: Vec::new(),
         }
     }
 }
@@ -368,6 +375,10 @@ pub struct OatsApp {
     /// Start listening as soon as the engine reports Idle (prefs said we were listening).
     auto_listen: bool,
     sidebar: SidebarState,
+    /// The notes listed under each project in the sidebar (newest first).
+    sidebar_episodes: HashMap<i64, Vec<SidebarEpisode>>,
+    /// The single-note view: this note of the viewed node, instead of the node's page.
+    focus_episode: Option<i64>,
     /// The Preferences window, when open.
     prefs_window: Option<PrefsWindow>,
     /// The search bar and its results, while open (the view underneath is untouched, so
@@ -424,6 +435,7 @@ impl OatsApp {
             (status.is_some() || options.native_menu).then(|| MenuEvents::install(&cc.egui_ctx));
         #[cfg(not(target_os = "macos"))]
         let menu_events = None;
+        let sidebar_open = prefs.sidebar_episodes_open.iter().copied().collect();
         let mut app = OatsApp {
             pipeline,
             audio,
@@ -460,7 +472,12 @@ impl OatsApp {
             transcript_focus: TranscriptFocus::default(),
             chime: Box::new(|| {}),
             warning: None,
-            sidebar: SidebarState::default(),
+            sidebar: SidebarState {
+                episodes_open: sidebar_open,
+                ..SidebarState::default()
+            },
+            sidebar_episodes: HashMap::new(),
+            focus_episode: None,
             prefs_window: None,
             search: None,
             topic: None,
@@ -793,6 +810,16 @@ impl OatsApp {
         self.topic.is_some()
     }
 
+    /// The note shown alone (the single-note view), if any.
+    pub fn focus_episode(&self) -> Option<i64> {
+        self.focus_episode
+    }
+
+    /// Notes expanded on the project page.
+    pub fn open_notes(&self) -> &std::collections::HashSet<i64> {
+        &self.notes_state.open_notes
+    }
+
     /// The episode the notes list will scroll to and flash when it lays its card out.
     pub fn pending_focus(&self) -> Option<i64> {
         self.notes_state.pending_focus
@@ -819,6 +846,7 @@ impl OatsApp {
     /// which flashes. The card consumes `pending_focus` when it is laid out.
     fn jump_to_episode(&mut self, id: i64, node: Option<i64>) {
         self.topic = None;
+        self.focus_episode = None;
         self.notes_state.pending_focus = Some(id);
         match node.filter(|n| self.nodes.iter().any(|x| x.id == *n)) {
             Some(n) => self.set_view(View::Node(n)),
@@ -845,7 +873,10 @@ impl OatsApp {
     fn set_view(&mut self, view: View) {
         if self.prefs.view != view {
             self.prefs.view = view;
+            self.focus_episode = None;
+            self.notes_state.editing = None;
             self.notes_state.show_transcript = false;
+            self.notes_state.show_all_steps = false;
             self.reload_rows();
             self.reload_brain_data();
         }
@@ -916,8 +947,40 @@ impl OatsApp {
         {
             self.prefs.view = View::Today;
         }
+        self.reload_sidebar_episodes();
         self.reload_rows();
         self.reload_brain_data();
+    }
+
+    /// The last [`SIDEBAR_EPISODES`] notes (low-signal ones left out) of every project.
+    fn reload_sidebar_episodes(&mut self) {
+        let mut map = HashMap::new();
+        for n in self
+            .nodes
+            .iter()
+            .filter(|n| n.kind == oats_core::NodeKind::Project && !n.archived)
+        {
+            match self.store.episodes_under(n.id, 40) {
+                Ok(eps) => {
+                    let list: Vec<SidebarEpisode> = eps
+                        .into_iter()
+                        .filter(|e| !e.low_signal)
+                        .take(SIDEBAR_EPISODES)
+                        .map(|e| SidebarEpisode {
+                            id: e.id,
+                            title: e.title,
+                            started_at: e.started_at,
+                        })
+                        .collect();
+                    map.insert(n.id, list);
+                }
+                Err(e) => {
+                    self.store_error(e);
+                    return;
+                }
+            }
+        }
+        self.sidebar_episodes = map;
     }
 
     fn reload_rows(&mut self) {
@@ -1317,7 +1380,22 @@ impl OatsApp {
         let mut changed = false;
         for a in actions {
             match a {
-                SidebarAction::Select(v) => self.set_view(v),
+                SidebarAction::Select(v) => {
+                    // the project's own row returns from a single note to its page
+                    self.focus_episode = None;
+                    self.set_view(v);
+                }
+                SidebarAction::SelectEpisode(id, node) => {
+                    self.topic = None;
+                    self.set_view(View::Node(node));
+                    self.notes_state.editing = None;
+                    self.focus_episode = Some(id);
+                }
+                SidebarAction::EpisodesToggled => {
+                    let mut open: Vec<i64> = self.sidebar.episodes_open.iter().copied().collect();
+                    open.sort_unstable();
+                    self.prefs.sidebar_episodes_open = open;
+                }
                 SidebarAction::ToggleSidebar => cmds.push(Command::ToggleSidebar),
                 SidebarAction::Add(name) => match self.store.add_category(&name) {
                     Ok(_) => changed = true,
@@ -1369,7 +1447,22 @@ impl OatsApp {
                 NotesAction::Reorganise => self.run(Command::Reorganise),
                 NotesAction::Reinterpret(id) => self.brain_send(BrainCommand::Reinterpret(id)),
                 NotesAction::Undo(id) => self.brain_send(BrainCommand::UndoChange(id)),
-                NotesAction::SelectNode(id) => self.set_view(View::Node(id)),
+                NotesAction::SelectNode(id) => {
+                    self.focus_episode = None;
+                    self.set_view(View::Node(id));
+                }
+                NotesAction::GoToNote(id) => {
+                    self.focus_episode = None;
+                    self.topic = None;
+                    self.notes_state.pending_focus = Some(id);
+                }
+                NotesAction::SaveEdit(id, content) => {
+                    let now = chrono::Local::now().timestamp_millis();
+                    match self.store.update_episode_content(id, &content, now) {
+                        Ok(()) => self.reload(),
+                        Err(e) => self.store_error(e),
+                    }
+                }
                 NotesAction::OpenTopic(topic) => self.open_topic(topic),
             }
         }
@@ -1757,6 +1850,30 @@ impl OatsApp {
         true
     }
 
+    /// Show a node's page (a test hook for `View::Node`).
+    pub fn selftest_view_node(&mut self, id: i64) {
+        self.set_view(View::Node(id));
+    }
+
+    /// Open a project's sidebar layer (its recent notes), as the triangle does.
+    pub fn open_project_layer(&mut self, id: i64) {
+        self.sidebar.episodes_open.insert(id);
+    }
+
+    /// Selftest only: open a project's sidebar layer.
+    pub(crate) fn selftest_open_project_layer(&mut self, name: &str) {
+        if let Some(id) = self.nodes.iter().find(|n| n.name == name).map(|n| n.id) {
+            self.sidebar.episodes_open.insert(id);
+        }
+    }
+
+    /// Selftest only: expand every note on the project page.
+    pub(crate) fn selftest_expand_notes(&mut self) {
+        for e in &self.episodes {
+            self.notes_state.open_notes.insert(e.id);
+        }
+    }
+
     /// Selftest only: open the search bar with this query already run.
     pub(crate) fn selftest_search(&mut self, query: &str) {
         self.run(Command::Search);
@@ -1831,6 +1948,15 @@ impl eframe::App for OatsApp {
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
         {
             self.close_topic();
+        } else if self.focus_episode.is_some()
+            && self.search.is_none()
+            && self.topic.is_none()
+            && self.prefs_window.is_none()
+            && self.notes_state.editing.is_none()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            // back from a single note to its project's page
+            self.focus_episode = None;
         }
 
         if !self.has_native_menu() {
@@ -1862,8 +1988,14 @@ impl eframe::App for OatsApp {
                         .inner_margin(egui::Margin::symmetric(6, 6)),
                 )
                 .show(ui, |ui| {
-                    sidebar_actions =
-                        sidebar_panel(ui, &mut self.sidebar, self.prefs.view, &self.nodes);
+                    sidebar_actions = sidebar_panel(
+                        ui,
+                        &mut self.sidebar,
+                        self.prefs.view,
+                        &self.nodes,
+                        &self.sidebar_episodes,
+                        self.focus_episode,
+                    );
                 });
             let w = resp.response.rect.width();
             if (w - self.prefs.sidebar_width).abs() > 0.5 {
@@ -2009,7 +2141,17 @@ impl eframe::App for OatsApp {
                             );
                         }
                         View::Node(id) if self.nodes.iter().any(|n| n.id == id) => {
-                            if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
+                            let focus = self
+                                .focus_episode
+                                .and_then(|f| self.episodes.iter().find(|e| e.id == f));
+                            if let Some(e) = focus {
+                                notes_actions = episode_view(
+                                    &mut list_ui,
+                                    &mut self.notes_state,
+                                    e,
+                                    &self.nodes,
+                                );
+                            } else if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
                                 let out = node_view(
                                     &mut list_ui,
                                     &mut self.notes_state,
@@ -2075,7 +2217,6 @@ impl eframe::App for OatsApp {
 mod tests {
     use super::*;
     use eframe::Storage as _;
-    use std::collections::HashMap;
 
     #[derive(Default)]
     struct MemStorage(HashMap<String, String>);
@@ -2103,6 +2244,7 @@ mod tests {
             listening: true,
             capture_system: false,
             command_sound: false,
+            sidebar_episodes_open: vec![3, 9],
         };
         prefs.store(&mut s);
         assert_eq!(AppPrefs::load(&s), prefs);

@@ -5,10 +5,10 @@
 //! a category; right-click → Rename / Delete with an inline rename. Selecting a node shows
 //! its notes (see `notes::node_view`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use egui::{Key, Rect, Sense, Stroke, pos2, vec2};
-use oats_core::{Node, View};
+use oats_core::{Node, NodeKind, View};
 
 use crate::app::{Command, with_shortcut};
 use crate::theme::Tokens;
@@ -24,12 +24,30 @@ pub struct SidebarState {
     pub focus: bool,
     /// Nodes whose children are hidden.
     pub collapsed: HashSet<i64>,
+    /// Projects whose layer (recent notes, then topics) is open; closed by default. The app
+    /// mirrors this into `AppPrefs::sidebar_episodes_open` when it changes.
+    pub episodes_open: HashSet<i64>,
 }
+
+/// One note listed under a project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarEpisode {
+    pub id: i64,
+    pub title: String,
+    pub started_at: i64,
+}
+
+/// How many notes a project lists in the sidebar.
+pub const SIDEBAR_EPISODES: usize = 5;
 
 /// What the user did in the sidebar this frame.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SidebarAction {
     Select(View),
+    /// A note under a project: `(episode, project)`.
+    SelectEpisode(i64, i64),
+    /// A project's layer was opened or closed (the app persists it).
+    EpisodesToggled,
     Add(String),
     Rename(i64, String),
     Delete(i64),
@@ -72,6 +90,8 @@ pub fn sidebar_panel(
     state: &mut SidebarState,
     view: View,
     nodes: &[Node],
+    episodes: &HashMap<i64, Vec<SidebarEpisode>>,
+    focus_episode: Option<i64>,
 ) -> Vec<SidebarAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
@@ -132,7 +152,14 @@ pub fn sidebar_panel(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let rows = visible_rows(nodes, &state.collapsed);
+            // a project folds with its notes layer (closed by default), not with `collapsed`
+            let mut folded = state.collapsed.clone();
+            for n in nodes {
+                if n.kind == NodeKind::Project && !state.episodes_open.contains(&n.id) {
+                    folded.insert(n.id);
+                }
+            }
+            let rows = visible_rows(nodes, &folded);
             let mut toggle: Option<i64> = None;
             for (n, depth) in rows {
                 if let Some((id, text)) = &mut state.renaming
@@ -152,9 +179,16 @@ pub fn sidebar_panel(
                     }
                     continue;
                 }
-                let disclosure =
-                    has_children(nodes, n.id).then_some(!state.collapsed.contains(&n.id));
-                let resp = hover_row(ui, &t, &n.name, view == View::Node(n.id), depth, disclosure);
+                let is_project = n.kind == NodeKind::Project;
+                let project_eps = episodes.get(&n.id).map_or(&[][..], Vec::as_slice);
+                let disclosure = if is_project {
+                    (has_children(nodes, n.id) || !project_eps.is_empty())
+                        .then_some(state.episodes_open.contains(&n.id))
+                } else {
+                    has_children(nodes, n.id).then_some(!state.collapsed.contains(&n.id))
+                };
+                let selected = view == View::Node(n.id) && focus_episode.is_none();
+                let resp = hover_row(ui, &t, &n.name, selected, depth, disclosure);
                 if resp.clicked() {
                     // a click on the triangle folds; anywhere else selects
                     let on_triangle = disclosure.is_some()
@@ -181,11 +215,11 @@ pub fn sidebar_panel(
                         ui.close();
                     }
                     if disclosure.is_some() {
-                        let label = if state.collapsed.contains(&n.id) {
-                            "Expand"
-                        } else {
-                            "Collapse"
+                        let closed = match disclosure {
+                            Some(open) => !open,
+                            None => false,
                         };
+                        let label = if closed { "Expand" } else { "Collapse" };
                         if ui.button(label).clicked() {
                             toggle = Some(n.id);
                             ui.close();
@@ -199,11 +233,27 @@ pub fn sidebar_panel(
                 if n.parent_id.is_none() && !has_children(nodes, n.id) {
                     empty_row(ui, &t, "No projects yet");
                 }
+                if is_project && state.episodes_open.contains(&n.id) {
+                    for ep in project_eps {
+                        let r = episode_row(ui, &t, ep, focus_episode == Some(ep.id), depth + 1);
+                        if r.clicked() {
+                            actions.push(SidebarAction::SelectEpisode(ep.id, n.id));
+                        }
+                    }
+                }
             }
-            if let Some(id) = toggle
-                && !state.collapsed.remove(&id)
-            {
-                state.collapsed.insert(id);
+            if let Some(id) = toggle {
+                let is_project = nodes
+                    .iter()
+                    .any(|n| n.id == id && n.kind == NodeKind::Project);
+                if is_project {
+                    if !state.episodes_open.remove(&id) {
+                        state.episodes_open.insert(id);
+                    }
+                    actions.push(SidebarAction::EpisodesToggled);
+                } else if !state.collapsed.remove(&id) {
+                    state.collapsed.insert(id);
+                }
             }
             if let Some(text) = &mut state.adding {
                 match inline_field(ui, text, &mut state.focus) {
@@ -234,6 +284,59 @@ fn empty_row(ui: &mut egui::Ui, t: &Tokens, label: &str) {
             t.text_tertiary,
         );
     }
+}
+
+/// A note under a project: a 22 pt row, the title clipped to the column (full title and date
+/// in the tooltip), the date ("29 Oct") right-aligned in the tertiary colour.
+fn episode_row(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    ep: &SidebarEpisode,
+    selected: bool,
+    depth: usize,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::click());
+    let date = crate::notes::short_date(ep.started_at);
+    let resp = resp.on_hover_text(format!("{} · {date}", ep.title));
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            format!("Note: {}", ep.title),
+        )
+    });
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let p = ui.painter();
+    let fill_rect = rect.shrink2(vec2(2.0, 1.0));
+    if selected {
+        p.rect_filled(fill_rect, 4.0, t.accent_alpha(0.35));
+    } else if resp.hovered() {
+        p.rect_filled(fill_rect, 4.0, t.hover);
+    }
+    let text_x = 12.0 + depth as f32 * 14.0 + 12.0;
+    let d = p.layout_no_wrap(date, t.font(10.5), t.text_tertiary);
+    let dw = d.size().x;
+    p.galley(
+        pos2(rect.right() - 8.0 - dw, rect.center().y - d.size().y / 2.0),
+        d,
+        t.text_tertiary,
+    );
+    let galley = p.layout_no_wrap(ep.title.clone(), t.font(12.0), t.text_secondary);
+    let clip = Rect::from_min_max(
+        pos2(rect.left() + text_x, rect.top()),
+        pos2(rect.right() - 8.0 - dw - 6.0, rect.bottom()),
+    );
+    p.with_clip_rect(clip).galley(
+        pos2(
+            rect.left() + text_x,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        t.text_secondary,
+    );
+    resp
 }
 
 fn group_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {

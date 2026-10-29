@@ -53,6 +53,34 @@ All transcripts stay transcript views; Notes shows every episode. The sidebar sh
 "No projects yet" row under a category without projects. `--selftest out.png --work` renders
 the Work view offscreen.
 
+**Project landing page** (`node_view` for `kind == project`): header, then "Next steps" — the
+action items of the project's episodes (newest note first, low-signal notes skipped, capped at
+`NEXT_STEPS_CAP` = 12 with "Show all N"), each with owner/due and a "from <note> · <date>"
+link (`NotesAction::GoToNote` → `pending_focus` + flash, staying on the page; a collapsed
+target is opened first); "No next steps yet" when empty. Then "Notes": every note NEWEST FIRST
+(the rest of the app is newest first), one collapsed 24 pt row each (triangle, date, time range,
+title, topic chips); a click toggles the full `episode_card` inline (`NotesState::open_notes`,
+not persisted; "Expand all · Collapse all"). Topics and the transcript toggle follow.
+Categories and topics keep the flat view.
+
+**Sidebar notes layer**: a project's row has a triangle (closed by default, persisted as
+`AppPrefs::sidebar_episodes_open`) listing its last `SIDEBAR_EPISODES` = 5 non-low-signal notes
+(newest first, 22 pt rows: truncated title, "29 Oct" at the right), then its topics (the
+triangle now folds both). Clicking one sets `OatsApp::focus_episode` (a UI mode, not a `View`):
+`notes::episode_view` shows that note's card under a breadcrumb "Work › Commerce project ›
+29 Oct" (node names are links). Escape, the project's sidebar row, any other navigation, or a
+breadcrumb link returns to the project page. `--selftest out.png --project [--expanded]`.
+
+**Editing notes**: every card has Edit next to Re-interpret. Edit mode (`notes::edit_card`)
+shows title, summary (markdown source), decisions (one per line), action items (one per line,
+`text | owner | due`, parsed leniently) and topics (comma separated); Save (⌘S) sends
+`NotesAction::SaveEdit` → `Store::update_episode_content`, Cancel / Escape discards. A saved
+note carries an "edited" chip. Schema v5: `episodes.user_edited_at` (added in place on open).
+The brain never rewrites such a note: `interpret_chunk` does not pick an edited episode as the
+prior to revise (the new speech becomes its own episode), `apply_interpretation` ignores an
+edited prior, and the review never merges an edited episode away; node re-filing, low-signal
+marks and events still apply. "Re-interpret" on an edited note first asks "Replace your edits?".
+
 ## The status item (`crates/oats-status/src/lib.rs`)
 
 `StatusItem`: `update(&StatusState)` (listening, enabled, tooltip; called only on change),
@@ -504,7 +532,7 @@ nested transaction (`Store::with_savepoint`; outermost `BEGIN IMMEDIATE`, inner 
 `SAVEPOINT`, rolled back on error or panic). `episodes.id` is `AUTOINCREMENT` (an older table
 is rebuilt in place on open, same schema version), so a reset or merged episode's id is never
 handed to a later episode that would adopt its events.
-Schema version 4 (`meta.schema_version`; a v1 file is migrated on open — `categories` become
+Schema version 5 (`meta.schema_version`; v5 added `episodes.user_edited_at`; a v1 file is migrated on open — `categories` become
 the root `nodes` with the same ids, `segments` is rebuilt — a v2 file gets two columns
 in place, `segments.source TEXT NOT NULL DEFAULT 'mic'` and `segments.echo_of INTEGER NULL`,
 and a v3 file's `reminders` table is rebuilt as the todos, same ids, by

@@ -553,6 +553,9 @@ fn apply_interpretation_in_tx(
     max_new_nodes: usize,
     now_ms: i64,
 ) -> Result<Applied, StoreError> {
+    // a note the user edited by hand is never content-revised: the interpretation is written
+    // as a new episode instead (the scheduler already avoids picking one as the prior)
+    let prior = prior.filter(|p| p.user_edited_at.is_none());
     let (node_id, new_nodes) = resolve_node(store, tree, interp, max_new_nodes)?;
     for n in &new_nodes {
         store.record_change(
@@ -955,6 +958,10 @@ pub fn apply_review(
                 let (Some(f), Some(i)) = (ep(from), ep(into)) else {
                     continue;
                 };
+                // merging deletes `from`: a note the user edited by hand is never merged away
+                if f.user_edited_at.is_some() {
+                    continue;
+                }
                 store.merge_episodes(from, into)?;
                 gone.push(from);
                 let d = format!("Merged episode '{}' into '{}' — {reason}", f.title, i.title);
@@ -1531,6 +1538,7 @@ mod tests {
             revision: 1,
             created_at: 0,
             last_revised_at: 0,
+            user_edited_at: None,
         };
         let req = interpret_request(&tree, &chunk, Some(&prior), &now, None);
         assert!(req.user_prompt.contains("Previous interpretation"));

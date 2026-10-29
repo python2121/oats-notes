@@ -1496,6 +1496,9 @@ impl Worker {
             .map_err(|e| e.to_string())?
             .into_iter()
             .filter(|e| chunk.started_at - e.ended_at <= gap)
+            // a note the user edited by hand is never content-revised: what follows it becomes
+            // an episode of its own
+            .filter(|e| e.user_edited_at.is_none())
             .max_by_key(|e| e.ended_at);
         let mut prior = None;
         let mut full = chunk.clone();
@@ -2115,6 +2118,60 @@ esac
             "First part"
         );
         assert_eq!(w.store.episodes(10).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hand_edited_episode_is_not_revised_by_its_continuation() {
+        let dir = temp_dir("edited");
+        let ok = r#"{"type":"result","is_error":false,"result":"","total_cost_usd":0.01,"structured_output":{"title":"Model title","summary":"model summary","low_signal":false,"node_id":null,"new_project":null,"new_topic":null,"decisions":[],"action_items":[],"topics":[],"events":[]}}"#;
+        let mut w = bare_worker(script_cli(&dir, &format!("echo '{ok}'")));
+        let sid = w.store.begin_session(0, "e").unwrap();
+        let t = now_ms() - 86_400_000;
+        let a = w
+            .store
+            .insert_segment(sid, t, t + 5_000, LONG_TEXT, None)
+            .unwrap();
+        let mine = w
+            .store
+            .insert_episode(
+                t,
+                t + 5_000,
+                &EpisodeContent {
+                    title: "Mine".into(),
+                    summary: "my careful summary".into(),
+                    ..Default::default()
+                },
+                t,
+            )
+            .unwrap();
+        w.store
+            .mark_segments_interpreted(&[a.id], mine.id, t)
+            .unwrap();
+        w.store
+            .update_episode_content(
+                mine.id,
+                &EpisodeContent {
+                    title: "Mine".into(),
+                    summary: "my careful summary".into(),
+                    ..Default::default()
+                },
+                t + 1,
+            )
+            .unwrap();
+        // speech right after it: without the edit this would REVISE `mine`
+        w.store
+            .insert_segment(sid, t + 6_000, t + 11_000, LONG_TEXT, None)
+            .unwrap();
+        w.run_interpret(false);
+        let kept = w.store.episode(mine.id).unwrap().unwrap();
+        assert_eq!(
+            (kept.title.as_str(), kept.summary.as_str(), kept.revision),
+            ("Mine", "my careful summary", 1)
+        );
+        let all = w.store.episodes(10).unwrap();
+        assert_eq!(all.len(), 2, "the continuation became its own episode");
+        assert!(all.iter().any(|e| e.summary == "model summary"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
