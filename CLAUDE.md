@@ -374,7 +374,14 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   `Offline` (connection / DNS errors), `Refused`, `Timeout`, `Exit` (model text is never
   classified). `CliError::unavailable_reason()` says which mean "claude as a whole is down".
 - `episodes`: pure cut of segments into episodes — a gap > 10 min starts a new one, capped at
-  3 h / 400 segments. System audio is a continuity signal: in a chunk that already has system
+  3 h / 400 segments. Calls bound episodes (`episodes::cut`): the first system segment stamped
+  `meeting` after anything that is not that call starts a new episode at its start, and mic
+  segments up to 2 min before it join it (the user joining); a call ends when 3 min pass with
+  no meeting-stamped system segment while other speech continues (that speech starts a new
+  episode); two different calls (`media_ref`; the row carries no app) back to back are two
+  episodes. The scheduler revises an open episode only when prior + new segments still cut as
+  ONE chunk, so a call is revised only by its own call and speech after it never revises it.
+  Media is never merged with conversation. System audio is a continuity signal: in a chunk that already has system
   segments, a further system segment continues it across up to twice the gap (calls pause).
   Echoes never take part. `render_transcript` writes `[HH:MM] me: …` / `[HH:MM] them: …`
   (mic / system; echoes left out); the categorise prompt uses the same prefixes.

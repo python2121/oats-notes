@@ -1695,7 +1695,15 @@ impl Worker {
                 .map_err(|e| e.to_string())?;
             // media continues only the same media, a conversation only a conversation
             let same_kind = episodes::media_key_of(&segs) == chunk.media_key();
+            // a call is revised only by the same call: the joined run must still cut as one
+            // episode (speech after the call ended, or another call, starts its own)
+            let joined_one = {
+                let mut all = segs.clone();
+                all.extend(chunk.segments.iter().cloned());
+                cut(&all, &rule).len() == 1
+            };
             if same_kind
+                && joined_one
                 && segs.len() + chunk.segments.len() <= rule.max_segments
                 && chunk.ended_at - p.started_at.min(chunk.started_at) <= max_len
             {

@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use oats_brain::episodes::{Chunk, EpisodeRule, cut, render_transcript};
-use oats_core::TranscriptRow;
+use oats_core::{AudioSourceKind, MediaClass, TranscriptRow};
 
 fn row(id: i64, start_ms: i64, end_ms: i64) -> TranscriptRow {
     TranscriptRow {
@@ -148,4 +148,78 @@ fn renders_one_line_per_segment_trimmed() {
         "[01:00] me: padded text\n[01:01] me: s2\n"
     );
     assert_eq!(render_transcript(&[], &tz), "");
+}
+
+// ---- meetings bound episodes ------------------------------------------------------------
+
+const MIN: i64 = 60_000;
+
+fn mic(id: i64, at_min: i64) -> TranscriptRow {
+    row(id, at_min * MIN, at_min * MIN + 5_000)
+}
+
+fn call(id: i64, at_min: i64, url: &str) -> TranscriptRow {
+    TranscriptRow {
+        source: AudioSourceKind::System,
+        media_kind: Some(MediaClass::Meeting),
+        media_ref: Some(url.into()),
+        ..row(id, at_min * MIN, at_min * MIN + 5_000)
+    }
+}
+
+#[test]
+fn a_call_starting_inside_a_run_of_speech_starts_its_own_episode() {
+    // 14:08..14:29 room speech every 3 min, then the call 14:30..14:58
+    let mut rows: Vec<TranscriptRow> = (0..8).map(|i| mic(i, i * 3)).collect(); // 0..21
+    rows.extend((0..10).map(|i| call(100 + i, 30 + i * 3, "https://meet/a")));
+    let chunks = cut(&rows, &rule());
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].segment_ids(), (0..8).collect::<Vec<_>>());
+    assert_eq!(chunks[1].started_at, 30 * MIN);
+    assert_eq!(chunks[1].meeting_key().as_deref(), Some("https://meet/a"));
+    assert_eq!(chunks[0].meeting_key(), None);
+}
+
+#[test]
+fn a_lead_in_of_mic_speech_joins_the_call() {
+    let rows = [
+        mic(1, 22),
+        mic(2, 27), // 3 min before: stays out
+        mic(3, 29), // 1 min before: lead-in
+        call(4, 30, "https://meet/a"),
+        mic(5, 31),
+    ];
+    let chunks = cut(&rows, &rule());
+    assert_eq!(ids(&chunks), vec![vec![1, 2], vec![3, 4, 5]]);
+    assert_eq!(chunks[1].started_at, 29 * MIN);
+    // only lead-in: the earlier episode vanishes rather than staying empty
+    let only = [mic(1, 29), call(2, 30, "u")];
+    assert_eq!(ids(&cut(&only, &rule())), vec![vec![1, 2]]);
+}
+
+#[test]
+fn room_talk_after_the_call_is_a_new_episode() {
+    let rows = [
+        call(1, 0, "u"),
+        mic(2, 2),
+        call(3, 4, "u"),
+        mic(4, 6), // 2 min after the last call segment: still the call
+        mic(5, 8), // 4 min after: the call is over
+        mic(6, 9),
+    ];
+    let chunks = cut(&rows, &rule());
+    assert_eq!(ids(&chunks), vec![vec![1, 2, 3, 4], vec![5, 6]]);
+    assert_eq!(chunks[1].meeting_key(), None);
+}
+
+#[test]
+fn two_different_calls_are_two_episodes() {
+    let rows = [call(1, 0, "https://meet/a"), call(2, 1, "https://meet/b")];
+    assert_eq!(ids(&cut(&rows, &rule())), vec![vec![1], vec![2]]);
+}
+
+#[test]
+fn a_pause_inside_a_call_does_not_split() {
+    let rows = [call(1, 0, "u"), call(2, 9, "u"), call(3, 18, "u")];
+    assert_eq!(ids(&cut(&rows, &rule())), vec![vec![1, 2, 3]]);
 }

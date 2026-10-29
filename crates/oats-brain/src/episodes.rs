@@ -9,6 +9,11 @@
 //! of up to twice the gap (calls have long pauses — someone shares a screen, reads, looks
 //! something up). Microphone echoes of system audio (`echo_of`) never take part.
 //!
+//! Calls bound episodes: the first system segment stamped `meeting` (after speech that is not
+//! that call) starts an episode, with the user's mic speech from up to 2 min before it; a call
+//! ends when 3 min pass without a meeting-stamped segment while other speech continues; two
+//! different calls (tab URL) back to back are two episodes.
+//!
 //! Media (system segments stamped YouTube / music, see [`oats_core::MediaClass::is_media`]) is
 //! never mixed with conversation: a change between media and not-media — or from one video
 //! to another — starts a new chunk, so a media episode is one video / one stream. Media
@@ -104,6 +109,11 @@ impl Chunk {
         media_key_of(&self.segments)
     }
 
+    /// The call this chunk is (see [`meeting_key_of`]).
+    pub fn meeting_key(&self) -> Option<String> {
+        meeting_key_of(&self.segments)
+    }
+
     /// A system segment of the chunk was heard during a known call (Zoom, Meet, …).
     pub fn has_known_meeting(&self) -> bool {
         self.segments.iter().any(|s| {
@@ -112,7 +122,34 @@ impl Chunk {
     }
 }
 
-/// Group `rows` (any order; sorted here) into chunks by the rule.
+/// A mic segment this close before a meeting's first segment is the user joining the call.
+const MEETING_LEAD_IN_MS: i64 = 2 * 60 * 1000;
+/// A meeting is over once no meeting-stamped system segment has been heard for this long while
+/// other speech goes on.
+const MEETING_END_MS: i64 = 3 * 60 * 1000;
+
+/// A system segment stamped as a call: which meeting it is (the tab URL, else empty — the app
+/// is not on the row).
+pub fn meeting_key(r: &TranscriptRow) -> Option<String> {
+    (r.source == AudioSourceKind::System && r.media_kind == Some(MediaClass::Meeting))
+        .then(|| r.media_ref.clone().unwrap_or_default())
+}
+
+/// The meeting a run of segments belongs to: the key of its first meeting-stamped segment.
+pub fn meeting_key_of(rows: &[TranscriptRow]) -> Option<String> {
+    rows.iter()
+        .filter(|r| r.echo_of.is_none())
+        .find_map(meeting_key)
+}
+
+/// A chunk plus what the cutter tracks about its meeting: (key, end of the last meeting segment).
+type Open = Option<(String, i64)>;
+
+/// Group `rows` (any order; sorted here) into chunks by the rule. Besides the gap and the caps,
+/// meetings bound episodes: the first segment stamped as a call (after anything that is not
+/// that call) starts an episode, with mic speech from up to two minutes before it; a call ends
+/// once other speech continues three minutes past its last stamped segment; two different
+/// calls are two episodes.
 pub fn cut(rows: &[TranscriptRow], rule: &EpisodeRule) -> Vec<Chunk> {
     let mut rows: Vec<TranscriptRow> = rows
         .iter()
@@ -123,10 +160,13 @@ pub fn cut(rows: &[TranscriptRow], rule: &EpisodeRule) -> Vec<Chunk> {
     let gap = rule.gap.as_millis() as i64;
     let max_len = rule.max_len.as_millis() as i64;
     let mut out: Vec<Chunk> = Vec::new();
+    let mut meet: Vec<Open> = Vec::new();
     for row in rows {
+        let rm = meeting_key(&row);
         let new_chunk = match out.last() {
             None => true,
             Some(c) => {
+                let cm = meet.last().and_then(|m| m.as_ref());
                 // media and conversation never share a chunk, nor two videos
                 let media_changes = c
                     .segments
@@ -137,20 +177,74 @@ pub fn cut(rows: &[TranscriptRow], rule: &EpisodeRule) -> Vec<Chunk> {
                 let call_continues = row.source == AudioSourceKind::System
                     && c.has_system_audio()
                     && silence <= 2 * gap;
-                media_changes
+                let meeting_changes = match (cm, &rm) {
+                    (None, Some(_)) => true,
+                    (Some((k, _)), Some(k2)) => k != k2,
+                    (Some((_, last)), None) => row.started_at - last >= MEETING_END_MS,
+                    (None, None) => false,
+                };
+                meeting_changes
+                    || media_changes
                     || (silence > gap && !call_continues)
                     || row.ended_at - c.started_at > max_len
                     || c.segments.len() >= rule.max_segments
             }
         };
         if new_chunk {
+            // entering a call: the user's own speech just before it joins it
+            let mut lead: Vec<TranscriptRow> = Vec::new();
+            if let (Some(_), Some(prev)) = (&rm, out.last_mut())
+                && meet.last().is_some_and(Option::is_none)
+            {
+                while let Some(last) = prev.segments.last() {
+                    let joins = last.source == AudioSourceKind::Mic
+                        && media_key(last).is_none()
+                        && row.started_at - last.started_at <= MEETING_LEAD_IN_MS;
+                    if !joins {
+                        break;
+                    }
+                    if let Some(seg) = prev.segments.pop() {
+                        lead.push(seg);
+                    }
+                }
+                lead.reverse();
+                if prev.segments.is_empty() {
+                    out.pop();
+                    meet.pop();
+                } else {
+                    prev.started_at = prev
+                        .segments
+                        .first()
+                        .map_or(prev.started_at, |s| s.started_at);
+                    prev.ended_at = prev
+                        .segments
+                        .iter()
+                        .map(|s| s.ended_at)
+                        .max()
+                        .unwrap_or(prev.ended_at);
+                }
+            }
+            let started_at = lead.first().map_or(row.started_at, |s| s.started_at);
+            let mut ended_at = row.ended_at;
+            for l in &lead {
+                ended_at = ended_at.max(l.ended_at);
+            }
+            let state = rm.map(|k| (k, row.ended_at));
+            lead.push(row);
             out.push(Chunk {
-                started_at: row.started_at,
-                ended_at: row.ended_at,
-                segments: vec![row],
+                started_at,
+                ended_at,
+                segments: lead,
             });
-        } else if let Some(c) = out.last_mut() {
+            meet.push(state);
+        } else if let (Some(c), Some(m)) = (out.last_mut(), meet.last_mut()) {
             c.ended_at = c.ended_at.max(row.ended_at);
+            if let Some(k) = rm {
+                match m {
+                    Some((_, last)) => *last = (*last).max(row.ended_at),
+                    None => *m = Some((k, row.ended_at)),
+                }
+            }
             c.segments.push(row);
         }
     }
