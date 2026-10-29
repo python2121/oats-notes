@@ -427,6 +427,19 @@ fn node_views_cover_exactly_the_subtree() -> R {
     assert_eq!(under(p.id, 10)?, vec![e_p, e_t1]);
     assert_eq!(under(work, 2)?, vec![e_sib, e_p], "limit applies");
     assert!(under(admin, 10)?.is_empty());
+
+    // episodes_unfiled: no node or a category node in; project / topic nodes out
+    let e_cat = ep(50, Some(work))?;
+    let unfiled = |limit: i64| -> Result<Vec<i64>, StoreError> {
+        Ok(s.episodes_unfiled(limit)?
+            .into_iter()
+            .map(|e| e.id)
+            .collect())
+    };
+    assert_eq!(unfiled(10)?, vec![e_cat, _e_none]);
+    assert_eq!(unfiled(1)?, vec![e_cat], "limit applies, newest first");
+    assert!(!unfiled(10)?.contains(&e_t1), "topic excluded");
+    assert!(!unfiled(10)?.contains(&e_p), "project excluded");
     Ok(())
 }
 

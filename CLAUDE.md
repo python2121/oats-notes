@@ -36,7 +36,7 @@ crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mi
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
-crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Notes / Calendar (month grid) / Todos views, node view (notes + projects), reminder + confirmation pop-ups
+crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Conversations / Calendar (month grid) / Todos views, node view (notes + projects), reminder + confirmation pop-ups
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
 vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
 vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream and a voice-processing input stream (macOS); NOT a workspace member
@@ -49,7 +49,7 @@ path as the header, its child projects (topics, under a project) as clickable ro
 count and last activity, the notes (episode cards, `Store::episodes_under`, newest first) of
 the subtree, and "Show transcript (N segments)" — the raw segments filed under the subtree,
 collapsed by default (`NotesState::show_transcript`, reset on every view change). Today and
-All transcripts stay transcript views; Notes shows every episode. The sidebar shows a muted
+All transcripts stay transcript views; Conversations (`View::Notes`, name kept for the saved pref; ⌘3) shows only UNFILED episodes (`Store::episodes_unfiled`: no node or a top-level category, i.e. not under a project or topic; low-signal included); filed ones live on the project pages. The app menu formerly titled "Notes" is now "Brain". The sidebar shows a muted
 "No projects yet" row under a category without projects. `--selftest out.png --work` renders
 the Work view offscreen.
 
@@ -252,10 +252,10 @@ command, else EMPTY (the data-directory path is no longer shown).
 
 Search (View → "Find…", ⌘F; `Command::Search`, `oats-ui/src/search.rs`): a 36 pt bar under the
 control bar (focused at once, match counts, × icon) and a results view that replaces the current
-view while open: Notes (episode cards, matches marked), Calendar (events), Transcript (lines),
+view while open: Conversations (episode cards, matches marked), Calendar (events), Transcript (lines),
 from `Store::search(query, 200)` (case-insensitive substring, echoes excluded, re-run only when
 the text or the data changes). Esc (also from the field) or × closes it and the previous view is
-back; ⌘F again re-selects the field. Clicking a note opens its node view (Notes if unfiled), an
+back; ⌘F again re-selects the field. Clicking a note opens its node view (Conversations if unfiled), an
 event opens Calendar, a line opens Today / All — no scroll-to-row yet from search (the
 calendar and todos do scroll to the row, see below).
 `--selftest out.png --search TEXT` renders it.
@@ -451,7 +451,7 @@ offline or rate limited (`CliError::unavailable_reason`), the brain marks itself
 successful call; the first real call after a probe is the probe for login and rate limits),
 keeps every new segment and voice command waiting, and reports
 `BrainEvent::Backlog { waiting_segments, waiting_commands }`. The status strip then reads
-"claude unavailable (not logged in) — N segments waiting" (also in the Notes strip). When it
+"claude unavailable (not logged in) — N segments waiting" (also in the Conversations strip). When it
 is back, the backlog is worked oldest-first: queued hotword commands first (an interpret run
 that finds hotword segments in the backlog hands them to tier 0 and comes back after them),
 then the rolling interpretation in chronological chunks within the budget, each chunk shown
@@ -525,7 +525,7 @@ Topic chips on episode cards are clickable (`NotesAction::OpenTopic`): `OatsApp:
 a `TopicState` shown over the current view like the search results (header "Tagged “…”" + count + ×;
 Escape closes; never touches the saved `prefs.view`). One concise row per episode (date, time range,
 title, node path); clicking a row calls `jump_to_episode`: it sets `NotesState::pending_focus`
-(`OatsApp::pending_focus()`) and switches to the episode's node view (Notes without a node). The card
+(`OatsApp::pending_focus()`) and switches to the episode's node view (Conversations without a node). The card
 that matches (`notes::focus_card`, run for every laid-out `episode_card`) consumes it with
 `ui.scroll_to_rect` and flashes an accent fill for 1.5 s (`NotesState::flash`, repaints only while it
 fades). Search-result clicks on a note use the same path.

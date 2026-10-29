@@ -670,6 +670,24 @@ fn a_topic_chip_lists_its_notes_and_a_row_jumps_to_the_card() {
         )
         .unwrap();
     }
+    {
+        // an unfiled conversation carries the chip the project's note no longer shows here
+        let s = Store::open(&dir.db()).unwrap();
+        let t = now_ms() - 7_200_000;
+        s.insert_episode(
+            t,
+            t + 60_000,
+            &EpisodeContent {
+                title: "Loose chat".into(),
+                summary: "- chatter".into(),
+                topics: vec!["Q4 roadmap".into()],
+                model: "m".into(),
+                ..Default::default()
+            },
+            t + 120_000,
+        )
+        .unwrap();
+    }
     let mut rig = build(&dir.db(), None, None);
     rig.app().run(Command::ShowNotes);
     rig.harness.run_steps(3);
@@ -678,7 +696,7 @@ fn a_topic_chip_lists_its_notes_and_a_row_jumps_to_the_card() {
     rig.harness.run_steps(3);
     assert!(rig.app().topic_open());
     assert!(rig.shows("Tagged “Q4 roadmap”"));
-    assert!(rig.shows("1 note"));
+    assert!(rig.shows("2 notes"));
     assert!(rig.shows("Pricing sync"));
     assert!(!rig.shows("- numbers"), "no summaries in the list");
     assert_eq!(
@@ -706,6 +724,59 @@ fn a_topic_chip_lists_its_notes_and_a_row_jumps_to_the_card() {
     rig.harness.key_press(egui::Key::Escape);
     rig.harness.run_steps(2);
     assert!(!rig.app().topic_open());
+}
+
+#[test]
+fn conversations_lists_only_unfiled_episodes() {
+    use oats_core::EpisodeContent;
+    let dir = TempDir::new("conversations");
+    let (work, _commerce, _lease) = seed_projects(&dir.db());
+    {
+        let s = Store::open(&dir.db()).unwrap();
+        let t = now_ms() - 3_600_000;
+        s.insert_episode(
+            t,
+            t + 60_000,
+            &EpisodeContent {
+                title: "Bare category chat".into(),
+                summary: "- hello".into(),
+                node_id: Some(work),
+                model: "m".into(),
+                ..Default::default()
+            },
+            t + 120_000,
+        )
+        .unwrap();
+    }
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowNotes);
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Bare category chat"));
+    assert!(
+        !rig.shows("Checkout flow decisions"),
+        "filed under a project"
+    );
+    assert!(!rig.shows("Lease renewal terms"));
+    let titles: Vec<_> = rig
+        .app()
+        .listed_episodes()
+        .iter()
+        .map(|e| e.title.clone())
+        .collect();
+    assert_eq!(titles, ["Bare category chat"]);
+}
+
+#[test]
+fn conversations_says_so_when_everything_is_filed() {
+    let dir = TempDir::new("conversations-empty");
+    seed_projects(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowNotes);
+    rig.harness.run_steps(3);
+    assert!(
+        rig.app().listed_episodes().is_empty(),
+        "the empty state shows"
+    );
 }
 
 // ---- todos, reminder pop-ups, the calendar's jump to the transcript ----------------------------

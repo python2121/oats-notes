@@ -300,13 +300,13 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                 Separator,
                 check("Today", Command::ShowToday, s.view == View::Today),
                 check("All Transcripts", Command::ShowAll, s.view == View::All),
-                check("Notes", Command::ShowNotes, s.view == View::Notes),
+                check("Conversations", Command::ShowNotes, s.view == View::Notes),
                 check("Calendar", Command::ShowCalendar, s.view == View::Calendar),
                 check("Todos", Command::ShowTodos, s.view == View::Todos),
             ],
         },
         MenuSection {
-            title: "Notes",
+            title: "Brain",
             entries: vec![
                 item("Interpret Now", Command::InterpretNow, s.brain_ready),
                 item("Review Now", Command::ReviewNow, s.brain_ready),
@@ -842,6 +842,11 @@ impl OatsApp {
     }
 
     /// The episode the notes list will scroll to and flash when it lays its card out.
+    /// The episodes the current view lists.
+    pub fn listed_episodes(&self) -> &[Episode] {
+        &self.episodes
+    }
+
     pub fn pending_focus(&self) -> Option<i64> {
         self.notes_state.pending_focus
     }
@@ -863,7 +868,7 @@ impl OatsApp {
         self.topic = None;
     }
 
-    /// Show an episode's note: its node's view (Notes when it has none), scrolled to its card,
+    /// Show an episode's note: its node's view (Conversations when it has none), scrolled to its card,
     /// which flashes. The card consumes `pending_focus` when it is laid out.
     fn jump_to_episode(&mut self, id: i64, node: Option<i64>) {
         self.topic = None;
@@ -1022,6 +1027,8 @@ impl OatsApp {
     fn reload_brain_data(&mut self) {
         let episodes = match self.prefs.view {
             View::Node(id) => self.store.episodes_under(id, 300),
+            // the Conversations view lists only what no project or topic has taken in
+            View::Notes => self.store.episodes_unfiled(300),
             _ => self.store.episodes(300),
         };
         match episodes {
@@ -2356,7 +2363,7 @@ mod tests {
             Some(("Start Listening".to_owned(), false))
         );
         let titles: Vec<_> = build_menu_model(&s).iter().map(|m| m.title).collect();
-        assert_eq!(titles, ["File", "Listen", "View", "Notes"]);
+        assert_eq!(titles, ["File", "Listen", "View", "Brain"]);
         // the system-audio toggle is a checked item in the Listen menu, following the pref
         let system = |model: &[MenuSection]| {
             model
@@ -2382,7 +2389,7 @@ mod tests {
             Some(false)
         );
         assert!(AppPrefs::default().capture_system, "on by default");
-        // the Notes menu follows the brain's readiness
+        // the Brain menu follows the brain's readiness
         let interpret = |model: &[MenuSection]| {
             model
                 .iter()

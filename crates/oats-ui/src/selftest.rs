@@ -24,7 +24,7 @@ pub struct SelftestOptions {
     /// Show the app in the Listening state with a fake input level (no audio is opened) and the
     /// All Transcripts view, so the pill, the meter and both day headings are in the capture.
     pub listening: bool,
-    /// Show the Notes view (a seeded interpreted episode with a project, action items and a
+    /// Show the Conversations view (unfiled seeded episodes and a
     /// change-log line) instead of the transcript.
     pub notes: bool,
     /// Show the Work category's view (its projects, their notes, the transcript toggle).
@@ -291,6 +291,21 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
                 low_signal: true,
                 model: "claude-sonnet-4-5".into(),
                 cost_usd: Some(0.004),
+                ..Default::default()
+            },
+            now,
+        )?;
+        // an unfiled conversation (the Conversations view lists only these)
+        store.insert_episode(
+            yesterday + 11 * H,
+            yesterday + 11 * H + 9 * M,
+            &EpisodeContent {
+                title: "Call with the landlord about the lease".into(),
+                summary: "- Rent stays flat for another year if the renewal is signed by the 15th.\n- Parking permit moves to the **second-floor garage**.".into(),
+                decisions: vec!["Sign the renewal before the 15th".into()],
+                topics: vec!["lease".into()],
+                model: "claude-sonnet-4-5".into(),
+                cost_usd: Some(0.009),
                 ..Default::default()
             },
             now,

@@ -1952,6 +1952,21 @@ impl Store {
         )
     }
 
+    /// Unfiled episodes, newest first (at most `limit`): no node, or a top-level category —
+    /// anything not under a project or topic. Low-signal ones are included.
+    pub fn episodes_unfiled(&self, limit: i64) -> Result<Vec<Episode>, StoreError> {
+        self.query_episodes(
+            &format!(
+                "SELECT {EPISODE_COLUMNS} FROM episodes
+                 WHERE node_id IS NULL
+                    OR node_id IN (SELECT id FROM nodes WHERE kind = 'category')
+                    OR node_id NOT IN (SELECT id FROM nodes)
+                 ORDER BY started_at DESC, id DESC LIMIT ?1"
+            ),
+            &[limit],
+        )
+    }
+
     /// Episodes filed under a node or anything below it, newest first.
     pub fn episodes_under(&self, node_id: i64, limit: i64) -> Result<Vec<Episode>, StoreError> {
         self.query_episodes(

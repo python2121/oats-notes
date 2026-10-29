@@ -1,4 +1,5 @@
-//! The Notes view: the brain's interpreted episodes, newest first — title, time range, the
+//! The Conversations view (`View::Notes`, name kept for the saved pref): the brain's unfiled
+//! episodes (not under a project or topic; those live on the project pages), newest first — title, time range, the
 //! node chip (category › project › topic), the summary (a small markdown subset: headings,
 //! bullets, **bold**), decisions, action items as a checklist-looking list, topics, a
 //! "Re-interpret" button — with the brain's control strip (Interpret now / Review now /
@@ -12,7 +13,7 @@ use oats_core::{ActionItem, BrainRun, Change, Episode, EpisodeContent, Node, Tra
 use crate::theme::Tokens;
 use crate::transcript::{TranscriptAction, clock, day_heading, day_of, transcript_rows};
 
-/// What the user did in the Notes view this frame.
+/// What the user did in the Conversations view this frame.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NotesAction {
     InterpretNow,
@@ -852,7 +853,7 @@ pub fn notes_view(
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "No notes yet. The brain interprets the transcript every 15 minutes while there is something new; Interpret now runs it at once.",
+            "No unfiled conversations. Everything is filed under a project.",
             t.font(12.5),
             t.text_tertiary,
         );
