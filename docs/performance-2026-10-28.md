@@ -354,3 +354,12 @@ skipped by the audio check (linked, discarded) / marked by the text rule`) and
 `scripts/perf.sh`. The thresholds are calibrated on synthetic signals only; if real rooms
 correlate lower, segments are simply transcribed as before (no saving, no loss) — the
 counters show which. `OATS_ECHO_AUDIO=never` gives the old behaviour for an A/B run.
+
+### 2026-10-29 — live check of the audio-level echo check (commit 4c4322f)
+
+A podcast played through the MacBook Air speakers for ~90 s while the release app listened on both
+lanes (brain on, load average ~6 from other apps). Every system segment (3, 90 s) had its microphone
+copy recognised acoustically and skipped before the model (3 empty echo rows, 0 text-rule fallbacks).
+`top` over 60 s: CPU mean 5.6 % of one core, p95 8.7 %, max 57.8 % (one transcription burst), energy
+impact 5.6 — down from 15.0 % mean / 34 % p95 in the earlier meeting sample where every echo was
+transcribed first. Same machine, same lanes, no builds running.
