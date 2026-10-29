@@ -1006,7 +1006,7 @@ impl OatsApp {
                 (Some(line), _) => format!(" · {line}"),
                 (None, Some(job)) => format!(" · brain: {job}…"),
                 (None, None) => {
-                    format!(" · brain ${:.2} today", self.brain_status.spend_today_usd)
+                    format!(" · brain usage {:.2} today", self.brain_status.spend_today_usd)
                 }
             },
         };

@@ -12,7 +12,9 @@
 //! crate depends on the platform-neutral contracts (`oats-core`, `oats-status`) only.
 //!
 //! `--listen` starts listening as soon as the engine is ready (as if the last session had
-//! quit while listening).
+//! quit while listening). `--audio-file <wav> [--audio-speed N] [--audio-loop]` plays a
+//! 16 kHz mono 16-bit WAV instead of opening the microphone (benchmarks, reproducible runs;
+//! `scripts/perf.sh`).
 //!
 //! Environment: `OATS_ENGINE=null` (no model), `OATS_NO_NATIVE_MENU=1` (menus in the window),
 //! `OATS_NO_STATUS_ITEM=1` (no menu bar extra; closing the window then quits),
@@ -89,12 +91,16 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen]\n       oats-notes --selftest <out.png> [--listening|--notes|--calendar]\n\n\
-         --listen     start listening as soon as the speech engine is ready\n\
-         --selftest   render the window offscreen to a PNG (demo content, no microphone)\n\
-         --listening  with --selftest: show the Listening state with a fake input level\n\
-         --notes      with --selftest: the Notes view (a seeded interpreted episode)\n\
-         --calendar   with --selftest: the Calendar view (seeded events and a reminder)"
+        "usage: oats-notes [--listen] [--audio-file <wav> [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--calendar]\n\n\
+         --listen       start listening as soon as the speech engine is ready\n\
+         --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
+         \x20              paced in real time; listening stops when the file ends\n\
+         --audio-speed  with --audio-file: playback rate relative to real time (default 1)\n\
+         --audio-loop   with --audio-file: start the file again at its end\n\
+         --selftest     render the window offscreen to a PNG (demo content, no microphone)\n\
+         --listening    with --selftest: show the Listening state with a fake input level\n\
+         --notes        with --selftest: the Notes view (a seeded interpreted episode)\n\
+         --calendar     with --selftest: the Calendar view (seeded events and a reminder)"
     );
     ExitCode::from(2)
 }
@@ -109,12 +115,35 @@ fn main() -> ExitCode {
         return selftest_cli(&args[1..]);
     }
     let mut start_listening = false;
-    for a in &args {
+    let mut audio_file: Option<std::path::PathBuf> = None;
+    let mut file_options = oats_audio::FileSourceOptions::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--listen" => start_listening = true,
+            "--audio-file" => match it.next() {
+                Some(p) => audio_file = Some(p.into()),
+                None => return usage(),
+            },
+            "--audio-speed" => match it.next().and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if v.is_finite() && v > 0.0 => file_options.speed = v,
+                _ => return usage(),
+            },
+            "--audio-loop" => file_options.looping = true,
             _ => return usage(),
         }
     }
+    // decoded once up front (a bad file fails here, not at the first Listen)
+    let audio_samples: Option<std::sync::Arc<[f32]>> = match &audio_file {
+        Some(path) => match oats_audio::file_source::load_wav(path) {
+            Ok(s) => Some(s.into()),
+            Err(e) => {
+                eprintln!("oatsnotes: --audio-file: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -166,11 +195,19 @@ fn main() -> ExitCode {
                 wake: Box::new(move || ctx.request_repaint()),
             }
             .spawn();
-            let audio: oats_ui::AudioStarter = Box::new(|tx| {
-                oats_audio::Capture::start(tx)
-                    .map(|c| Box::new(c) as Box<dyn Any>)
-                    .map_err(|e| e.to_string())
-            });
+            let audio: oats_ui::AudioStarter = match audio_samples {
+                // --audio-file: the WAV instead of the microphone, from the start each time
+                Some(samples) => Box::new(move |tx| {
+                    oats_audio::FileSource::start(samples.clone(), file_options, tx)
+                        .map(|s| Box::new(s) as Box<dyn Any>)
+                        .map_err(|e| e.to_string())
+                }),
+                None => Box::new(|tx| {
+                    oats_audio::Capture::start(tx)
+                        .map(|c| Box::new(c) as Box<dyn Any>)
+                        .map_err(|e| e.to_string())
+                }),
+            };
             // macOS: the menus go in the system menu bar (opt out with OATS_NO_NATIVE_MENU=1);
             // every other platform keeps the in-window egui menu bar.
             let native_menu =

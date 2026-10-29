@@ -274,7 +274,7 @@ fn brain_strip(
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.label(
-            RichText::new(format!("${:.2} today", status.spend_today_usd))
+            RichText::new(format!("usage {:.2} today", status.spend_today_usd))
                 .color(t.text_tertiary)
                 .size(11.0),
         );

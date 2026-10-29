@@ -200,6 +200,8 @@ on the pipeline's own thread via an `EngineFactory`, so they need not be `Send`
 cargo run -p oats-notes                   # the app (first run downloads the Parakeet CoreML model, ~600 MB, into ~/Library/Application Support/FluidAudio)
 OATS_ENGINE=null cargo run -p oats-notes  # the app without a model (UI work; speech detected, not transcribed)
 cargo run -p oats-audio --example levels  # mic sanity check: prints input level for 5 s
+cargo run -p oats-notes -- --listen --audio-file speech.wav [--audio-speed 4] [--audio-loop]   # deterministic input instead of the mic (16 kHz mono i16 WAV)
+scripts/perf.sh [rest|idle|speech|stress]    # CPU/memory/energy profile per scenario (release build); see docs/performance-2026-10-28.md
 cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events — how the shell is verified without a window
 cargo run -p oats-notes -- --listen      # start listening as soon as the engine is ready (doesn't change the remembered pref)
 OATS_NO_NATIVE_MENU=1 …                   # in-window egui menu bar instead of the macOS menu bar

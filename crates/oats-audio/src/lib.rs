@@ -14,6 +14,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod file_source;
 pub mod resample;
 
 use std::sync::mpsc::Sender;
@@ -23,6 +24,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use oats_core::SAMPLE_RATE;
 
+pub use crate::file_source::{FileSource, FileSourceOptions, WavError};
 use crate::resample::Resampler;
 
 /// Samples per chunk sent to the sink: 100 ms at 16 kHz.

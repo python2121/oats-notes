@@ -366,11 +366,11 @@ fn brain_events_update_readiness_spend_and_the_notes() {
         interpret_enabled(app) == Some(true)
     });
     rig.harness.run_steps(2);
-    assert!(rig.shows("$0.00 today"));
+    assert!(rig.shows("usage 0.00 today"));
     assert!(rig.shows("no brain run yet"));
 
     rig.app().run(Command::InterpretNow);
-    rig.until_label("the spend", "$0.25 today");
+    rig.until_label("the spend", "usage 0.25 today");
     // the Changed event reloaded the episodes: the new one is listed
     rig.until_label("the new episode", "Weather chat");
     rig.until_label("the last run line", "last run: interpret");
