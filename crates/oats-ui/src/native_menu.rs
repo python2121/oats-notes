@@ -376,12 +376,8 @@ mod tests {
     fn view_and_listen_accelerators() {
         let get = |cmd| menu_shortcut(cmd).as_ref().and_then(accelerator);
         assert_eq!(
-            get(Command::ShowToday),
+            get(Command::ShowTranscripts),
             Some(Accelerator::new(Modifiers::META, Code::Digit1))
-        );
-        assert_eq!(
-            get(Command::ShowAll),
-            Some(Accelerator::new(Modifiers::META, Code::Digit2))
         );
         assert_eq!(
             get(Command::ToggleListening),

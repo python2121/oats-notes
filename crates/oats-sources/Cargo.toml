@@ -1,0 +1,12 @@
+[package]
+name = "oats-sources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Which processes are producing audio output right now: the platform-neutral contract (Producer, AudioProducers, NoProducers). Platform crates: oats-sources-macos (Core Audio process objects); a Linux crate would read PipeWire stream application names."
+
+[lints]
+workspace = true
+
+[dependencies]

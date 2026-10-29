@@ -2325,6 +2325,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+
+[[package]]
 name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2579,6 +2585,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oats-media"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "log",
+ "lz4_flex",
+ "oats-core",
+ "oats-sources",
+ "serde_json",
+]
+
+[[package]]
 name = "oats-notes"
 version = "0.1.0"
 dependencies = [
@@ -2592,9 +2610,25 @@ dependencies = [
  "oats-brain",
  "oats-core",
  "oats-engine-fluidaudio",
+ "oats-media",
+ "oats-sources-macos",
  "oats-status",
  "oats-status-macos",
  "oats-ui",
+]
+
+[[package]]
+name = "oats-sources"
+version = "0.1.0"
+
+[[package]]
+name = "oats-sources-macos"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "oats-sources",
+ "objc2-core-audio",
+ "objc2-core-foundation",
 ]
 
 [[package]]

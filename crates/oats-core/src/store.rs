@@ -2,7 +2,8 @@
 //! pipeline writes segments, the brain writes interpretations, the UI reads). Times are Unix
 //! milliseconds (UTC); the UI formats them in local time.
 //!
-//! Schema version 6 (`meta.schema_version`; v1 to v5 databases are migrated on open; v5 added
+//! Schema version 7 (`meta.schema_version`; v1 to v6 databases are migrated on open; v7 added
+//! the media columns and `media_plays`, see `store_media.rs`; v5 added
 //! `episodes.user_edited_at`, the time the user last edited a note by hand; v6 re-keyed
 //! interpretation events without the episode id, see [`interpretation_event_key`]):
 //! - `sessions(id, started_at, ended_at NULL, engine)` — one per listen start/stop.
@@ -77,6 +78,12 @@ pub struct TranscriptRow {
     /// For a microphone segment that only repeats a system segment (speaker echo): that
     /// segment's id. Echoes are hidden from the default views and the brain.
     pub echo_of: Option<i64>,
+    /// What was playing when a system segment was heard (v7: `segments.media_kind`; `None`
+    /// for microphone segments and when nothing was known). YouTube / music segments are
+    /// rendered as `media:` lines, never as a conversation.
+    pub media_kind: Option<crate::media::MediaClass>,
+    /// The page / stream it came from (`segments.media_ref`, e.g. the YouTube watch URL).
+    pub media_ref: Option<String>,
 }
 
 /// What [`Store::search`] found.
@@ -365,11 +372,10 @@ pub struct Change {
 /// What the transcript list shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum View {
-    /// Segments since local midnight.
+    /// The transcript, paged by row count (see [`Store::segments_page`]). Saved prefs from before the rename say `Today` or `All`.
     #[default]
-    Today,
-    /// Everything.
-    All,
+    #[serde(alias = "Today", alias = "All")]
+    Transcripts,
     /// Segments filed under one node or anything below it.
     Node(i64),
     /// The interpreted episodes (the Notes view).
@@ -387,7 +393,7 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// The v2 schema, first half (meta, sessions, nodes, episodes); every statement is idempotent so
 /// it doubles as the "make sure everything exists" step.
@@ -542,7 +548,7 @@ ALTER TABLE segments ADD COLUMN source TEXT NOT NULL DEFAULT 'mic';
 ALTER TABLE segments ADD COLUMN echo_of INTEGER;
 ";
 
-const SEGMENT_COLUMNS: &str = "id, session_id, started_at, ended_at, text, confidence, node_id, episode_id, interpreted_at, categorised, source, echo_of";
+const SEGMENT_COLUMNS: &str = "id, session_id, started_at, ended_at, text, confidence, node_id, episode_id, interpreted_at, categorised, source, echo_of, media_kind, media_ref";
 
 /// Longer than any stored segment (the segmenter caps them at 30 s): how far before a
 /// window [`Store::segments_near`] looks for segments reaching into it.
@@ -565,6 +571,11 @@ fn row_to_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRow> {
         categorised: row.get::<_, i64>(9)? != 0,
         source: AudioSourceKind::parse(&row.get::<_, String>(10)?),
         echo_of: row.get(11)?,
+        media_kind: row
+            .get::<_, Option<String>>(12)?
+            .as_deref()
+            .and_then(crate::media::MediaClass::parse),
+        media_ref: row.get(13)?,
     })
 }
 
@@ -906,6 +917,13 @@ impl Store {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
+            Some(6) => {
+                // v6 → v7 is media: `segments.media_kind` / `media_ref`, `episodes.kind` and
+                // `media_plays`, added by `ensure_media_schema` below
+                log::info!("migrating the database from schema 6 to {SCHEMA_VERSION}");
+                conn.execute_batch(SCHEMA)?;
+                conn.execute_batch(SCHEMA_REST)?;
+            }
             Some(5) => {
                 // v5 → v6 is the event re-key + orphan cleanup, `migrate_event_keys` below
                 log::info!("migrating the database from schema 5 to {SCHEMA_VERSION}");
@@ -922,6 +940,8 @@ impl Store {
         Self::ensure_episode_edit_column(conn)?;
         Self::episode_ids_never_reused(conn)?;
         Self::ensure_todos_table(conn)?;
+        // after the episodes rebuild (it copies `SELECT *` into the v2 layout)
+        Self::ensure_media_schema(conn)?;
         if from_version.is_some_and(|v| v < 6) {
             Self::migrate_event_keys(conn)?;
         }
@@ -1271,6 +1291,8 @@ impl Store {
             categorised: false,
             source,
             echo_of,
+            media_kind: None,
+            media_ref: None,
         })
     }
 
@@ -1332,19 +1354,13 @@ impl Store {
         Ok(rows)
     }
 
-    /// Segments for a view, oldest first. `today_start` is local midnight in Unix ms (the UI
-    /// computes it; the store stays timezone-free). The Notes and Calendar views have no
-    /// segments.
-    pub fn segments(&self, view: View, today_start: i64) -> Result<Vec<TranscriptRow>, StoreError> {
+    /// Segments for a view, oldest first. `Transcripts` is EVERY segment (tests and tools; the
+    /// UI pages it with [`Store::segments_for_day`] instead); the Notes, Calendar and Todos
+    /// views have no segments.
+    pub fn segments(&self, view: View) -> Result<Vec<TranscriptRow>, StoreError> {
         let order = "ORDER BY started_at, id";
         match view {
-            View::Today => self.query_segments(
-                &format!(
-                    "SELECT {SEGMENT_COLUMNS} FROM segments WHERE started_at >= ?1 AND {NOT_ECHO} {order}"
-                ),
-                &[today_start],
-            ),
-            View::All => self.query_segments(
+            View::Transcripts => self.query_segments(
                 &format!("SELECT {SEGMENT_COLUMNS} FROM segments WHERE {NOT_ECHO} {order}"),
                 &[],
             ),
@@ -1357,6 +1373,44 @@ impl Store {
             ),
             View::Notes | View::Calendar | View::Todos => Ok(Vec::new()),
         }
+    }
+
+    /// One page of the transcript, keyed on `(started_at, id)`: the newest `limit` listed
+    /// (non-echo) segments strictly before `before` (`None` = from the very newest), returned
+    /// oldest first for display. A result shorter than `limit` means the history begins there.
+    pub fn segments_page(
+        &self,
+        before: Option<(i64, i64)>,
+        limit: i64,
+    ) -> Result<Vec<TranscriptRow>, StoreError> {
+        let (t, id) = before.unwrap_or((i64::MAX, i64::MAX));
+        let mut rows = self.query_segments(
+            &format!(
+                "SELECT {SEGMENT_COLUMNS} FROM segments
+                 WHERE (started_at, id) < (?1, ?2) AND {NOT_ECHO}
+                 ORDER BY started_at DESC, id DESC LIMIT ?3"
+            ),
+            &[t, id, limit],
+        )?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// The paging-forward twin of [`Store::segments_page`]: the oldest `limit` listed segments
+    /// strictly after `after` `(started_at, id)`, oldest first.
+    pub fn segments_after(
+        &self,
+        after: (i64, i64),
+        limit: i64,
+    ) -> Result<Vec<TranscriptRow>, StoreError> {
+        self.query_segments(
+            &format!(
+                "SELECT {SEGMENT_COLUMNS} FROM segments
+                 WHERE (started_at, id) > (?1, ?2) AND {NOT_ECHO}
+                 ORDER BY started_at, id LIMIT ?3"
+            ),
+            &[after.0, after.1, limit],
+        )
     }
 
     /// Segments with `started_at` in `[from, to)`, oldest first.
@@ -2751,7 +2805,7 @@ mod tests {
         let s = Store::open_in_memory()?;
         let names: Vec<String> = s.categories()?.into_iter().map(|c| c.name).collect();
         assert_eq!(names, DEFAULT_CATEGORIES);
-        assert_eq!(version(&s)?, "6");
+        assert_eq!(version(&s)?, SCHEMA_VERSION.to_string());
         assert!(s.categories()?.iter().all(|c| c.kind == NodeKind::Category));
         Ok(())
     }
@@ -2780,7 +2834,7 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory()?;
         conn.execute_batch(V1)?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "6");
+        assert_eq!(version(&s)?, SCHEMA_VERSION.to_string());
         let cats = s.categories()?;
         assert_eq!(
             cats.iter()
@@ -2788,7 +2842,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, "Work"), (2, "Admin"), (7, "Ideas")]
         );
-        let rows = s.segments(View::All, 0)?;
+        let rows = s.segments(View::Transcripts)?;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].node_id, Some(7));
         assert!(rows[0].categorised);
@@ -2799,7 +2853,7 @@ mod tests {
         // the old table is gone, the new ones work, the migration doesn't run twice
         assert!(s.conn.prepare("SELECT * FROM categories").is_err());
         assert!(s.episodes(10)?.is_empty());
-        assert_eq!(s.segments(View::Node(7), 0)?.len(), 1);
+        assert_eq!(s.segments(View::Node(7))?.len(), 1);
         assert!(
             rows.iter()
                 .all(|r| r.source == AudioSourceKind::Mic && r.echo_of.is_none())
@@ -2837,8 +2891,8 @@ mod tests {
              INSERT INTO segments VALUES (2, 1, 4000, 5000, 'loose', NULL, NULL, NULL, NULL, 0);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "6");
-        let rows = s.segments(View::All, 0)?;
+        assert_eq!(version(&s)?, SCHEMA_VERSION.to_string());
+        let rows = s.segments(View::Transcripts)?;
         assert_eq!(rows.len(), 2);
         assert_eq!(
             (rows[0].node_id, rows[0].episode_id, rows[0].interpreted_at),
@@ -2860,7 +2914,7 @@ mod tests {
             Some(AudioSourceKind::System)
         );
         s.init_locked()?;
-        assert_eq!(s.segments(View::All, 0)?.len(), 3);
+        assert_eq!(s.segments(View::Transcripts)?.len(), 3);
         Ok(())
     }
 
@@ -2892,9 +2946,12 @@ mod tests {
         )?;
         let me2 = s.insert_segment(session, 5_000, 6_000, "me again", None)?;
         let ids = |rows: Vec<TranscriptRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
-        assert_eq!(ids(s.segments(View::All, 0)?), vec![me.id, them.id, me2.id]);
         assert_eq!(
-            ids(s.segments(View::Today, 0)?),
+            ids(s.segments(View::Transcripts)?),
+            vec![me.id, them.id, me2.id]
+        );
+        assert_eq!(
+            ids(s.segments_between(0, 86_400_000)?),
             vec![me.id, them.id, me2.id]
         );
         assert_eq!(
@@ -2928,9 +2985,9 @@ mod tests {
         );
         // a later system segment can claim a stored mic row
         s.set_segment_echo(me2.id, Some(them.id))?;
-        assert_eq!(ids(s.segments(View::All, 0)?), vec![me.id, them.id]);
+        assert_eq!(ids(s.segments(View::Transcripts)?), vec![me.id, them.id]);
         s.delete_segment(them.id)?;
-        assert_eq!(ids(s.segments(View::All, 0)?), vec![me.id]);
+        assert_eq!(ids(s.segments(View::Transcripts)?), vec![me.id]);
         assert!(s.segment(echo.id)?.is_none() && s.segment(me2.id)?.is_none());
         Ok(())
     }
@@ -2990,24 +3047,24 @@ mod tests {
         assert_eq!(old.confidence, Some(0.5));
         assert_eq!(old.node_id, None);
 
-        let all = s.segments(View::All, 1_000)?;
+        let all = s.segments(View::Transcripts)?;
         assert_eq!(all, vec![old.clone(), earlier.clone(), new.clone()]);
-        let today = s.segments(View::Today, 1_000)?;
+        let today = s.segments_between(1_000, 86_400_000)?;
         assert_eq!(today, vec![earlier.clone(), new.clone()]);
         assert_eq!(s.segment_count_since(1_000)?, 2);
         assert_eq!(s.segment_count_since(0)?, 3);
         assert_eq!(s.segments_between(4_000, 5_000)?, vec![earlier.clone()]);
-        assert!(s.segments(View::Notes, 0)?.is_empty());
+        assert!(s.segments(View::Notes)?.is_empty());
 
         let work = s.categories()?[0].id;
         s.set_segment_node(new.id, Some(work))?;
-        let filed = s.segments(View::Node(work), 0)?;
+        let filed = s.segments(View::Node(work))?;
         assert_eq!(filed.len(), 1);
         assert_eq!(filed[0].id, new.id);
         assert_eq!(filed[0].node_id, Some(work));
         assert!(filed[0].categorised);
         s.set_segment_node(new.id, None)?;
-        assert!(s.segments(View::Node(work), 0)?.is_empty());
+        assert!(s.segments(View::Node(work))?.is_empty());
         // the user's choice beats the automatic pass
         assert_eq!(s.uncategorised_segments(10)?.len(), 2);
         s.apply_categorisation(&[(new.id, Some(work)), (old.id, Some(work))])?;
@@ -3016,7 +3073,7 @@ mod tests {
         assert_eq!(s.uncategorised_segments(10)?.len(), 1);
 
         s.delete_segment(old.id)?;
-        assert_eq!(s.segments(View::All, 0)?.len(), 2);
+        assert_eq!(s.segments(View::Transcripts)?.len(), 2);
         Ok(())
     }
 
@@ -3056,9 +3113,9 @@ mod tests {
         let sid = s.begin_session(0, "e")?;
         let seg = s.insert_segment(sid, 1, 2, "x", None)?;
         s.set_segment_node(seg.id, Some(topic.id))?;
-        assert_eq!(s.segments(View::Node(work), 0)?.len(), 1);
-        assert_eq!(s.segments(View::Node(proj.id), 0)?.len(), 1);
-        assert!(s.segments(View::Node(s.categories()?[1].id), 0)?.is_empty());
+        assert_eq!(s.segments(View::Node(work))?.len(), 1);
+        assert_eq!(s.segments(View::Node(proj.id))?.len(), 1);
+        assert!(s.segments(View::Node(s.categories()?[1].id))?.is_empty());
 
         // archive + revive through add_node
         s.set_node_archived(topic.id, true)?;
@@ -3079,7 +3136,7 @@ mod tests {
         s.merge_nodes(proj.id, other.id)?;
         assert!(s.node(proj.id)?.is_none());
         assert_eq!(s.node(topic.id)?.and_then(|n| n.parent_id), Some(other.id));
-        assert_eq!(s.segments(View::Node(other.id), 0)?.len(), 1);
+        assert_eq!(s.segments(View::Node(other.id))?.len(), 1);
         // a move under its own subtree is refused
         s.move_node(other.id, Some(topic.id))?;
         assert_eq!(s.node(other.id)?.and_then(|n| n.parent_id), Some(work));
@@ -3091,7 +3148,7 @@ mod tests {
         assert_eq!(s.categories()?[0].name, "Office");
         s.delete_node(admin)?;
         assert!(s.node(topic.id)?.is_none());
-        assert_eq!(s.segments(View::All, 0)?[0].node_id, None);
+        assert_eq!(s.segments(View::Transcripts)?[0].node_id, None);
         assert_eq!(s.categories()?.len(), 2);
         // positions keep growing after a delete
         assert_eq!(s.add_category("Next")?.position, 3);
@@ -3250,7 +3307,7 @@ mod tests {
             INSERT INTO reminders VALUES (8, NULL, 600, 'old one', 1, 'hotword', NULL, NULL, 20);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "6");
+        assert_eq!(version(&s)?, SCHEMA_VERSION.to_string());
         let all = s.todos(TodoFilter::All)?;
         assert_eq!(all.len(), 2);
         let open = &all[0];
@@ -3297,7 +3354,7 @@ mod tests {
                  last_revised_at) VALUES (3, 10, 20, 'Old note', 'old summary', 2, 5, 6);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "6");
+        assert_eq!(version(&s)?, SCHEMA_VERSION.to_string());
         let e = s.episode(3)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         assert_eq!(
             (e.title.as_str(), e.revision, e.user_edited_at),
@@ -3552,7 +3609,7 @@ mod tests {
             s.insert_segment(sid, 1, 2, "kept", None)?;
         }
         let s = Store::open(&path)?;
-        assert_eq!(s.segments(View::All, 0)?[0].text, "kept");
+        assert_eq!(s.segments(View::Transcripts)?[0].text, "kept");
         assert_eq!(s.categories()?.len(), 3);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3606,7 +3663,10 @@ mod tests {
             Err(StoreError::Io(std::io::Error::other("fail mid-way")))
         });
         assert!(r.is_err());
-        assert!(s.segments(View::All, 0)?.is_empty(), "nothing half-applied");
+        assert!(
+            s.segments(View::Transcripts)?.is_empty(),
+            "nothing half-applied"
+        );
         assert!(s.conn.is_autocommit(), "no transaction left open");
         s.with_savepoint(|s| {
             s.insert_segment(sid, 1, 2, "kept", None)?;
@@ -3617,7 +3677,7 @@ mod tests {
             assert!(inner.is_err());
             Ok(())
         })?;
-        let rows = s.segments(View::All, 0)?;
+        let rows = s.segments(View::Transcripts)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "kept");
         Ok(())
@@ -3672,7 +3732,7 @@ mod tests {
             ))?;
         }
         let s = Store::open(&path)?;
-        assert_eq!(version(&s)?, "6");
+        assert_eq!(version(&s)?, SCHEMA_VERSION.to_string());
         assert_eq!(s.episodes(10)?.len(), 1, "rows survive the rebuild");
         let c = s.insert_episode(40, 50, &content, 2)?;
         let events = s.events_from(i64::MIN, 10)?;
@@ -3750,7 +3810,7 @@ mod tests {
                  VALUES (1, 5, 'prep', 'hotword', 'k1', 1), (2, 6, 'orphaned', 'hotword', 'k2', 1);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "6");
+        assert_eq!(version(&s)?, SCHEMA_VERSION.to_string());
         let events = s.events_from(i64::MIN, 20)?;
         let by_id = |id: i64| events.iter().find(|e| e.id == id);
         assert!(by_id(5).is_none() && by_id(6).is_none(), "{events:?}");
@@ -3788,3 +3848,9 @@ mod tests {
         assert!(!k.starts_with("hotword:"));
     }
 }
+
+// v7: media on the system lane (`segments.media_kind` / `media_ref`, `episodes.kind`,
+// `media_plays`) — kept in its own file.
+#[path = "store_media.rs"]
+mod media;
+pub use media::{EPISODE_CONVERSATION, EPISODE_MEDIA, MEDIA_CATEGORY};

@@ -48,8 +48,8 @@ Categories are folders. Selecting a category / project / topic (`View::Node(id)`
 path as the header, its child projects (topics, under a project) as clickable rows with note
 count and last activity, the notes (episode cards, `Store::episodes_under`, newest first) of
 the subtree, and "Show transcript (N segments)" — the raw segments filed under the subtree,
-collapsed by default (`NotesState::show_transcript`, reset on every view change). Today and
-All transcripts stay transcript views; Conversations (`View::Notes`, name kept for the saved pref; ⌘3) shows only UNFILED episodes (`Store::episodes_unfiled`: no node or a top-level category, i.e. not under a project or topic; low-signal included); filed ones live on the project pages. The app menu formerly titled "Notes" is now "Brain". The sidebar shows a muted
+collapsed by default (`NotesState::show_transcript`, reset on every view change). Transcripts
+(`View::Transcripts`, ⌘1; there is no Today view — old prefs saying `Today` / `All` load as it) stays a transcript view, paged by day (below); Conversations (`View::Notes`, name kept for the saved pref; ⌘3) shows only UNFILED episodes (`Store::episodes_unfiled`: no node or a top-level category, i.e. not under a project or topic; low-signal included); filed ones live on the project pages. The app menu formerly titled "Notes" is now "Brain". The sidebar shows a muted
 "No projects yet" row under a category without projects. `--selftest out.png --work` renders
 the Work view offscreen.
 
@@ -121,7 +121,7 @@ starts listening again). A session row the store refuses becomes
 `PipelineEvent::ListenFailed` and the UI closes the microphone. Dropping the `PipelineHandle`
 joins for at most 2 s (the worker also checks a cancel flag between engine-load steps), so
 quitting during a first-run model download doesn't hang. The UI schedules one
-`request_repaint_after` until local midnight so "Today" rolls over without other events.
+`request_repaint_after` until local midnight so the Transcripts view's "today" page rolls over without other events.
 
 ## Audio sources and lanes (`crates/oats-audio`, `oats-core::pipeline`, `oats-core::echo`)
 
@@ -256,8 +256,8 @@ view while open: Conversations (episode cards, matches marked), Calendar (events
 from `Store::search(query, 200)` (case-insensitive substring, echoes excluded, re-run only when
 the text or the data changes). Esc (also from the field) or × closes it and the previous view is
 back; ⌘F again re-selects the field. Clicking a note opens its node view (Conversations if unfiled), an
-event opens Calendar, a line opens Today / All — no scroll-to-row yet from search (the
-calendar and todos do scroll to the row, see below).
+event opens Calendar, a line opens Transcripts around that segment, scrolled to the row and flashed
+(same jump as the calendar and todos, see below).
 `--selftest out.png --search TEXT` renders it.
 
 Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui::Window` anchored
@@ -320,10 +320,29 @@ hotword; hotwords are unchanged.
   the canvas — completed todos struck through) and "+N"; a hotword event's own same-titled
   todo is folded into the event in the grid (`calendar::items_by_day`). The day panel below
   lists the selected day's events and todos in full with their right-click actions.
+- **Transcripts paging** (`transcript::TranscriptPages`, `Store::segments_page(before, limit)` /
+  `segments_after(after, limit)`, keyed on `(started_at, id)`): ONE contiguous range of rows,
+  paged by row count (`PAGE_ROWS` = 1000; a 1000-row page lays out in ~4 ms per frame in the
+  headless profile), not by day. Day headings are drawn only where the local day changes
+  between consecutive rows, so an empty day never shows and nothing is special about "today"
+  (there is no Today view). Initial load = the newest page. The top marker ("Loading earlier…"
+  / "Beginning of history" when a page came back short) and, after a jump, the bottom marker
+  ("Loading later…") request their page (`TranscriptAction::LoadEarlier/LoadLater`) once within
+  `PREFETCH_VIEWPORTS` (1.5) viewport heights of the visible area (`near_viewport`); one
+  synchronous page per frame, repaint until satisfied; nothing is requested on the first layout
+  of a new range (stick-to-bottom has not applied yet) or while a jump scrolls. Rows inserted
+  above the viewport shift content: the row at the viewport top is recorded each frame, and the
+  next layout moves the scroll offset by that row's shift (skipped when stuck to the end) and
+  discards the pass (`request_discard`), so nothing paints at the old offset. No eviction. Live
+  segments append only while the range ends at the newest row (`has_later == false`), and
+  stick-to-bottom is off while `has_later`. A jump to a row not loaded replaces the range with
+  `PAGE_ROWS / 2` rows either side of it, then pages outward both ways until the tail is
+  reached and live appends resume. Shortcuts: ⌘1 Transcripts, ⌘3 Conversations, ⌘4 Calendar,
+  ⌘5 Todos (⌘2 is unused).
 - **Jump to the transcript**: clicking a calendar chip / day-panel row / a dictated todo's text
   resolves its source (`source_segment_id`; an interpreted event: the first segment of its
-  `source_episode_id`; a todo without one: its event's source), switches to Today (said
-  today) or All transcripts, scrolls to the row and flashes it 1.5 s
+  `source_episode_id`; a todo without one: its event's source), switches to Transcripts, loads a window of
+  rows around that segment (replacing the loaded range when it is not in it), scrolls to the row and flashes it 1.5 s
   (`transcript::TranscriptFocus`, consumed when the row is laid out; stick-to-bottom is off
   while it runs). No source / deleted: "No transcript for this item" in the status strip.
 
@@ -632,3 +651,72 @@ cpal's `pipewire` feature for the Linux system lane, the two-lane perf run (two 
 4×); .app packaging with Info.plist (`NSMicrophoneUsageDescription`,
 `NSAudioCaptureUsageDescription`, then `LSUIElement`-style options, Dock reopen), the Linux
 engine and status-item crates.
+
+Layout table — add:
+crates/oats-sources            audio-producer contract: Producer { pid, bundle_id, name }, AudioProducers::running_output(), NoProducers, ProducerWatch (changes only)  (no platform code)
+crates/oats-sources-macos      macOS producers: Core Audio process objects via objc2-core-audio (already in the tree via cpal); NOT a workspace member (FFI needs unsafe), checked by its own lines in ci.sh
+crates/oats-media              media context: Firefox session-store reader (mozlz4 via lz4_flex), URL/bundle classifier, resolve(), MediaWatcher thread  (no platform code)
+
+## Media on the system lane (`oats-core::media`, `oats-media`, `oats-sources*`)
+
+A YouTube video in Firefox must never be taken for the user's conversation ("set a reminder"
+from a video creates nothing), and what was watched is recorded.
+- Producers: `oats_sources_macos::MacProducers` reads `kAudioHardwarePropertyProcessObjectList`
+  and per process `kAudioProcessPropertyIsRunningOutput` / `PID` / `BundleID` (macOS 14.2+;
+  property reads only, no TCC prompt, ~1 ms per poll). All `unsafe` sits in its `src/macos.rs`;
+  the crate is excluded from the workspace (`exclude` in the root Cargo.toml) and `ci.sh` runs
+  its clippy + tests separately (`CARGO_TARGET_DIR=target/sources-macos`). Linux (not built):
+  PipeWire playback streams' `application.name` / `application.process.id`.
+- Firefox: `oats_media::FirefoxSession` reads the newest
+  `<profile>/sessionstore-backups/recovery.jsonlz4` (mozlz4: `mozLz40\0`, u32 LE size, one
+  LZ4 block) — every tab's current entry, `selected`, `lastAccessed`, front window first; re-
+  parsed only when the mtime changes. Permission-free (no Automation/Accessibility grant, no
+  extension), same path layout on Linux (`~/.mozilla/firefox`, snap, flatpak). Firefox rewrites
+  it at most every 15 s and only when something changed, so a tab switch shows up with ≤ 15 s
+  delay; the store has no "tab is playing" flag.
+- `oats_media::resolve(producers, tabs)` (pure): per producer its bundle kind (Spotify/Music →
+  Music, Zoom/Teams/FaceTime/Webex → Meeting, browsers → Browser); for Firefox: a selected tab
+  that explains the sound (youtube.com/watch|shorts|live, youtu.be → YouTube{video_id, title};
+  meet.google.com, *.zoom.us, teams.microsoft.com, whereby, meet.jit.si, … → Meeting;
+  open.spotify.com, music.youtube.com, … → Music), else a call in ANY tab, else the most
+  recently shown non-selected YouTube/music tab (`background = true`, a guess), else Browser.
+  Several producers: Meeting > YouTube > Music > Browser > Other. Meetings are never media.
+- `MediaWatcher` (thread "oats-media", in the binary): active only while system audio is
+  captured (its guard is part of the capture guard; blocked, no timer, otherwise); producers
+  every 2 s, Firefox every 5 s while Firefox plays; publishes `MediaStamp { class, url, title,
+  producer }` into the pipeline's `MediaFeed` (`PipelineHandle::media_feed()`; read per system
+  chunk via an atomic version) and wakes the UI on change. `OATS_MEDIA=off` disables it.
+- Policy `oats_core::MediaPolicy { Ignore, LogOnly (default), Transcribe }`, YouTube/Music only:
+  stored in `meta.media_policy`, read at each session start, `OATS_MEDIA_POLICY` overrides,
+  `PipelineHandle::set_media_policy` for a live change. Ignore / LogOnly: no VAD and no
+  transcription on the system lane while media plays (the system ring still feeds the mic's
+  audio-level echo check, so the room copy is dropped); LogOnly and Transcribe log
+  `media_plays` rows (one per contiguous play of one URL; closed on change, stop, session end
+  or a pause > 2 min; < 3 s blips dropped; end flushed every 30 s). Transcribe: segments
+  stamped and counted in the play. Every stored system segment gets `media_kind` / `media_ref`
+  when something is known (calls too: `meeting`).
+- Store v7 (`store_media.rs`, idempotent `ensure_media_schema`): `segments.media_kind`,
+  `segments.media_ref`, `episodes.kind` ('conversation' | 'media'), `media_plays(id,
+  started_at, ended_at, kind, url, title, producer, segments_count)`; `set_segment_media`,
+  `begin_media_play` / `update_media_play` / `media_plays_between`, `episode_kind` /
+  `set_episode_kind`, `media_category()` (top-level **Media**, `created_by = auto`, on first use).
+- Brain: `episodes::cut` never mixes media with conversation (nor two videos); media segments
+  render as `[HH:MM] media: …` under `Media: <title> <url>` (titles from `media_plays`); the
+  interpret prompt says media is informational (no decisions/actions/todos/reminders/events,
+  never the user's words); a media chunk gets a `media: true` hint, a known call a stronger
+  `meeting: true`. `apply_interpretation` enforces it for media chunks: title = the video,
+  node = Media, summary header `**Media:** [title](url)`, no decisions/action items/events/new
+  projects, `episodes.kind = media`; a tiny media chunk is filed without a call; the review
+  never merges media with conversation nor re-files a media episode; categorisation files
+  media segments under Media without a call; hotwords stay mic-only (`can_command`).
+- UI: Preferences "YouTube & music: Ignore / Log only / Transcribe"; the status strip shows
+  "▶ <title>" while media plays; the Calendar day panel lists "Watched: <title> 10:12–10:40"
+  (click opens the URL); media rows are tagged "media" instead of "them".
+- Checks: `cargo run -p oats-media --example firefox_tabs -- --watch 60` (Firefox tabs, session
+  rewrites), `cargo run --manifest-path crates/oats-sources-macos/Cargo.toml --example producers
+  -- 20` (what plays). Roadmap: Linux producers (PipeWire), Chrome/Safari tabs, a "Video" class
+  for TV/IINA/VLC, channel names.
+
+Commands block — add:
+OATS_MEDIA_POLICY=ignore|log|transcribe …  # YouTube / music on system audio (default log; Preferences sets meta.media_policy)
+OATS_MEDIA=off …                            # no media detection (no producer polling, no Firefox reads)

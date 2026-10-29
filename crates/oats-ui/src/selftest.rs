@@ -22,7 +22,7 @@ pub const PIXELS_PER_POINT: f32 = 2.0;
 #[derive(Clone, Debug, Default)]
 pub struct SelftestOptions {
     /// Show the app in the Listening state with a fake input level (no audio is opened) and the
-    /// All Transcripts view, so the pill, the meter and both day headings are in the capture.
+    /// Transcripts view, so the pill, the meter and both day headings are in the capture.
     pub listening: bool,
     /// Show the Conversations view (unfiled seeded episodes and a
     /// change-log line) instead of the transcript.
@@ -49,7 +49,7 @@ pub struct SelftestOptions {
     pub topic: Option<String>,
 }
 
-/// [`run_with`] with the default options (Today view, not listening).
+/// [`run_with`] with the default options (Transcripts view, not listening).
 pub fn run(
     out: &Path,
     store: Store,
@@ -108,7 +108,7 @@ pub fn run_with(
     }
     if options.listening {
         let app = harness.state_mut();
-        app.run(Command::ShowAll);
+        app.run(Command::ShowTranscripts);
         app.selftest_fake_listening(-22.0, true);
     }
     if options.notes {
@@ -145,8 +145,9 @@ pub fn run_with(
     if let Some(q) = &options.topic {
         harness.state_mut().selftest_topic(q);
     }
-    // settle: fonts, layout, the scroll area's stick-to-bottom
-    harness.run_steps(4);
+    // settle: fonts, layout, the scroll area's stick-to-bottom, and the Transcripts view paging
+    // in the earlier day (one page per frame while the list is shorter than the window)
+    harness.run_steps(10);
     let image = harness.render()?;
     let (w, h) = image.dimensions();
     if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {

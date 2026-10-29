@@ -41,6 +41,7 @@ use crate::echo_audio::{self, EchoAudioMode, SystemRing};
 use crate::engine::{
     AudioChunk, AudioSourceKind, EnergyVad, EngineFactory, SAMPLE_RATE, SpeechEngine,
 };
+use crate::media::{FeedReader, MediaFeed, MediaPolicy};
 use crate::segmenter::{Segment, Segmenter, SegmenterConfig};
 use crate::store::{Store, TranscriptRow};
 
@@ -56,6 +57,12 @@ const LEVEL_STALE: Duration = Duration::from_secs(1);
 /// would notice). Counted in chunks, not time, so a processing stall (chunks queued) can't
 /// fake it.
 const MIC_LOST_AFTER_CHUNKS: u32 = 30;
+/// A media play paused longer than this is closed (a resume opens a new row).
+const MEDIA_PAUSE_CLOSES_MS: i64 = 120_000;
+/// An open play's end is written back at least this often (a crash loses little).
+const MEDIA_FLUSH_MS: i64 = 30_000;
+/// Plays shorter than this (a preview, a tab switch) are not kept.
+const MEDIA_MIN_PLAY_MS: i64 = 3_000;
 /// How long dropping the handle waits for the worker before detaching it (a model load can
 /// take minutes and can't be interrupted; quitting must not wait for it).
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -162,6 +169,9 @@ pub struct PipelineHandle {
     echo_audio: Arc<AtomicU8>,
     echo_pending_timeout_ms: Arc<AtomicU64>,
     echo_stats: Arc<Mutex<EchoStats>>,
+    /// What plays on the system lane (written by the media resolver).
+    media_feed: MediaFeed,
+    media_policy: Arc<AtomicU8>,
 }
 
 /// The audio a session reads: the plain microphone-only stream (every chunk is the
@@ -221,6 +231,8 @@ impl Pipeline {
         let echo_audio = Arc::new(AtomicU8::new(echo_mode.to_u8()));
         let echo_pending_timeout_ms = Arc::new(AtomicU64::new(echo_audio::ECHO_PENDING_TIMEOUT_MS));
         let echo_stats = Arc::new(Mutex::new(EchoStats::default()));
+        let media_feed = MediaFeed::new();
+        let media_policy = Arc::new(AtomicU8::new(MediaPolicy::default().to_u8()));
         let out = Outbox {
             tx: event_tx,
             wake,
@@ -229,6 +241,8 @@ impl Pipeline {
             echo_audio: echo_audio.clone(),
             echo_pending_timeout_ms: echo_pending_timeout_ms.clone(),
             echo_stats: echo_stats.clone(),
+            media_feed: media_feed.clone(),
+            media_policy: media_policy.clone(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
@@ -261,6 +275,8 @@ impl Pipeline {
             echo_audio,
             echo_pending_timeout_ms,
             echo_stats,
+            media_feed,
+            media_policy,
         }
     }
 }
@@ -328,6 +344,23 @@ impl PipelineHandle {
         self.echo_dedup.clone()
     }
 
+    /// The slot the media resolver writes what plays on the system lane into (system
+    /// segments are stamped with it; YouTube / music follow the media policy).
+    pub fn media_feed(&self) -> MediaFeed {
+        self.media_feed.clone()
+    }
+
+    /// Change the YouTube / music policy now (each session also starts from the stored one:
+    /// `meta.media_policy`, `OATS_MEDIA_POLICY` overriding — so the caller stores it too).
+    pub fn set_media_policy(&self, policy: MediaPolicy) {
+        self.media_policy.store(policy.to_u8(), Ordering::Relaxed);
+    }
+
+    /// The policy in force.
+    pub fn media_policy(&self) -> MediaPolicy {
+        MediaPolicy::from_u8(self.media_policy.load(Ordering::Relaxed))
+    }
+
     /// Drain pending events (call once per UI frame).
     pub fn poll(&self) -> Vec<PipelineEvent> {
         self.events.try_iter().collect()
@@ -373,6 +406,8 @@ struct Outbox {
     echo_audio: Arc<AtomicU8>,
     echo_pending_timeout_ms: Arc<AtomicU64>,
     echo_stats: Arc<Mutex<EchoStats>>,
+    media_feed: MediaFeed,
+    media_policy: Arc<AtomicU8>,
 }
 
 impl Outbox {
@@ -526,6 +561,7 @@ fn worker(
                     store: &store,
                     out,
                     echo: EchoState::default(),
+                    media: MediaState::new(out.media_feed.clone()),
                 };
                 match session.run(config, &listen, cmd_rx) {
                     AfterListen::Idle => next = cmd_rx.recv().ok(),
@@ -616,6 +652,39 @@ struct EchoState {
     published: EchoStats,
 }
 
+/// A media play being logged (`media_plays` row `id`).
+#[derive(Debug)]
+struct OpenPlay {
+    id: i64,
+    key: String,
+    title: String,
+    started_ms: i64,
+    /// The end of the last chunk with sound.
+    last_signal_ms: i64,
+    flushed_ms: i64,
+    segments: i64,
+}
+
+/// The session's view of what plays on the system lane.
+#[derive(Debug)]
+struct MediaState {
+    reader: FeedReader,
+    /// YouTube / music plays and the policy skips it: the system lane runs no VAD, closes no
+    /// segment.
+    skip_system: bool,
+    open: Option<OpenPlay>,
+}
+
+impl MediaState {
+    fn new(feed: MediaFeed) -> Self {
+        Self {
+            reader: FeedReader::new(feed),
+            skip_system: false,
+            open: None,
+        }
+    }
+}
+
 /// One listening session's borrowed context.
 struct Session<'a> {
     engine: &'a mut dyn SpeechEngine,
@@ -623,6 +692,7 @@ struct Session<'a> {
     store: &'a Store,
     out: &'a Outbox,
     echo: EchoState,
+    media: MediaState,
 }
 
 impl Session<'_> {
@@ -647,6 +717,15 @@ impl Session<'_> {
         };
         // a new session counts from zero
         self.publish_echo_stats();
+        let stored = self.store.meta(MediaPolicy::META_KEY).ok().flatten();
+        let policy = MediaPolicy::effective(stored.as_deref());
+        self.out
+            .media_policy
+            .store(policy.to_u8(), Ordering::Relaxed);
+        log::info!(
+            "media policy (YouTube / music on system audio): {}",
+            policy.as_str()
+        );
         self.out.send(PipelineEvent::SessionStarted(session_id));
         self.out
             .send(PipelineEvent::Status(PipelineStatus::Listening));
@@ -681,6 +760,9 @@ impl Session<'_> {
                         }
                     }
                     lane.signal |= !silent;
+                    if lane.kind == AudioSourceKind::System {
+                        self.media.skip_system = self.media_skips();
+                    }
                     self.feed(
                         lane,
                         &chunk.samples,
@@ -695,6 +777,11 @@ impl Session<'_> {
                         EnergyVad::rms_db(&chunk.samples)
                     };
                     lane.last_chunk = Some(Instant::now());
+                    if lane.kind == AudioSourceKind::System
+                        && let Some(clock) = lane.clock
+                    {
+                        self.track_media(clock.ms_at(lane.received), !silent);
+                    }
 
                     // an all-zero system chunk (nothing playing) wakes nobody
                     let report = chunk.source == AudioSourceKind::Mic || !silent;
@@ -756,6 +843,7 @@ impl Session<'_> {
             }
         }
         self.expire_pending(i64::MAX);
+        self.close_play();
         self.end_echo_stats(session_id);
         if let Err(e) = self.store.end_session(session_id, now_ms()) {
             self.out.send(PipelineEvent::Warning(format!(
@@ -799,25 +887,26 @@ impl Session<'_> {
         while lane.pending.len() - offset >= frame_len {
             let frame = &lane.pending[offset..offset + frame_len];
             offset += frame_len;
-            let is_speech =
-                if lane.kind == AudioSourceKind::System && frame.iter().all(|s| *s == 0.0) {
-                    // digital silence from the tap: nothing to classify
-                    false
-                } else {
-                    match lane.energy_vad.as_mut() {
-                        Some(vad) => vad.classify(frame).is_speech,
-                        None => match self.engine.vad_lane(lane.kind, frame) {
-                            Ok(v) => v.first().is_some_and(|f| f.is_speech),
-                            Err(e) => {
-                                if !*vad_warned {
-                                    *vad_warned = true;
-                                    self.out.send(PipelineEvent::Warning(e.to_string()));
-                                }
-                                false
+            let is_speech = if lane.kind == AudioSourceKind::System
+                && (self.media.skip_system || frame.iter().all(|s| *s == 0.0))
+            {
+                // digital silence from the tap, or media the policy skips: nothing to classify
+                false
+            } else {
+                match lane.energy_vad.as_mut() {
+                    Some(vad) => vad.classify(frame).is_speech,
+                    None => match self.engine.vad_lane(lane.kind, frame) {
+                        Ok(v) => v.first().is_some_and(|f| f.is_speech),
+                        Err(e) => {
+                            if !*vad_warned {
+                                *vad_warned = true;
+                                self.out.send(PipelineEvent::Warning(e.to_string()));
                             }
-                        },
-                    }
-                };
+                            false
+                        }
+                    },
+                }
+            };
             if let Some(seg) = lane.segmenter.push(frame, is_speech) {
                 self.finish_segment(lane.kind, session_id, &clock, &seg);
             }
@@ -970,6 +1059,11 @@ impl Session<'_> {
     ) {
         let started_at = clock.ms_at(seg.start_sample);
         let ended_at = clock.ms_at(seg.start_sample + seg.samples.len() as u64);
+        if source == AudioSourceKind::System && self.media.skip_system {
+            // media the policy doesn't transcribe (a segment open when it started playing)
+            log::debug!("system segment {} ms skipped: media", seg.duration_ms());
+            return;
+        }
         if source == AudioSourceKind::Mic
             && self
                 .echo_mode()
@@ -1022,7 +1116,7 @@ impl Session<'_> {
         } else {
             None
         };
-        let row = match self.store.insert_segment_from(
+        let mut row = match self.store.insert_segment_from(
             session_id,
             started_at,
             ended_at,
@@ -1045,6 +1139,9 @@ impl Session<'_> {
                 row.id
             );
         }
+        if source == AudioSourceKind::System {
+            self.stamp_media(&mut row);
+        }
         self.out.send(PipelineEvent::Segment(row.clone()));
         if source == AudioSourceKind::System {
             if !self.echo.pending.is_empty() {
@@ -1053,6 +1150,131 @@ impl Session<'_> {
             if dedup {
                 self.claim_echoes(&row);
             }
+        }
+    }
+
+    fn media_policy(&self) -> MediaPolicy {
+        MediaPolicy::from_u8(self.out.media_policy.load(Ordering::Relaxed))
+    }
+
+    /// YouTube / music plays and the policy doesn't transcribe it.
+    fn media_skips(&mut self) -> bool {
+        let policy = self.media_policy();
+        policy.skips_transcription() && self.media.reader.get().is_some_and(|m| m.is_media())
+    }
+
+    /// Stamp a stored system segment with what was playing when it closed (and count it
+    /// toward the open play).
+    fn stamp_media(&mut self, row: &mut TranscriptRow) {
+        let Some(stamp) = self.media.reader.get().cloned() else {
+            return;
+        };
+        if let Err(e) =
+            self.store
+                .set_segment_media(row.id, Some(stamp.class), stamp.url.as_deref())
+        {
+            return log::warn!("could not stamp segment {} with its media: {e}", row.id);
+        }
+        row.media_kind = Some(stamp.class);
+        row.media_ref = stamp.url.clone();
+        if let Some(open) = self.media.open.as_mut()
+            && open.key == stamp.play_key()
+        {
+            open.segments += 1;
+        }
+    }
+
+    /// Follow the media plays on the system lane (`at_ms`: the end of the chunk just fed;
+    /// `signal`: it had sound). While the policy logs plays, a YouTube / music stamp with
+    /// sound opens a `media_plays` row, which is extended while it sounds and closed when
+    /// the media changes, stops being media, pauses longer than [`MEDIA_PAUSE_CLOSES_MS`]
+    /// or the session ends.
+    fn track_media(&mut self, at_ms: i64, signal: bool) {
+        let policy = self.media_policy();
+        let stamp = self
+            .media
+            .reader
+            .get()
+            .filter(|m| m.is_media() && policy.logs_plays())
+            .cloned();
+        let Some(stamp) = stamp else {
+            return self.close_play();
+        };
+        let same = self
+            .media
+            .open
+            .as_ref()
+            .is_some_and(|o| o.key == stamp.play_key());
+        if !same {
+            self.close_play();
+        }
+        if let Some(open) = self.media.open.as_mut() {
+            if signal {
+                open.last_signal_ms = at_ms;
+            }
+            if !stamp.title.is_empty() && stamp.title != open.title {
+                open.title = stamp.title.clone();
+                if let Err(e) = self.store.set_media_play_title(open.id, &open.title) {
+                    log::warn!("media play: {e}");
+                }
+            }
+            if at_ms - open.last_signal_ms > MEDIA_PAUSE_CLOSES_MS {
+                return self.close_play();
+            }
+            if open.last_signal_ms - open.flushed_ms >= MEDIA_FLUSH_MS {
+                open.flushed_ms = open.last_signal_ms;
+                if let Err(e) =
+                    self.store
+                        .update_media_play(open.id, open.last_signal_ms, open.segments)
+                {
+                    log::warn!("media play: {e}");
+                }
+            }
+            return;
+        }
+        if !signal {
+            return;
+        }
+        // the chunk's sound started about one chunk before its end
+        let started = at_ms - 100;
+        match self.store.begin_media_play(started, &stamp) {
+            Ok(id) => {
+                log::info!("media play {id} started ({})", stamp.class.as_str());
+                self.media.open = Some(OpenPlay {
+                    id,
+                    key: stamp.play_key().to_string(),
+                    title: stamp.title.clone(),
+                    started_ms: started,
+                    last_signal_ms: at_ms,
+                    flushed_ms: started,
+                    segments: 0,
+                });
+            }
+            Err(e) => log::warn!("could not log a media play: {e}"),
+        }
+    }
+
+    /// Close the open play (its end = its last sound); a blip shorter than
+    /// [`MEDIA_MIN_PLAY_MS`] is dropped.
+    fn close_play(&mut self) {
+        let Some(open) = self.media.open.take() else {
+            return;
+        };
+        let result =
+            if open.last_signal_ms - open.started_ms < MEDIA_MIN_PLAY_MS && open.segments == 0 {
+                self.store.delete_media_play(open.id)
+            } else {
+                log::info!(
+                    "media play {} ended: {} s, {} segments",
+                    open.id,
+                    (open.last_signal_ms - open.started_ms) / 1000,
+                    open.segments
+                );
+                self.store
+                    .update_media_play(open.id, open.last_signal_ms, open.segments)
+            };
+        if let Err(e) = result {
+            log::warn!("media play: {e}");
         }
     }
 
@@ -1238,7 +1460,7 @@ mod tests {
         drop(audio_tx);
         drop(h);
 
-        let rows = Store::open(&path).and_then(|s| s.segments(View::All, 0));
+        let rows = Store::open(&path).and_then(|s| s.segments(View::Transcripts));
         assert!(rows.is_ok_and(|r| r.len() == 1 && r[0].text.contains("no engine")));
         if let Some(dir) = path.parent() {
             let _ = std::fs::remove_dir_all(dir);

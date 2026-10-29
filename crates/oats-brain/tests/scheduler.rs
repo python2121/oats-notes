@@ -455,5 +455,5 @@ fn an_interpretation_run_respects_the_new_node_cap() {
         1,
         "the project is reused, not duplicated"
     );
-    assert_eq!(s.segments(View::All, 0).unwrap().len(), 1);
+    assert_eq!(s.segments(View::Transcripts).unwrap().len(), 1);
 }

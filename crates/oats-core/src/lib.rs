@@ -12,6 +12,8 @@
 //!   system-audio segment (speakers heard by the microphone) — pure.
 //! - [`echo_audio`]: the audio-level pre-check that recognises such an echo by correlating
 //!   loudness envelopes BEFORE the model runs, and the system-audio ring it reads — pure.
+//! - [`media`]: what plays on the system lane (YouTube, music, a call, …), the stamp its
+//!   segments carry, the YouTube / music policy and the feed the media resolver writes.
 //! - [`paths`]: where the database and logs live.
 //!
 //! The engine implementation (`oats-engine-fluidaudio` on macOS) and the audio capture
@@ -22,6 +24,7 @@
 pub mod echo;
 pub mod echo_audio;
 pub mod engine;
+pub mod media;
 pub mod paths;
 pub mod pipeline;
 pub mod segmenter;
@@ -34,6 +37,7 @@ pub use engine::{
     AudioChunk, AudioSourceKind, EngineError, EngineFactory, NullEngine, SAMPLE_RATE, SpeechEngine,
     Transcription, VadFrame,
 };
+pub use media::{MediaClass, MediaFeed, MediaPlay, MediaPolicy, MediaStamp};
 pub use pipeline::{Pipeline, PipelineEvent, PipelineHandle, PipelineStatus};
 pub use segmenter::{Segment, Segmenter, SegmenterConfig};
 pub use store::{

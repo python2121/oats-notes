@@ -23,7 +23,10 @@ use serde_json::{Value, json};
 
 use crate::claude_cli::Request;
 use crate::dates;
-use crate::episodes::{Chunk, render_transcript};
+use crate::episodes::{Chunk, render_transcript_titled};
+use oats_core::MediaClass;
+use oats_core::store::{EPISODE_MEDIA, MEDIA_CATEGORY};
+use std::collections::HashMap;
 
 pub const INTERPRET_SYSTEM: &str = include_str!("../prompts/interpret.system.md");
 pub const INTERPRET_USER: &str = include_str!("../prompts/interpret.user.md");
@@ -361,9 +364,21 @@ fn render_prior(prior: Option<&Episode>) -> String {
 }
 
 /// The `meeting: true` hint for an episode with system audio (the other side of a call or a
-/// video in `them:` lines), else nothing.
+/// video in `them:` lines), else nothing. When the app KNOWS the system audio was a call
+/// (Zoom, Meet, Teams, … — `MediaClass::Meeting`) the hint says so; when the whole episode is
+/// media (a YouTube video, music) it gets the media hint instead.
 pub fn meeting_hint(chunk: &Chunk) -> &'static str {
-    if chunk.has_system_audio() {
+    if chunk.media_key().is_some() {
+        "# Hint\n\nmedia: true — this whole episode is media the computer played (`media:` \
+         lines under the `Media:` header: a YouTube video or music), not a conversation. \
+         Summarise what it was about for the user's record and title it after the video; no \
+         decisions, no action items, no events. The app files it under Media.\n\n"
+    } else if chunk.has_known_meeting() {
+        "# Hint\n\nmeeting: true — the system audio in this episode (`them:` lines) was a \
+         call: the app saw a meeting app or meeting page (Zoom, Google Meet, Microsoft Teams, \
+         …) playing it, next to the user's microphone (`me:` lines). Meetings usually belong \
+         under Work; that is a hint, not a rule (personal calls exist).\n\n"
+    } else if chunk.has_system_audio() {
         "# Hint\n\nmeeting: true — this episode contains system audio (`them:` lines: what the \
          computer played, usually the other side of a call or meeting, sometimes a video) next \
          to the user's microphone (`me:` lines). Meetings usually belong under Work; that is a \
@@ -381,6 +396,19 @@ pub fn interpret_request(
     now: &DateTime<Local>,
     model: Option<String>,
 ) -> Request {
+    interpret_request_with(tree, chunk, prior, now, model, &HashMap::new())
+}
+
+/// [`interpret_request`] with media titles for the transcript's `Media:` headers (URL →
+/// title; see [`media_titles`]).
+pub fn interpret_request_with(
+    tree: &[Node],
+    chunk: &Chunk,
+    prior: Option<&Episode>,
+    now: &DateTime<Local>,
+    model: Option<String>,
+    media_titles: &HashMap<String, String>,
+) -> Request {
     let user = render(
         INTERPRET_USER,
         &[
@@ -393,7 +421,11 @@ pub fn interpret_request(
             ("meeting", meeting_hint(chunk)),
             (
                 "transcript",
-                &strip_delimiters(&render_transcript(&chunk.segments, &Local)),
+                &strip_delimiters(&render_transcript_titled(
+                    &chunk.segments,
+                    &Local,
+                    media_titles,
+                )),
             ),
         ],
     );
@@ -510,6 +542,104 @@ pub fn root_of(tree: &[Node], id: i64) -> Option<i64> {
     None
 }
 
+/// What a media chunk is (see [`media_of`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaInfo {
+    pub class: MediaClass,
+    pub url: Option<String>,
+    /// The video's title (from the logged play), else the URL.
+    pub title: String,
+}
+
+/// The titles of the media played around `[from, to]` (URL → title), from `media_plays`.
+pub fn media_titles(store: &Store, from: i64, to: i64) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let slack = 5 * 60_000;
+    for p in store
+        .media_plays_between(from - slack, to + slack)
+        .unwrap_or_default()
+    {
+        if let Some(url) = p.url
+            && !p.title.trim().is_empty()
+        {
+            out.insert(url, p.title);
+        }
+    }
+    out
+}
+
+/// The media a chunk is made of (every segment one video / stream), `None` for a
+/// conversation.
+pub fn media_of(store: &Store, chunk: &Chunk) -> Option<MediaInfo> {
+    let key = chunk.media_key()?;
+    let first = chunk.segments.iter().find(|s| s.echo_of.is_none())?;
+    let url = first.media_ref.clone();
+    let title = url
+        .as_ref()
+        .and_then(|u| media_titles(store, chunk.started_at, chunk.ended_at).remove(u))
+        .unwrap_or_else(|| key.clone());
+    Some(MediaInfo {
+        class: first.media_kind.unwrap_or(MediaClass::YouTube),
+        url,
+        title: title.split_whitespace().collect::<Vec<_>>().join(" "),
+    })
+}
+
+/// The summary header of a media episode: `**Media:** [title](url)`.
+pub fn media_summary_header(media: &MediaInfo) -> String {
+    let title = media.title.replace(['[', ']'], "");
+    match &media.url {
+        Some(url) => format!("**Media:** [{title}]({})", url.replace([' ', ')'], "")),
+        None => format!("**Media:** {title}"),
+    }
+}
+
+/// A media episode's content, whatever the model returned: titled by the video, filed under
+/// the Media category, the URL in a summary header, and nothing actionable — media content
+/// is informational, never the user's own decisions, todos or dates.
+fn media_content(content: &mut EpisodeContent, media: &MediaInfo, media_node: i64) {
+    if !media.title.trim().is_empty() {
+        content.title = media.title.trim().chars().take(200).collect();
+    }
+    let body: Vec<&str> = content
+        .summary
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("**Media:**"))
+        .collect();
+    let body = body.join("\n");
+    let body = body.trim();
+    content.summary = if body.is_empty() {
+        media_summary_header(media)
+    } else {
+        format!("{}\n\n{body}", media_summary_header(media))
+    };
+    content.node_id = Some(media_node);
+    content.decisions.clear();
+    content.action_items.clear();
+}
+
+/// File a media chunk too short to be worth a call: a media episode titled by the video,
+/// under Media, the URL in its summary — no model involved.
+pub fn file_media_without_call(
+    store: &Store,
+    chunk: &Chunk,
+    media: &MediaInfo,
+    now_ms: i64,
+) -> Result<Episode, StoreError> {
+    store.with_savepoint(|store| {
+        let node = store.media_category()?;
+        let mut content = EpisodeContent {
+            model: "none".into(),
+            ..Default::default()
+        };
+        media_content(&mut content, media, node.id);
+        let ep = store.insert_episode(chunk.started_at, chunk.ended_at, &content, now_ms)?;
+        store.set_episode_kind(ep.id, EPISODE_MEDIA)?;
+        store.mark_segments_interpreted(&chunk.segment_ids(), ep.id, now_ms)?;
+        Ok(ep)
+    })
+}
+
 /// Write an interpretation: create or revise the episode, file it, reconcile its events, mark
 /// the chunk's segments interpreted, record created nodes as changes. All of it is one
 /// transaction ([`Store::with_savepoint`]): a failure half-way leaves no half-applied episode.
@@ -556,7 +686,23 @@ fn apply_interpretation_in_tx(
     // a note the user edited by hand is never content-revised: the interpretation is written
     // as a new episode instead (the scheduler already avoids picking one as the prior)
     let prior = prior.filter(|p| p.user_edited_at.is_none());
-    let (node_id, new_nodes) = resolve_node(store, tree, interp, max_new_nodes)?;
+    let media = media_of(store, chunk);
+    let (node_id, mut new_nodes) = match &media {
+        // a media episode never creates projects: it goes under Media
+        Some(_) => (None, Vec::new()),
+        None => resolve_node(store, tree, interp, max_new_nodes)?,
+    };
+    let media_node = match &media {
+        Some(_) => {
+            let existed = store.find_node(None, MEDIA_CATEGORY)?.is_some();
+            let node = store.media_category()?;
+            if !existed {
+                new_nodes.push(node.clone());
+            }
+            Some(node.id)
+        }
+        None => None,
+    };
     for n in &new_nodes {
         store.record_change(
             run_id,
@@ -598,6 +744,11 @@ fn apply_interpretation_in_tx(
         model: model.to_owned(),
         cost_usd,
     };
+    let mut content = content;
+    if let (Some(m), Some(node)) = (&media, media_node) {
+        media_content(&mut content, m, node);
+    }
+    let node_id = content.node_id;
     let (started_at, ended_at) = match prior {
         Some(p) => (
             p.started_at.min(chunk.started_at),
@@ -616,6 +767,9 @@ fn apply_interpretation_in_tx(
                 .id
         }
     };
+    if media.is_some() {
+        store.set_episode_kind(episode_id, EPISODE_MEDIA)?;
+    }
     store.mark_segments_interpreted(&chunk.segment_ids(), episode_id, now_ms)?;
     // a re-interpretation (the episode was reset): events the dead episode produced from these
     // segments become this episode's, so the drop below also covers them
@@ -625,7 +779,8 @@ fn apply_interpretation_in_tx(
     // proposes (screenpipe's "reuse a stable id, merge duplicates" rule)
     let mut kept = Vec::new();
     let mut events = Vec::new();
-    if !interp.low_signal {
+    // media never puts dates on the calendar (a video saying "next Friday" isn't the user's)
+    if !interp.low_signal && media.is_none() {
         for e in &interp.events {
             let Some(d) = dates::parse_date(&e.date) else {
                 continue;
@@ -961,6 +1116,10 @@ pub fn apply_review(
                 if f.user_edited_at.is_some() {
                     continue;
                 }
+                // media and conversation are never merged into each other
+                if store.episode_kind(from)? != store.episode_kind(into)? {
+                    continue;
+                }
                 store.merge_episodes(from, into)?;
                 gone.push(from);
                 let d = format!("Merged episode '{}' into '{}' — {reason}", f.title, i.title);
@@ -982,6 +1141,10 @@ pub fn apply_review(
                     continue;
                 };
                 if e.node_id == Some(node) {
+                    continue;
+                }
+                // a media episode stays under Media
+                if store.episode_kind(id)?.as_deref() == Some(EPISODE_MEDIA) {
                     continue;
                 }
                 store.set_episode_node(id, Some(node))?;

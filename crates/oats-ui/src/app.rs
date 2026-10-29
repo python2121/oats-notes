@@ -32,7 +32,8 @@ use crate::toast::{Confirmation, ToastAction, ToastState, toasts};
 use crate::todos::{TodoAction, TodosState, todos_view};
 use crate::topic::{BAR_H as TOPIC_BAR_H, TopicAction, TopicState, topic_header, topic_list};
 use crate::transcript::{
-    TranscriptAction, TranscriptFocus, local_midnight_ms, transcript_list, until_local_midnight,
+    PAGE_ROWS, TranscriptAction, TranscriptFocus, TranscriptPages, local_midnight_ms,
+    transcript_list, until_local_midnight,
 };
 
 /// eframe storage key for [`AppPrefs`] (RON).
@@ -63,7 +64,7 @@ impl Default for AppPrefs {
         Self {
             sidebar_visible: true,
             sidebar_width: 220.0,
-            view: View::Today,
+            view: View::Transcripts,
             listening: false,
             capture_system: true,
             command_sound: true,
@@ -158,8 +159,8 @@ pub enum Command {
     ToggleSidebar,
     /// Open the search bar (or re-focus it).
     Search,
-    ShowToday,
-    ShowAll,
+    /// The Transcripts view (⌘1).
+    ShowTranscripts,
     ShowNotes,
     ShowCalendar,
     ShowTodos,
@@ -188,8 +189,8 @@ pub const SHORTCUTS: &[(KeyboardShortcut, Command)] = &[
     (sc(CMD_SHIFT, Key::S), Command::ToggleSidebar),
     (sc(Modifiers::COMMAND, Key::L), Command::ToggleListening),
     (sc(Modifiers::COMMAND, Key::N), Command::NewCategory),
-    (sc(Modifiers::COMMAND, Key::Num1), Command::ShowToday),
-    (sc(Modifiers::COMMAND, Key::Num2), Command::ShowAll),
+    // ⌘2 was "All Transcripts" before Today went away; the rest keep their numbers
+    (sc(Modifiers::COMMAND, Key::Num1), Command::ShowTranscripts),
     (sc(Modifiers::COMMAND, Key::Num3), Command::ShowNotes),
     (sc(Modifiers::COMMAND, Key::Num4), Command::ShowCalendar),
     (sc(Modifiers::COMMAND, Key::Num5), Command::ShowTodos),
@@ -298,8 +299,11 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                 Separator,
                 check("Show Sidebar", Command::ToggleSidebar, s.sidebar_visible),
                 Separator,
-                check("Today", Command::ShowToday, s.view == View::Today),
-                check("All Transcripts", Command::ShowAll, s.view == View::All),
+                check(
+                    "Transcripts",
+                    Command::ShowTranscripts,
+                    s.view == View::Transcripts,
+                ),
                 check("Conversations", Command::ShowNotes, s.view == View::Notes),
                 check("Calendar", Command::ShowCalendar, s.view == View::Calendar),
                 check("Todos", Command::ShowTodos, s.view == View::Todos),
@@ -342,7 +346,16 @@ pub struct OatsApp {
     system_on: bool,
     /// The system-audio lane delivered only silence since the start (no tap signal).
     system_no_signal: bool,
+    /// The Calendar day panel's media plays ("Watched: …") and the day they are for (`None`:
+    /// reload at the next frame).
+    media_plays: Vec<oats_core::MediaPlay>,
+    media_plays_day: Option<chrono::NaiveDate>,
+    /// The segments of a Node view (the Transcripts view uses `pages`).
     rows: Vec<TranscriptRow>,
+    /// The Transcripts view: the loaded range of rows.
+    pages: TranscriptPages,
+    /// Rows per page (`PAGE_ROWS`; tests shrink it).
+    page_rows: usize,
     /// The whole category → project → topic tree.
     nodes: Vec<Node>,
     today_count: i64,
@@ -454,7 +467,11 @@ impl OatsApp {
             level: None,
             system_on: false,
             system_no_signal: false,
+            media_plays: Vec::new(),
+            media_plays_day: None,
             rows: Vec::new(),
+            pages: TranscriptPages::default(),
+            page_rows: PAGE_ROWS,
             nodes: Vec::new(),
             today_count: 0,
             today_start: local_midnight_ms(),
@@ -759,8 +776,7 @@ impl OatsApp {
                 }
                 None => self.search = Some(SearchState::opened()),
             },
-            Command::ShowToday => self.set_view(View::Today),
-            Command::ShowAll => self.set_view(View::All),
+            Command::ShowTranscripts => self.set_view(View::Transcripts),
             Command::ShowNotes => self.set_view(View::Notes),
             Command::ShowCalendar => self.set_view(View::Calendar),
             Command::ShowTodos => self.set_view(View::Todos),
@@ -810,14 +826,7 @@ impl OatsApp {
                     self.close_search();
                     self.jump_to_episode(id, node);
                 }
-                SearchAction::OpenSegment(at) => {
-                    self.close_search();
-                    if at >= self.today_start {
-                        self.set_view(View::Today);
-                    } else {
-                        self.set_view(View::All);
-                    }
-                }
+                SearchAction::OpenSegment(id) => self.jump_to_segment(Some(id)),
                 SearchAction::OpenEvent(_) => {
                     self.close_search();
                     self.set_view(View::Calendar);
@@ -971,7 +980,7 @@ impl OatsApp {
             && !self.nodes.iter().any(|n| n.id == id)
             && !self.nodes.is_empty()
         {
-            self.prefs.view = View::Today;
+            self.prefs.view = View::Transcripts;
         }
         self.reload_sidebar_episodes();
         self.reload_rows();
@@ -1010,16 +1019,150 @@ impl OatsApp {
     }
 
     fn reload_rows(&mut self) {
-        self.today_start = local_midnight_ms();
-        match self.store.segments(self.prefs.view, self.today_start) {
-            Ok(r) => self.rows = r,
-            Err(e) => self.store_error(e),
+        let today = local_midnight_ms();
+        self.today_start = today;
+        match self.prefs.view {
+            View::Transcripts => {
+                self.rows.clear();
+                if self.pages.rows.is_empty() {
+                    self.reset_pages();
+                } else {
+                    self.refresh_pages();
+                }
+            }
+            View::Node(_) => match self.store.segments(self.prefs.view) {
+                Ok(r) => self.rows = r,
+                Err(e) => self.store_error(e),
+            },
+            View::Notes | View::Calendar | View::Todos => self.rows.clear(),
         }
         match self.store.segment_count_since(self.today_start) {
             Ok(n) => self.today_count = n,
             Err(e) => self.store_error(e),
         }
         self.run_search();
+    }
+
+    /// The newest `limit` rows strictly before `before`, oldest first, and whether older ones
+    /// remain (asked for one more than shown).
+    fn fetch_before(
+        &mut self,
+        before: Option<(i64, i64)>,
+        limit: usize,
+    ) -> (Vec<TranscriptRow>, bool) {
+        match self.store.segments_page(before, limit as i64 + 1) {
+            Ok(mut rows) => {
+                let more = rows.len() > limit;
+                if more {
+                    rows.remove(0);
+                }
+                (rows, more)
+            }
+            Err(e) => {
+                self.store_error(e);
+                (Vec::new(), false)
+            }
+        }
+    }
+
+    /// The oldest `limit` rows strictly after `after`, and whether newer ones remain.
+    fn fetch_after(&mut self, after: (i64, i64), limit: usize) -> (Vec<TranscriptRow>, bool) {
+        match self.store.segments_after(after, limit as i64 + 1) {
+            Ok(mut rows) => {
+                let more = rows.len() > limit;
+                rows.truncate(limit);
+                (rows, more)
+            }
+            Err(e) => {
+                self.store_error(e);
+                (Vec::new(), false)
+            }
+        }
+    }
+
+    /// The initial Transcripts list: the newest page of rows.
+    fn reset_pages(&mut self) {
+        let (rows, more) = self.fetch_before(None, self.page_rows);
+        self.pages.set(rows, more, false);
+    }
+
+    /// Re-read the loaded range (a segment was filed, deleted, interpreted…).
+    fn refresh_pages(&mut self) {
+        let len = self.pages.rows.len().max(self.page_rows);
+        if self.pages.has_later {
+            let Some((t, id)) = self.pages.first_key() else {
+                return self.reset_pages();
+            };
+            // strictly after the key just below the first row: the same range, re-read
+            let (rows, more) = self.fetch_after((t, id - 1), len);
+            let earlier = self.pages.has_earlier;
+            self.pages.set(rows, earlier, more);
+        } else {
+            let (rows, more) = self.fetch_before(None, len);
+            self.pages.set(rows, more, false);
+        }
+    }
+
+    /// Make sure `row` is in the loaded range. When it is not, a window of `page_rows / 2`
+    /// rows either side of it REPLACES the range; paging then continues outward both ways
+    /// (forward until the newest rows are reached, where live appends resume).
+    fn ensure_row_loaded(&mut self, row: &TranscriptRow) {
+        if self.pages.contains_row(row.id) {
+            return;
+        }
+        let half = (self.page_rows / 2).max(1);
+        let key = (row.started_at, row.id);
+        let (mut rows, earlier) = self.fetch_before(Some(key), half);
+        rows.push(row.clone());
+        let (later_rows, later) = self.fetch_after(key, half);
+        rows.extend(later_rows);
+        self.pages.set(rows, earlier, later);
+    }
+
+    /// Load the page a [`TranscriptAction::LoadEarlier`] / `LoadLater` asked for.
+    fn load_adjacent(&mut self, later: bool) {
+        if later {
+            if !self.pages.has_later {
+                return;
+            }
+            let Some(last) = self.pages.last_key() else {
+                return;
+            };
+            let (rows, more) = self.fetch_after(last, self.page_rows);
+            self.pages.append(rows, more);
+        } else {
+            if !self.pages.has_earlier {
+                return;
+            }
+            let Some(first) = self.pages.first_key() else {
+                return;
+            };
+            let (rows, more) = self.fetch_before(Some(first), self.page_rows);
+            self.pages.prepend(rows, more);
+        }
+    }
+
+    /// Rows loaded in the Transcripts view, and the ids of the first and last (tests).
+    pub fn loaded_rows(&self) -> (usize, Option<i64>, Option<i64>) {
+        (
+            self.pages.rows.len(),
+            self.pages.rows.first().map(|r| r.id),
+            self.pages.rows.last().map(|r| r.id),
+        )
+    }
+
+    /// Whether newer rows than the loaded ones exist (after a jump; tests).
+    pub fn transcript_has_later(&self) -> bool {
+        self.pages.has_later
+    }
+
+    /// Rows per page (tests use a small one so a few hundred rows make several pages).
+    #[doc(hidden)]
+    pub fn set_page_rows(&mut self, n: usize) {
+        self.page_rows = n.max(2);
+        if self.prefs.view == View::Transcripts {
+            self.reset_pages();
+        }
     }
 
     /// Episodes (of the selected subtree in a Node view, else all), events, reminders, the
@@ -1057,6 +1200,8 @@ impl OatsApp {
             Ok(c) => self.changes = c,
             Err(e) => self.store_error(e),
         }
+        // the Calendar's media list reloads with the rest
+        self.media_plays_day = None;
         if let Ok(runs) = self.store.runs(1) {
             self.brain_status.last_run = runs.into_iter().next();
         }
@@ -1079,8 +1224,8 @@ impl OatsApp {
         }
     }
 
-    /// Show a transcript line: the view that holds its day (Today, else All transcripts),
-    /// scrolled to the row, which flashes. A missing or hidden (echo) segment says so in the
+    /// Show a transcript line: the Transcripts view with that segment's day loaded (whatever
+    /// the day, however long ago), scrolled to the row, which flashes. A missing or hidden (echo) segment says so in the
     /// status strip.
     fn jump_to_segment(&mut self, id: Option<i64>) {
         let row = match id.map(|id| self.store.segment(id)) {
@@ -1097,12 +1242,8 @@ impl OatsApp {
         };
         self.close_search();
         self.topic = None;
-        self.today_start = local_midnight_ms();
-        if row.started_at >= self.today_start {
-            self.set_view(View::Today);
-        } else {
-            self.set_view(View::All);
-        }
+        self.set_view(View::Transcripts);
+        self.ensure_row_loaded(&row);
         self.transcript_focus.pending = Some(row.id);
     }
 
@@ -1160,8 +1301,8 @@ impl OatsApp {
     /// Whether a freshly stored row belongs in the list being shown.
     fn in_view(&self, row: &TranscriptRow) -> bool {
         match self.prefs.view {
-            View::Today => row.started_at >= self.today_start,
-            View::All => true,
+            // the Transcripts pages take live rows in `handle_events`
+            View::Transcripts => false,
             View::Node(id) => row.node_id.is_some_and(|n| self.in_subtree(n, id)),
             View::Notes | View::Calendar | View::Todos => false,
         }
@@ -1287,14 +1428,12 @@ impl OatsApp {
                     // the speakers heard by the microphone: kept in the store, never shown
                 }
                 PipelineEvent::EchoMarked { segment, .. } => {
-                    let before = self.rows.len();
                     self.rows.retain(|r| r.id != segment);
-                    if self.rows.len() < before || self.prefs.view != View::Today {
-                        // recount rather than guess whether it was today's
-                        match self.store.segment_count_since(self.today_start) {
-                            Ok(n) => self.today_count = n,
-                            Err(e) => self.store_error(e),
-                        }
+                    self.pages.remove_row(segment);
+                    // recount rather than guess whether it was today's
+                    match self.store.segment_count_since(self.today_start) {
+                        Ok(n) => self.today_count = n,
+                        Err(e) => self.store_error(e),
                     }
                 }
                 PipelineEvent::SystemAudio { signal } => {
@@ -1307,7 +1446,13 @@ impl OatsApp {
                     if let Some(b) = &self.brain {
                         b.segment_arrived(row.clone());
                     }
-                    if self.in_view(&row) {
+                    if self.prefs.view == View::Transcripts {
+                        // live rows join the loaded range when it ends at the newest row (after a
+                        // jump it ends earlier; paging forward gets there)
+                        if !self.pages.has_later {
+                            self.pages.rows.push(row);
+                        }
+                    } else if self.in_view(&row) {
                         self.rows.push(row);
                     }
                 }
@@ -1436,7 +1581,7 @@ impl OatsApp {
                 SidebarAction::Delete(id) => match self.store.delete_node(id) {
                     Ok(()) => {
                         if self.prefs.view == View::Node(id) {
-                            self.prefs.view = View::Today;
+                            self.prefs.view = View::Transcripts;
                         }
                         changed = true;
                     }
@@ -1449,22 +1594,41 @@ impl OatsApp {
         }
     }
 
-    fn apply_transcript(&mut self, actions: Vec<TranscriptAction>) {
-        if actions.is_empty() {
-            return;
-        }
+    fn apply_transcript(&mut self, ctx: &egui::Context, actions: Vec<TranscriptAction>) {
+        let mut edited = false;
+        let mut loaded = false;
         for a in actions {
             let r = match a {
                 TranscriptAction::Move { segment, category } => {
+                    edited = true;
                     self.store.set_segment_node(segment, category)
                 }
-                TranscriptAction::Delete { segment } => self.store.delete_segment(segment),
+                TranscriptAction::Delete { segment } => {
+                    edited = true;
+                    self.store.delete_segment(segment)
+                }
+                TranscriptAction::LoadEarlier => {
+                    self.load_adjacent(false);
+                    loaded = true;
+                    continue;
+                }
+                TranscriptAction::LoadLater => {
+                    self.load_adjacent(true);
+                    loaded = true;
+                    continue;
+                }
             };
             if let Err(e) = r {
                 self.store_error(e);
             }
         }
-        self.reload_rows();
+        if edited {
+            self.reload_rows();
+        }
+        if loaded {
+            // the next frame measures the shift and looks at the edges again
+            ctx.request_repaint();
+        }
     }
 
     fn apply_notes(&mut self, actions: Vec<NotesAction>) {
@@ -1585,6 +1749,48 @@ impl OatsApp {
         self.apply_todos(todo_actions);
     }
 
+    /// The media plays of local `day` for the Calendar's day panel.
+    fn load_media_plays(&mut self, day: chrono::NaiveDate) {
+        use chrono::TimeZone;
+        let ms = |d: chrono::NaiveDate| {
+            d.and_hms_opt(0, 0, 0)
+                .and_then(|t| chrono::Local.from_local_datetime(&t).earliest())
+                .map(|t| t.timestamp_millis())
+        };
+        self.media_plays_day = Some(day);
+        let (Some(from), Some(to)) = (ms(day), day.succ_opt().and_then(ms)) else {
+            self.media_plays.clear();
+            return;
+        };
+        match self.store.media_plays_between(from, to) {
+            Ok(p) => self.media_plays = p,
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    /// " · ▶ <title>" while YouTube or music plays on the system lane (what the pipeline
+    /// stamps), else nothing.
+    fn media_label(&self) -> String {
+        if !self.is_listening() || !self.system_on {
+            return String::new();
+        }
+        match self.pipeline.media_feed().current() {
+            Some(m) if m.is_media() => {
+                let title = if m.title.trim().is_empty() {
+                    m.producer.clone()
+                } else {
+                    m.title.clone()
+                };
+                let mut short: String = title.chars().take(40).collect();
+                if title.chars().count() > 40 {
+                    short.push('…');
+                }
+                format!(" · ▶ {short}")
+            }
+            _ => String::new(),
+        }
+    }
+
     /// "listening · mic + system", "listening · mic", "idle", …
     pub fn state_label(&self) -> String {
         match self.status {
@@ -1683,6 +1889,15 @@ impl OatsApp {
         let mut save = false;
         let mut close = false;
         let mut sound = self.prefs.command_sound;
+        // the YouTube & music policy: OATS_MEDIA_POLICY fixes it, else `meta.media_policy`
+        let fixed_policy = oats_core::MediaPolicy::env_override();
+        let stored_policy = self
+            .store
+            .meta(oats_core::MediaPolicy::META_KEY)
+            .ok()
+            .flatten();
+        let policy_before = oats_core::MediaPolicy::effective(stored_policy.as_deref());
+        let mut policy = policy_before;
         egui::Window::new("Preferences")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
@@ -1717,7 +1932,38 @@ impl OatsApp {
                 );
                 ui.add_space(8.0);
                 ui.checkbox(&mut sound, "Play a sound for voice commands");
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("YouTube & music").color(t.text_secondary));
+                ui.add_enabled_ui(fixed_policy.is_none(), |ui| {
+                    ui.horizontal(|ui| {
+                        for p in oats_core::MediaPolicy::ALL {
+                            ui.radio_value(&mut policy, p, p.label());
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(if fixed_policy.is_some() {
+                        "Set by OATS_MEDIA_POLICY."
+                    } else {
+                        "Videos and music the computer plays (recognised from the app and the \
+                         Firefox tab) are never taken for your conversation. Ignore: not \
+                         transcribed. Log only: listed as “Watched: …” in the Calendar. \
+                         Transcribe: also transcribed and filed under Media."
+                    })
+                    .color(t.text_tertiary)
+                    .size(11.0),
+                );
             });
+        if policy != policy_before {
+            match self
+                .store
+                .set_meta(oats_core::MediaPolicy::META_KEY, policy.as_str())
+            {
+                Ok(()) => self.pipeline.set_media_policy(policy),
+                Err(e) => self.warning = Some(format!("Could not save the media policy: {e}")),
+            }
+        }
         if !open || ctx.input(|i| i.key_pressed(Key::Escape)) {
             save = true;
             close = true;
@@ -1763,8 +2009,9 @@ impl OatsApp {
             ""
         };
         let left = format!(
-            "{engine} · {}{no_signal} · {n} segment{} today{brain}",
+            "{engine} · {}{no_signal}{} · {n} segment{} today{brain}",
             self.state_label(),
+            self.media_label(),
             if n == 1 { "" } else { "s" }
         );
         let left_galley = p.layout_no_wrap(left, t.mono(9.5), t.text_tertiary);
@@ -2155,13 +2402,25 @@ impl eframe::App for OatsApp {
                             );
                         }
                         View::Calendar => {
+                            let day = self
+                                .calendar_state
+                                .selected
+                                .unwrap_or_else(|| chrono::Local::now().date_naive());
+                            if self.media_plays_day != Some(day) {
+                                self.load_media_plays(day);
+                            }
                             calendar_actions = calendar_view(
                                 &mut list_ui,
                                 &mut self.calendar_state,
                                 &self.events,
                                 &self.todos,
                                 &self.nodes,
+                                &self.media_plays,
                             );
+                            if self.calendar_state.selected.is_some_and(|d| d != day) {
+                                // another day was picked: its plays next frame
+                                ui.ctx().request_repaint();
+                            }
                         }
                         View::Todos => {
                             todo_actions = todos_view(
@@ -2198,7 +2457,7 @@ impl eframe::App for OatsApp {
                         _ => {
                             transcript_actions = transcript_list(
                                 &mut list_ui,
-                                &self.rows,
+                                &mut self.pages,
                                 &self.nodes,
                                 &mut self.transcript_focus,
                             );
@@ -2220,7 +2479,7 @@ impl eframe::App for OatsApp {
         let toast_actions = toasts(&ctx, list_top, &self.due_now, &mut self.toasts);
         self.preferences_window(&ctx, &t);
         self.apply_sidebar(sidebar_actions, &mut cmds);
-        self.apply_transcript(transcript_actions);
+        self.apply_transcript(&ctx, transcript_actions);
         self.apply_notes(notes_actions);
         self.apply_calendar(calendar_actions);
         self.apply_todos(todo_actions);
@@ -2286,6 +2545,24 @@ mod tests {
     }
 
     #[test]
+    fn prefs_saved_with_the_old_today_or_all_view_load_as_transcripts() {
+        for old in ["Today", "All"] {
+            let mut s = MemStorage::default();
+            s.set_string(
+                PREFS_KEY,
+                format!("(sidebar_width: 250.0, view: {old}, listening: true)"),
+            );
+            let prefs = AppPrefs::load(&s);
+            assert_eq!(prefs.view, View::Transcripts, "{old}");
+            assert_eq!(
+                prefs.sidebar_width, 250.0,
+                "the rest of the blob still loads"
+            );
+            assert!(prefs.listening);
+        }
+    }
+
+    #[test]
     fn shortcuts_are_unique_and_cover_the_menu() {
         for (i, (a, _)) in SHORTCUTS.iter().enumerate() {
             for (b, _) in &SHORTCUTS[i + 1..] {
@@ -2297,8 +2574,7 @@ mod tests {
             Command::NewCategory,
             Command::Preferences,
             Command::ToggleSidebar,
-            Command::ShowToday,
-            Command::ShowAll,
+            Command::ShowTranscripts,
             Command::ShowNotes,
             Command::ShowCalendar,
             Command::ShowTodos,
@@ -2338,7 +2614,7 @@ mod tests {
             capture_system: true,
             status: PipelineStatus::Loading("x".to_owned()),
             sidebar_visible: true,
-            view: View::Today,
+            view: View::Transcripts,
             brain_ready: false,
         };
         assert_eq!(

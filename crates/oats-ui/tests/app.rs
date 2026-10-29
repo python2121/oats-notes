@@ -288,7 +288,7 @@ fn selecting_a_node_view_reloads_the_rows() {
     let dir = TempDir::new("node-view");
     let work = seed(&dir.db());
     let mut rig = build(&dir.db(), None, None);
-    assert_eq!(rig.harness.state().prefs().view, View::Today);
+    assert_eq!(rig.harness.state().prefs().view, View::Transcripts);
     assert!(rig.shows("filed under work"));
     assert!(rig.shows("loose words"));
 
@@ -301,9 +301,9 @@ fn selecting_a_node_view_reloads_the_rows() {
     assert!(rig.shows("filed under work"));
     assert!(!rig.shows("loose words"), "only the Work subtree is listed");
 
-    rig.app().run(Command::ShowAll);
+    rig.app().run(Command::ShowTranscripts);
     rig.harness.run_steps(2);
-    assert_eq!(rig.harness.state().prefs().view, View::All);
+    assert_eq!(rig.harness.state().prefs().view, View::Transcripts);
     assert!(rig.shows("loose words"));
 }
 
@@ -346,7 +346,7 @@ fn a_segment_for_another_view_bumps_the_count_without_appending() {
     );
 
     // in a view it belongs to, the next one is appended without a reload
-    rig.app().run(Command::ShowToday);
+    rig.app().run(Command::ShowTranscripts);
     rig.harness.run_steps(2);
     assert_eq!(
         rig.harness
@@ -607,7 +607,7 @@ fn search_opens_finds_segments_and_episodes_and_escape_restores_the_view() {
     let dir = TempDir::new("search");
     seed_projects(&dir.db());
     let mut rig = build(&dir.db(), None, None);
-    rig.app().run(Command::ShowAll);
+    rig.app().run(Command::ShowTranscripts);
     rig.harness.run_steps(2);
     assert!(!rig.app().search_open());
     rig.app().run(Command::Search);
@@ -630,7 +630,7 @@ fn search_opens_finds_segments_and_episodes_and_escape_restores_the_view() {
     rig.harness.key_press(egui::Key::Escape);
     rig.harness.run_steps(2);
     assert!(!rig.app().search_open());
-    assert_eq!(rig.app().prefs().view, View::All);
+    assert_eq!(rig.app().prefs().view, View::Transcripts);
     assert!(rig.shows("loose words"));
 }
 
@@ -1101,7 +1101,11 @@ fn a_calendar_item_jumps_to_where_it_was_said() {
     // the day panel (today is selected) lists it; clicking it shows the transcript
     rig.harness.get_by_label("Dentist appointment").click();
     rig.harness.step();
-    assert_eq!(rig.app().prefs().view, View::Today, "said today");
+    assert_eq!(
+        rig.app().prefs().view,
+        View::Transcripts,
+        "said transcripts"
+    );
     rig.harness.run_steps(3);
     assert_eq!(
         rig.app().pending_segment_focus(),
@@ -1296,4 +1300,190 @@ fn editing_a_note_saves_to_the_store_and_cancel_discards() {
     assert!(e.summary.contains("pricing detail alpha"));
     assert!(e.user_edited_at.is_some());
     assert!(rig.shows("my added line"), "read-only card re-rendered");
+}
+
+// ---- the Transcripts view pages by row count -----------------------------------------------
+
+/// `n` segments "r<i>" five minutes apart, the last one a minute ago (so they span a couple of
+/// days and the day headings show); returns their ids oldest first.
+fn seed_rows(db: &Path, n: usize) -> Vec<i64> {
+    let s = Store::open(db).unwrap();
+    let sid = s.begin_session(0, "history").unwrap();
+    let base = now_ms() - 60_000 - n as i64 * 300_000;
+    s.with_savepoint(|s| {
+        (0..n)
+            .map(|i| {
+                let at = base + i as i64 * 300_000;
+                Ok(
+                    s.insert_segment(sid, at, at + 3_000, &format!("r{i}"), None)?
+                        .id,
+                )
+            })
+            .collect()
+    })
+    .unwrap()
+}
+
+#[test]
+fn the_sidebar_has_no_today_and_says_transcripts() {
+    let dir = TempDir::new("no-today");
+    let mut rig = build(&dir.db(), None, None);
+    // (the sidebar's rows are painted, not accessible: they are checked against VIEW_ROWS in
+    // the sidebar's unit test; the View menu is the other place the views are listed)
+    rig.harness.get_by_label("View").click();
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Transcripts"));
+    assert!(rig.shows("Conversations"));
+    assert!(!rig.shows("Today"));
+    assert!(!rig.shows("All Transcripts"));
+    assert_eq!(rig.app().prefs().view, View::Transcripts);
+}
+
+#[test]
+fn an_empty_history_shows_no_empty_days() {
+    let dir = TempDir::new("no-rows");
+    let mut rig = build(&dir.db(), None, None);
+    rig.harness.run_steps(3);
+    // (the placeholder is painted text; nothing loaded and no day heading is what matters)
+    assert_eq!(rig.app().loaded_rows(), (0, None, None));
+    assert!(!rig.shows("Nothing today yet"));
+}
+
+#[test]
+fn the_newest_page_of_rows_loads_first() {
+    let dir = TempDir::new("first-page");
+    let ids = seed_rows(&dir.db(), 400);
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().set_page_rows(150);
+    rig.harness.run_steps(4);
+    assert_eq!(
+        rig.app().loaded_rows(),
+        (150, Some(ids[250]), Some(ids[399]))
+    );
+    assert!(rig.shows("r399"));
+    assert!(!rig.shows("r10"), "older pages wait");
+    assert!(!rig.app().transcript_has_later());
+}
+
+#[test]
+fn the_default_page_is_a_thousand_rows_and_lays_out_in_reasonable_time() {
+    let dir = TempDir::new("big-page");
+    let ids = seed_rows(&dir.db(), 1_200);
+    let mut rig = build(&dir.db(), None, None);
+    let started = Instant::now();
+    rig.harness.run_steps(10);
+    let per_frame = started.elapsed() / 10;
+    eprintln!("1000-row page: {per_frame:?} per frame (debug-optimised test profile)");
+    assert_eq!(rig.app().loaded_rows().0, 1_000);
+    assert_eq!(rig.app().loaded_rows().2, Some(ids[1_199]));
+    assert!(per_frame < Duration::from_millis(400), "{per_frame:?}");
+}
+
+#[test]
+fn scrolling_toward_the_top_loads_the_previous_page_without_a_jump() {
+    let dir = TempDir::new("prefetch");
+    let ids = seed_rows(&dir.db(), 400);
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().set_page_rows(150);
+    rig.harness.run_steps(4);
+    assert_eq!(rig.app().loaded_rows().0, 150);
+    rig.harness.hover_at(egui::pos2(600.0, 400.0));
+    let wheel = |rig: &mut Rig, dy: f32| {
+        rig.harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, dy),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        rig.harness.run_steps(6);
+    };
+    // the y of a row of the first page that is on screen, to follow it across the load
+    let probe = |rig: &Rig| -> Option<(String, f32)> {
+        (250..400).find_map(|i| {
+            let label = format!("r{i}");
+            let r = rig.harness.query_by_label(&label)?.rect();
+            (r.top() > 150.0 && r.bottom() < 650.0).then_some((label, r.top()))
+        })
+    };
+    let mut steps = 0;
+    let mut checked = false;
+    while rig.app().loaded_rows().0 < 300 {
+        assert!(steps < 120, "the previous page never loaded");
+        let before = probe(&rig);
+        wheel(&mut rig, 200.0);
+        steps += 1;
+        if rig.app().loaded_rows().0 >= 300
+            && let Some((label, y)) = before
+            && let Some(node) = rig.harness.query_by_label(&label)
+        {
+            // the row moved by about the wheel step (200 px down the screen), not by the
+            // height of the new page (thousands of px)
+            let moved = node.rect().top() - y;
+            checked = true;
+            assert!((moved - 200.0).abs() < 60.0, "the list jumped by {moved}");
+        }
+    }
+    assert_eq!(
+        rig.app().loaded_rows(),
+        (300, Some(ids[100]), Some(ids[399]))
+    );
+    assert!(
+        checked,
+        "the row to follow was found on both sides of the load"
+    );
+}
+
+#[test]
+fn a_search_hit_from_far_back_loads_a_window_around_it_and_paging_forward_reaches_the_tail() {
+    let dir = TempDir::new("search-far");
+    let ids = seed_rows(&dir.db(), 600);
+    {
+        // a unique line deep in the past (it sorts between r100 and r101)
+        let s = Store::open(&dir.db()).unwrap();
+        let sid = s.begin_session(0, "old").unwrap();
+        let at = now_ms() - 60_000 - 600 * 300_000 + 100 * 300_000 + 1_000;
+        s.insert_segment(sid, at, at + 3_000, "zebra crossing budget", None)
+            .unwrap();
+    }
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().set_page_rows(100);
+    rig.app().run(Command::ShowCalendar);
+    rig.harness.run_steps(2);
+    rig.app().run(Command::Search);
+    rig.harness.run_steps(2);
+    rig.harness.event(egui::Event::Text("zebra".to_owned()));
+    rig.harness.run_steps(3);
+    rig.until_label("the hit", "zebra crossing budget");
+    rig.harness.get_by_label_contains("zebra crossing").click();
+    rig.harness.run_steps(4);
+    assert!(!rig.app().search_open());
+    assert_eq!(rig.app().prefs().view, View::Transcripts);
+    let (n, first, last) = rig.app().loaded_rows();
+    assert!(n >= 100, "a window of rows around the target, got {n}");
+    assert!(first.unwrap() <= ids[100] && last.unwrap() >= ids[101]);
+    assert!(
+        rig.app().transcript_has_later(),
+        "the tail is not loaded yet"
+    );
+    assert_eq!(
+        rig.app().pending_segment_focus(),
+        None,
+        "the row consumed it"
+    );
+    assert!(rig.shows("zebra crossing budget"));
+    // scroll down: pages load forward until the newest rows are reached
+    rig.harness.hover_at(egui::pos2(600.0, 400.0));
+    let mut steps = 0;
+    while rig.app().transcript_has_later() {
+        assert!(steps < 200, "the tail was never reached");
+        rig.harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -600.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        rig.harness.run_steps(4);
+        steps += 1;
+    }
+    assert_eq!(rig.app().loaded_rows().2, Some(ids[599]));
 }

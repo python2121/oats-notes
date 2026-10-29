@@ -3,7 +3,9 @@ resolver = "3"
 members = ["crates/*", "apps/*"]
 # vendor/ holds third-party crates referenced by path; they are not members, so the workspace
 # lints (`unsafe_code = "forbid"`, …) don't apply to them.
-exclude = ["vendor"]
+# crates/oats-sources-macos calls Core Audio through FFI (`unsafe`), so it stays out of the
+# workspace (and its `unsafe_code = "forbid"`) like the vendored crates.
+exclude = ["vendor", "crates/oats-sources-macos"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +22,9 @@ oats-ui = { path = "crates/oats-ui" }
 oats-brain = { path = "crates/oats-brain" }
 oats-status = { path = "crates/oats-status" }
 oats-status-macos = { path = "crates/oats-status-macos" }
+oats-sources = { path = "crates/oats-sources" }
+oats-sources-macos = { path = "crates/oats-sources-macos" }
+oats-media = { path = "crates/oats-media" }
 
 # foundation
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +35,8 @@ ctrlc = { version = "3", features = ["termination"] }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
+# Firefox's session store is mozlz4 (an LZ4 block); pure Rust, no unsafe with safe-decode/encode (MIT)
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode", "safe-encode", "checked-decode"] }
 
 # storage
 rusqlite = { version = "0.41", features = ["bundled"] }

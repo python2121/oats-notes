@@ -373,7 +373,7 @@ fn listen_while_listening_flushes_and_closes_the_previous_session() {
     });
     let rows = Store::open(&rig.db)
         .unwrap()
-        .segments(View::All, 0)
+        .segments(View::Transcripts)
         .unwrap();
     assert_eq!(
         rows.iter().map(|r| r.session_id).collect::<Vec<_>>(),
@@ -418,7 +418,7 @@ fn stop_flushes_the_open_segment_with_consistent_times() {
     // what was reported is what was stored
     let stored = Store::open(&rig.db)
         .unwrap()
-        .segments(View::All, 0)
+        .segments(View::Transcripts)
         .unwrap();
     assert_eq!(stored, vec![row]);
 }
@@ -451,7 +451,7 @@ fn a_segment_with_empty_text_is_not_stored() {
     );
     let stored = Store::open(&rig.db)
         .unwrap()
-        .segments(View::All, 0)
+        .segments(View::Transcripts)
         .unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].id, row.id);
@@ -560,7 +560,10 @@ fn dropping_the_handle_while_listening_shuts_down_promptly_and_saves() {
     let took = t.elapsed();
     assert!(took < Duration::from_secs(2), "drop took {took:?}");
     // the open segment was flushed and the session closed on the way out
-    let rows = Store::open(&db).unwrap().segments(View::All, 0).unwrap();
+    let rows = Store::open(&db)
+        .unwrap()
+        .segments(View::Transcripts)
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].session_id, sid);
     assert!(session_row(&db, sid).1.is_some());
@@ -830,7 +833,7 @@ fn two_lanes_segment_separately_and_interleave_by_time() {
     assert!(segs[0].ended_at <= segs[1].started_at + 500);
     let stored = Store::open(&rig.db)
         .unwrap()
-        .segments(View::All, 0)
+        .segments(View::Transcripts)
         .unwrap();
     assert_eq!(
         stored.iter().map(|r| r.source).collect::<Vec<_>>(),
@@ -886,7 +889,7 @@ fn a_microphone_echo_of_system_audio_is_linked_and_hidden() {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(all.len(), 2, "{tag}: {all:?}");
-        let visible = store.segments(View::All, 0).unwrap();
+        let visible = store.segments(View::Transcripts).unwrap();
         if dedup {
             assert_eq!(visible.len(), 1, "{tag}: {visible:?}");
             assert_eq!(visible[0].source, AudioSourceKind::System, "{tag}");

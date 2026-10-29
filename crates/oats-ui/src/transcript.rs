@@ -21,6 +21,95 @@ pub enum TranscriptAction {
     Delete {
         segment: i64,
     },
+    /// Load the page of rows before the first loaded one.
+    LoadEarlier,
+    /// Load the page of rows after the last loaded one (only after a jump: otherwise the
+    /// loaded rows already end at the newest).
+    LoadLater,
+}
+
+/// Rows per page of the Transcripts view.
+pub const PAGE_ROWS: usize = 1000;
+
+/// Start loading the next page when its edge is within this many viewport heights of the
+/// visible area, so the rows are there before the user scrolls to them.
+pub const PREFETCH_VIEWPORTS: f32 = 1.5;
+
+/// Whether `rect` (a list edge marker, in screen coordinates) is within the prefetch distance
+/// of the visible `viewport`.
+pub fn near_viewport(rect: Rect, viewport: Rect) -> bool {
+    viewport
+        .expand2(vec2(0.0, PREFETCH_VIEWPORTS * viewport.height()))
+        .intersects(rect)
+}
+
+/// The Transcripts view's data: ONE contiguous range of rows, oldest first, grown a page at a
+/// time at either end, plus the bookkeeping that keeps the scroll position still when rows are
+/// inserted above the visible part. There is no eviction: a row is a line of text.
+#[derive(Debug, Default)]
+pub struct TranscriptPages {
+    pub rows: Vec<TranscriptRow>,
+    /// Older rows exist beyond the first loaded one (`false`: "Beginning of history").
+    pub has_earlier: bool,
+    /// Newer rows exist beyond the last loaded one (only after a jump). While `false`, live
+    /// segments are appended and the list sticks to the bottom.
+    pub has_later: bool,
+    /// The row at (or just above) the viewport top and its y in content coordinates, as of the
+    /// last layout without a pending insert.
+    anchor: Option<(i64, f32)>,
+    /// Rows were inserted above since `anchor` was recorded: the next layout measures how far
+    /// the anchor moved and scrolls by that much.
+    armed: bool,
+    /// The viewport was at the end of the content at the last layout (egui keeps it there by
+    /// itself, so there is nothing to correct).
+    at_end: bool,
+}
+
+impl TranscriptPages {
+    /// Replace everything (the initial load, a jump).
+    pub fn set(&mut self, rows: Vec<TranscriptRow>, has_earlier: bool, has_later: bool) {
+        self.rows = rows;
+        self.has_earlier = has_earlier;
+        self.has_later = has_later;
+        self.anchor = None;
+        self.armed = false;
+    }
+
+    /// Put older rows (oldest first) in front.
+    pub fn prepend(&mut self, mut older: Vec<TranscriptRow>, has_earlier: bool) {
+        self.has_earlier = has_earlier;
+        if !older.is_empty() {
+            older.append(&mut self.rows);
+            self.rows = older;
+            self.armed = true;
+        }
+    }
+
+    /// Put newer rows (oldest first) at the end.
+    pub fn append(&mut self, newer: Vec<TranscriptRow>, has_later: bool) {
+        self.has_later = has_later;
+        self.rows.extend(newer);
+    }
+
+    pub fn contains_row(&self, id: i64) -> bool {
+        self.rows.iter().any(|r| r.id == id)
+    }
+
+    /// Drop a row (an echo that was marked, a deletion). `true` when it was loaded.
+    pub fn remove_row(&mut self, id: i64) -> bool {
+        let before = self.rows.len();
+        self.rows.retain(|r| r.id != id);
+        self.rows.len() < before
+    }
+
+    /// `(started_at, id)` of the first / last loaded row, the paging keys.
+    pub fn first_key(&self) -> Option<(i64, i64)> {
+        self.rows.first().map(|r| (r.started_at, r.id))
+    }
+
+    pub fn last_key(&self) -> Option<(i64, i64)> {
+        self.rows.last().map(|r| (r.started_at, r.id))
+    }
 }
 
 /// The jump-to-a-line mechanism (a calendar item or todo → where it was said): the row to
@@ -125,17 +214,43 @@ pub fn day_breaks<Tz: TimeZone>(
     out
 }
 
-/// The list. The scroll area sticks to the bottom: while the user is at the end, a new segment
-/// scrolls into view; once they scroll up it stays where they left it until they return.
+/// A thin muted line at the top / bottom of the list; returns its rect.
+fn edge_marker(ui: &mut egui::Ui, t: &Tokens, text: &str) -> Rect {
+    let r = ui
+        .horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new(text)
+                    .font(t.font(11.5))
+                    .color(t.text_tertiary),
+            );
+        })
+        .response
+        .rect;
+    ui.add_space(4.0);
+    r
+}
+
+/// The Transcripts list: one contiguous range of rows, oldest at the top, a day heading wherever
+/// the local day changes between consecutive rows (so an empty day never shows). The scroll
+/// area sticks to the bottom while the range ends at the newest row: a new segment scrolls into
+/// view while the user is at the end; once they scroll up it stays where they left it.
+///
+/// Paging: the top marker ("Loading earlier…" / "Beginning of history") and, after a jump, the
+/// bottom marker ask for their page ([`TranscriptAction::LoadEarlier`] / `LoadLater`) as soon as
+/// they come within [`PREFETCH_VIEWPORTS`] viewport heights of the visible area. Rows inserted
+/// above the viewport shift everything below them down: the row that was at the viewport top is
+/// remembered and the scroll offset is moved by however far it went, in the same frame (the
+/// pass is discarded and redone, so nothing is painted at the old offset).
 pub fn transcript_list(
     ui: &mut egui::Ui,
-    rows: &[TranscriptRow],
+    pages: &mut TranscriptPages,
     nodes: &[Node],
     focus: &mut TranscriptFocus,
 ) -> Vec<TranscriptAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
-    if rows.is_empty() {
+    if pages.rows.is_empty() && !pages.has_earlier && !pages.has_later {
         let rect = ui.available_rect_before_wrap();
         ui.painter().text(
             rect.center(),
@@ -146,16 +261,48 @@ pub fn transcript_list(
         );
         return actions;
     }
-    let breaks = day_breaks(rows, &Local);
     let this_year = Local::now().year();
-    egui::ScrollArea::vertical()
+    let was_armed = pages.armed;
+    let at_end_before = pages.at_end;
+    // a jump scrolls to its row (a smooth scroll toward an absolute offset): load nothing
+    // meanwhile, rows inserted above would move the row out from under it
+    let jumping = focus.pending.is_some() || focus.flash.is_some();
+    // the first layout of a new range has not stuck to the bottom yet (egui needs one pass to
+    // know the content size): looking at the edges then would load a page nobody needs
+    let settled = pages.anchor.is_some();
+    let emit = !was_armed && !jumping && settled;
+    if was_armed || !settled {
+        ui.ctx().request_repaint();
+    }
+    let mut correction = 0.0_f32;
+    let mut new_anchor: Option<(i64, f32)> = None;
+    let anchor = pages.anchor;
+    let rows = &pages.rows;
+    let (has_earlier, has_later) = (pages.has_earlier, pages.has_later);
+    let breaks = day_breaks(rows, &Local);
+    let out = egui::ScrollArea::vertical()
         .id_salt("transcript-scroll")
         .auto_shrink([false, false])
-        // a jump scrolls to its row instead of the end
-        .stick_to_bottom(focus.pending.is_none() && focus.flash.is_none())
+        // a jump scrolls to its row instead of the end; with newer rows still unloaded the end
+        // is not the end of the transcript
+        .stick_to_bottom(!jumping && !has_later)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            let origin = ui.min_rect().top();
+            let view = ui.clip_rect();
             ui.add_space(6.0);
+            let r = edge_marker(
+                ui,
+                &t,
+                if has_earlier {
+                    "Loading earlier…"
+                } else {
+                    "Beginning of history"
+                },
+            );
+            if emit && has_earlier && near_viewport(r, view) {
+                actions.push(TranscriptAction::LoadEarlier);
+            }
             let mut next_break = breaks.iter().peekable();
             for (i, row) in rows.iter().enumerate() {
                 if let Some((_, day)) = next_break.next_if(|(at, _)| *at == i) {
@@ -177,9 +324,45 @@ pub fn transcript_list(
                 }
                 let rect = transcript_row(ui, &t, row, nodes, &mut actions);
                 focus_row(ui, &t, focus, row.id, rect);
+                let y = rect.top() - origin;
+                if was_armed {
+                    if let Some((id, old)) = anchor
+                        && id == row.id
+                    {
+                        correction = y - old;
+                    }
+                } else if new_anchor.is_none() || rect.top() <= view.top() + 1.0 {
+                    new_anchor = Some((row.id, y));
+                }
+            }
+            if has_later {
+                ui.add_space(10.0);
+                let r = edge_marker(ui, &t, "Loading later…");
+                if emit && near_viewport(r, view) {
+                    actions.push(TranscriptAction::LoadLater);
+                }
             }
             ui.add_space(8.0);
         });
+    pages.at_end = out.state.offset.y + out.inner_rect.height() >= out.content_size.y - 2.0;
+    if was_armed {
+        pages.armed = false;
+        if correction.abs() > 0.5 && !at_end_before {
+            let mut state = out.state;
+            state.offset.y = (state.offset.y + correction).max(0.0);
+            state.store(ui.ctx(), out.id);
+            if !jumping {
+                ui.ctx()
+                    .request_discard("transcript rows were inserted above");
+            }
+        }
+    } else {
+        pages.anchor = new_anchor;
+    }
+    if jumping && focus.pending.is_none() && focus.flash.is_none() {
+        // the jump is over: look at the edges once more
+        ui.ctx().request_repaint();
+    }
     actions
 }
 
@@ -252,11 +435,12 @@ pub(crate) fn source_tag(ui: &egui::Ui, t: &Tokens, at: egui::Pos2, label: &str)
     p.galley(at + vec2(4.0, 1.0), galley, t.accent);
 }
 
-/// The label a row's lane gets in the list ("them" for system audio, none for the
-/// microphone); echoes are never listed.
+/// The label a row's lane gets in the list ("them" for system audio, "media" for a YouTube
+/// video / music on it, none for the microphone); echoes are never listed.
 pub fn source_label(row: &TranscriptRow) -> Option<&'static str> {
     match row.source {
         AudioSourceKind::Mic => None,
+        AudioSourceKind::System if row.media_kind.is_some_and(|k| k.is_media()) => Some("media"),
         AudioSourceKind::System => Some("them"),
     }
 }
@@ -416,6 +600,17 @@ mod tests {
             ..row(2, 0)
         };
         assert_eq!(source_label(&them), Some("them"));
+        // a YouTube video / music on the system lane is media, a call stays "them"
+        let video = TranscriptRow {
+            media_kind: Some(oats_core::MediaClass::YouTube),
+            ..them.clone()
+        };
+        assert_eq!(source_label(&video), Some("media"));
+        let call = TranscriptRow {
+            media_kind: Some(oats_core::MediaClass::Meeting),
+            ..them
+        };
+        assert_eq!(source_label(&call), Some("them"));
     }
 
     #[test]
@@ -462,5 +657,37 @@ mod tests {
         assert_eq!(b.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 2, 3]);
         assert_eq!(b[1].1, NaiveDate::from_ymd_opt(2026, 10, 28));
         assert!(day_breaks(&[], &tz).is_empty());
+    }
+
+    #[test]
+    fn the_prefetch_distance_is_one_and_a_half_viewports() {
+        let view = Rect::from_min_size(pos2(0.0, 1000.0), vec2(400.0, 600.0));
+        let marker = |y: f32| Rect::from_min_size(pos2(0.0, y), vec2(400.0, 20.0));
+        // inside the viewport, and just under 900 px above / below it (1.5 x 600): near
+        assert!(near_viewport(marker(1100.0), view));
+        assert!(near_viewport(marker(1000.0 - 890.0), view));
+        assert!(near_viewport(marker(1600.0 + 890.0), view));
+        // beyond 1.5 viewports: not yet
+        assert!(!near_viewport(marker(1000.0 - 900.0 - 21.0), view));
+        assert!(!near_viewport(marker(1600.0 + 901.0), view));
+    }
+
+    #[test]
+    fn pages_grow_at_both_ends_and_arm_the_scroll_correction_only_for_rows_above() {
+        let mut p = TranscriptPages::default();
+        p.set(vec![row(5, 50), row(6, 60)], true, true);
+        assert!(!p.armed);
+        p.append(vec![row(7, 70)], false);
+        assert!(!p.armed, "rows below shift nothing");
+        assert!(!p.has_later);
+        p.prepend(vec![row(3, 30), row(4, 40)], true);
+        assert!(p.armed);
+        assert_eq!(p.first_key(), Some((30, 3)));
+        assert_eq!(p.last_key(), Some((70, 7)));
+        p.armed = false;
+        p.prepend(vec![], false);
+        assert!(!p.armed && !p.has_earlier, "a short page ends the history");
+        assert!(p.contains_row(6) && p.remove_row(6) && !p.remove_row(6));
+        assert_eq!(p.rows.len(), 4);
     }
 }

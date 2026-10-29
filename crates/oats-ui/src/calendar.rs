@@ -8,13 +8,15 @@
 //! transcript.
 //!
 //! Events and todos come from the brain's interpretation (significant dates) or from voice
-//! commands; the source is shown so the user can audit.
+//! commands; the source is shown so the user can audit. Under them the panel lists what the
+//! computer played that day ("Watched: <title> 10:12–10:40", from `media_plays`); a click
+//! opens the video in the browser.
 
 use std::collections::BTreeMap;
 
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use egui::{Align2, Rect, RichText, Sense, Stroke, pos2, vec2};
-use oats_core::{Event, Node, Todo};
+use oats_core::{Event, MediaClass, MediaPlay, Node, Todo};
 
 use crate::notes::{chip, node_path};
 use crate::theme::Tokens;
@@ -123,6 +125,7 @@ pub fn calendar_view(
     events: &[Event],
     todos: &[Todo],
     nodes: &[Node],
+    media_plays: &[MediaPlay],
 ) -> Vec<CalendarAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
@@ -187,12 +190,25 @@ pub fn calendar_view(
             }
             ui.add_space(12.0);
             let panel_items = items_by_day(events, todos, &Local, false);
+            // the host loads the selected day's plays; a day just clicked lists none until
+            // they are loaded (the next frame)
+            let day_plays: Vec<MediaPlay> = media_plays
+                .iter()
+                .filter(|p| {
+                    Local
+                        .timestamp_millis_opt(p.started_at)
+                        .single()
+                        .is_some_and(|d| d.date_naive() == selected)
+                })
+                .cloned()
+                .collect();
             day_panel(
                 ui,
                 &t,
                 selected,
                 panel_items.get(&selected).map(Vec::as_slice).unwrap_or(&[]),
                 nodes,
+                &day_plays,
                 &mut actions,
             );
             ui.add_space(10.0);
@@ -369,6 +385,7 @@ fn day_panel(
     day: NaiveDate,
     items: &[DayItem<'_>],
     nodes: &[Node],
+    media_plays: &[MediaPlay],
     actions: &mut Vec<CalendarAction>,
 ) {
     let this_year = Local::now().year();
@@ -381,7 +398,7 @@ fn day_panel(
         );
     });
     ui.add_space(4.0);
-    if items.is_empty() {
+    if items.is_empty() && media_plays.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(MARGIN);
             ui.label(
@@ -400,6 +417,61 @@ fn day_panel(
             DayItem::Event(e) => event_row(ui, t, e, nodes, actions),
             DayItem::Todo(td) => todo_row(ui, t, td, nodes, actions),
         }
+    }
+    media_section(ui, t, media_plays);
+}
+
+/// "Watched: <title> 10:12–10:40" / "Listened: …" per play of the day; a click opens the URL.
+fn media_section(ui: &mut egui::Ui, t: &Tokens, plays: &[MediaPlay]) {
+    if plays.is_empty() {
+        return;
+    }
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(MARGIN);
+        ui.label(
+            RichText::new("Media")
+                .font(crate::theme::font_medium(ui.ctx(), 12.0))
+                .color(t.text_secondary),
+        );
+    });
+    for p in plays {
+        ui.horizontal(|ui| {
+            ui.add_space(MARGIN);
+            let verb = match p.kind {
+                MediaClass::Music => "Listened",
+                _ => "Watched",
+            };
+            let title = if p.title.trim().is_empty() {
+                p.url.as_deref().unwrap_or("something")
+            } else {
+                p.title.as_str()
+            };
+            let when = format!(
+                "{}–{}",
+                clock(p.started_at, &Local),
+                clock(p.ended_at, &Local)
+            );
+            let text = RichText::new(format!("{verb}: {title}")).size(12.5);
+            match &p.url {
+                Some(url) => {
+                    let link = ui
+                        .add(
+                            egui::Label::new(text.color(t.accent))
+                                .sense(Sense::click())
+                                .truncate(),
+                        )
+                        .on_hover_text(url.as_str());
+                    if link.clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                    }
+                }
+                None => {
+                    ui.add(egui::Label::new(text.color(t.text)).truncate());
+                }
+            }
+            ui.label(RichText::new(when).color(t.text_tertiary).size(11.5));
+        });
     }
 }
 

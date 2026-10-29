@@ -221,7 +221,7 @@ fn every_tier_runs_through_the_isolated_cli() {
         1
     );
     assert!(s.uncategorised_segments(10).unwrap().is_empty());
-    assert_eq!(s.segments(View::Node(work), 0).unwrap().len(), 1);
+    assert_eq!(s.segments(View::Node(work)).unwrap().len(), 1);
 
     // ---- tier 1: interpret (sonnet) ---------------------------------------------------------
     let chunk = Chunk {

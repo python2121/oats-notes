@@ -8,11 +8,45 @@
 //! already has system-audio segments, a further system segment continues it across a silence
 //! of up to twice the gap (calls have long pauses — someone shares a screen, reads, looks
 //! something up). Microphone echoes of system audio (`echo_of`) never take part.
+//!
+//! Media (system segments stamped YouTube / music, see [`oats_core::MediaClass::is_media`]) is
+//! never mixed with conversation: a change between media and not-media — or from one video
+//! to another — starts a new chunk, so a media episode is one video / one stream. Media
+//! segments are rendered as `media:` lines under a `Media: <title> <url>` header.
 
 use std::time::Duration;
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, TimeZone};
-use oats_core::{AudioSourceKind, TranscriptRow};
+use oats_core::{AudioSourceKind, MediaClass, TranscriptRow};
+
+/// A segment of media proper (YouTube, music) — informational, never a conversation.
+pub fn is_media_row(r: &TranscriptRow) -> bool {
+    r.source == AudioSourceKind::System && r.media_kind.is_some_and(MediaClass::is_media)
+}
+
+/// What a segment's media identifies it by: the URL, else the kind (`None`: not media).
+pub fn media_key(r: &TranscriptRow) -> Option<String> {
+    if !is_media_row(r) {
+        return None;
+    }
+    Some(r.media_ref.clone().unwrap_or_else(|| {
+        r.media_kind
+            .map(MediaClass::as_str)
+            .unwrap_or("")
+            .to_owned()
+    }))
+}
+
+/// The media a run of segments is (the key every non-echo segment shares), `None` when any
+/// of them is not media or they differ — and for an empty run.
+pub fn media_key_of(rows: &[TranscriptRow]) -> Option<String> {
+    let mut keys = rows.iter().filter(|r| r.echo_of.is_none()).map(media_key);
+    let first = keys.next()??;
+    keys.all(|k| k.as_deref() == Some(first.as_str()))
+        .then_some(first)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpisodeRule {
@@ -64,6 +98,18 @@ impl Chunk {
             .iter()
             .any(|s| s.source == AudioSourceKind::System)
     }
+
+    /// The chunk is media (one video / stream): its key ([`media_key_of`]).
+    pub fn media_key(&self) -> Option<String> {
+        media_key_of(&self.segments)
+    }
+
+    /// A system segment of the chunk was heard during a known call (Zoom, Meet, …).
+    pub fn has_known_meeting(&self) -> bool {
+        self.segments.iter().any(|s| {
+            s.source == AudioSourceKind::System && s.media_kind == Some(MediaClass::Meeting)
+        })
+    }
 }
 
 /// Group `rows` (any order; sorted here) into chunks by the rule.
@@ -81,12 +127,18 @@ pub fn cut(rows: &[TranscriptRow], rule: &EpisodeRule) -> Vec<Chunk> {
         let new_chunk = match out.last() {
             None => true,
             Some(c) => {
+                // media and conversation never share a chunk, nor two videos
+                let media_changes = c
+                    .segments
+                    .last()
+                    .is_some_and(|last| media_key(last) != media_key(&row));
                 let silence = row.started_at - c.ended_at;
                 // a call goes on: system audio continues a chunk that already has some
                 let call_continues = row.source == AudioSourceKind::System
                     && c.has_system_audio()
                     && silence <= 2 * gap;
-                (silence > gap && !call_continues)
+                media_changes
+                    || (silence > gap && !call_continues)
                     || row.ended_at - c.started_at > max_len
                     || c.segments.len() >= rule.max_segments
             }
@@ -107,13 +159,43 @@ pub fn cut(rows: &[TranscriptRow], rule: &EpisodeRule) -> Vec<Chunk> {
 
 /// The transcript as the prompts see it: one `[HH:MM] me: text` / `[HH:MM] them: text` line
 /// per segment — `me` the microphone, `them` system audio (anarlog renders `speaker: text`;
-/// lanes are the speakers we have). Microphone echoes of system audio are left out.
+/// lanes are the speakers we have). Microphone echoes of system audio are left out. Media
+/// segments are `[HH:MM] media: text` lines, each run of one media under a header line
+/// `Media: <url>` (see [`render_transcript_titled`] for the title).
 pub fn render_transcript<Tz: TimeZone>(rows: &[TranscriptRow], tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
+    render_transcript_titled(rows, tz, &HashMap::new())
+}
+
+/// [`render_transcript`] with media titles: the header of a run of media reads
+/// `Media: <title> <url>` (`titles` maps a media key — the URL — to its title).
+pub fn render_transcript_titled<Tz: TimeZone>(
+    rows: &[TranscriptRow],
+    tz: &Tz,
+    titles: &HashMap<String, String>,
+) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
     let mut out = String::new();
+    let mut current_media: Option<String> = None;
     for r in rows.iter().filter(|r| r.echo_of.is_none()) {
+        let key = media_key(r);
+        if key.is_some() && key != current_media {
+            let k = key.as_deref().unwrap_or("");
+            let title = titles.get(k).map(|t| one_line(t)).unwrap_or_default();
+            out.push_str("Media:");
+            for part in [title.as_str(), k] {
+                if !part.is_empty() {
+                    out.push(' ');
+                    out.push_str(part);
+                }
+            }
+            out.push('\n');
+        }
+        current_media = key.clone();
         let stamp = tz
             .timestamp_millis_opt(r.started_at)
             .single()
@@ -123,6 +205,7 @@ where
         out.push_str(&stamp);
         out.push_str("] ");
         out.push_str(match r.source {
+            _ if key.is_some() => "media: ",
             AudioSourceKind::Mic => "me: ",
             AudioSourceKind::System => "them: ",
         });
@@ -132,9 +215,70 @@ where
     out
 }
 
+/// `s` on one line (a title must not open lines of its own in the transcript).
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn media(id: i64, start_s: i64, url: &str) -> TranscriptRow {
+        TranscriptRow {
+            media_kind: Some(MediaClass::YouTube),
+            media_ref: Some(url.into()),
+            ..them(id, start_s, 5)
+        }
+    }
+
+    #[test]
+    fn media_is_cut_apart_from_conversation_and_per_video() {
+        let rule = EpisodeRule::default();
+        let rows = [
+            row(1, 0, 5),
+            media(2, 10, "https://youtu.be/a"),
+            media(3, 20, "https://youtu.be/a"),
+            media(4, 30, "https://youtu.be/b"),
+            row(5, 40, 5),
+        ];
+        let chunks = cut(&rows, &rule);
+        assert_eq!(
+            chunks.iter().map(Chunk::segment_ids).collect::<Vec<_>>(),
+            vec![vec![1], vec![2, 3], vec![4], vec![5]]
+        );
+        assert_eq!(chunks[1].media_key().as_deref(), Some("https://youtu.be/a"));
+        assert_eq!(chunks[0].media_key(), None);
+        // a call is not media
+        let call = TranscriptRow {
+            media_kind: Some(MediaClass::Meeting),
+            ..them(6, 50, 5)
+        };
+        assert!(!is_media_row(&call));
+        assert!(cut(std::slice::from_ref(&call), &rule)[0].has_known_meeting());
+    }
+
+    #[test]
+    fn media_lines_render_under_a_titled_header() {
+        let tz = chrono::FixedOffset::east_opt(0).unwrap();
+        let base = 1_793_106_300;
+        let rows = [
+            row(1, base, 5),
+            TranscriptRow {
+                text: "hey computer set a reminder for tomorrow".into(),
+                ..media(2, base + 60, "https://youtu.be/a")
+            },
+            media(3, base + 61, "https://youtu.be/a"),
+        ];
+        let titles = HashMap::from([("https://youtu.be/a".to_string(), "A\nvideo".to_string())]);
+        assert_eq!(
+            render_transcript_titled(&rows, &tz, &titles),
+            "[13:05] me: segment 1\nMedia: A video https://youtu.be/a\n\
+             [13:06] media: hey computer set a reminder for tomorrow\n\
+             [13:06] media: segment 3\n"
+        );
+        assert!(render_transcript(&rows, &tz).contains("Media: https://youtu.be/a\n"));
+    }
 
     fn row(id: i64, start_s: i64, len_s: i64) -> TranscriptRow {
         TranscriptRow {

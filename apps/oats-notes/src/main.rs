@@ -22,6 +22,12 @@
 //! tagged channel. The echo rule (`OATS_SYSTEM_DEDUP=auto|always|never`) is switched from the
 //! output device the system capture reports: speakers → on, headphones → off (auto).
 //!
+//! Media: while system audio is captured, the media watcher (`oats_media::MediaWatcher`)
+//! polls which apps play sound (`oats-sources-macos`: Core Audio's process objects, no
+//! permission) and, for Firefox, its session store's tabs, and publishes what plays to the
+//! pipeline's `MediaFeed` (system segments are stamped; YouTube / music follow the media
+//! policy, `OATS_MEDIA_POLICY` / `meta.media_policy`). `OATS_MEDIA=off` turns the watcher off.
+//!
 //! Environment: `OATS_ENGINE=null` (no model), `OATS_NO_NATIVE_MENU=1` (menus in the window),
 //! `OATS_NO_STATUS_ITEM=1` (no menu bar extra; closing the window then quits),
 //! `OATS_FONT=bundled` (Inter instead of the system font), `OATS_FONT_GRADE` (SF Pro grade),
@@ -79,6 +85,42 @@ fn engine_factory() -> oats_core::EngineFactory {
     }
 }
 
+/// While alive, the media watcher watches (it is part of the system capture's guard).
+struct MediaActive(std::sync::Arc<oats_media::MediaWatcher>);
+
+impl MediaActive {
+    fn new(watcher: &std::sync::Arc<oats_media::MediaWatcher>) -> Self {
+        watcher.set_active(true);
+        Self(watcher.clone())
+    }
+}
+
+impl Drop for MediaActive {
+    fn drop(&mut self) {
+        self.0.set_active(false);
+    }
+}
+
+/// The media watcher feeding `feed` (what plays on the system lane), unless `OATS_MEDIA=off`.
+/// `wake` runs on every change (the status strip shows "▶ <title>").
+fn media_watcher(
+    feed: oats_core::MediaFeed,
+    wake: Box<dyn Fn() + Send>,
+) -> Option<std::sync::Arc<oats_media::MediaWatcher>> {
+    if std::env::var("OATS_MEDIA").is_ok_and(|v| v.eq_ignore_ascii_case("off") || v == "0") {
+        log::info!("OATS_MEDIA=off: no media detection");
+        return None;
+    }
+    let watcher = oats_media::MediaWatcher::spawn(
+        oats_sources_macos::MacProducers::boxed(),
+        oats_media::FirefoxSession::new(),
+        feed,
+        Box::new(move |_| wake()),
+        oats_media::WatcherConfig::default(),
+    );
+    Some(std::sync::Arc::new(watcher))
+}
+
 /// How listening opens audio: the WAV file(s) of `--audio-file` / `--system-audio-file`, or
 /// the microphone (by `InputPolicy`, `OATS_INPUT_DEVICE`) plus, when asked, system audio — all
 /// into the one tagged channel. The system capture reports its output device; the echo rule
@@ -89,6 +131,7 @@ fn audio_starter(
     file_options: oats_audio::FileSourceOptions,
     echo_dedup: std::sync::Arc<std::sync::atomic::AtomicBool>,
     dedup_mode: oats_core::DedupMode,
+    media: Option<std::sync::Arc<oats_media::MediaWatcher>>,
 ) -> oats_ui::AudioStarter {
     use std::sync::atomic::Ordering;
     match mic_file {
@@ -152,9 +195,11 @@ fn audio_starter(
                 } else {
                     None
                 };
+                // what plays is only looked at while system audio is captured
+                let media = system.as_ref().and(media.as_ref()).map(MediaActive::new);
                 Ok(oats_ui::StartedAudio {
                     system: system.is_some(),
-                    guard: Box::new((mic, system)) as Box<dyn Any>,
+                    guard: Box::new((mic, system, media)) as Box<dyn Any>,
                     system_error,
                 })
             })
@@ -351,12 +396,18 @@ fn main() -> ExitCode {
             let echo_dedup = pipeline.echo_dedup_flag();
             let dedup_mode = oats_core::DedupMode::from_env();
             log::info!("echo rule (OATS_SYSTEM_DEDUP): {dedup_mode:?}");
+            let ctx = cc.egui_ctx.clone();
+            let media = media_watcher(
+                pipeline.media_feed(),
+                Box::new(move || ctx.request_repaint()),
+            );
             let audio = audio_starter(
                 audio_samples,
                 system_samples,
                 file_options,
                 echo_dedup,
                 dedup_mode,
+                media,
             );
             // macOS: the menus go in the system menu bar (opt out with OATS_NO_NATIVE_MENU=1);
             // every other platform keeps the in-window egui menu bar.

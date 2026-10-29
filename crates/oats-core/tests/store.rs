@@ -138,7 +138,7 @@ fn migrates_a_realistic_v1_file_keeping_every_row_and_id() -> R {
     let v1 = write_v1(&path);
 
     let s = Store::open(&path)?;
-    assert_eq!(s.meta("schema_version")?.as_deref(), Some("6"));
+    assert_eq!(s.meta("schema_version")?.as_deref(), Some("7"));
 
     // categories became root nodes with the same ids, in position order; nothing re-seeded
     let cats = s.categories()?;
@@ -161,7 +161,7 @@ fn migrates_a_realistic_v1_file_keeping_every_row_and_id() -> R {
     assert_eq!(s.nodes()?.len(), 4);
 
     // every segment survives with its id, session, times, text, confidence and node
-    let rows = s.segments(View::All, 0)?;
+    let rows = s.segments(View::Transcripts)?;
     assert_eq!(rows.len(), v1.len());
     for (new, old) in rows.iter().zip(&v1) {
         assert_eq!(new.id, old.id);
@@ -189,11 +189,7 @@ fn migrates_a_realistic_v1_file_keeping_every_row_and_id() -> R {
             .filter(|r| r.category_id == Some(cat))
             .map(|r| r.id)
             .collect();
-        let got: Vec<i64> = s
-            .segments(View::Node(cat), 0)?
-            .iter()
-            .map(|r| r.id)
-            .collect();
+        let got: Vec<i64> = s.segments(View::Node(cat))?.iter().map(|r| r.id).collect();
         assert_eq!(got, want, "category {cat}");
     }
     // the unfiled ones are what the categorisation pass will look at; nothing is interpreted
@@ -259,7 +255,7 @@ fn migrates_a_realistic_v1_file_keeping_every_row_and_id() -> R {
 
     // reopening is a no-op: nothing migrates twice, nothing is lost
     let s = Store::open(&path)?;
-    assert_eq!(s.segments(View::All, 0)?.len(), v1.len() + 1);
+    assert_eq!(s.segments(View::Transcripts)?.len(), v1.len() + 1);
     assert_eq!(s.categories()?.len(), 5);
     Ok(())
 }
@@ -279,7 +275,7 @@ fn migrating_a_v1_file_without_categories_seeds_the_defaults() -> R {
     let s = Store::open(&path)?;
     let names: Vec<String> = s.categories()?.into_iter().map(|c| c.name).collect();
     assert_eq!(names, ["Work", "Admin", "Personal"]);
-    let rows = s.segments(View::All, 0)?;
+    let rows = s.segments(View::Transcripts)?;
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].node_id, rows[0].categorised), (None, false));
     Ok(())
@@ -333,12 +329,12 @@ fn a_newer_schema_file_is_refused_and_left_alone() -> R {
         let conn = raw(&path);
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES ('schema_version', '7');",
+             INSERT INTO meta VALUES ('schema_version', '99');",
         )?;
     }
     assert!(matches!(
         Store::open(&path),
-        Err(StoreError::SchemaTooNew(7))
+        Err(StoreError::SchemaTooNew(99))
     ));
     let conn = raw(&path);
     assert!(
@@ -350,7 +346,7 @@ fn a_newer_schema_file_is_refused_and_left_alone() -> R {
         [],
         |r| r.get(0),
     )?;
-    assert_eq!(v, "7");
+    assert_eq!(v, "99");
     Ok(())
 }
 
@@ -381,7 +377,7 @@ fn node_views_cover_exactly_the_subtree() -> R {
     let _loose = at(600, "loose", None)?;
 
     let ids = |v: View| -> Result<Vec<i64>, StoreError> {
-        Ok(s.segments(v, 0)?.into_iter().map(|r| r.id).collect())
+        Ok(s.segments(v)?.into_iter().map(|r| r.id).collect())
     };
     assert_eq!(
         ids(View::Node(work))?,
@@ -761,7 +757,7 @@ fn delete_category_unfiles_everything_in_the_subtree() -> R {
         assert!(f.s.node(id)?.is_none(), "node {id} deleted");
     }
     // nothing else is lost: rows stay, episodes keep their segments, other filing untouched
-    assert_eq!(f.s.segments(View::All, 0)?.len(), 4);
+    assert_eq!(f.s.segments(View::Transcripts)?.len(), 4);
     assert_eq!(f.s.episodes(10)?.len(), 3);
     assert_eq!(f.s.segments_of_episode(f.eps[1])?.len(), 1);
     assert_eq!(f.s.events_from(i64::MIN, 10)?.len(), 3);
@@ -778,7 +774,7 @@ fn delete_category_unfiles_everything_in_the_subtree() -> R {
         ["Admin", "Personal"]
     );
     // the views of the deleted nodes are simply empty
-    assert!(f.s.segments(View::Node(f.work), 0)?.is_empty());
+    assert!(f.s.segments(View::Node(f.work))?.is_empty());
     Ok(())
 }
 
@@ -818,7 +814,7 @@ fn merge_moves_everything_and_reparents_children() -> R {
     assert!(s.node(f.project)?.is_none());
     assert_eq!(s.node(f.topic)?.and_then(|n| n.parent_id), Some(target.id));
     assert_eq!(s.subtree_ids(f.admin)?, vec![f.admin, target.id, f.topic]);
-    assert_eq!(s.segments(View::Node(f.admin), 0)?.len(), 2);
+    assert_eq!(s.segments(View::Node(f.admin))?.len(), 2);
 
     // refused: into itself, into its own descendant (would orphan a cycle)
     s.merge_nodes(target.id, target.id)?;
@@ -842,8 +838,8 @@ fn move_node_appends_and_refuses_cycles() -> R {
     let moved = s.node(f.project)?.unwrap();
     assert_eq!((moved.parent_id, moved.position), (Some(f.admin), 2));
     // the filed rows travel with the node (they point at the node, not the category)
-    assert_eq!(s.segments(View::Node(f.admin), 0)?.len(), 2);
-    assert_eq!(s.segments(View::Node(f.work), 0)?.len(), 1);
+    assert_eq!(s.segments(View::Node(f.admin))?.len(), 2);
+    assert_eq!(s.segments(View::Node(f.work))?.len(), 1);
     // under itself and under its own topic: refused
     s.move_node(f.project, Some(f.project))?;
     s.move_node(f.project, Some(f.topic))?;
@@ -870,7 +866,7 @@ fn archive_hides_categories_and_add_revives_by_name() -> R {
         "still in the tree"
     );
     // archiving changes no filing, and the view still answers
-    assert_eq!(s.segments(View::Node(f.work), 0)?.len(), 3);
+    assert_eq!(s.segments(View::Node(f.work))?.len(), 3);
     let revived = s.add_category("  WORK ")?;
     assert_eq!(revived.id, f.work);
     assert!(!revived.archived);
@@ -1079,6 +1075,51 @@ fn segment_count_since_is_inclusive_and_follows_deletes() -> R {
     Ok(())
 }
 
+#[test]
+fn the_transcript_pages_by_row_count_in_both_directions() -> R {
+    let s = Store::open_in_memory()?;
+    let sid = s.begin_session(0, "e")?;
+    // ten rows; ids ascend with time except two that share a started_at
+    let mut ids = Vec::new();
+    for i in 0..10 {
+        let at = 1_000 + (i / 2) * 10; // pairs share a timestamp: order falls back to the id
+        ids.push(s.insert_segment(sid, at, at + 5, &format!("r{i}"), None)?);
+    }
+    let echo = s.insert_segment_from(
+        sid,
+        1_000 + 100,
+        1_000 + 105,
+        "echo",
+        None,
+        oats_core::AudioSourceKind::Mic,
+        Some(ids[9].id),
+    )?;
+    let key = |r: &oats_core::TranscriptRow| (r.started_at, r.id);
+    let texts =
+        |v: Vec<oats_core::TranscriptRow>| v.into_iter().map(|r| r.text).collect::<Vec<_>>();
+    // newest page, oldest first, echoes never listed
+    let newest = s.segments_page(None, 4)?;
+    assert_eq!(texts(newest.clone()), ["r6", "r7", "r8", "r9"]);
+    assert!(newest.iter().all(|r| r.id != echo.id));
+    // the page before it, keyed on its first row (strictly before)
+    let before = s.segments_page(Some(key(&newest[0])), 4)?;
+    assert_eq!(texts(before.clone()), ["r2", "r3", "r4", "r5"]);
+    // a short page = the beginning of history
+    let first = s.segments_page(Some(key(&before[0])), 4)?;
+    assert_eq!(texts(first), ["r0", "r1"]);
+    // forward from a position: strictly after, oldest first, limited
+    let after = s.segments_after(key(&ids[3]), 3)?;
+    assert_eq!(texts(after), ["r4", "r5", "r6"]);
+    assert!(
+        s.segments_after(key(&ids[9]), 3)?.is_empty(),
+        "past the tail"
+    );
+    // rows that share a timestamp are neither skipped nor repeated at a page edge
+    let pair = s.segments_page(Some(key(&ids[3])), 10)?;
+    assert_eq!(texts(pair), ["r0", "r1", "r2"]);
+    Ok(())
+}
+
 // ---- several connections on one file ---------------------------------------------------------
 
 #[test]
@@ -1111,11 +1152,11 @@ fn a_second_connection_sees_committed_writes() -> R {
     let work = writer.categories()?[0].id;
     let filed: Vec<(i64, Option<i64>)> = more.iter().map(|id| (*id, Some(work))).collect();
     writer.apply_categorisation(&filed)?;
-    assert_eq!(reader.segments(View::Node(work), 0)?.len(), 5);
+    assert_eq!(reader.segments(View::Node(work))?.len(), 5);
 
     // and the other way round: the reader's edit shows up in the writer
     reader.set_segment_node(row.id, Some(work))?;
-    assert_eq!(writer.segments(View::Node(work), 0)?.len(), 6);
+    assert_eq!(writer.segments(View::Node(work))?.len(), 6);
     Ok(())
 }
 
@@ -1166,7 +1207,7 @@ fn concurrent_writers_on_separate_threads_lose_nothing() {
     b.join().unwrap().unwrap();
     reader.join().unwrap().unwrap();
     let s = Store::open(&path).unwrap();
-    let rows = s.segments(View::All, 0).unwrap();
+    let rows = s.segments(View::Transcripts).unwrap();
     assert_eq!(rows.len() as i64, 2 * PER_THREAD);
     for tag in ["pipeline", "brain"] {
         assert_eq!(

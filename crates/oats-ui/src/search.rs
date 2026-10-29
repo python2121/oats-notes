@@ -86,7 +86,7 @@ pub enum SearchAction {
     Close,
     /// Show this episode (in its node's view).
     OpenEpisode(i64),
-    /// Show the transcript around this time.
+    /// Show this transcript segment (id) in the Transcripts view.
     OpenSegment(i64),
     OpenEvent(i64),
     /// A notes-card action (Re-interpret, …).
@@ -422,7 +422,7 @@ pub fn search_results(
                         day_label(ui, &t, row.started_at, year);
                     }
                     if transcript_hit(ui, &t, row, hl) {
-                        actions.push(SearchAction::OpenSegment(row.started_at));
+                        actions.push(SearchAction::OpenSegment(row.id));
                     }
                 }
             }

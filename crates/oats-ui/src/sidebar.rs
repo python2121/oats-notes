@@ -1,4 +1,4 @@
-//! The left sidebar: the "Views" group (Today, All transcripts, Conversations, Calendar, Todos) and the tree
+//! The left sidebar: the "Views" group (Transcripts, Conversations, Calendar, Todos) and the tree
 //! group — the store's categories as 22 pt hover rows, with the projects the brain created
 //! under them and topics under those, collapsible per node (a disclosure triangle on rows with
 //! children, indented SwiftInvert-style); a "+" header icon that reveals an inline field to add
@@ -344,9 +344,8 @@ fn group_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {
 
 /// The "Views" group, in order. `View::Notes` is the Conversations view (the variant keeps its
 /// name so saved prefs still load).
-pub const VIEW_ROWS: [(&str, View); 5] = [
-    ("Today", View::Today),
-    ("All transcripts", View::All),
+pub const VIEW_ROWS: [(&str, View); 4] = [
+    ("Transcripts", View::Transcripts),
     ("Conversations", View::Notes),
     ("Calendar", View::Calendar),
     ("Todos", View::Todos),
@@ -524,6 +523,11 @@ mod tests {
         let labels: Vec<_> = super::VIEW_ROWS.iter().map(|r| r.0).collect();
         assert!(labels.contains(&"Conversations"));
         assert!(!labels.contains(&"Notes"));
+        assert_eq!(
+            labels,
+            ["Transcripts", "Conversations", "Calendar", "Todos"],
+            "no Today, no All transcripts"
+        );
     }
 
     use super::*;

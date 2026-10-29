@@ -23,6 +23,9 @@ oats-engine-fluidaudio = { workspace = true }
 oats-ui = { workspace = true }
 oats-status = { workspace = true }
 oats-status-macos = { workspace = true }
+oats-media = { workspace = true }
+# not a workspace member (Core Audio FFI needs `unsafe`); a no-op off macOS
+oats-sources-macos = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "persistence", "wayland", "x11"] }
 egui = { workspace = true }
 log = { workspace = true }

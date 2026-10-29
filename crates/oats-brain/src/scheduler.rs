@@ -43,7 +43,7 @@ use chrono::{DateTime, Local, TimeZone, Timelike};
 use oats_core::{BrainRun, EpisodeContent, RunOutcome, Store, TranscriptRow};
 
 use crate::claude_cli::{ClaudeCli, CliError, Request, resolve_binary};
-use crate::episodes::{Chunk, EpisodeRule, cut};
+use crate::episodes::{self, Chunk, EpisodeRule, cut};
 use crate::hotword::{self, HotwordConfig};
 use crate::interpret;
 
@@ -1279,6 +1279,29 @@ impl Worker {
         if batch.is_empty() {
             return;
         }
+        let more = batch.len() >= self.cfg.categorise_batch;
+        // media (YouTube, music) is filed under the Media category without a call
+        let (media, batch): (Vec<TranscriptRow>, Vec<TranscriptRow>) =
+            batch.into_iter().partition(episodes::is_media_row);
+        if !media.is_empty() {
+            let filed = self.store.media_category().and_then(|node| {
+                let filed: Vec<(i64, Option<i64>)> =
+                    media.iter().map(|r| (r.id, Some(node.id))).collect();
+                self.store.apply_categorisation(&filed)
+            });
+            match filed {
+                Ok(()) => self.out.send(BrainEvent::Changed(Vec::new())),
+                Err(e) => self
+                    .out
+                    .send(BrainEvent::Warning(format!("categorise media: {e}"))),
+            }
+        }
+        if batch.is_empty() {
+            if more {
+                self.categorise_due = Some(Instant::now());
+            }
+            return;
+        }
         if !self.cli_ready() {
             self.categorise_due = Some(Instant::now() + Duration::from_secs(30 * 60));
             return;
@@ -1288,7 +1311,6 @@ impl Worker {
             return;
         }
         let model = self.cfg.models.reactive.clone();
-        let more = batch.len() >= self.cfg.categorise_batch;
         let ok = self
             .run_job(Tier::Reactive, "categorise", move |w, _| {
                 let tree = w.store.nodes().map_err(|e| e.to_string())?;
@@ -1507,7 +1529,10 @@ impl Worker {
                 .store
                 .segments_of_episode(p.id)
                 .map_err(|e| e.to_string())?;
-            if segs.len() + chunk.segments.len() <= rule.max_segments
+            // media continues only the same media, a conversation only a conversation
+            let same_kind = episodes::media_key_of(&segs) == chunk.media_key();
+            if same_kind
+                && segs.len() + chunk.segments.len() <= rule.max_segments
                 && chunk.ended_at - p.started_at.min(chunk.started_at) <= max_len
             {
                 segs.extend(chunk.segments.iter().cloned());
@@ -1528,6 +1553,11 @@ impl Worker {
             if chunk.is_open(now, &rule) && !force {
                 return Ok(ChunkStep::Waiting);
             }
+            if let Some(media) = interpret::media_of(&self.store, chunk) {
+                interpret::file_media_without_call(&self.store, chunk, &media, now)
+                    .map_err(|e| e.to_string())?;
+                return Ok(ChunkStep::Fragment);
+            }
             let content = EpisodeContent {
                 title: "Fragments".into(),
                 summary: "A few words, too short to interpret.".into(),
@@ -1545,12 +1575,14 @@ impl Worker {
             return Ok(ChunkStep::Fragment);
         }
         let tree = self.store.nodes().map_err(|e| e.to_string())?;
-        let req = interpret::interpret_request(
+        let titles = interpret::media_titles(&self.store, full.started_at, full.ended_at);
+        let req = interpret::interpret_request_with(
             &tree,
             &full,
             prior.as_ref(),
             &Local::now(),
             Some(model.to_owned()),
+            &titles,
         );
         let resp = match self.call(&req) {
             Ok(r) => r,
@@ -1903,7 +1935,7 @@ esac
         // the "one week ahead" reminder and the event's own todo for the day
         assert_eq!(s.todos(oats_core::TodoFilter::Open).unwrap().len(), 2);
         assert_eq!(
-            s.segments(View::All, 0)
+            s.segments(View::Transcripts)
                 .unwrap()
                 .iter()
                 .filter(|r| r.interpreted_at.is_some())

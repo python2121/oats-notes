@@ -2,3 +2,5 @@ target/
 *.sqlite
 *.sqlite-*
 .DS_Store
+# crates/oats-sources-macos is outside the workspace (built with its own lock when checked alone)
+crates/oats-sources-macos/Cargo.lock
