@@ -21,6 +21,6 @@ pub mod theme;
 pub mod transcript;
 
 pub use app::{
-    AppOptions, AppPrefs, AudioStarter, Command, MenuEntry, MenuSection, MenuState, OatsApp,
-    SHORTCUTS, build_menu_model,
+    AppOptions, AppPrefs, AudioRequest, AudioStarter, Command, MenuEntry, MenuSection, MenuState,
+    OatsApp, SHORTCUTS, StartedAudio, build_menu_model,
 };

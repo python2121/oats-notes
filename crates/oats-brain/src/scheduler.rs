@@ -929,7 +929,7 @@ impl Worker {
     }
 
     fn on_segment(&mut self, row: TranscriptRow) {
-        if hotword::detect(&row.text, &self.cfg.hotword).is_some() {
+        if hotword::can_command(&row) && hotword::detect(&row.text, &self.cfg.hotword).is_some() {
             self.queue_command(row);
             self.report_backlog();
             return;
@@ -1107,6 +1107,9 @@ impl Worker {
         let Some(text) = hotword::detect(&seg.text, &self.cfg.hotword) else {
             return;
         };
+        if !hotword::can_command(&seg) {
+            return;
+        }
         // already executed (the segment arrived twice, or an interpret run re-queued it after
         // it ran): notes and projects aren't deduplicated, so never run a command twice
         if let Ok(Some(stored)) = self.store.segment(seg.id)
@@ -1287,9 +1290,10 @@ impl Worker {
         };
         // segments with a hotword (stored while the brain wasn't running) are commands, not
         // conversation: route them to tier 0 and keep them out of every episode
-        let (commands, rows): (Vec<TranscriptRow>, Vec<TranscriptRow>) = rows
-            .into_iter()
-            .partition(|r| hotword::detect(&r.text, &self.cfg.hotword).is_some());
+        let (commands, rows): (Vec<TranscriptRow>, Vec<TranscriptRow>) =
+            rows.into_iter().partition(|r| {
+                hotword::can_command(r) && hotword::detect(&r.text, &self.cfg.hotword).is_some()
+            });
         let mut queued = 0usize;
         for c in commands {
             if self.queue_command(c) {

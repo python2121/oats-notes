@@ -1,21 +1,32 @@
-//! Microphone capture: the default input device, at its default config, delivered as 16 kHz
-//! mono f32 chunks of [`CHUNK_LEN`] samples (100 ms) over an `mpsc` channel.
+//! Audio capture into 16 kHz mono f32 chunks of [`CHUNK_LEN`] samples (100 ms), tagged with
+//! their lane ([`AudioChunk`]) and sent over one `mpsc` channel shared by both captures:
+//!
+//! - [`Capture`]: the microphone, chosen by [`InputPolicy`] — never a Bluetooth headset unless
+//!   asked for by name (a headset's microphone switches it to its call profile and playback
+//!   degrades): `OATS_INPUT_DEVICE` if set, else the built-in microphone, else the system
+//!   default with a warning.
+//! - [`SystemCapture`] (`system` module): what the computer plays — cpal's loopback on macOS
+//!   (a Core Audio process tap on the default output device; macOS 14.6+, the "System Audio
+//!   Recording Only" permission) and the sink monitor on Linux (PipeWire host) — through the
+//!   same mix-down and resampler.
 //!
 //! The cpal callback does the minimum: convert to f32 and mix down to mono, run the
 //! [`resample::Resampler`], and send full chunks. All scratch buffers are reused; the only
 //! allocation in steady state is the `Vec` handed to the channel, ten times a second.
 //!
 //! A lost device (unplugged USB mic, the input going away) arrives on cpal's error callback;
-//! a terminal error drops the channel's sender there, so the pipeline sees the audio channel
-//! disconnect and ends the session ("audio input closed" in the UI). Following a change of
-//! the default input device to a new one is not done: listening stops and the user starts it
-//! again (cpal's `DeviceChanged` — an automatic reroute of a default-device stream — is not
-//! terminal and is only logged).
+//! a terminal error drops that capture's sender there. For the microphone that ends the
+//! session once the other lane's sender is gone too ("audio input closed" in the UI); the
+//! system-audio lane rebuilds itself (see [`SystemCapture`]). Following a change of the
+//! default input device is not done: listening stops and the user starts it again (cpal's
+//! `DeviceChanged` — an automatic reroute of a default-device stream — is not terminal and is
+//! only logged).
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod file_source;
 pub mod resample;
+pub mod system;
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -23,9 +34,11 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use oats_core::SAMPLE_RATE;
+pub use oats_core::{AudioChunk, AudioSourceKind};
 
-pub use crate::file_source::{FileSource, FileSourceOptions, WavError};
+pub use crate::file_source::{ChunkSink, FileSource, FileSourceOptions, WavError};
 use crate::resample::Resampler;
+pub use crate::system::{OutputInfo, SystemCapture, output_is_speakers};
 
 /// Samples per chunk sent to the sink: 100 ms at 16 kHz.
 pub const CHUNK_LEN: usize = SAMPLE_RATE as usize / 10;
@@ -34,10 +47,16 @@ pub const CHUNK_LEN: usize = SAMPLE_RATE as usize / 10;
 pub enum CaptureError {
     #[error("no audio input device is available")]
     NoInputDevice,
+    #[error("no audio output device is available (nothing to record system audio from)")]
+    NoOutputDevice,
     #[error("unsupported input sample format: {0}")]
     UnsupportedFormat(String),
     #[error("audio input error: {0}")]
     Cpal(String),
+    #[error("system audio capture is not supported on this platform's audio host")]
+    LoopbackUnsupported,
+    #[error("could not start the system audio thread: {0}")]
+    Spawn(std::io::Error),
 }
 
 /// The device capture is running on, with its native (pre-resampling) config.
@@ -46,6 +65,131 @@ pub struct DeviceInfo {
     pub name: String,
     pub sample_rate: u32,
     pub channels: u16,
+}
+
+/// Which microphone to open.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum InputPolicy {
+    /// The computer's own microphone (macOS: the device named "MacBook … Microphone" /
+    /// "Built-in …"; elsewhere the default input), falling back to the default input with a
+    /// warning. Never silently a Bluetooth headset: its microphone switches it to the call
+    /// profile and playback degrades.
+    #[default]
+    BuiltIn,
+    /// Whatever the system's default input is.
+    SystemDefault,
+    /// The input device with this name (exact, case-insensitive; else the first whose name
+    /// contains it), falling back to [`InputPolicy::BuiltIn`] with a warning.
+    Named(String),
+}
+
+impl InputPolicy {
+    /// `OATS_INPUT_DEVICE` (a device name) overrides `self` when set and not empty.
+    pub fn with_env(self) -> InputPolicy {
+        match std::env::var("OATS_INPUT_DEVICE") {
+            Ok(name) if !name.trim().is_empty() => InputPolicy::Named(name.trim().to_owned()),
+            _ => self,
+        }
+    }
+}
+
+/// How [`choose_input`] picked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputChoice {
+    /// `names[i]`, the device asked for by name.
+    Named(usize),
+    /// `names[i]`, the built-in microphone.
+    BuiltIn(usize),
+    /// The system default input; `warn` = why that is not what the policy wanted.
+    Default { warn: Option<String> },
+}
+
+/// Whether an input device name is the computer's own microphone (macOS naming).
+pub fn is_builtin_input(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("macbook") || n.contains("built-in") || n.contains("builtin")
+}
+
+/// Pick an input device by `policy` from the input devices' `names` (pure; tested).
+/// `platform_names_builtin`: the platform names its built-in microphone recognisably (macOS);
+/// elsewhere [`InputPolicy::BuiltIn`] means the default input.
+pub fn choose_input(
+    policy: &InputPolicy,
+    names: &[String],
+    platform_names_builtin: bool,
+) -> InputChoice {
+    let mut note: Option<String> = None;
+    if let InputPolicy::Named(want) = policy {
+        let w = want.to_lowercase();
+        if let Some(i) = names
+            .iter()
+            .position(|n| n.to_lowercase() == w)
+            .or_else(|| names.iter().position(|n| n.to_lowercase().contains(&w)))
+        {
+            return InputChoice::Named(i);
+        }
+        note = Some(format!(
+            "input device \"{want}\" (OATS_INPUT_DEVICE) not found among {names:?}"
+        ));
+    }
+    if matches!(policy, InputPolicy::SystemDefault) {
+        return InputChoice::Default { warn: None };
+    }
+    if !platform_names_builtin {
+        return InputChoice::Default { warn: note };
+    }
+    if let Some(i) = names.iter().position(|n| is_builtin_input(n)) {
+        if let Some(n) = note {
+            log::warn!("{n}; using the built-in microphone");
+        }
+        return InputChoice::BuiltIn(i);
+    }
+    let why = "no built-in microphone found; using the system default input, which may be a \
+               Bluetooth headset (its call profile degrades playback) or another unknown device";
+    InputChoice::Default {
+        warn: Some(match note {
+            Some(n) => format!("{n}; {why}"),
+            None => why.to_owned(),
+        }),
+    }
+}
+
+/// A device's display name.
+pub(crate) fn device_name(device: &cpal::Device, fallback: &str) -> String {
+    device
+        .description()
+        .map(|d| d.name().to_owned())
+        .unwrap_or_else(|_| fallback.to_owned())
+}
+
+/// The input device [`InputPolicy`] picks on the default host, with its name.
+fn pick_input(policy: &InputPolicy) -> Result<(cpal::Device, String), CaptureError> {
+    let host = cpal::default_host();
+    let devices: Vec<cpal::Device> = host
+        .input_devices()
+        .map(|d| d.collect())
+        .unwrap_or_default();
+    let names: Vec<String> = devices
+        .iter()
+        .map(|d| device_name(d, "(unknown input device)"))
+        .collect();
+    let choice = choose_input(policy, &names, cfg!(target_os = "macos"));
+    let pick = match choice {
+        InputChoice::Named(i) | InputChoice::BuiltIn(i) => devices.into_iter().nth(i),
+        InputChoice::Default { warn } => {
+            let d = host.default_input_device();
+            if let (Some(w), Some(d)) = (warn, &d) {
+                log::warn!(
+                    "audio input: {w} (\"{}\")",
+                    device_name(d, "(unknown input device)")
+                );
+            }
+            d
+        }
+    };
+    let device = pick.ok_or(CaptureError::NoInputDevice)?;
+    let name = device_name(&device, "(unknown input device)");
+    Ok((device, name))
 }
 
 /// A running microphone capture. Dropping it stops the stream.
@@ -63,19 +207,16 @@ impl std::fmt::Debug for Capture {
 }
 
 impl Capture {
-    /// Open the default input device with its default input config (the device's nominal rate
-    /// is left alone), start the stream, and send ~100 ms chunks of 16 kHz mono f32 to `sink`.
-    /// Capture stops when the returned [`Capture`] is dropped; once the receiver is gone the
-    /// callback stops doing any work.
-    pub fn start(sink: Sender<Vec<f32>>) -> Result<Capture, CaptureError> {
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or(CaptureError::NoInputDevice)?;
-        let name = device
-            .description()
-            .map(|d| d.name().to_owned())
-            .unwrap_or_else(|_| "(unknown input device)".to_owned());
+    /// Open the microphone [`InputPolicy`] picks (`OATS_INPUT_DEVICE` applied by the caller
+    /// through [`InputPolicy::with_env`]) with its default input config (the device's nominal
+    /// rate is left alone), start the stream, and send ~100 ms chunks of 16 kHz mono f32,
+    /// tagged [`AudioSourceKind::Mic`], to `sink`. Capture stops when the returned [`Capture`]
+    /// is dropped; once the receiver is gone the callback stops doing any work.
+    pub fn start_mic(
+        sink: Sender<AudioChunk>,
+        policy: &InputPolicy,
+    ) -> Result<Capture, CaptureError> {
+        let (device, name) = pick_input(policy)?;
         let supported = device
             .default_input_config()
             .map_err(|e| CaptureError::Cpal(e.to_string()))?;
@@ -87,14 +228,14 @@ impl Capture {
             channels: config.channels,
         };
         log::info!(
-            "audio input: \"{}\" at {} Hz, {} channel(s), {:?} → {} Hz mono",
+            "audio input ({policy:?}): \"{}\" at {} Hz, {} channel(s), {:?} → {} Hz mono",
             info.name,
             info.sample_rate,
             info.channels,
             format,
             SAMPLE_RATE
         );
-
+        let sink = Sink::new(sink, AudioSourceKind::Mic);
         let stream = match format {
             SampleFormat::F32 => build::<f32>(&device, &config, sink),
             SampleFormat::I16 => build::<i16>(&device, &config, sink),
@@ -116,33 +257,38 @@ impl Capture {
     }
 }
 
-fn build<T>(
+pub(crate) fn build<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    sink: Sender<Vec<f32>>,
+    sink: Sink,
 ) -> Result<Stream, CaptureError>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
-    let sink = Sink::new(sink);
     let on_error = sink.clone();
     let mut conv = Converter::new(config.sample_rate, config.channels, sink);
     device
         .build_input_stream::<T, _, _>(
             *config,
             move |data: &[T], _: &cpal::InputCallbackInfo| conv.push(data),
-            move |err| {
-                if is_terminal(err.kind()) {
-                    log::warn!("audio input lost: {err}; closing the audio channel");
-                    on_error.close();
-                } else {
-                    log::warn!("audio input stream error: {err}");
-                }
-            },
+            move |err| on_stream_error(&on_error, &err),
             None,
         )
         .map_err(|e| CaptureError::Cpal(e.to_string()))
+}
+
+/// The error callback: a terminal error closes this capture's sender (its lane).
+pub(crate) fn on_stream_error(sink: &Sink, err: &cpal::Error) {
+    if is_terminal(err.kind()) {
+        log::warn!(
+            "{} audio lost: {err}; closing its lane",
+            sink.source.as_str()
+        );
+        sink.close();
+    } else {
+        log::warn!("{} audio stream error: {err}", sink.source.as_str());
+    }
 }
 
 /// Stream errors after which no more audio will come: the device is gone, the host went
@@ -157,21 +303,31 @@ pub fn is_terminal(kind: cpal::ErrorKind) -> bool {
     )
 }
 
-/// The channel's sender, shared by the data callback and the error callback so the latter
-/// can drop it (the receiver then sees `Disconnected`). The lock is uncontended except at
-/// the moment of a device loss.
+/// One capture's end of the shared channel, shared by the data callback and the error
+/// callback so the latter can drop it (when every capture's sender is gone the receiver sees
+/// `Disconnected`). The lock is uncontended except at the moment of a device loss.
 #[derive(Clone)]
-struct Sink(Arc<Mutex<Option<Sender<Vec<f32>>>>>);
+pub(crate) struct Sink {
+    tx: Arc<Mutex<Option<Sender<AudioChunk>>>>,
+    source: AudioSourceKind,
+}
 
 impl Sink {
-    fn new(tx: Sender<Vec<f32>>) -> Self {
-        Sink(Arc::new(Mutex::new(Some(tx))))
+    pub(crate) fn new(tx: Sender<AudioChunk>, source: AudioSourceKind) -> Self {
+        Sink {
+            tx: Arc::new(Mutex::new(Some(tx))),
+            source,
+        }
     }
 
     /// `false` when the sender is closed or the receiver is gone.
-    fn send(&self, chunk: Vec<f32>) -> bool {
-        let Ok(mut guard) = self.0.lock() else {
+    fn send(&self, samples: Vec<f32>) -> bool {
+        let Ok(mut guard) = self.tx.lock() else {
             return false;
+        };
+        let chunk = AudioChunk {
+            source: self.source,
+            samples,
         };
         match guard.as_ref() {
             Some(tx) if tx.send(chunk).is_ok() => true,
@@ -184,10 +340,15 @@ impl Sink {
     }
 
     /// Drop the sender (idempotent).
-    fn close(&self) {
-        if let Ok(mut guard) = self.0.lock() {
+    pub(crate) fn close(&self) {
+        if let Ok(mut guard) = self.tx.lock() {
             *guard = None;
         }
+    }
+
+    /// Whether the sender was closed (a terminal stream error, or the receiver went away).
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.lock().map(|g| g.is_none()).unwrap_or(true)
     }
 }
 
@@ -212,7 +373,7 @@ where
 }
 
 /// The per-stream state the callback owns: reusable buffers, the resampler, the sink.
-struct Converter {
+pub(crate) struct Converter {
     channels: u16,
     mono: Vec<f32>,
     resampled: Vec<f32>,
@@ -223,7 +384,7 @@ struct Converter {
 }
 
 impl Converter {
-    fn new(in_rate: u32, channels: u16, sink: Sink) -> Self {
+    pub(crate) fn new(in_rate: u32, channels: u16, sink: Sink) -> Self {
         Self {
             channels,
             mono: Vec::with_capacity(8192),
@@ -235,7 +396,7 @@ impl Converter {
         }
     }
 
-    fn push<T>(&mut self, data: &[T])
+    pub(crate) fn push<T>(&mut self, data: &[T])
     where
         T: SizedSample,
         f32: FromSample<T>,
@@ -286,13 +447,15 @@ mod tests {
     #[test]
     fn converter_sends_full_chunks() {
         let (tx, rx) = mpsc::channel();
-        let mut conv = Converter::new(48_000, 2, Sink::new(tx));
+        let mut conv = Converter::new(48_000, 2, Sink::new(tx, AudioSourceKind::System));
         // 1 s of stereo 48 kHz, in 10 ms callbacks.
         let block = vec![0.25f32; 480 * 2];
         for _ in 0..100 {
             conv.push(&block);
         }
-        let chunks: Vec<Vec<f32>> = rx.try_iter().collect();
+        let chunks: Vec<AudioChunk> = rx.try_iter().collect();
+        assert!(chunks.iter().all(|c| c.source == AudioSourceKind::System));
+        let chunks: Vec<Vec<f32>> = chunks.into_iter().map(|c| c.samples).collect();
         // ~16 000 samples minus the filter look-ahead → 9 full chunks.
         assert_eq!(chunks.len(), 9);
         assert!(chunks.iter().all(|c| c.len() == CHUNK_LEN));
@@ -303,7 +466,7 @@ mod tests {
     fn converter_stops_when_receiver_dropped() {
         let (tx, rx) = mpsc::channel();
         drop(rx);
-        let mut conv = Converter::new(16_000, 1, Sink::new(tx));
+        let mut conv = Converter::new(16_000, 1, Sink::new(tx, AudioSourceKind::Mic));
         conv.push(&vec![0.0f32; CHUNK_LEN]);
         assert!(conv.closed);
     }
@@ -313,11 +476,13 @@ mod tests {
     #[test]
     fn closing_the_sink_disconnects_the_receiver() {
         let (tx, rx) = mpsc::channel();
-        let sink = Sink::new(tx);
+        let sink = Sink::new(tx, AudioSourceKind::Mic);
         let mut conv = Converter::new(16_000, 1, sink.clone());
         conv.push(&vec![0.0f32; CHUNK_LEN * 2]);
         assert!(rx.try_recv().is_ok());
+        assert!(!sink.is_closed());
         sink.close();
+        assert!(sink.is_closed());
         while rx.try_recv().is_ok() {}
         assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
         conv.push(&vec![0.0f32; CHUNK_LEN]);
@@ -325,5 +490,72 @@ mod tests {
         assert!(is_terminal(cpal::ErrorKind::DeviceNotAvailable));
         assert!(!is_terminal(cpal::ErrorKind::DeviceChanged));
         assert!(!is_terminal(cpal::ErrorKind::Xrun));
+    }
+
+    fn names(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_built_in_microphone_wins_over_a_headset() {
+        let devs = names(&[
+            "Alex’s AirPods",
+            "MacBook Air Microphone",
+            "Alex’s iPhone Microphone",
+        ]);
+        assert_eq!(
+            choose_input(&InputPolicy::BuiltIn, &devs, true),
+            InputChoice::BuiltIn(1)
+        );
+        // an older Mac's naming
+        assert_eq!(
+            choose_input(
+                &InputPolicy::BuiltIn,
+                &names(&["Built-in Microphone"]),
+                true
+            ),
+            InputChoice::BuiltIn(0)
+        );
+        // no built-in microphone (a Mac mini): the default, with a warning
+        assert!(matches!(
+            choose_input(&InputPolicy::BuiltIn, &names(&["Alex’s AirPods"]), true),
+            InputChoice::Default { warn: Some(w) } if w.contains("Bluetooth")
+        ));
+        // Linux: the default input, nothing to warn about
+        assert_eq!(
+            choose_input(&InputPolicy::BuiltIn, &devs, false),
+            InputChoice::Default { warn: None }
+        );
+        assert_eq!(
+            choose_input(&InputPolicy::SystemDefault, &devs, true),
+            InputChoice::Default { warn: None }
+        );
+    }
+
+    #[test]
+    fn a_named_device_is_found_case_insensitively_else_the_built_in() {
+        let devs = names(&[
+            "MacBook Air Microphone",
+            "Scarlett 2i2 USB",
+            "Alex’s AirPods",
+        ]);
+        let named = |n: &str| InputPolicy::Named(n.to_owned());
+        assert_eq!(
+            choose_input(&named("scarlett 2i2 usb"), &devs, true),
+            InputChoice::Named(1)
+        );
+        assert_eq!(
+            choose_input(&named("airpods"), &devs, true),
+            InputChoice::Named(2)
+        );
+        assert_eq!(
+            choose_input(&named("Yeti"), &devs, true),
+            InputChoice::BuiltIn(0)
+        );
+        assert!(matches!(
+            choose_input(&named("Yeti"), &names(&["Alex’s AirPods"]), true),
+            InputChoice::Default { warn: Some(w) } if w.contains("Yeti")
+        ));
+        assert_eq!(InputPolicy::default(), InputPolicy::BuiltIn);
     }
 }

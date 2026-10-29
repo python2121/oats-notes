@@ -3,10 +3,21 @@
 //! while listening, pulls 16 kHz mono chunks from an audio channel, runs VAD → [`Segmenter`] →
 //! transcription, writes each segment to the [`Store`] and reports [`PipelineEvent`]s.
 //!
+//! Two lanes: the microphone ("me") and system audio ("them", what the computer plays — a call,
+//! a video). Chunks arrive on ONE channel tagged with their [`AudioSourceKind`]; each lane has
+//! its own pending buffer, VAD state ([`SpeechEngine::vad_lane`]), [`Segmenter`] and sample
+//! clock, and the closed segments of both are transcribed on this one thread, first come first
+//! served (the engine is not `Send`). Segments carry their `source`; the store orders by
+//! `started_at`, so the lanes interleave on one timeline. A microphone segment that only
+//! repeats a system segment (speakers heard by the microphone) is stored as its echo
+//! ([`crate::echo`]) while the echo rule is on ([`PipelineHandle::set_echo_dedup`]).
+//!
 //! Efficiency rules (the app runs all day on an M2 Air):
 //! - The worker blocks on the audio channel; nothing spins. With no audio channel attached
 //!   (not listening) it blocks on the command channel.
-//! - VAD runs on every frame (cheap); the model runs only on closed speech segments.
+//! - VAD runs on every frame (cheap) — except all-zero system-audio frames (the tap delivers
+//!   exact digital silence while nothing plays), which skip the engine; the model runs only on
+//!   closed speech segments.
 //! - Level events are rate-limited to ~4 Hz (and off while the UI says it has no use for them); the UI repaints only when an event arrives
 //!   (`wake` is called after each event is queued).
 
@@ -15,7 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::engine::{EnergyVad, EngineFactory, SAMPLE_RATE, SpeechEngine};
+use crate::echo;
+use crate::engine::{
+    AudioChunk, AudioSourceKind, EnergyVad, EngineFactory, SAMPLE_RATE, SpeechEngine,
+};
 use crate::segmenter::{Segment, Segmenter, SegmenterConfig};
 use crate::store::{Store, TranscriptRow};
 
@@ -23,6 +37,8 @@ use crate::store::{Store, TranscriptRow};
 const AUDIO_POLL: Duration = Duration::from_millis(100);
 /// Minimum spacing of `Level` events (~4 Hz).
 const LEVEL_INTERVAL: Duration = Duration::from_millis(250);
+/// A lane that delivered nothing for this long reads as silent in `Level` events.
+const LEVEL_STALE: Duration = Duration::from_secs(1);
 /// How long dropping the handle waits for the worker before detaching it (a model load can
 /// take minutes and can't be interrupted; quitting must not wait for it).
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -44,14 +60,32 @@ pub enum PipelineEvent {
     Status(PipelineStatus),
     /// Engine name, once known.
     Engine(String),
-    /// Input level (RMS dBFS of the latest chunk) and whether a speech segment is open.
+    /// Input levels (RMS dBFS of each lane's latest chunk; −100 for a lane that is silent or
+    /// delivers nothing) and whether a speech segment is open on each lane.
     Level {
-        rms_db: f32,
-        in_speech: bool,
+        rms_db_mic: f32,
+        rms_db_system: f32,
+        in_speech_mic: bool,
+        in_speech_system: bool,
     },
-    /// A segment was transcribed and stored (the row as stored). Empty transcriptions are
-    /// not stored and not reported.
+    /// A segment was transcribed and stored (the row as stored; `source` says which lane, and
+    /// `echo_of` is set for a microphone echo of system audio, which the views hide). Empty
+    /// transcriptions are not stored and not reported.
     Segment(TranscriptRow),
+    /// An already reported microphone segment turned out to be the echo of a system segment
+    /// stored after it: it is now hidden.
+    EchoMarked {
+        segment: i64,
+        echo_of: i64,
+    },
+    /// The system-audio lane (when expected, [`ListenOptions::system`]) produced nothing but
+    /// silence for [`ListenOptions::no_signal_after`] since the session started
+    /// (`signal: false`: nothing is playing, or the System Audio Recording permission is
+    /// missing — macOS then delivers zeros), or produced sound after such a report
+    /// (`signal: true`).
+    SystemAudio {
+        signal: bool,
+    },
     /// A new session row was opened / closed.
     SessionStarted(i64),
     SessionEnded(i64),
@@ -60,6 +94,25 @@ pub enum PipelineEvent {
     ListenFailed(String),
     /// A non-fatal problem (one transcription failed, the store refused a write).
     Warning(String),
+}
+
+/// What a listening session expects from its audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenOptions {
+    /// System audio was asked for (the "no signal" report only runs then).
+    pub system: bool,
+    /// Report [`PipelineEvent::SystemAudio`] `{ signal: false }` after this long without a
+    /// single non-zero system sample.
+    pub no_signal_after: Duration,
+}
+
+impl Default for ListenOptions {
+    fn default() -> Self {
+        Self {
+            system: false,
+            no_signal_after: Duration::from_secs(30),
+        }
+    }
 }
 
 /// The UI's handle: start/stop listening, receive events. Dropping it shuts the worker down.
@@ -71,12 +124,34 @@ pub struct PipelineHandle {
     cancel: Arc<AtomicBool>,
     /// Whether the worker sends `Level` events (the UI turns them off while hidden).
     levels_wanted: Arc<AtomicBool>,
+    /// Whether the echo rule runs (see [`PipelineHandle::set_echo_dedup`]).
+    echo_dedup: Arc<AtomicBool>,
+}
+
+/// The audio a session reads: the plain microphone-only stream (every chunk is the
+/// microphone lane — the file source and older callers) or tagged chunks from both lanes.
+pub(crate) enum AudioIn {
+    Mono(Receiver<Vec<f32>>),
+    Lanes(Receiver<AudioChunk>),
+}
+
+impl AudioIn {
+    fn recv_timeout(&self, timeout: Duration) -> Result<AudioChunk, RecvTimeoutError> {
+        match self {
+            AudioIn::Mono(rx) => rx.recv_timeout(timeout).map(AudioChunk::mic),
+            AudioIn::Lanes(rx) => rx.recv_timeout(timeout),
+        }
+    }
+}
+
+pub(crate) struct Listen {
+    audio: AudioIn,
+    options: ListenOptions,
 }
 
 pub(crate) enum Command {
-    /// Start listening: consume 16 kHz mono chunks from this channel until it closes or
-    /// `Stop` arrives.
-    Listen(Receiver<Vec<f32>>),
+    /// Start listening: consume chunks from this channel until it closes or `Stop` arrives.
+    Listen(Listen),
     Stop,
     Shutdown,
 }
@@ -104,10 +179,12 @@ impl Pipeline {
             wake,
         } = self;
         let levels_wanted = Arc::new(AtomicBool::new(true));
+        let echo_dedup = Arc::new(AtomicBool::new(true));
         let out = Outbox {
             tx: event_tx,
             wake,
             levels_wanted: levels_wanted.clone(),
+            echo_dedup: echo_dedup.clone(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
@@ -136,18 +213,33 @@ impl Pipeline {
             thread,
             cancel,
             levels_wanted,
+            echo_dedup,
         }
     }
 }
 
 impl PipelineHandle {
-    /// Begin a listening session over `audio` (16 kHz mono f32 chunks, any chunk size).
+    /// Begin a microphone-only listening session over `audio` (16 kHz mono f32 chunks, any
+    /// chunk size; every chunk is the microphone lane).
     pub fn start(&self, audio: Receiver<Vec<f32>>) {
-        let _ = self.cmd_tx.send(Command::Listen(audio));
+        let _ = self.cmd_tx.send(Command::Listen(Listen {
+            audio: AudioIn::Mono(audio),
+            options: ListenOptions::default(),
+        }));
     }
 
-    /// End the listening session: the open segment is flushed and transcribed, the session row
-    /// closed.
+    /// Begin a listening session over tagged chunks from both lanes (the microphone and the
+    /// system-audio capture share the sender). A lane whose capture stops (its sender
+    /// dropped) simply goes quiet; the session ends when every sender is gone.
+    pub fn start_lanes(&self, audio: Receiver<AudioChunk>, options: ListenOptions) {
+        let _ = self.cmd_tx.send(Command::Listen(Listen {
+            audio: AudioIn::Lanes(audio),
+            options,
+        }));
+    }
+
+    /// End the listening session: the open segments are flushed and transcribed, the session
+    /// row closed.
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(Command::Stop);
     }
@@ -156,6 +248,18 @@ impl PipelineHandle {
     /// all other events are unaffected.
     pub fn set_levels_wanted(&self, wanted: bool) {
         self.levels_wanted.store(wanted, Ordering::Relaxed);
+    }
+
+    /// Turn the echo rule on or off (default on): while on, a microphone segment that repeats
+    /// an overlapping system segment is stored as its echo. The audio side decides
+    /// ([`crate::DedupMode`]: off while the output is headphones).
+    pub fn set_echo_dedup(&self, on: bool) {
+        self.echo_dedup.store(on, Ordering::Relaxed);
+    }
+
+    /// The echo rule's switch, for a capture thread that follows the output device.
+    pub fn echo_dedup_flag(&self) -> Arc<AtomicBool> {
+        self.echo_dedup.clone()
     }
 
     /// Drain pending events (call once per UI frame).
@@ -168,7 +272,6 @@ impl PipelineHandle {
         self.events.recv_timeout(timeout).ok()
     }
 }
-
 impl Drop for PipelineHandle {
     /// Shut the worker down: a bounded join. Normally the worker is back on its command
     /// channel within a poll interval; while the engine is still loading (which can't be
@@ -200,6 +303,7 @@ struct Outbox {
     tx: Sender<PipelineEvent>,
     wake: Box<dyn Fn() + Send + Sync>,
     levels_wanted: Arc<AtomicBool>,
+    echo_dedup: Arc<AtomicBool>,
 }
 
 impl Outbox {
@@ -340,16 +444,16 @@ fn worker(
     let mut next = cmd_rx.recv().ok();
     while let Some(cmd) = next.take() {
         match cmd {
-            Command::Listen(audio_rx) => {
+            Command::Listen(listen) => {
                 let mut session = Session {
                     engine: engine.as_mut(),
                     engine_name: &engine_name,
                     store: &store,
                     out,
                 };
-                match session.run(config, &audio_rx, cmd_rx) {
+                match session.run(config, &listen, cmd_rx) {
                     AfterListen::Idle => next = cmd_rx.recv().ok(),
-                    AfterListen::Listen(rx) => next = Some(Command::Listen(rx)),
+                    AfterListen::Listen(l) => next = Some(Command::Listen(l)),
                     AfterListen::Shutdown => return,
                 }
             }
@@ -363,8 +467,52 @@ fn worker(
 enum AfterListen {
     Idle,
     /// A new `Listen` arrived mid-session: the old session was closed, start this one.
-    Listen(Receiver<Vec<f32>>),
+    Listen(Listen),
     Shutdown,
+}
+
+/// One lane's state within a session.
+struct Lane {
+    kind: AudioSourceKind,
+    segmenter: Segmenter,
+    /// Samples not yet making up a whole VAD frame.
+    pending: Vec<f32>,
+    /// Anchored when the lane's first chunk arrives (a capture can start later than the
+    /// session, e.g. the system-audio tap).
+    clock: Option<SampleClock>,
+    /// Samples received so far.
+    received: u64,
+    /// `Some` when the engine has no VAD of its own.
+    energy_vad: Option<EnergyVad>,
+    /// RMS dBFS of the latest chunk, and when it arrived.
+    last_db: f32,
+    last_chunk: Option<Instant>,
+    /// Any non-zero sample seen this session.
+    signal: bool,
+}
+
+impl Lane {
+    fn new(kind: AudioSourceKind, config: SegmenterConfig, energy: bool) -> Self {
+        Self {
+            kind,
+            segmenter: Segmenter::new(config),
+            pending: Vec::new(),
+            clock: None,
+            received: 0,
+            energy_vad: energy.then(EnergyVad::new),
+            last_db: -100.0,
+            last_chunk: None,
+            signal: false,
+        }
+    }
+
+    /// The level to report: the latest chunk's, or silence when the lane went quiet.
+    fn level(&self) -> (f32, bool) {
+        match self.last_chunk {
+            Some(t) if t.elapsed() < LEVEL_STALE => (self.last_db, self.segmenter.in_speech()),
+            _ => (-100.0, self.segmenter.in_speech()),
+        }
+    }
 }
 
 /// One listening session's borrowed context.
@@ -379,10 +527,11 @@ impl Session<'_> {
     fn run(
         &mut self,
         config: SegmenterConfig,
-        audio_rx: &Receiver<Vec<f32>>,
+        listen: &Listen,
         cmd_rx: &Receiver<Command>,
     ) -> AfterListen {
         let started_ms = now_ms();
+        let started = Instant::now();
         let session_id = match self.store.begin_session(started_ms, self.engine_name) {
             Ok(id) => id,
             Err(e) => {
@@ -400,68 +549,91 @@ impl Session<'_> {
 
         let engine_frame = self.engine.vad_frame_len().filter(|&n| n > 0);
         let frame_len = engine_frame.unwrap_or(EnergyVad::FRAME_LEN);
-        let mut energy_vad = engine_frame.is_none().then(EnergyVad::new);
-        let mut segmenter = Segmenter::new(config);
-        let mut pending: Vec<f32> = Vec::new();
+        let energy = engine_frame.is_none();
+        let mut lanes = [
+            Lane::new(AudioSourceKind::Mic, config, energy),
+            Lane::new(AudioSourceKind::System, config, energy),
+        ];
         let mut last_level: Option<Instant> = None;
         let mut vad_warned = false;
-        let mut clock = SampleClock::new(started_ms, Instant::now());
-        let mut received: u64 = 0;
+        let mut no_signal_reported = false;
 
         let after = loop {
-            match audio_rx.recv_timeout(AUDIO_POLL) {
+            match listen.audio.recv_timeout(AUDIO_POLL) {
                 Ok(chunk) => {
-                    clock.observe(received, now_ms(), Instant::now());
-                    received += chunk.len() as u64;
-                    pending.extend_from_slice(&chunk);
-                    let mut offset = 0;
-                    while pending.len() - offset >= frame_len {
-                        let frame = &pending[offset..offset + frame_len];
-                        offset += frame_len;
-                        let is_speech = match energy_vad.as_mut() {
-                            Some(vad) => vad.classify(frame).is_speech,
-                            None => match self.engine.vad(frame) {
-                                Ok(v) => v.first().is_some_and(|f| f.is_speech),
-                                Err(e) => {
-                                    if !vad_warned {
-                                        vad_warned = true;
-                                        self.out.send(PipelineEvent::Warning(e.to_string()));
-                                    }
-                                    false
-                                }
-                            },
-                        };
-                        if let Some(seg) = segmenter.push(frame, is_speech) {
-                            self.finish_segment(session_id, &clock, &seg);
+                    let lane = &mut lanes[chunk.source.index()];
+                    let silent = chunk.samples.iter().all(|s| *s == 0.0);
+                    if lane.kind == AudioSourceKind::System && !silent && !lane.signal {
+                        log::info!("system audio: first signal");
+                        if no_signal_reported {
+                            no_signal_reported = false;
+                            self.out.send(PipelineEvent::SystemAudio { signal: true });
                         }
                     }
-                    pending.drain(..offset);
+                    lane.signal |= !silent;
+                    self.feed(
+                        lane,
+                        &chunk.samples,
+                        started_ms,
+                        session_id,
+                        frame_len,
+                        &mut vad_warned,
+                    );
+                    lane.last_db = if silent {
+                        -100.0
+                    } else {
+                        EnergyVad::rms_db(&chunk.samples)
+                    };
+                    lane.last_chunk = Some(Instant::now());
 
-                    if self.out.levels_wanted.load(Ordering::Relaxed)
+                    // an all-zero system chunk (nothing playing) wakes nobody
+                    let report = chunk.source == AudioSourceKind::Mic || !silent;
+                    if report
+                        && self.out.levels_wanted.load(Ordering::Relaxed)
                         && last_level.is_none_or(|t| t.elapsed() >= LEVEL_INTERVAL)
                     {
                         last_level = Some(Instant::now());
+                        let (rms_db_mic, in_speech_mic) = lanes[0].level();
+                        let (rms_db_system, in_speech_system) = lanes[1].level();
                         self.out.send(PipelineEvent::Level {
-                            rms_db: EnergyVad::rms_db(&chunk),
-                            in_speech: segmenter.in_speech(),
+                            rms_db_mic,
+                            rms_db_system,
+                            in_speech_mic,
+                            in_speech_system,
                         });
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break AfterListen::Idle,
             }
+            if listen.options.system
+                && !no_signal_reported
+                && !lanes[1].signal
+                && started.elapsed() >= listen.options.no_signal_after
+            {
+                no_signal_reported = true;
+                log::warn!(
+                    "system audio: no signal {:?} after the start (nothing playing, or no \
+                     System Audio Recording permission)",
+                    listen.options.no_signal_after
+                );
+                self.out.send(PipelineEvent::SystemAudio { signal: false });
+            }
             match cmd_rx.try_recv() {
                 Ok(Command::Stop) => break AfterListen::Idle,
                 Ok(Command::Shutdown) | Err(TryRecvError::Disconnected) => {
                     break AfterListen::Shutdown;
                 }
-                Ok(Command::Listen(rx)) => break AfterListen::Listen(rx),
+                Ok(Command::Listen(l)) => break AfterListen::Listen(l),
                 Err(TryRecvError::Empty) => {}
             }
         };
 
-        if let Some(seg) = segmenter.flush() {
-            self.finish_segment(session_id, &clock, &seg);
+        // system first: a microphone echo flushed after it finds it
+        for lane in lanes.iter_mut().rev() {
+            if let (Some(seg), Some(clock)) = (lane.segmenter.flush(), lane.clock) {
+                self.finish_segment(lane.kind, session_id, &clock, &seg);
+            }
         }
         if let Err(e) = self.store.end_session(session_id, now_ms()) {
             self.out.send(PipelineEvent::Warning(format!(
@@ -473,35 +645,170 @@ impl Session<'_> {
         after
     }
 
-    /// Transcribe a closed segment, store it and report it.
-    fn finish_segment(&mut self, session_id: i64, clock: &SampleClock, seg: &Segment) {
+    /// Append a chunk to its lane and run every whole VAD frame through VAD → segmenter,
+    /// finishing the segments that close.
+    fn feed(
+        &mut self,
+        lane: &mut Lane,
+        samples: &[f32],
+        session_started_ms: i64,
+        session_id: i64,
+        frame_len: usize,
+        vad_warned: &mut bool,
+    ) {
+        let wall = now_ms();
+        let mono = Instant::now();
+        let chunk_ms = samples.len() as i64 * 1000 / i64::from(SAMPLE_RATE);
+        let clock = lane.clock.get_or_insert_with(|| {
+            // the chunk's first sample was captured about one chunk ago
+            let anchor = (wall - chunk_ms).max(session_started_ms);
+            let back = Duration::from_millis((wall - anchor).max(0) as u64);
+            SampleClock::new(anchor, mono.checked_sub(back).unwrap_or(mono))
+        });
+        clock.observe(lane.received, wall, mono);
+        let clock = *clock;
+        lane.received += samples.len() as u64;
+        lane.pending.extend_from_slice(samples);
+        let mut offset = 0;
+        while lane.pending.len() - offset >= frame_len {
+            let frame = &lane.pending[offset..offset + frame_len];
+            offset += frame_len;
+            let is_speech =
+                if lane.kind == AudioSourceKind::System && frame.iter().all(|s| *s == 0.0) {
+                    // digital silence from the tap: nothing to classify
+                    false
+                } else {
+                    match lane.energy_vad.as_mut() {
+                        Some(vad) => vad.classify(frame).is_speech,
+                        None => match self.engine.vad_lane(lane.kind, frame) {
+                            Ok(v) => v.first().is_some_and(|f| f.is_speech),
+                            Err(e) => {
+                                if !*vad_warned {
+                                    *vad_warned = true;
+                                    self.out.send(PipelineEvent::Warning(e.to_string()));
+                                }
+                                false
+                            }
+                        },
+                    }
+                };
+            if let Some(seg) = lane.segmenter.push(frame, is_speech) {
+                self.finish_segment(lane.kind, session_id, &clock, &seg);
+            }
+        }
+        lane.pending.drain(..offset);
+    }
+
+    /// Transcribe a closed segment, store it (as an echo when it repeats system audio) and
+    /// report it.
+    fn finish_segment(
+        &mut self,
+        source: AudioSourceKind,
+        session_id: i64,
+        clock: &SampleClock,
+        seg: &Segment,
+    ) {
         let started_at = clock.ms_at(seg.start_sample);
         let ended_at = clock.ms_at(seg.start_sample + seg.samples.len() as u64);
-        match self.engine.transcribe(&seg.samples) {
-            Ok(t) => {
-                let text = t.text.trim();
-                if text.is_empty() {
-                    return;
-                }
-                log::debug!(
-                    "segment {} ms transcribed in {:.0} ms",
-                    seg.duration_ms(),
-                    t.processing_ms
-                );
-                match self.store.insert_segment(
-                    session_id,
-                    started_at,
-                    ended_at,
-                    text,
-                    t.confidence,
-                ) {
-                    Ok(row) => self.out.send(PipelineEvent::Segment(row)),
-                    Err(e) => self.out.send(PipelineEvent::Warning(format!(
-                        "could not save a segment: {e}"
-                    ))),
-                }
+        let t = match self.engine.transcribe(&seg.samples) {
+            Ok(t) => t,
+            Err(e) => return self.out.send(PipelineEvent::Warning(e.to_string())),
+        };
+        let text = t.text.trim();
+        if text.is_empty() {
+            return;
+        }
+        log::debug!(
+            "{} segment {} ms transcribed in {:.0} ms",
+            source.as_str(),
+            seg.duration_ms(),
+            t.processing_ms
+        );
+        let dedup = self.out.echo_dedup.load(Ordering::Relaxed);
+        let echo_of = if dedup && source == AudioSourceKind::Mic {
+            self.echo_target(started_at, ended_at, text)
+        } else {
+            None
+        };
+        let row = match self.store.insert_segment_from(
+            session_id,
+            started_at,
+            ended_at,
+            text,
+            t.confidence,
+            source,
+            echo_of,
+        ) {
+            Ok(row) => row,
+            Err(e) => {
+                return self.out.send(PipelineEvent::Warning(format!(
+                    "could not save a segment: {e}"
+                )));
             }
-            Err(e) => self.out.send(PipelineEvent::Warning(e.to_string())),
+        };
+        if let Some(sys) = echo_of {
+            log::info!(
+                "mic segment {} stored as the echo of system segment {sys}",
+                row.id
+            );
+        }
+        self.out.send(PipelineEvent::Segment(row.clone()));
+        if dedup && source == AudioSourceKind::System {
+            self.claim_echoes(&row);
+        }
+    }
+
+    /// The system segment a new microphone segment repeats, if any.
+    fn echo_target(&self, started_at: i64, ended_at: i64, text: &str) -> Option<i64> {
+        match self.store.segments_near(
+            AudioSourceKind::System,
+            started_at - echo::ECHO_WINDOW_MS,
+            ended_at + echo::ECHO_WINDOW_MS,
+        ) {
+            Ok(near) => echo::find_echo_of(started_at, ended_at, text, &near),
+            Err(e) => {
+                log::warn!("echo check: {e}");
+                None
+            }
+        }
+    }
+
+    /// A system segment stored after the microphone heard it: the microphone rows that repeat
+    /// it become its echoes (and the UI drops them).
+    fn claim_echoes(&mut self, system: &TranscriptRow) {
+        let near = match self.store.segments_near(
+            AudioSourceKind::Mic,
+            system.started_at - echo::ECHO_WINDOW_MS,
+            system.ended_at + echo::ECHO_WINDOW_MS,
+        ) {
+            Ok(n) => n,
+            Err(e) => return log::warn!("echo check: {e}"),
+        };
+        for mic in near {
+            if echo::find_echo_of(
+                mic.started_at,
+                mic.ended_at,
+                &mic.text,
+                std::slice::from_ref(system),
+            )
+            .is_none()
+            {
+                continue;
+            }
+            match self.store.set_segment_echo(mic.id, Some(system.id)) {
+                Ok(()) => {
+                    log::info!(
+                        "mic segment {} marked as the echo of system segment {}",
+                        mic.id,
+                        system.id
+                    );
+                    self.out.send(PipelineEvent::EchoMarked {
+                        segment: mic.id,
+                        echo_of: system.id,
+                    });
+                }
+                Err(e) => log::warn!("echo mark: {e}"),
+            }
         }
     }
 }

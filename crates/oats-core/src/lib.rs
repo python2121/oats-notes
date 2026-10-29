@@ -8,6 +8,8 @@
 //! - [`store`]: the SQLite transcript store (sessions, segments, categories).
 //! - [`pipeline`]: the worker thread that owns the engine, consumes 16 kHz audio, runs VAD →
 //!   segmentation → transcription, writes to the store and reports events to the UI.
+//! - [`echo`]: the text-level rule that marks a microphone segment as the echo of a
+//!   system-audio segment (speakers heard by the microphone) — pure.
 //! - [`paths`]: where the database and logs live.
 //!
 //! The engine implementation (`oats-engine-fluidaudio` on macOS) and the audio capture
@@ -15,14 +17,17 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod echo;
 pub mod engine;
 pub mod paths;
 pub mod pipeline;
 pub mod segmenter;
 pub mod store;
 
+pub use echo::DedupMode;
 pub use engine::{
-    EngineError, EngineFactory, NullEngine, SAMPLE_RATE, SpeechEngine, Transcription, VadFrame,
+    AudioChunk, AudioSourceKind, EngineError, EngineFactory, NullEngine, SAMPLE_RATE, SpeechEngine,
+    Transcription, VadFrame,
 };
 pub use pipeline::{Pipeline, PipelineEvent, PipelineHandle, PipelineStatus};
 pub use segmenter::{Segment, Segmenter, SegmenterConfig};

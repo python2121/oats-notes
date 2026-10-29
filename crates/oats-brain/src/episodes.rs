@@ -3,11 +3,16 @@
 //! one meeting detectors fall back to (screenpipe ends a meeting on silence): a gap of more
 //! than [`EpisodeRule::gap`] between segments starts a new episode, and an episode is capped
 //! in length and segment count so a prompt stays a sane size.
+//!
+//! System audio ("them": a call, a video) is a continuity signal: within an episode that
+//! already has system-audio segments, a further system segment continues it across a silence
+//! of up to twice the gap (calls have long pauses — someone shares a screen, reads, looks
+//! something up). Microphone echoes of system audio (`echo_of`) never take part.
 
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone};
-use oats_core::TranscriptRow;
+use oats_core::{AudioSourceKind, TranscriptRow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpisodeRule {
@@ -51,11 +56,23 @@ impl Chunk {
     pub fn text_len(&self) -> usize {
         self.segments.iter().map(|s| s.text.len()).sum()
     }
+
+    /// Whether the chunk contains system audio (the other side of a call, a video): the
+    /// interpretation is told it is probably a meeting.
+    pub fn has_system_audio(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| s.source == AudioSourceKind::System)
+    }
 }
 
 /// Group `rows` (any order; sorted here) into chunks by the rule.
 pub fn cut(rows: &[TranscriptRow], rule: &EpisodeRule) -> Vec<Chunk> {
-    let mut rows: Vec<TranscriptRow> = rows.to_vec();
+    let mut rows: Vec<TranscriptRow> = rows
+        .iter()
+        .filter(|r| r.echo_of.is_none())
+        .cloned()
+        .collect();
     rows.sort_by_key(|r| (r.started_at, r.id));
     let gap = rule.gap.as_millis() as i64;
     let max_len = rule.max_len.as_millis() as i64;
@@ -64,7 +81,12 @@ pub fn cut(rows: &[TranscriptRow], rule: &EpisodeRule) -> Vec<Chunk> {
         let new_chunk = match out.last() {
             None => true,
             Some(c) => {
-                row.started_at - c.ended_at > gap
+                let silence = row.started_at - c.ended_at;
+                // a call goes on: system audio continues a chunk that already has some
+                let call_continues = row.source == AudioSourceKind::System
+                    && c.has_system_audio()
+                    && silence <= 2 * gap;
+                (silence > gap && !call_continues)
                     || row.ended_at - c.started_at > max_len
                     || c.segments.len() >= rule.max_segments
             }
@@ -83,14 +105,15 @@ pub fn cut(rows: &[TranscriptRow], rule: &EpisodeRule) -> Vec<Chunk> {
     out
 }
 
-/// The transcript as the prompts see it: one `[HH:MM] text` line per segment (anarlog renders
-/// `speaker: text`; we have no speakers yet).
+/// The transcript as the prompts see it: one `[HH:MM] me: text` / `[HH:MM] them: text` line
+/// per segment — `me` the microphone, `them` system audio (anarlog renders `speaker: text`;
+/// lanes are the speakers we have). Microphone echoes of system audio are left out.
 pub fn render_transcript<Tz: TimeZone>(rows: &[TranscriptRow], tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
     let mut out = String::new();
-    for r in rows {
+    for r in rows.iter().filter(|r| r.echo_of.is_none()) {
         let stamp = tz
             .timestamp_millis_opt(r.started_at)
             .single()
@@ -99,6 +122,10 @@ where
         out.push('[');
         out.push_str(&stamp);
         out.push_str("] ");
+        out.push_str(match r.source {
+            AudioSourceKind::Mic => "me: ",
+            AudioSourceKind::System => "them: ",
+        });
         out.push_str(r.text.trim());
         out.push('\n');
     }
@@ -121,6 +148,14 @@ mod tests {
             episode_id: None,
             interpreted_at: None,
             categorised: false,
+            ..TranscriptRow::default()
+        }
+    }
+
+    fn them(id: i64, start_s: i64, len_s: i64) -> TranscriptRow {
+        TranscriptRow {
+            source: AudioSourceKind::System,
+            ..row(id, start_s, len_s)
         }
     }
 
@@ -180,7 +215,55 @@ mod tests {
         let rows = [row(1, 1_793_106_300, 5), row(2, 1_793_106_360, 5)];
         assert_eq!(
             render_transcript(&rows, &tz),
-            "[13:05] segment 1\n[13:06] segment 2\n"
+            "[13:05] me: segment 1\n[13:06] me: segment 2\n"
         );
+    }
+
+    #[test]
+    fn renders_me_and_them_and_leaves_echoes_out() {
+        let tz = chrono::FixedOffset::east_opt(0).unwrap();
+        let base = 1_793_106_300;
+        let rows = [
+            row(1, base, 5),
+            them(2, base + 60, 5),
+            TranscriptRow {
+                echo_of: Some(2),
+                ..row(3, base + 61, 5)
+            },
+            row(4, base + 120, 5),
+        ];
+        assert_eq!(
+            render_transcript(&rows, &tz),
+            "[13:05] me: segment 1\n[13:06] them: segment 2\n[13:07] me: segment 4\n"
+        );
+    }
+
+    #[test]
+    fn system_audio_carries_an_episode_across_a_longer_silence() {
+        let rule = EpisodeRule {
+            gap: Duration::from_secs(600),
+            ..Default::default()
+        };
+        // a call: them, then 15 min of silence, then them again → one episode
+        let call = [them(1, 0, 10), row(2, 20, 10), them(3, 930, 10)];
+        let chunks = cut(&call, &rule);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].has_system_audio());
+        // the same silence before a microphone row: a new episode (the gap rule)
+        let mic = [them(1, 0, 10), row(2, 20, 10), row(3, 930, 10)];
+        assert_eq!(cut(&mic, &rule).len(), 2);
+        // no system audio before: system audio after a long silence starts a new one
+        let fresh = [row(1, 0, 10), them(2, 930, 10)];
+        assert_eq!(cut(&fresh, &rule).len(), 2);
+        // beyond twice the gap even a call is split
+        let long = [them(1, 0, 10), them(2, 1_300, 10)];
+        assert_eq!(cut(&long, &rule).len(), 2);
+        // echoes take no part
+        let echo = [TranscriptRow {
+            echo_of: Some(1),
+            ..row(9, 0, 10)
+        }];
+        assert!(cut(&echo, &rule).is_empty());
+        assert!(!cut(&[row(1, 0, 1)], &rule)[0].has_system_audio());
     }
 }

@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use egui::{Align2, Rect, Sense, pos2, vec2};
-use oats_core::{Node, TranscriptRow};
+use oats_core::{AudioSourceKind, Node, TranscriptRow};
 
 use crate::notes::node_path;
 
@@ -171,6 +171,24 @@ pub fn transcript_list(
 /// Width of the time column.
 const TIME_W: f32 = 44.0;
 
+/// The small lane tag ("them") of a system-audio row, top-left at `at`.
+fn source_tag(ui: &egui::Ui, t: &Tokens, at: egui::Pos2, label: &str) {
+    let p = ui.painter();
+    let galley = p.layout_no_wrap(label.to_owned(), t.mono(8.5), t.accent);
+    let rect = Rect::from_min_size(at, galley.size() + vec2(8.0, 2.0));
+    p.rect_filled(rect, 3.0, t.accent_alpha(0.16));
+    p.galley(at + vec2(4.0, 1.0), galley, t.accent);
+}
+
+/// The label a row's lane gets in the list ("them" for system audio, none for the
+/// microphone); echoes are never listed.
+pub fn source_label(row: &TranscriptRow) -> Option<&'static str> {
+    match row.source {
+        AudioSourceKind::Mic => None,
+        AudioSourceKind::System => Some("them"),
+    }
+}
+
 fn transcript_row(
     ui: &mut egui::Ui,
     t: &Tokens,
@@ -186,7 +204,12 @@ fn transcript_row(
     let inner = ui
         .horizontal_top(|ui| {
             ui.add_space(8.0);
-            let (time_rect, _) = ui.allocate_exact_size(vec2(TIME_W, 18.0), Sense::hover());
+            let tag = source_label(row);
+            let them = tag.is_some();
+            // "them" rows (system audio: the other side of a call) carry a small tag under
+            // the time; "me" rows (the microphone) look as they always did
+            let (time_rect, time_resp) = ui
+                .allocate_exact_size(vec2(TIME_W, if them { 32.0 } else { 18.0 }), Sense::hover());
             ui.painter().text(
                 pos2(time_rect.left() + 4.0, time_rect.top() + 3.0),
                 Align2::LEFT_TOP,
@@ -194,6 +217,15 @@ fn transcript_row(
                 t.mono(10.5),
                 t.text_tertiary,
             );
+            if let Some(tag) = tag {
+                source_tag(
+                    ui,
+                    t,
+                    pos2(time_rect.left() + 4.0, time_rect.top() + 18.0),
+                    tag,
+                );
+                time_resp.on_hover_text("them — system audio (what the computer played)");
+            }
             let w = (ui.available_width() - 44.0).max(60.0);
             ui.vertical(|ui| {
                 ui.set_width(w);
@@ -298,7 +330,18 @@ mod tests {
             episode_id: None,
             interpreted_at: None,
             categorised: false,
+            ..TranscriptRow::default()
         }
+    }
+
+    #[test]
+    fn system_rows_are_tagged_them() {
+        assert_eq!(source_label(&row(1, 0)), None);
+        let them = TranscriptRow {
+            source: AudioSourceKind::System,
+            ..row(2, 0)
+        };
+        assert_eq!(source_label(&them), Some("them"));
     }
 
     #[test]

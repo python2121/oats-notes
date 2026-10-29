@@ -32,13 +32,14 @@ never changes.
 ```
 crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, paths  (no platform code)
 crates/oats-brain              the brain: `claude` CLI wrapper, episode cutting, prompts (prompts/*.md), hotword commands, tiered scheduler  (no platform code)
-crates/oats-audio              cpal microphone capture → 16 kHz mono f32 chunks + own FIR resampler
+crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mic/system + own FIR resampler: microphone (InputPolicy) and system audio (SystemCapture)
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
 crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Notes / Calendar views
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
 vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
+vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream (macOS); NOT a workspace member
 ```
 
 ## The status item (`crates/oats-status/src/lib.rs`)
@@ -59,21 +60,97 @@ carries on; "Show OatsNotes" brings it back); Quit (⌘Q or the status item's Qu
 is hidden, so everything the status item drives lives in `logic`. Without a status item
 (`OATS_NO_STATUS_ITEM=1`, or none on the platform) closing the window quits.
 
-Data flow: `oats-audio` (cpal callback, resample) → mpsc `Vec<f32>` → `oats-core::pipeline`
-worker thread (owns the engine; VAD every frame, the model only on closed speech segments) →
+Data flow: `oats-audio` (cpal callbacks, resample; microphone + system audio) → one mpsc of
+`AudioChunk { source: Mic | System, samples }` → `oats-core::pipeline` worker thread (owns the
+engine; two lanes, VAD every frame per lane, the model only on closed speech segments) →
 `Store` (SQLite, WAL) + `PipelineEvent`s → `oats-ui` (repaints only on events) → every stored
 segment is forwarded to the `oats-brain` worker (`BrainCommand::SegmentArrived`), which runs
 the `claude` CLI on its own thread and reports `BrainEvent`s back (the UI reloads on `Changed`).
 
 Failure edges: a lost microphone arrives on cpal's error callback; a terminal error
-(device / host gone, permission revoked, stream invalidated) drops the channel's sender, the
-pipeline sees `Disconnected` and ends the session, and the UI stops listening with "audio
-input closed" in the status strip (following a newly chosen default device is not done — the
-user starts listening again). A session row the store refuses becomes
+(device / host gone, permission revoked, stream invalidated) drops that capture's sender. A
+lane error closes only that lane: the session runs on while the other capture's sender lives
+(the system capture rebuilds itself, see below); when every sender is gone the pipeline sees
+`Disconnected` and ends the session, and the UI stops listening with "audio input closed" in
+the status strip (following a newly chosen default input device is not done — the user
+starts listening again). A session row the store refuses becomes
 `PipelineEvent::ListenFailed` and the UI closes the microphone. Dropping the `PipelineHandle`
 joins for at most 2 s (the worker also checks a cancel flag between engine-load steps), so
 quitting during a first-run model download doesn't hang. The UI schedules one
 `request_repaint_after` until local midnight so "Today" rolls over without other events.
+
+## Audio sources and lanes (`crates/oats-audio`, `oats-core::pipeline`, `oats-core::echo`)
+
+Design and sources: `docs/research-system-audio.md` (phases 1–4 built; phase 5 — per-app taps,
+meeting detection from the Core Audio process list, VPIO/AEC — not). Two lanes, never mixed:
+**mic** ("me") and **system** ("them": what the computer plays — the other side of a call, a
+video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
+
+- **Microphone device policy** (`oats_audio::InputPolicy`, default `BuiltIn`; a user decision):
+  never capture from a Bluetooth headset unless named — its microphone switches AirPods to the
+  call profile and playback degrades. Order: `OATS_INPUT_DEVICE` (a device name: exact,
+  case-insensitive, else substring) → the built-in microphone (macOS: name contains
+  "MacBook" / "Built-in"; Linux: the default input) → the system default with a `warn!`
+  ("may be a Bluetooth headset or another unknown device"). The choice is logged at info
+  (`audio input (BuiltIn): "MacBook Air Microphone" …`). `InputPolicy::SystemDefault` /
+  `Named` exist for a later UI. Pure picker: `choose_input` (tested).
+- **System audio** (`oats_audio::SystemCapture::start(sink)` / `start_with(sink, on_output)`):
+  the default OUTPUT device recorded through the same mix-down + resampler. macOS: a Core
+  Audio process tap + private aggregate device built by cpal; we call the vendored cpal's
+  `build_loopback_stream_raw` (stock cpal opens a headset's microphone when the output device
+  also has an input — see `vendor/cpal/VENDORED.md`). Linux: an input stream on the PipeWire
+  host's default sink records its monitor (needs cpal's `pipewire` feature, not enabled yet;
+  under ALSA the lane fails to open and the mic carries on). The stream is opened on the
+  capture's OWN thread: on macOS the first open blocks inside Core Audio while the
+  permission prompt is up (observed), and that must not freeze the UI; dropping the guard
+  waits ≤ 0.5 s, then detaches. The thread polls the default output every 2 s (one property
+  read; cpal has no change notification for an input stream) and rebuilds the tap when it
+  changes (AirPods connect) or after a terminal error (retry ≤ every 30 s); each open reports
+  `OutputInfo { name, speakers }` (`output_is_speakers`: MacBook/Built-in/"speaker"/"display",
+  not headphones/AirPods/buds/headsets). Known gap: the lane's sample clock is not corrected
+  for the < 2 s rebuild gap.
+- **TCC permission**: system audio needs "System Audio Recording Only" (System Settings →
+  Privacy & Security → Screen & System Audio Recording). Run from a terminal the grant (and
+  the prompt) goes to the *responsible* app — the terminal (or whatever spawned it; under
+  ClaudeShip the prompt read "claudeship would like access to record your system audio").
+  iTerm / VS Code may not prompt: add them by hand. Denial is silent: the tap delivers
+  zeros. Permission changes need a restart of that app. A bundled `.app` needs
+  `NSAudioCaptureUsageDescription` (in the Info.plist itself) next to
+  `NSMicrophoneUsageDescription`. `cargo run -p oats-audio --example levels -- --system`
+  is the check (prints both lanes, and "all zeros" when the grant is missing).
+- **Pipeline lanes**: `PipelineHandle::start_lanes(rx, ListenOptions { system, no_signal_after
+  })` (the old `start(Receiver<Vec<f32>>)` stays: every chunk is the mic lane). Each lane has
+  its own pending buffer, `Segmenter`, `SampleClock` (anchored at the lane's first chunk) and
+  VAD state (`SpeechEngine::vad_lane`; `NullEngine` → one `EnergyVad` per lane); `transcribe`
+  is shared, on the one worker thread, first come first served. All-zero system frames skip
+  VAD (the tap delivers digital silence while nothing plays) and all-zero system chunks send
+  no `Level` event. `PipelineEvent::Level { rms_db_mic, rms_db_system, in_speech_mic,
+  in_speech_system }` (−100 for a lane that is silent / stale > 1 s); the UI meter shows the
+  louder lane. `PipelineEvent::SystemAudio { signal: false }` when system audio was expected
+  and produced only zeros for 30 s after the start (`true` when sound arrives later).
+  Stop / flush closes both lanes (system first). Segments carry `source`.
+- **Echo / duplication** (`oats_core::echo`, pure, tested; the user's chosen baseline): on
+  speakers the microphone hears the call. Before inserting a MIC segment, the system
+  segments reaching into ±45 s of it (`Store::segments_near`) are compared: word-Jaccard OR
+  containment ≥ 0.8 over normalised words (lower case, punctuation/apostrophes dropped),
+  exact match only when either side has < 4 words; the window's system rows joined are tried
+  too. A match is STORED with `segments.echo_of = <system id>` (nothing is dropped; the rule is
+  auditable: `Store::echoes_of`). The reverse order (system segment stored second) marks the
+  stored mic row and sends `PipelineEvent::EchoMarked { segment, echo_of }` (the UI drops the
+  row). Echoes are excluded from every listing: the views, counts, the brain's queues and
+  transcript rendering; deleting a system segment deletes its echoes. Switch:
+  `OATS_SYSTEM_DEDUP=auto|always|never` (default auto; `oats_core::DedupMode`): auto runs the
+  rule only while the default output is speakers (`OutputInfo::speakers`), i.e. skips it on
+  headphones/AirPods. The binary sets `PipelineHandle::set_echo_dedup` from the system
+  capture's `on_output`; with `--system-audio-file` (no device) auto counts as speakers.
+- **UI**: "Capture System Audio" (Listen menu, checked) and a "System audio" pill in the
+  control bar toggle the `AppPrefs::capture_system` pref (persisted, default on; toggling while
+  listening reopens the captures). The status strip reads "listening · mic + system" /
+  "listening · mic", plus "system audio: no signal" after the 30 s check; a system capture that
+  fails to open shows "System audio: …" as the warning while the mic runs. Transcript rows from
+  system audio carry a small "them" tag under the time; echoes never appear.
+  `oats_ui::AudioStarter` = `Fn(Sender<AudioChunk>, AudioRequest { system }) ->
+  Result<StartedAudio { guard, system, system_error }, String>`.
 
 ## The brain (`crates/oats-brain`)
 
@@ -103,7 +180,10 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   `Offline` (connection / DNS errors), `Refused`, `Timeout`, `Exit` (model text is never
   classified). `CliError::unavailable_reason()` says which mean "claude as a whole is down".
 - `episodes`: pure cut of segments into episodes — a gap > 10 min starts a new one, capped at
-  3 h / 400 segments.
+  3 h / 400 segments. System audio is a continuity signal: in a chunk that already has system
+  segments, a further system segment continues it across up to twice the gap (calls pause).
+  Echoes never take part. `render_transcript` writes `[HH:MM] me: …` / `[HH:MM] them: …`
+  (mic / system; echoes left out); the categorise prompt uses the same prefixes.
 - `interpret`: prompts in `crates/oats-brain/prompts/*.md` (`include_str!`; edit the text,
   rebuild) — `interpret.*` (episode → title, markdown summary, filing into an existing node or
   a proposed project/topic, decisions, action items, topics, significant dates; `low_signal`
@@ -126,7 +206,9 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   confirmation", nothing changed, no Undo). Undo of a `node_move` the store would refuse
   (the tree changed since) is reported as not undoable, not marked done.
 - `hotword`: "hey computer" / "hey oats" (`OATS_HOTWORDS`) detected on segment TEXT,
-  punctuation-insensitive; the command text goes to `command.*` (haiku) → actions
+  punctuation-insensitive, and only on the user's own microphone (`hotword::can_command`: a
+  `them:` segment or a mic echo never commands this computer); the command text goes to
+  `command.*` (haiku) → actions
   `add_event` / `add_reminder` (relative offsets: "one week ahead" = `offset_days: -7` from the
   event in the same command) / `add_note` / `create_project` / `unknown`, executed with
   `source = hotword` and the source segment id. The segment is marked consumed (never part of
@@ -144,7 +226,9 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   segment, batches of 40. 1 rolling (sonnet): interpretation every 15 min
   (`OATS_INTERPRET_EVERY_MIN`) while uninterpreted segments exist, ⌘I on demand; an episode
   that ended less than a gap before the new segments is REVISED with the fuller transcript
-  (`episodes.revision`, `last_revised_at`); chunks under 80 chars are filed as low-signal
+  (`episodes.revision`, `last_revised_at`); an episode with system segments gets a
+  `meeting: true` hint in the user prompt (`interpret::meeting_hint`: "meetings usually belong
+  under Work — a hint, not a rule"), and the system prompt explains `me:` / `them:`; chunks under 80 chars are filed as low-signal
   "Fragments" without a call. 2 review (sonnet): every 4 h or after 8 touched episodes or on
   demand. 3 reorganise (opus): once a day in the 02:00–05:00 local idle window (next window
   when the machine was asleep) or on demand ("Reorganise…"). Budget: `OATS_BRAIN_BUDGET_USD`
@@ -189,6 +273,8 @@ through the REAL CLI (a few cents) — the end-to-end check.
 
 `SpeechEngine`: `load(status)` (download/compile models, first run can take a while),
 `vad_frame_len()` / `vad(samples)` (cheap, runs all day; `None` = the core's energy VAD is used),
+`vad_lane(lane, samples)` (per-lane VAD state; the default forwards to `vad`; FluidAudio keeps
+one `VadStream` per lane — the mic's made by `load`, the system's on its first chunk),
 `transcribe(samples)` (one closed segment, ≤ ~30 s, stateless between calls). Engines are built
 on the pipeline's own thread via an `EngineFactory`, so they need not be `Send`
 (`fluidaudio_rs::VadStream` isn't). The pipeline calls `vad` once per `vad_frame_len()` frame
@@ -205,7 +291,11 @@ across a listen stop/start (harmless: Silero re-converges within a few chunks). 
 cargo run -p oats-notes                   # the app (first run downloads the Parakeet CoreML model, ~600 MB, into ~/Library/Application Support/FluidAudio)
 OATS_ENGINE=null cargo run -p oats-notes  # the app without a model (UI work; speech detected, not transcribed)
 cargo run -p oats-audio --example levels  # mic sanity check: prints input level for 5 s
+cargo run -p oats-audio --example levels -- --system   # both lanes for 10 s (grants/prompts the System Audio Recording permission; "all zeros" = no grant)
 cargo run -p oats-notes -- --listen --audio-file speech.wav [--audio-speed 4] [--audio-loop]   # deterministic input instead of the mic (16 kHz mono i16 WAV)
+cargo run -p oats-notes -- --listen --audio-file mic.wav --system-audio-file them.wav           # two lanes from two WAVs (the echo rule end to end)
+OATS_INPUT_DEVICE="Scarlett 2i2" …         # microphone by name (default: the built-in microphone, never silently a Bluetooth headset)
+OATS_SYSTEM_DEDUP=auto|always|never …      # the mic-echo rule (auto: only while the output is speakers)
 scripts/perf.sh [rest|idle|speech|stress]    # CPU/memory/energy profile per scenario (release build); see docs/performance-2026-10-28.md
 cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events — how the shell is verified without a window
 cargo run -p oats-notes -- --listen      # start listening as soon as the engine is ready (doesn't change the remembered pref)
@@ -228,6 +318,8 @@ Xcode; fetches FluidAudio from GitHub at the pinned tag). The binary needs the S
 runtime at run time: `apps/oats-notes/build.rs` adds `-rpath /usr/lib/swift` (without it dyld
 fails with "no LC_RPATH's found"). Microphone access: run from a terminal, macOS prompts for
 the terminal's mic permission; a bundled .app will need `NSMicrophoneUsageDescription`.
+System audio: "System Audio Recording Only", granted to the terminal app when run from one;
+a bundled .app needs `NSAudioCaptureUsageDescription` (see "Audio sources and lanes").
 
 ## Database (`crates/oats-core/src/store.rs`)
 
@@ -244,16 +336,31 @@ nested transaction (`Store::with_savepoint`; outermost `BEGIN IMMEDIATE`, inner 
 `SAVEPOINT`, rolled back on error or panic). `episodes.id` is `AUTOINCREMENT` (an older table
 is rebuilt in place on open, same schema version), so a reset or merged episode's id is never
 handed to a later episode that would adopt its events.
-Schema version 2 (`meta.schema_version`; a v1 file is migrated on open — `categories` become
-the root `nodes` with the same ids, `segments` is rebuilt): `sessions`; `nodes` (ONE tree:
+Schema version 3 (`meta.schema_version`; a v1 file is migrated on open — `categories` become
+the root `nodes` with the same ids, `segments` is rebuilt — and a v2 file gets two columns
+in place, `segments.source TEXT NOT NULL DEFAULT 'mic'` and `segments.echo_of INTEGER NULL`):
+`sessions`; `nodes` (ONE tree:
 `kind` category | project | topic, `parent_id`, `description`, `created_by` user | auto |
 hotword, `archived`; categories seeded Work/Admin/Personal); `segments` (`node_id` = most
-specific node, `episode_id`, `interpreted_at`, `categorised`); `episodes` (title, markdown
+specific node, `episode_id`, `interpreted_at`, `categorised`, `source` mic | system,
+`echo_of` = the system segment a mic segment repeats — echoes are left out of every listing:
+views, counts, `uninterpreted_*` / `uncategorised_*`, `segments_between`, `segments_of_episode`;
+ordering by `started_at, id` interleaves the lanes); `episodes` (title, markdown
 summary, node, decisions / action items / topics JSON, `low_signal`, model, cost, `revision`,
 `last_revised_at`); `events` (`dedupe_key` UNIQUE, `source`, `source_segment_id`,
 `source_episode_id`, `confidence`); `reminders` (`event_id`, `due`, `done`); `notes`;
 `brain_runs` (tier, kind, model, cost, duration, ok/error, summary); `changes` (kind,
 description, before/after JSON, `undone`). `View::Node(id)` means the subtree (recursive CTE).
+
+## Vendored cpal (`vendor/cpal`)
+
+cpal 0.18.2 from crates.io, swapped in by `[patch.crates-io] cpal = { path = "vendor/cpal" }`
+(the workspace still says `cpal = "0.18"`), excluded from the workspace, formatting and clippy
+off like fluidaudio-rs. One change, in `src/host/coreaudio/macos/device.rs`: a public
+`Device::build_loopback_stream_raw` that always builds the process-tap path, because stock
+cpal taps an output device only when it has NO input — on AirPods (output + microphone) it
+would open the headset microphone and switch it to the call profile. Details, evidence and
+the update procedure: `vendor/cpal/VENDORED.md`; attribution: `THIRD_PARTY.md`.
 
 ## Vendored fluidaudio-rs (`vendor/fluidaudio-rs`)
 
@@ -294,6 +401,11 @@ Performance notes: `docs/performance-2026-10-28.md`.
 
 Brain: a month-grid calendar view, undo for node merges (recorded, not reversible yet),
 reminders that notify (they are only listed), prompt editing without a rebuild, per-tier
-budgets in the UI. Elsewhere: diarization (FluidAudio has it), system-audio capture for calls,
-.app packaging with Info.plist (then `LSUIElement`-style options, Dock reopen), the Linux engine
-and status-item crates.
+budgets in the UI. Elsewhere: diarization (FluidAudio has it); system audio phase 5
+(`docs/research-system-audio.md`: per-app taps and "which app is on the call" from the Core
+Audio process list, starting the lane only during calls, VPIO/AEC if text dedup is not
+enough), an input-device picker in the UI over `InputPolicy`, a "show echoes" audit view,
+cpal's `pipewire` feature for the Linux system lane, the two-lane perf run (two WAVs at 1× and
+4×); .app packaging with Info.plist (`NSMicrophoneUsageDescription`,
+`NSAudioCaptureUsageDescription`, then `LSUIElement`-style options, Dock reopen), the Linux
+engine and status-item crates.

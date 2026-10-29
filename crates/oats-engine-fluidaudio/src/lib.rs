@@ -30,7 +30,7 @@ pub fn factory() -> EngineFactory {
 #[cfg(target_os = "macos")]
 mod mac {
     use fluidaudio_rs::{FluidAudio, VadStream};
-    use oats_core::{EngineError, SpeechEngine, Transcription, VadFrame};
+    use oats_core::{AudioSourceKind, EngineError, SpeechEngine, Transcription, VadFrame};
 
     /// Silero VAD chunk in FluidAudio: `VadManager.chunkSize = 4096` (256 ms at 16 kHz), from
     /// `Sources/FluidAudio/VAD/VadManager.swift` in FluidAudio 0.14.8; the vendored bridge's
@@ -42,12 +42,14 @@ mod mac {
     const VAD_THRESHOLD: f32 = 0.6;
 
     pub struct FluidAudioEngine {
-        /// Stateful Silero stream: the LSTM state is carried from chunk to chunk, one
-        /// inference per 256 ms chunk. Created by `load` (or lazily by the first `vad`).
-        /// The `SpeechEngine` contract has no session boundary, so the state also carries
-        /// across a listen stop/start; that is harmless (the model re-converges within a few
-        /// chunks of new audio).
-        vad_stream: Option<VadStream>,
+        /// Stateful Silero streams, one per lane (microphone, system audio; indexed by
+        /// [`AudioSourceKind::index`]): the LSTM state is carried from chunk to chunk, one
+        /// inference per 256 ms chunk, and the lanes never share context. Same CoreML model.
+        /// The microphone's is created by `load`, the system lane's on its first chunk. The
+        /// `SpeechEngine` contract has no session boundary, so the state also carries across
+        /// a listen stop/start; that is harmless (the model re-converges within a few chunks
+        /// of new audio).
+        vad_streams: [Option<VadStream>; 2],
         fluid: FluidAudio,
         chip: String,
         vad_loaded: bool,
@@ -70,7 +72,7 @@ mod mac {
             let fluid = FluidAudio::new().map_err(|e| EngineError::Load(e.to_string()))?;
             let chip = fluid.system_info().chip_name.trim().to_owned();
             Ok(Self {
-                vad_stream: None,
+                vad_streams: [None, None],
                 fluid,
                 chip,
                 vad_loaded: false,
@@ -78,17 +80,18 @@ mod mac {
             })
         }
 
-        /// The VAD stream, created on first use (needs `init_vad`, done by `load`).
-        fn vad_stream(&mut self) -> Result<&mut VadStream, EngineError> {
-            if self.vad_stream.is_none() {
+        /// A lane's VAD stream, created on first use (needs `init_vad`, done by `load`).
+        fn vad_stream(&mut self, lane: AudioSourceKind) -> Result<&mut VadStream, EngineError> {
+            let slot = &mut self.vad_streams[lane.index()];
+            if slot.is_none() {
                 let stream = self
                     .fluid
                     .vad_stream_start()
                     .map_err(|e| EngineError::Vad(e.to_string()))?;
-                self.vad_stream = Some(stream);
+                log::info!("FluidAudio VAD stream for the {} lane", lane.as_str());
+                *slot = Some(stream);
             }
-            self.vad_stream
-                .as_mut()
+            slot.as_mut()
                 .ok_or_else(|| EngineError::Vad("no VAD stream".to_owned()))
         }
     }
@@ -110,7 +113,7 @@ mod mac {
                     .init_vad(VAD_THRESHOLD)
                     .map_err(|e| EngineError::Load(format!("VAD: {e}")))?;
                 self.vad_loaded = true;
-                self.vad_stream()
+                self.vad_stream(AudioSourceKind::Mic)
                     .map_err(|e| EngineError::Load(format!("VAD stream: {e}")))?;
                 log::info!("FluidAudio VAD loaded (threshold {VAD_THRESHOLD})");
             }
@@ -130,10 +133,18 @@ mod mac {
         }
 
         fn vad(&mut self, samples: &[f32]) -> Result<Vec<VadFrame>, EngineError> {
+            self.vad_lane(AudioSourceKind::Mic, samples)
+        }
+
+        fn vad_lane(
+            &mut self,
+            lane: AudioSourceKind,
+            samples: &[f32],
+        ) -> Result<Vec<VadFrame>, EngineError> {
             if samples.is_empty() {
                 return Ok(Vec::new());
             }
-            let stream = self.vad_stream()?;
+            let stream = self.vad_stream(lane)?;
             let mut frames = Vec::with_capacity(samples.len().div_ceil(VAD_CHUNK));
             for chunk in samples.chunks(VAD_CHUNK) {
                 let frame = if chunk.len() == VAD_CHUNK {

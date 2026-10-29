@@ -10,6 +10,70 @@
 /// The one sample rate the whole app speaks. Audio capture resamples to it; engines consume it.
 pub const SAMPLE_RATE: u32 = 16_000;
 
+/// Where a stretch of audio came from: the microphone ("me") or what the computer plays
+/// ("them": a call, a video). The two are processed as separate lanes and never mixed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AudioSourceKind {
+    #[default]
+    Mic,
+    System,
+}
+
+impl AudioSourceKind {
+    /// Both lanes, in lane order.
+    pub const ALL: [AudioSourceKind; 2] = [AudioSourceKind::Mic, AudioSourceKind::System];
+
+    /// The store's spelling (`segments.source`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioSourceKind::Mic => "mic",
+            AudioSourceKind::System => "system",
+        }
+    }
+
+    /// Anything but `"system"` reads as the microphone (the column's default).
+    pub fn parse(s: &str) -> AudioSourceKind {
+        if s.eq_ignore_ascii_case("system") {
+            AudioSourceKind::System
+        } else {
+            AudioSourceKind::Mic
+        }
+    }
+
+    /// 0 for the microphone, 1 for system audio.
+    pub fn index(self) -> usize {
+        match self {
+            AudioSourceKind::Mic => 0,
+            AudioSourceKind::System => 1,
+        }
+    }
+}
+
+/// A chunk of 16 kHz mono f32 (100 ms from the captures) from one source. The microphone and
+/// the system-audio capture share one `Sender<AudioChunk>`; the pipeline sorts the chunks into
+/// lanes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioChunk {
+    pub source: AudioSourceKind,
+    pub samples: Vec<f32>,
+}
+
+impl AudioChunk {
+    pub fn mic(samples: Vec<f32>) -> Self {
+        Self {
+            source: AudioSourceKind::Mic,
+            samples,
+        }
+    }
+
+    pub fn system(samples: Vec<f32>) -> Self {
+        Self {
+            source: AudioSourceKind::System,
+            samples,
+        }
+    }
+}
+
 /// One VAD frame's verdict.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VadFrame {
@@ -58,6 +122,18 @@ pub trait SpeechEngine {
 
     /// Classify `samples` (a whole number of VAD frames) frame by frame, in order.
     fn vad(&mut self, samples: &[f32]) -> Result<Vec<VadFrame>, EngineError>;
+
+    /// [`SpeechEngine::vad`] for one lane: an engine with recurrent VAD state keeps one state
+    /// per lane, so the microphone and system audio never bleed into each other's context.
+    /// The default forwards to [`SpeechEngine::vad`] (fine for a stateless VAD).
+    fn vad_lane(
+        &mut self,
+        lane: AudioSourceKind,
+        samples: &[f32],
+    ) -> Result<Vec<VadFrame>, EngineError> {
+        let _ = lane;
+        self.vad(samples)
+    }
 
     /// Transcribe one speech segment (≤ ~30 s). Each call is independent: no state carries
     /// over between segments.

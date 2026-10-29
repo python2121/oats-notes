@@ -1,5 +1,8 @@
 //! A deterministic audio source: a PCM 16-bit mono 16 kHz WAV file played into the same
-//! `Sender<Vec<f32>>` the microphone capture feeds, in [`CHUNK_LEN`] (100 ms) chunks.
+//! channel the captures feed, in [`CHUNK_LEN`] (100 ms) chunks — a lanes channel
+//! (`Sender<AudioChunk>`, the chunks tagged with [`FileSourceOptions::source`], so two files
+//! can stand in for the microphone and system audio) or a plain `Sender<Vec<f32>>`
+//! (microphone-only, see [`ChunkSink`]).
 //!
 //! Paced in real time by default (one chunk per 100 ms) on a monotonic schedule — chunk `n` is
 //! due at `start + n × interval`, so a late wake-up never pushes later chunks back and drift
@@ -17,7 +20,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use oats_core::SAMPLE_RATE;
+use oats_core::{AudioChunk, AudioSourceKind, SAMPLE_RATE};
 
 use crate::CHUNK_LEN;
 
@@ -147,6 +150,8 @@ pub struct FileSourceOptions {
     pub speed: f64,
     /// Start again at the end of the file instead of closing the channel.
     pub looping: bool,
+    /// The lane the chunks are tagged with (a plain `Sender<Vec<f32>>` ignores it).
+    pub source: AudioSourceKind,
 }
 
 impl Default for FileSourceOptions {
@@ -154,7 +159,27 @@ impl Default for FileSourceOptions {
         Self {
             speed: 1.0,
             looping: false,
+            source: AudioSourceKind::Mic,
         }
+    }
+}
+
+/// Where a [`FileSource`] sends its chunks: a lanes channel (tagged with the source) or the
+/// older microphone-only `Sender<Vec<f32>>`.
+pub trait ChunkSink: Send + 'static {
+    /// `false` once the receiver is gone.
+    fn send_chunk(&self, source: AudioSourceKind, samples: Vec<f32>) -> bool;
+}
+
+impl ChunkSink for Sender<AudioChunk> {
+    fn send_chunk(&self, source: AudioSourceKind, samples: Vec<f32>) -> bool {
+        self.send(AudioChunk { source, samples }).is_ok()
+    }
+}
+
+impl ChunkSink for Sender<Vec<f32>> {
+    fn send_chunk(&self, _source: AudioSourceKind, samples: Vec<f32>) -> bool {
+        self.send(samples).is_ok()
     }
 }
 
@@ -231,7 +256,7 @@ impl FileSource {
     pub fn open(
         path: &Path,
         options: FileSourceOptions,
-        sink: Sender<Vec<f32>>,
+        sink: impl ChunkSink,
     ) -> Result<FileSource, WavError> {
         let samples: Arc<[f32]> = load_wav(path)?.into();
         Self::start(samples, options, sink)
@@ -241,12 +266,14 @@ impl FileSource {
     pub fn start(
         samples: Arc<[f32]>,
         options: FileSourceOptions,
-        sink: Sender<Vec<f32>>,
+        sink: impl ChunkSink,
     ) -> Result<FileSource, WavError> {
         let pacer = Pacer::new(Instant::now(), options.speed)?;
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let source = options.source;
         log::info!(
-            "audio input: file, {:.1} s at {}× real time{}",
+            "audio input ({}): file, {:.1} s at {}× real time{}",
+            source.as_str(),
             samples.len() as f64 / f64::from(SAMPLE_RATE),
             options.speed,
             if options.looping { ", looping" } else { "" }
@@ -267,7 +294,7 @@ impl FileSource {
                         Err(RecvTimeoutError::Timeout) => {}
                         Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
                     }
-                    if sink.send(chunk).is_err() {
+                    if !sink.send_chunk(source, chunk) {
                         return;
                     }
                     n += 1;
@@ -385,13 +412,14 @@ mod tests {
     #[test]
     fn plays_the_file_paced_then_disconnects() {
         let samples: Arc<[f32]> = ramp(CHUNK_LEN * 20).into();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
         let t0 = Instant::now();
         let src = FileSource::start(
             samples.clone(),
             FileSourceOptions {
                 speed: 50.0,
                 looping: false,
+                ..Default::default()
             },
             tx,
         );
@@ -413,12 +441,13 @@ mod tests {
     #[test]
     fn dropping_the_guard_stops_playback() {
         let samples: Arc<[f32]> = ramp(CHUNK_LEN * 100).into();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
         let src = FileSource::start(
             samples,
             FileSourceOptions {
                 speed: 1.0,
                 looping: true,
+                ..Default::default()
             },
             tx,
         );
@@ -431,13 +460,33 @@ mod tests {
     }
 
     #[test]
+    fn a_lanes_channel_gets_chunks_tagged_with_the_source() {
+        let (tx, rx) = mpsc::channel::<AudioChunk>();
+        let src = FileSource::start(
+            ramp(CHUNK_LEN * 3).into(),
+            FileSourceOptions {
+                speed: 50.0,
+                looping: false,
+                source: AudioSourceKind::System,
+            },
+            tx,
+        );
+        assert!(src.is_ok());
+        let got: Vec<AudioChunk> =
+            std::iter::from_fn(|| rx.recv_timeout(Duration::from_millis(300)).ok()).collect();
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|c| c.source == AudioSourceKind::System));
+    }
+
+    #[test]
     fn a_bad_speed_is_refused() {
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::channel::<Vec<f32>>();
         let r = FileSource::start(
             Arc::from(vec![0.0f32; 10]),
             FileSourceOptions {
                 speed: 0.0,
                 looping: false,
+                ..Default::default()
             },
             tx,
         );

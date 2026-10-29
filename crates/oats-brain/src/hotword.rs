@@ -73,6 +73,13 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a segment may carry a voice command: only what the user said into the microphone.
+/// System audio ("them": a call, a video) saying "hey computer" never commands this computer,
+/// and neither does a microphone echo of it.
+pub fn can_command(row: &oats_core::TranscriptRow) -> bool {
+    row.source == oats_core::AudioSourceKind::Mic && row.echo_of.is_none()
+}
+
 /// The command text after the hotword, if the segment contains one (the original words after
 /// the phrase, so dates and names survive).
 pub fn detect(text: &str, cfg: &HotwordConfig) -> Option<String> {
@@ -547,6 +554,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_users_own_microphone_commands() {
+        let mic = oats_core::TranscriptRow::default();
+        assert!(can_command(&mic));
+        let them = oats_core::TranscriptRow {
+            source: oats_core::AudioSourceKind::System,
+            ..mic.clone()
+        };
+        assert!(!can_command(&them));
+        let echo = oats_core::TranscriptRow {
+            echo_of: Some(4),
+            ..mic
+        };
+        assert!(!can_command(&echo));
+    }
     use chrono::{FixedOffset, NaiveDate};
 
     const SENTENCE: &str =

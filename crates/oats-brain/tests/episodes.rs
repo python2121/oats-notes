@@ -18,6 +18,7 @@ fn row(id: i64, start_ms: i64, end_ms: i64) -> TranscriptRow {
         episode_id: None,
         interpreted_at: None,
         categorised: false,
+        ..TranscriptRow::default()
     }
 }
 
@@ -144,7 +145,7 @@ fn renders_one_line_per_segment_trimmed() {
     let b = row(2, 61_000, 62_000);
     assert_eq!(
         render_transcript(&[a, b], &tz),
-        "[01:00] padded text\n[01:01] s2\n"
+        "[01:00] me: padded text\n[01:01] me: s2\n"
     );
     assert_eq!(render_transcript(&[], &tz), "");
 }

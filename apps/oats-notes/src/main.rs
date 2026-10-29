@@ -14,12 +14,19 @@
 //! `--listen` starts listening as soon as the engine is ready (as if the last session had
 //! quit while listening). `--audio-file <wav> [--audio-speed N] [--audio-loop]` plays a
 //! 16 kHz mono 16-bit WAV instead of opening the microphone (benchmarks, reproducible runs;
-//! `scripts/perf.sh`).
+//! `scripts/perf.sh`); `--system-audio-file <wav>` plays a second one as the system-audio lane.
+//!
+//! Audio: the microphone by `oats_audio::InputPolicy` (`OATS_INPUT_DEVICE`, else the built-in
+//! microphone, never silently a Bluetooth headset) and, while the "Capture System Audio" pref is
+//! on, system audio from the default output device (`oats_audio::SystemCapture`), both into one
+//! tagged channel. The echo rule (`OATS_SYSTEM_DEDUP=auto|always|never`) is switched from the
+//! output device the system capture reports: speakers → on, headphones → off (auto).
 //!
 //! Environment: `OATS_ENGINE=null` (no model), `OATS_NO_NATIVE_MENU=1` (menus in the window),
 //! `OATS_NO_STATUS_ITEM=1` (no menu bar extra; closing the window then quits),
 //! `OATS_FONT=bundled` (Inter instead of the system font), `OATS_FONT_GRADE` (SF Pro grade),
-//! `OATS_DATA_DIR` (where the database lives), `RUST_LOG`; the brain's `OATS_BRAIN=off`,
+//! `OATS_DATA_DIR` (where the database lives), `OATS_INPUT_DEVICE` (a microphone by name),
+//! `OATS_SYSTEM_DEDUP` (the echo rule), `RUST_LOG`; the brain's `OATS_BRAIN=off`,
 //! `OATS_CLAUDE_BIN`, `OATS_CLAUDE_MODEL`, `OATS_INTERPRET_EVERY_MIN`, `OATS_BRAIN_BUDGET_USD`,
 //! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
 //! `oats_brain::BrainConfig::from_env`).
@@ -71,6 +78,83 @@ fn engine_factory() -> oats_core::EngineFactory {
     }
 }
 
+/// How listening opens audio: the WAV file(s) of `--audio-file` / `--system-audio-file`, or
+/// the microphone (by `InputPolicy`, `OATS_INPUT_DEVICE`) plus, when asked, system audio — all
+/// into the one tagged channel. The system capture reports its output device; the echo rule
+/// follows it (`dedup_mode`). A system capture that fails leaves the microphone running.
+fn audio_starter(
+    mic_file: Option<std::sync::Arc<[f32]>>,
+    system_file: Option<std::sync::Arc<[f32]>>,
+    file_options: oats_audio::FileSourceOptions,
+    echo_dedup: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dedup_mode: oats_core::DedupMode,
+) -> oats_ui::AudioStarter {
+    use std::sync::atomic::Ordering;
+    match mic_file {
+        // --audio-file: the WAV instead of the microphone, from the start each time; a
+        // --system-audio-file plays alongside as the system lane (no device: auto dedups)
+        Some(samples) => Box::new(move |tx, request| {
+            let mic = oats_audio::FileSource::start(samples.clone(), file_options, tx.clone())
+                .map_err(|e| e.to_string())?;
+            let system = match (&system_file, request.system) {
+                (Some(sys), true) => {
+                    echo_dedup.store(dedup_mode.active(true), Ordering::Relaxed);
+                    let options = oats_audio::FileSourceOptions {
+                        source: oats_core::AudioSourceKind::System,
+                        ..file_options
+                    };
+                    Some(
+                        oats_audio::FileSource::start(sys.clone(), options, tx)
+                            .map_err(|e| e.to_string())?,
+                    )
+                }
+                _ => None,
+            };
+            Ok(oats_ui::StartedAudio {
+                system: system.is_some(),
+                guard: Box::new((mic, system)) as Box<dyn Any>,
+                system_error: None,
+            })
+        }),
+        None => {
+            let policy = oats_audio::InputPolicy::default().with_env();
+            Box::new(move |tx, request| {
+                let mic = oats_audio::Capture::start_mic(tx.clone(), &policy)
+                    .map_err(|e| e.to_string())?;
+                let mut system_error = None;
+                let system = if request.system {
+                    // until the output is known: on unless the mode says never
+                    echo_dedup.store(dedup_mode.active(true), Ordering::Relaxed);
+                    let flag = echo_dedup.clone();
+                    let started = oats_audio::SystemCapture::start_with(tx, move |out| {
+                        let on = dedup_mode.active(out.speakers);
+                        flag.store(on, Ordering::Relaxed);
+                        log::info!(
+                            "echo rule {} (output \"{}\", {dedup_mode:?})",
+                            if on { "on" } else { "off" },
+                            out.name
+                        );
+                    });
+                    match started {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            system_error = Some(e.to_string());
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(oats_ui::StartedAudio {
+                    system: system.is_some(),
+                    guard: Box::new((mic, system)) as Box<dyn Any>,
+                    system_error,
+                })
+            })
+        }
+    }
+}
+
 /// The status item (menu bar extra): the macOS implementation, unless `OATS_NO_STATUS_ITEM` is
 /// set. A Linux (StatusNotifierItem) crate would be picked here the same way. `None` (logged)
 /// when the platform has none or it fails to install.
@@ -91,10 +175,11 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen] [--audio-file <wav> [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--calendar]\n\n\
+        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--calendar]\n\n\
          --listen       start listening as soon as the speech engine is ready\n\
          --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
          \x20              paced in real time; listening stops when the file ends\n\
+         --system-audio-file  with --audio-file: a second WAV played as the system-audio lane\n\
          --audio-speed  with --audio-file: playback rate relative to real time (default 1)\n\
          --audio-loop   with --audio-file: start the file again at its end\n\
          --selftest     render the window offscreen to a PNG (demo content, no microphone)\n\
@@ -116,6 +201,7 @@ fn main() -> ExitCode {
     }
     let mut start_listening = false;
     let mut audio_file: Option<std::path::PathBuf> = None;
+    let mut system_audio_file: Option<std::path::PathBuf> = None;
     let mut file_options = oats_audio::FileSourceOptions::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -123,6 +209,10 @@ fn main() -> ExitCode {
             "--listen" => start_listening = true,
             "--audio-file" => match it.next() {
                 Some(p) => audio_file = Some(p.into()),
+                None => return usage(),
+            },
+            "--system-audio-file" => match it.next() {
+                Some(p) => system_audio_file = Some(p.into()),
                 None => return usage(),
             },
             "--audio-speed" => match it.next().and_then(|v| v.parse::<f64>().ok()) {
@@ -133,16 +223,31 @@ fn main() -> ExitCode {
             _ => return usage(),
         }
     }
+    if system_audio_file.is_some() && audio_file.is_none() {
+        return usage();
+    }
     // decoded once up front (a bad file fails here, not at the first Listen)
-    let audio_samples: Option<std::sync::Arc<[f32]>> = match &audio_file {
-        Some(path) => match oats_audio::file_source::load_wav(path) {
-            Ok(s) => Some(s.into()),
-            Err(e) => {
-                eprintln!("oatsnotes: --audio-file: {e}");
-                return ExitCode::from(2);
-            }
-        },
-        None => None,
+    let load = |path: &Option<std::path::PathBuf>,
+                flag: &str|
+     -> Result<Option<std::sync::Arc<[f32]>>, ExitCode> {
+        match path {
+            Some(path) => match oats_audio::file_source::load_wav(path) {
+                Ok(s) => Ok(Some(s.into())),
+                Err(e) => {
+                    eprintln!("oatsnotes: {flag}: {e}");
+                    Err(ExitCode::from(2))
+                }
+            },
+            None => Ok(None),
+        }
+    };
+    let audio_samples = match load(&audio_file, "--audio-file") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let system_samples = match load(&system_audio_file, "--system-audio-file") {
+        Ok(s) => s,
+        Err(code) => return code,
     };
 
     let options = eframe::NativeOptions {
@@ -195,19 +300,16 @@ fn main() -> ExitCode {
                 wake: Box::new(move || ctx.request_repaint()),
             }
             .spawn();
-            let audio: oats_ui::AudioStarter = match audio_samples {
-                // --audio-file: the WAV instead of the microphone, from the start each time
-                Some(samples) => Box::new(move |tx| {
-                    oats_audio::FileSource::start(samples.clone(), file_options, tx)
-                        .map(|s| Box::new(s) as Box<dyn Any>)
-                        .map_err(|e| e.to_string())
-                }),
-                None => Box::new(|tx| {
-                    oats_audio::Capture::start(tx)
-                        .map(|c| Box::new(c) as Box<dyn Any>)
-                        .map_err(|e| e.to_string())
-                }),
-            };
+            let echo_dedup = pipeline.echo_dedup_flag();
+            let dedup_mode = oats_core::DedupMode::from_env();
+            log::info!("echo rule (OATS_SYSTEM_DEDUP): {dedup_mode:?}");
+            let audio = audio_starter(
+                audio_samples,
+                system_samples,
+                file_options,
+                echo_dedup,
+                dedup_mode,
+            );
             // macOS: the menus go in the system menu bar (opt out with OATS_NO_NATIVE_MENU=1);
             // every other platform keeps the in-window egui menu bar.
             let native_menu =
@@ -288,7 +390,7 @@ fn selftest_cli(args: &[String]) -> ExitCode {
     }
     .spawn();
     let audio: oats_ui::AudioStarter =
-        Box::new(|_tx| Err("the selftest never opens the microphone".to_owned()));
+        Box::new(|_tx, _request| Err("the selftest never opens the microphone".to_owned()));
     let result = oats_ui::selftest::run_with(&out, store, pipeline, audio, options);
     if std::env::var_os("OATS_DATA_DIR").is_none() {
         let _ = std::fs::remove_dir_all(&dir);

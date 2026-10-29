@@ -33,7 +33,8 @@ directories = "6"
 # storage
 rusqlite = { version = "0.41", features = ["bundled"] }
 
-# audio
+# audio — crates.io's cpal 0.18.2, patched below to the vendored copy (an explicit loopback
+# stream, see vendor/cpal/VENDORED.md)
 cpal = "0.18"
 
 # ui (the SwiftInvert shell's stack, same versions)
@@ -74,3 +75,8 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 debug = 0
+
+# Vendored, pinned cpal 0.18.2 with `build_loopback_stream_raw` (macOS): system audio from a
+# headset's output without opening its microphone. See vendor/cpal/VENDORED.md.
+[patch.crates-io]
+cpal = { path = "vendor/cpal" }

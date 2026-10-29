@@ -327,6 +327,19 @@ fn render_prior(prior: Option<&Episode>) -> String {
     s
 }
 
+/// The `meeting: true` hint for an episode with system audio (the other side of a call or a
+/// video in `them:` lines), else nothing.
+pub fn meeting_hint(chunk: &Chunk) -> &'static str {
+    if chunk.has_system_audio() {
+        "# Hint\n\nmeeting: true — this episode contains system audio (`them:` lines: what the \
+         computer played, usually the other side of a call or meeting, sometimes a video) next \
+         to the user's microphone (`me:` lines). Meetings usually belong under Work; that is a \
+         hint, not a rule (personal calls and videos exist).\n\n"
+    } else {
+        ""
+    }
+}
+
 /// Build the interpretation request for a chunk (`prior` = the episode being revised).
 pub fn interpret_request(
     tree: &[Node],
@@ -344,6 +357,7 @@ pub fn interpret_request(
             ("episode_end", &clock(chunk.ended_at, &Local)),
             ("tree", &render_tree(tree, None)),
             ("prior", &render_prior(prior)),
+            ("meeting", meeting_hint(chunk)),
             (
                 "transcript",
                 &strip_delimiters(&render_transcript(&chunk.segments, &Local)),
@@ -680,9 +694,13 @@ pub fn categorise_request(
     let mut lines = String::new();
     for s in segments {
         lines.push_str(&format!(
-            "#{} [{}] {}\n",
+            "#{} [{}] {}: {}\n",
             s.id,
             clock(s.started_at, &Local),
+            match s.source {
+                oats_core::AudioSourceKind::Mic => "me",
+                oats_core::AudioSourceKind::System => "them",
+            },
             strip_delimiters(s.text.trim())
         ));
     }
@@ -1300,6 +1318,7 @@ mod tests {
             episode_id: None,
             interpreted_at: None,
             categorised: false,
+            ..TranscriptRow::default()
         }
     }
 
@@ -1359,6 +1378,39 @@ mod tests {
     }
 
     #[test]
+    fn an_episode_with_system_audio_gets_the_meeting_hint_and_lane_prefixes() {
+        let (_, tree, mut chunk) = seeded();
+        let mut them = chunk.segments[0].clone();
+        them.id = 999;
+        them.text = "Can everyone see my screen?".into();
+        them.source = oats_core::AudioSourceKind::System;
+        let mut echo = them.clone();
+        echo.id = 1000;
+        echo.source = oats_core::AudioSourceKind::Mic;
+        echo.text = "echo that must not appear".into();
+        echo.echo_of = Some(999);
+        chunk.segments.push(them);
+        chunk.segments.push(echo);
+        let req = interpret_request(&tree, &chunk, None, &Local::now(), None);
+        assert!(req.user_prompt.contains("meeting: true"));
+        assert!(req.user_prompt.contains("usually belong under Work"));
+        assert!(
+            req.user_prompt
+                .contains("them: Can everyone see my screen?")
+        );
+        assert!(
+            req.user_prompt
+                .contains("me: let's ship the exporter on Friday")
+        );
+        assert!(!req.user_prompt.contains("echo that must not appear"));
+        // the hint sits outside the transcript tags
+        let hint = req.user_prompt.find("meeting: true").unwrap_or(usize::MAX);
+        let open = req.user_prompt.find("<transcript>").unwrap_or(0);
+        assert!(hint < open);
+        assert!(INTERPRET_SYSTEM.contains("`me:`"));
+    }
+
+    #[test]
     fn interpret_request_carries_transcript_tree_and_prior() {
         let (_, tree, chunk) = seeded();
         let now = Local::now();
@@ -1371,6 +1423,10 @@ mod tests {
         assert!(req.user_prompt.contains("Work (category)"));
         assert!(!req.user_prompt.contains("Previous interpretation"));
         assert!(!req.user_prompt.contains("{{"));
+        assert!(
+            !req.user_prompt.contains("meeting: true"),
+            "mic only: no hint"
+        );
         assert_eq!(req.model.as_deref(), Some("sonnet"));
         assert!(req.json_schema.is_some());
         let prior = Episode {

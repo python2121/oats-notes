@@ -11,9 +11,10 @@ use std::sync::mpsc;
 
 use egui::{Key, KeyboardShortcut, Modifiers, Rect, Sense, pos2, vec2};
 use oats_brain::{BrainCommand, BrainEvent, BrainHandle};
+use oats_core::pipeline::ListenOptions;
 use oats_core::{
-    Change, Episode, Event, Node, PipelineEvent, PipelineHandle, PipelineStatus, Reminder, Store,
-    TranscriptRow, View,
+    AudioChunk, Change, Episode, Event, Node, PipelineEvent, PipelineHandle, PipelineStatus,
+    Reminder, Store, TranscriptRow, View,
 };
 use oats_status::{StatusAction, StatusItem, StatusState};
 
@@ -40,6 +41,9 @@ pub struct AppPrefs {
     pub view: View,
     /// Listening was on at quit: start again once the engine is ready ("listen all day").
     pub listening: bool,
+    /// Capture system audio (what the computer plays: the other side of a call) next to the
+    /// microphone.
+    pub capture_system: bool,
 }
 
 impl Default for AppPrefs {
@@ -49,6 +53,7 @@ impl Default for AppPrefs {
             sidebar_width: 220.0,
             view: View::Today,
             listening: false,
+            capture_system: true,
         }
     }
 }
@@ -88,15 +93,47 @@ impl Default for AppOptions {
     }
 }
 
-/// How the app starts the microphone: given the sender the pipeline's audio channel reads from,
-/// return a guard that keeps capture running while it is alive (dropping it stops capture).
+/// What [`AudioStarter`] is asked to open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioRequest {
+    /// System audio too (the "Capture System Audio" pref), not only the microphone.
+    pub system: bool,
+}
+
+/// What an [`AudioStarter`] opened.
+pub struct StartedAudio {
+    /// Keeps every capture running while alive (dropping it stops them).
+    pub guard: Box<dyn Any>,
+    /// The system-audio capture is running (`false` when not asked for or when it failed).
+    pub system: bool,
+    /// Why system audio could not be opened (shown in the status strip; the microphone runs).
+    pub system_error: Option<String>,
+}
+
+impl StartedAudio {
+    /// The microphone only.
+    pub fn mic(guard: Box<dyn Any>) -> Self {
+        Self {
+            guard,
+            system: false,
+            system_error: None,
+        }
+    }
+}
+
+/// How the app starts audio: given the sender the pipeline's audio channel reads from (both
+/// captures share it; chunks are tagged with their lane) and what to open, return a guard that
+/// keeps capture running while it is alive. An `Err` means the microphone could not be opened.
 /// Boxed so `oats-ui` doesn't depend on the audio crate.
-pub type AudioStarter = Box<dyn Fn(mpsc::Sender<Vec<f32>>) -> Result<Box<dyn Any>, String>>;
+pub type AudioStarter =
+    Box<dyn Fn(mpsc::Sender<AudioChunk>, AudioRequest) -> Result<StartedAudio, String>>;
 
 /// Everything a menu item or shortcut can do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     ToggleListening,
+    /// Capture system audio next to the microphone (a pref; restarts listening when on).
+    ToggleSystemAudio,
     NewCategory,
     ToggleSidebar,
     ShowToday,
@@ -174,6 +211,8 @@ pub enum MenuEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MenuState {
     pub listening: bool,
+    /// The "Capture System Audio" pref.
+    pub capture_system: bool,
     pub status: PipelineStatus,
     pub sidebar_visible: bool,
     pub view: View,
@@ -204,15 +243,23 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
         },
         MenuSection {
             title: "Listen",
-            entries: vec![item(
-                if s.listening {
-                    "Stop Listening"
-                } else {
-                    "Start Listening"
-                },
-                Command::ToggleListening,
-                listen_enabled,
-            )],
+            entries: vec![
+                item(
+                    if s.listening {
+                        "Stop Listening"
+                    } else {
+                        "Start Listening"
+                    },
+                    Command::ToggleListening,
+                    listen_enabled,
+                ),
+                Separator,
+                check(
+                    "Capture System Audio",
+                    Command::ToggleSystemAudio,
+                    s.capture_system,
+                ),
+            ],
         },
         MenuSection {
             title: "View",
@@ -249,8 +296,12 @@ pub struct OatsApp {
     native_menu: bool,
     status: PipelineStatus,
     engine_name: String,
-    /// Latest input level: RMS dBFS and whether a segment is open.
+    /// Latest input level: RMS dBFS and whether a segment is open — the louder lane.
     level: Option<(f32, bool)>,
+    /// The system-audio lane is running in this listening session.
+    system_on: bool,
+    /// The system-audio lane delivered only silence since the start (no tap signal).
+    system_no_signal: bool,
     rows: Vec<TranscriptRow>,
     /// The whole category → project → topic tree.
     nodes: Vec<Node>,
@@ -335,6 +386,8 @@ impl OatsApp {
             status: PipelineStatus::Loading("Starting…".to_owned()),
             engine_name: String::new(),
             level: None,
+            system_on: false,
+            system_no_signal: false,
             rows: Vec::new(),
             nodes: Vec::new(),
             today_count: 0,
@@ -404,7 +457,8 @@ impl OatsApp {
         let n = self.today_count;
         let tooltip = match &self.status {
             PipelineStatus::Listening if listening => format!(
-                "OatsNotes — Listening · {n} segment{} today",
+                "OatsNotes — Listening · {} · {n} segment{} today",
+                self.sources_label(),
                 if n == 1 { "" } else { "s" }
             ),
             PipelineStatus::Idle | PipelineStatus::Listening => "OatsNotes — Idle".to_owned(),
@@ -486,6 +540,20 @@ impl OatsApp {
         self.capture.is_some()
     }
 
+    /// "mic + system" / "mic": what this listening session hears.
+    pub fn sources_label(&self) -> &'static str {
+        if self.system_on {
+            "mic + system"
+        } else {
+            "mic"
+        }
+    }
+
+    /// The system-audio lane is running in this session.
+    pub fn system_audio_on(&self) -> bool {
+        self.system_on
+    }
+
     pub fn status(&self) -> &PipelineStatus {
         &self.status
     }
@@ -499,6 +567,7 @@ impl OatsApp {
     pub fn menu_model(&self) -> Vec<MenuSection> {
         build_menu_model(&MenuState {
             listening: self.is_listening(),
+            capture_system: self.prefs.capture_system,
             status: self.status.clone(),
             sidebar_visible: self.prefs.sidebar_visible,
             view: self.prefs.view,
@@ -526,6 +595,16 @@ impl OatsApp {
                     self.prefs.listening = true;
                 }
                 self.auto_listen = false;
+            }
+            Command::ToggleSystemAudio => {
+                self.prefs.capture_system = !self.prefs.capture_system;
+                // apply at once: reopen the captures with the new choice
+                if self.is_listening() {
+                    self.stop_listening();
+                    if !self.start_listening() {
+                        self.prefs.listening = false;
+                    }
+                }
             }
             Command::NewCategory => {
                 self.prefs.sidebar_visible = true;
@@ -561,11 +640,26 @@ impl OatsApp {
             return false;
         }
         let (tx, rx) = mpsc::channel();
-        match (self.audio)(tx) {
-            Ok(guard) => {
-                self.capture = Some(guard);
-                self.pipeline.start(rx);
-                log::info!("listening started");
+        let request = AudioRequest {
+            system: self.prefs.capture_system,
+        };
+        match (self.audio)(tx, request) {
+            Ok(started) => {
+                self.capture = Some(started.guard);
+                self.system_on = started.system;
+                self.system_no_signal = false;
+                if let Some(e) = started.system_error {
+                    log::warn!("system audio: {e}");
+                    self.warning = Some(format!("System audio: {e}"));
+                }
+                self.pipeline.start_lanes(
+                    rx,
+                    ListenOptions {
+                        system: started.system,
+                        ..ListenOptions::default()
+                    },
+                );
+                log::info!("listening started ({})", self.sources_label());
                 true
             }
             Err(e) => {
@@ -582,6 +676,8 @@ impl OatsApp {
             self.pipeline.stop();
             self.capture = None;
             self.level = None;
+            self.system_on = false;
+            self.system_no_signal = false;
             log::info!("listening stopped");
         }
     }
@@ -775,10 +871,36 @@ impl OatsApp {
                     self.status = s;
                 }
                 PipelineEvent::Engine(name) => self.engine_name = name,
-                PipelineEvent::Level { rms_db, in_speech } => {
+                PipelineEvent::Level {
+                    rms_db_mic,
+                    rms_db_system,
+                    in_speech_mic,
+                    in_speech_system,
+                } => {
                     if self.capture.is_some() {
-                        self.level = Some((rms_db, in_speech));
+                        // the meter shows the louder lane
+                        self.level = Some((
+                            rms_db_mic.max(rms_db_system),
+                            in_speech_mic || in_speech_system,
+                        ));
                     }
+                }
+                PipelineEvent::Segment(row) if row.echo_of.is_some() => {
+                    // the speakers heard by the microphone: kept in the store, never shown
+                }
+                PipelineEvent::EchoMarked { segment, .. } => {
+                    let before = self.rows.len();
+                    self.rows.retain(|r| r.id != segment);
+                    if self.rows.len() < before || self.prefs.view != View::Today {
+                        // recount rather than guess whether it was today's
+                        match self.store.segment_count_since(self.today_start) {
+                            Ok(n) => self.today_count = n,
+                            Err(e) => self.store_error(e),
+                        }
+                    }
+                }
+                PipelineEvent::SystemAudio { signal } => {
+                    self.system_no_signal = !signal && self.system_on;
                 }
                 PipelineEvent::Segment(row) => {
                     if row.started_at >= self.today_start {
@@ -953,12 +1075,13 @@ impl OatsApp {
         self.reload_brain_data();
     }
 
-    fn state_label(&self) -> &'static str {
+    /// "listening · mic + system", "listening · mic", "idle", …
+    pub fn state_label(&self) -> String {
         match self.status {
-            PipelineStatus::Loading(_) => "Loading…",
-            PipelineStatus::Idle => "Idle",
-            PipelineStatus::Listening => "Listening",
-            PipelineStatus::Failed(_) => "Failed",
+            PipelineStatus::Loading(_) => "loading…".to_owned(),
+            PipelineStatus::Idle => "idle".to_owned(),
+            PipelineStatus::Listening => format!("listening · {}", self.sources_label()),
+            PipelineStatus::Failed(_) => "failed".to_owned(),
         }
     }
 
@@ -978,6 +1101,19 @@ impl OatsApp {
             .clicked()
         {
             cmds.push(Command::ToggleListening);
+        }
+        ui.add_space(6.0);
+        let system = self.prefs.capture_system;
+        let tip = if system {
+            "Capturing system audio (what the computer plays: the other side of a call) — click to turn off"
+        } else {
+            "Capture system audio (what the computer plays: the other side of a call) next to the microphone"
+        };
+        if pill(ui, t, "System audio", system, true)
+            .on_hover_text(tip)
+            .clicked()
+        {
+            cmds.push(Command::ToggleSystemAudio);
         }
         ui.add_space(6.0);
         level_meter(ui, t, if listening { self.level } else { None });
@@ -1034,8 +1170,13 @@ impl OatsApp {
                 }
             },
         };
+        let no_signal = if self.system_no_signal && self.is_listening() {
+            " · system audio: no signal"
+        } else {
+            ""
+        };
         let left = format!(
-            "{engine} · {} · {n} segment{} today{brain}",
+            "{engine} · {}{no_signal} · {n} segment{} today{brain}",
             self.state_label(),
             if n == 1 { "" } else { "s" }
         );
@@ -1151,6 +1292,7 @@ impl OatsApp {
     /// Selftest only: show the Listening state with a fixed input level, no audio opened.
     pub(crate) fn selftest_fake_listening(&mut self, rms_db: f32, in_speech: bool) {
         self.capture = Some(Box::new(()));
+        self.system_on = self.prefs.capture_system;
         self.status = PipelineStatus::Listening;
         self.level = Some((rms_db, in_speech));
     }
@@ -1335,6 +1477,7 @@ mod tests {
             sidebar_width: 250.0,
             view: View::Node(7),
             listening: true,
+            capture_system: false,
         };
         prefs.store(&mut s);
         assert_eq!(AppPrefs::load(&s), prefs);
@@ -1392,6 +1535,7 @@ mod tests {
     fn menu_model_has_the_listen_item() {
         let mut s = MenuState {
             listening: false,
+            capture_system: true,
             status: PipelineStatus::Loading("x".to_owned()),
             sidebar_visible: true,
             view: View::Today,
@@ -1420,6 +1564,31 @@ mod tests {
         );
         let titles: Vec<_> = build_menu_model(&s).iter().map(|m| m.title).collect();
         assert_eq!(titles, ["File", "Listen", "View", "Notes"]);
+        // the system-audio toggle is a checked item in the Listen menu, following the pref
+        let system = |model: &[MenuSection]| {
+            model
+                .iter()
+                .flat_map(|s| s.entries.iter())
+                .find_map(|e| match e {
+                    MenuEntry::Item {
+                        cmd: Command::ToggleSystemAudio,
+                        label,
+                        checked,
+                        ..
+                    } => Some((label.clone(), *checked)),
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            system(&build_menu_model(&s)),
+            Some(("Capture System Audio".to_owned(), Some(true)))
+        );
+        s.capture_system = false;
+        assert_eq!(
+            system(&build_menu_model(&s)).and_then(|(_, c)| c),
+            Some(false)
+        );
+        assert!(AppPrefs::default().capture_system, "on by default");
         // the Notes menu follows the brain's readiness
         let interpret = |model: &[MenuSection]| {
             model
@@ -1485,7 +1654,7 @@ mod tests {
             wake: Box::new(|| {}),
         }
         .spawn();
-        let audio: AudioStarter = Box::new(|_tx| Err("no microphone in tests".to_owned()));
+        let audio: AudioStarter = Box::new(|_tx, _req| Err("no microphone in tests".to_owned()));
         let item = FakeStatusItem::default();
         let shown = item.shown.clone();
         let queue = item.queue.clone();

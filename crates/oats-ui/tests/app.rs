@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use oats_brain::{Brain, BrainConfig, BrainHandle, ClaudeCli};
-use oats_core::{NullEngine, Pipeline, PipelineStatus, SpeechEngine, Store, View};
+use oats_core::{AudioChunk, NullEngine, Pipeline, PipelineStatus, SpeechEngine, Store, View};
 use oats_status::{StatusAction, StatusItem, StatusState};
-use oats_ui::{AppOptions, AudioStarter, Command, MenuEntry, OatsApp};
+use oats_ui::{AppOptions, AudioStarter, Command, MenuEntry, OatsApp, StartedAudio};
 
 struct TempDir(PathBuf);
 
@@ -65,7 +65,7 @@ impl StatusItem for FakeItem {
 }
 
 /// The microphone: hands the pipeline's sender to the test instead of opening a device.
-type Mic = Rc<RefCell<Option<Sender<Vec<f32>>>>>;
+type Mic = Rc<RefCell<Option<Sender<AudioChunk>>>>;
 
 struct Rig {
     harness: Harness<'static, OatsApp>,
@@ -83,9 +83,9 @@ fn build(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>) -> Rig {
     .spawn();
     let mic: Mic = Rc::default();
     let m = mic.clone();
-    let audio: AudioStarter = Box::new(move |tx| {
+    let audio: AudioStarter = Box::new(move |tx, _request| {
         *m.borrow_mut() = Some(tx);
-        Ok(Box::new(()))
+        Ok(StartedAudio::mic(Box::new(())))
     });
     let harness = Harness::builder()
         .with_size(egui::vec2(1100.0, 720.0))
@@ -185,10 +185,10 @@ impl Rig {
                     0.3 * (n as f32 * 2.0 * std::f32::consts::PI * 440.0 / 16_000.0).sin()
                 })
                 .collect();
-            tx.send(chunk).unwrap();
+            tx.send(AudioChunk::mic(chunk)).unwrap();
         }
         for _ in 0..15 {
-            tx.send(vec![0.0; 1_600]).unwrap();
+            tx.send(AudioChunk::mic(vec![0.0; 1_600])).unwrap();
         }
     }
 }
@@ -254,7 +254,7 @@ fn a_segment_for_another_view_bumps_the_count_without_appending() {
     });
     assert_eq!(
         rig.harness.state().status_item_state().tooltip,
-        "OatsNotes — Listening · 2 segments today"
+        "OatsNotes — Listening · mic · 2 segments today"
     );
 
     rig.speak(2);

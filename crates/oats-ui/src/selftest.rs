@@ -111,8 +111,8 @@ pub fn run_with(
     Ok([w, h])
 }
 
-/// A session and eight segments: four yesterday afternoon, four this morning; two filed under
-/// Work.
+/// A session and eight segments: four yesterday afternoon, four this morning (two of them
+/// system audio from a call, plus a hidden microphone echo); two filed under Work.
 fn seed(store: &Store) -> Result<(), oats_core::StoreError> {
     const H: i64 = 3_600_000;
     const M: i64 = 60_000;
@@ -166,8 +166,35 @@ fn seed(store: &Store) -> Result<(), oats_core::StoreError> {
     ];
     let session = store.begin_session(yesterday + 14 * H, "selftest")?;
     let mut ids = Vec::new();
-    for (start, text, confidence) in lines {
-        let row = store.insert_segment(session, start, start + 8_000, text, confidence)?;
+    // this morning's stand-up was a call: the other side (lines 4 and 6) came in as system
+    // audio ("them"); the microphone's echo of line 6 is stored but never shown
+    let them = [4usize, 6];
+    for (i, (start, text, confidence)) in lines.into_iter().enumerate() {
+        let source = if them.contains(&i) {
+            oats_core::AudioSourceKind::System
+        } else {
+            oats_core::AudioSourceKind::Mic
+        };
+        let row = store.insert_segment_from(
+            session,
+            start,
+            start + 8_000,
+            text,
+            confidence,
+            source,
+            None,
+        )?;
+        if i == 6 {
+            store.insert_segment_from(
+                session,
+                start + 300,
+                start + 8_400,
+                text,
+                Some(0.7),
+                oats_core::AudioSourceKind::Mic,
+                Some(row.id),
+            )?;
+        }
         ids.push(row.id);
     }
     store.end_session(session, today + 10 * H + 6 * M)?;

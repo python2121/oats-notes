@@ -10,6 +10,12 @@ fonts and images are listed in `assets/ATTRIBUTION.md`.
   MIT License (`vendor/fluidaudio-rs/LICENSE`). Modified by OatsNotes (a stateful VAD
   stream); origin and changes in `vendor/fluidaudio-rs/VENDORED.md`.
 
+- `vendor/cpal/` — **cpal** 0.18.2, cross-platform audio I/O, by the RustAudio contributors
+  (<https://github.com/RustAudio/cpal>). Apache License 2.0 (`vendor/cpal/LICENSE`). Modified
+  by OatsNotes (an explicit loopback stream on macOS, so system audio from a headset never
+  opens its microphone); origin and changes in `vendor/cpal/VENDORED.md`. Used through
+  `[patch.crates-io]` in the root `Cargo.toml`.
+
 ## Fetched at build time (macOS)
 
 - **FluidAudio** 0.14.8 (<https://github.com/FluidInference/FluidAudio>), Apache License 2.0.
