@@ -342,14 +342,16 @@ fn inline_field(ui: &mut egui::Ui, text: &mut String, focus: &mut bool) -> Field
 }
 
 #[derive(Clone, Copy)]
-enum HeaderIcon {
+pub(crate) enum HeaderIcon {
     Plus,
     HideSidebar,
+    /// Same panel glyph, for the restore button in the control bar.
+    ShowSidebar,
 }
 
 /// A 24 pt frameless icon button: hover/press backdrop, the icon stroked in the secondary text
 /// colour (primary on hover).
-fn header_icon(ui: &mut egui::Ui, icon: HeaderIcon) -> egui::Response {
+pub(crate) fn header_icon(ui: &mut egui::Ui, icon: HeaderIcon) -> egui::Response {
     let t = Tokens::get(ui.ctx());
     let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
     if !ui.is_rect_visible(rect) {
@@ -376,7 +378,7 @@ fn header_icon(ui: &mut egui::Ui, icon: HeaderIcon) -> egui::Response {
             p.line_segment([at(12.0, 6.0), at(12.0, 18.0)], stroke);
             p.line_segment([at(6.0, 12.0), at(18.0, 12.0)], stroke);
         }
-        HeaderIcon::HideSidebar => {
+        HeaderIcon::HideSidebar | HeaderIcon::ShowSidebar => {
             // a window with its left pane (the sidebar) shaded
             let frame = Rect::from_min_max(at(3.0, 4.5), at(21.0, 19.5));
             let pane = Rect::from_min_max(frame.min, pos2(at(9.0, 0.0).x, frame.max.y));

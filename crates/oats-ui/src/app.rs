@@ -21,7 +21,7 @@ use oats_status::{StatusAction, StatusItem, StatusState};
 use crate::calendar::{CalendarAction, CalendarState, calendar_view};
 use crate::menu_events::MenuEvents;
 use crate::notes::{BrainStatus, NotesAction, NotesState, node_view, notes_view};
-use crate::sidebar::{SidebarAction, SidebarState, sidebar_panel};
+use crate::sidebar::{HeaderIcon, SidebarAction, SidebarState, header_icon, sidebar_panel};
 use crate::theme::Tokens;
 use crate::transcript::{
     TranscriptAction, local_midnight_ms, transcript_list, until_local_midnight,
@@ -1111,6 +1111,19 @@ impl OatsApp {
     fn control_bar(&self, ui: &mut egui::Ui, t: &Tokens) -> Vec<Command> {
         let mut cmds = Vec::new();
         ui.add_space(12.0);
+        if !self.prefs.sidebar_visible {
+            if header_icon(ui, HeaderIcon::ShowSidebar)
+                .on_hover_text(with_shortcut(
+                    ui.ctx(),
+                    "Show sidebar",
+                    Command::ToggleSidebar,
+                ))
+                .clicked()
+            {
+                cmds.push(Command::ToggleSidebar);
+            }
+            ui.add_space(6.0);
+        }
         let listening = self.is_listening();
         let enabled = listening || self.status == PipelineStatus::Idle;
         let (label, tip) = if listening {

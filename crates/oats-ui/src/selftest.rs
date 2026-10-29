@@ -31,6 +31,8 @@ pub struct SelftestOptions {
     pub work: bool,
     /// Show the Calendar view (seeded events and a reminder).
     pub calendar: bool,
+    /// Start with the sidebar hidden (the control bar then shows the restore button).
+    pub no_sidebar: bool,
 }
 
 /// [`run_with`] with the default options (Today view, not listening).
@@ -86,6 +88,9 @@ pub fn run_with(
         }
         harness.step();
         std::thread::sleep(Duration::from_millis(10));
+    }
+    if options.no_sidebar {
+        harness.state_mut().run(Command::ToggleSidebar);
     }
     if options.listening {
         let app = harness.state_mut();

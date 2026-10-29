@@ -578,3 +578,22 @@ fn the_preferences_command_opens_the_window_and_enter_saves_the_name() {
     );
     assert!(!rig.shows("Your name"), "Enter closes the window");
 }
+
+#[test]
+fn a_hidden_sidebar_has_a_restore_button_in_the_control_bar() {
+    let dir = TempDir::new("sidebar-restore");
+    let mut rig = build(&dir.db(), None, None);
+    assert!(rig.app().prefs().sidebar_visible);
+    rig.app().run(Command::ToggleSidebar);
+    rig.harness.step();
+    rig.harness.step();
+    assert!(!rig.app().prefs().sidebar_visible);
+    // the button is painted (no label): 24 pt wide after the bar's 12 pt margin, in the 34 pt
+    // control bar under the menu bar
+    let menu = rig.harness.get_by_label("File").rect();
+    rig.click_at(egui::pos2(24.0, menu.bottom() + 12.0));
+    assert!(
+        rig.app().prefs().sidebar_visible,
+        "the button shows the sidebar"
+    );
+}
