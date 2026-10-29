@@ -165,7 +165,7 @@ pub fn bold_spans(text: &str) -> Vec<(String, bool)> {
     out
 }
 
-fn rich_line(ui: &mut egui::Ui, t: &Tokens, text: &str, size: f32, color: egui::Color32) {
+fn rich_line(ui: &mut egui::Ui, t: &Tokens, text: &str, size: f32, color: egui::Color32, hl: &str) {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = ui.available_width();
     for (span, bold) in bold_spans(text) {
@@ -174,9 +174,11 @@ fn rich_line(ui: &mut egui::Ui, t: &Tokens, text: &str, size: f32, color: egui::
         } else {
             t.font(size)
         };
-        job.append(
+        crate::search::append_marked(
+            &mut job,
+            t,
             &span,
-            0.0,
+            hl,
             egui::TextFormat {
                 font_id: font,
                 color,
@@ -187,7 +189,7 @@ fn rich_line(ui: &mut egui::Ui, t: &Tokens, text: &str, size: f32, color: egui::
     ui.add(egui::Label::new(job).wrap().selectable(false));
 }
 
-fn summary_block(ui: &mut egui::Ui, t: &Tokens, summary: &str) {
+fn summary_block(ui: &mut egui::Ui, t: &Tokens, summary: &str, hl: &str) {
     for line in md_lines(summary) {
         match line {
             MdLine::Blank => ui.add_space(3.0),
@@ -203,10 +205,10 @@ fn summary_block(ui: &mut egui::Ui, t: &Tokens, summary: &str) {
                 ui.horizontal_top(|ui| {
                     ui.add_space(6.0);
                     ui.label(RichText::new("•").color(t.text_secondary).size(12.5));
-                    rich_line(ui, t, &b, 12.5, t.text);
+                    rich_line(ui, t, &b, 12.5, t.text, hl);
                 });
             }
-            MdLine::Text(x) => rich_line(ui, t, &x, 12.5, t.text),
+            MdLine::Text(x) => rich_line(ui, t, &x, 12.5, t.text, hl),
         }
     }
 }
@@ -347,14 +349,18 @@ impl StrikeIf for RichText {
     }
 }
 
-fn episode_card(
+/// One episode card. `hl` is a search string to mark in the text ("" for none); `open`, when
+/// given, makes the title clickable and receives the episode's id on a click (search results).
+pub(crate) fn episode_card(
     ui: &mut egui::Ui,
     t: &Tokens,
     state: &mut NotesState,
     e: &Episode,
     nodes: &[Node],
     actions: &mut Vec<NotesAction>,
-) {
+    hl: &str,
+    open: Option<&mut Option<i64>>,
+) -> egui::Rect {
     let collapsed = e.low_signal && !state.expanded.contains(&e.id);
     let fill = ui.painter().add(egui::Shape::Noop);
     let left = ui.max_rect().left();
@@ -374,19 +380,35 @@ fn episode_card(
                 } else {
                     e.title.clone()
                 };
-                let resp = ui.add(
-                    egui::Label::new(
-                        RichText::new(title)
-                            .font(crate::theme::font_medium(ui.ctx(), 13.5))
-                            .color(title_col),
-                    )
-                    .sense(if e.low_signal {
-                        Sense::click()
-                    } else {
-                        Sense::hover()
-                    })
-                    .truncate(),
+                let mut title_job = egui::text::LayoutJob::default();
+                crate::search::append_marked(
+                    &mut title_job,
+                    t,
+                    &title,
+                    hl,
+                    egui::TextFormat {
+                        font_id: crate::theme::font_medium(ui.ctx(), 13.5),
+                        color: title_col,
+                        ..Default::default()
+                    },
                 );
+                let mut resp = ui.add(
+                    egui::Label::new(title_job)
+                        .sense(if e.low_signal || open.is_some() {
+                            Sense::click()
+                        } else {
+                            Sense::hover()
+                        })
+                        .truncate(),
+                );
+                if let Some(open) = open {
+                    resp = resp
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Show in the notes");
+                    if resp.clicked() {
+                        *open = Some(e.id);
+                    }
+                }
                 if e.low_signal && resp.clicked() {
                     if let Some(i) = state.expanded.iter().position(|x| *x == e.id) {
                         state.expanded.remove(i);
@@ -428,7 +450,7 @@ fn episode_card(
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
                         ui.set_width((ui.available_width() - 12.0).max(80.0));
-                        summary_block(ui, t, &e.summary);
+                        summary_block(ui, t, &e.summary, hl);
                         if !e.decisions.is_empty() {
                             ui.add_space(4.0);
                             ui.label(
@@ -440,7 +462,7 @@ fn episode_card(
                                 ui.horizontal_top(|ui| {
                                     ui.add_space(6.0);
                                     ui.label(RichText::new("✓").color(t.accent).size(12.0));
-                                    rich_line(ui, t, d, 12.5, t.text);
+                                    rich_line(ui, t, d, 12.5, t.text, hl);
                                 });
                             }
                         }
@@ -462,7 +484,7 @@ fn episode_card(
                                     if let Some(d) = &a.due {
                                         text.push_str(&format!(" (due {d})"));
                                     }
-                                    rich_line(ui, t, &text, 12.5, t.text);
+                                    rich_line(ui, t, &text, 12.5, t.text, hl);
                                 });
                             }
                         }
@@ -485,6 +507,7 @@ fn episode_card(
         ),
     );
     ui.add_space(6.0);
+    rect
 }
 
 /// The view. `episodes` newest first.
@@ -538,7 +561,7 @@ pub fn notes_view(
                     });
                     ui.add_space(4.0);
                 }
-                episode_card(ui, &t, state, e, nodes, &mut actions);
+                episode_card(ui, &t, state, e, nodes, &mut actions, "", None);
             }
             ui.add_space(8.0);
         });
@@ -728,7 +751,7 @@ pub fn node_view(
                     });
                     ui.add_space(4.0);
                 }
-                episode_card(ui, &t, state, e, nodes, &mut out.notes);
+                episode_card(ui, &t, state, e, nodes, &mut out.notes, "", None);
             }
             ui.add_space(8.0);
             let label = format!(

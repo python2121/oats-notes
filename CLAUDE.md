@@ -192,6 +192,15 @@ failure line only (the engine name is in the status strip, not repeated). Status
 left = engine · state · segment count · brain line; right = the warning, else the last voice
 command, else EMPTY (the data-directory path is no longer shown).
 
+Search (View → "Find…", ⌘F; `Command::Search`, `oats-ui/src/search.rs`): a 36 pt bar under the
+control bar (focused at once, match counts, × icon) and a results view that replaces the current
+view while open: Notes (episode cards, matches marked), Calendar (events), Transcript (lines),
+from `Store::search(query, 200)` (case-insensitive substring, echoes excluded, re-run only when
+the text or the data changes). Esc (also from the field) or × closes it and the previous view is
+back; ⌘F again re-selects the field. Clicking a note opens its node view (Notes if unfiled), an
+event opens Calendar, a line opens Today / All — no scroll-to-row yet.
+`--selftest out.png --search TEXT` renders it.
+
 Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui::Window` anchored
 centre with one field, "Your name", saved on Enter / blur / close via `Store::set_user_name`
 (a blank name clears it). Stored in the database, `meta` key `user_name`

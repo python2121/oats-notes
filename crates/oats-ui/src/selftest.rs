@@ -19,7 +19,7 @@ pub const SIZE: [f32; 2] = [1100.0, 720.0];
 pub const PIXELS_PER_POINT: f32 = 2.0;
 
 /// Capture variants.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SelftestOptions {
     /// Show the app in the Listening state with a fake input level (no audio is opened) and the
     /// All Transcripts view, so the pill, the meter and both day headings are in the capture.
@@ -33,6 +33,8 @@ pub struct SelftestOptions {
     pub calendar: bool,
     /// Start with the sidebar hidden (the control bar then shows the restore button).
     pub no_sidebar: bool,
+    /// Open the search bar with this query over the seeded data.
+    pub search: Option<String>,
 }
 
 /// [`run_with`] with the default options (Today view, not listening).
@@ -106,6 +108,9 @@ pub fn run_with(
         }
     } else if options.calendar {
         harness.state_mut().run(Command::ShowCalendar);
+    }
+    if let Some(q) = &options.search {
+        harness.state_mut().selftest_search(q);
     }
     // settle: fonts, layout, the scroll area's stick-to-bottom
     harness.run_steps(4);

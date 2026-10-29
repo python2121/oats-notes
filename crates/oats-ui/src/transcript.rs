@@ -204,7 +204,7 @@ pub fn transcript_rows(
 const TIME_W: f32 = 44.0;
 
 /// The small lane tag ("them") of a system-audio row, top-left at `at`.
-fn source_tag(ui: &egui::Ui, t: &Tokens, at: egui::Pos2, label: &str) {
+pub(crate) fn source_tag(ui: &egui::Ui, t: &Tokens, at: egui::Pos2, label: &str) {
     let p = ui.painter();
     let galley = p.layout_no_wrap(label.to_owned(), t.mono(8.5), t.accent);
     let rect = Rect::from_min_size(at, galley.size() + vec2(8.0, 2.0));

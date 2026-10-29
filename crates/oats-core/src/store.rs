@@ -71,6 +71,15 @@ pub struct TranscriptRow {
     pub echo_of: Option<i64>,
 }
 
+/// What [`Store::search`] found.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SearchResults {
+    /// Transcript lines, newest first (echoes excluded).
+    pub segments: Vec<TranscriptRow>,
+    pub episodes: Vec<Episode>,
+    pub events: Vec<Event>,
+}
+
 /// What kind of node in the tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1601,6 +1610,57 @@ impl Store {
         Ok(rows)
     }
 
+    /// Case-insensitive substring search over transcript text (echoes excluded, newest
+    /// first), episodes (title, summary, decisions, action items; newest first) and events
+    /// (title, details; newest first). Each list holds at most `limit` hits; a blank query
+    /// finds nothing. `%`, `_` and `\\` in the query match themselves.
+    pub fn search(&self, query: &str, limit: i64) -> Result<SearchResults, StoreError> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(SearchResults::default());
+        }
+        let mut pat = String::with_capacity(q.len() + 2);
+        pat.push('%');
+        for c in q.chars() {
+            if matches!(c, '%' | '_' | '\\') {
+                pat.push('\\');
+            }
+            pat.push(c);
+        }
+        pat.push('%');
+        let run =
+            |sql: &str| -> rusqlite::Result<rusqlite::Statement<'_>> { self.conn.prepare(sql) };
+        let mut stmt = run(&format!(
+            "SELECT {SEGMENT_COLUMNS} FROM segments WHERE {NOT_ECHO} AND text LIKE ?1 ESCAPE '\\'
+             ORDER BY started_at DESC, id DESC LIMIT ?2"
+        ))?;
+        let segments = stmt
+            .query_map(rusqlite::params![pat, limit], row_to_segment)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = run(&format!(
+            "SELECT {EPISODE_COLUMNS} FROM episodes WHERE title LIKE ?1 ESCAPE '\\'
+                OR summary LIKE ?1 ESCAPE '\\' OR decisions_json LIKE ?1 ESCAPE '\\'
+                OR action_items_json LIKE ?1 ESCAPE '\\'
+             ORDER BY started_at DESC, id DESC LIMIT ?2"
+        ))?;
+        let episodes = stmt
+            .query_map(rusqlite::params![pat, limit], row_to_episode)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = run(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE title LIKE ?1 ESCAPE '\\'
+                OR details LIKE ?1 ESCAPE '\\'
+             ORDER BY when_start DESC, id DESC LIMIT ?2"
+        ))?;
+        let events = stmt
+            .query_map(rusqlite::params![pat, limit], row_to_event)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SearchResults {
+            segments,
+            episodes,
+            events,
+        })
+    }
+
     /// Newest first (at most `limit`).
     pub fn episodes(&self, limit: i64) -> Result<Vec<Episode>, StoreError> {
         self.query_episodes(
@@ -2066,6 +2126,135 @@ mod tests {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    #[test]
+    fn search_finds_text_in_all_three_places_and_skips_echoes() -> R {
+        let s = Store::open_in_memory()?;
+        let sess = s.begin_session(0, "t")?;
+        let a = s.insert_segment_from(
+            sess,
+            1000,
+            2000,
+            "The Roadmap is tight",
+            None,
+            AudioSourceKind::System,
+            None,
+        )?;
+        s.insert_segment_from(
+            sess,
+            3000,
+            4000,
+            "the roadmap is tight",
+            None,
+            AudioSourceKind::Mic,
+            Some(a.id),
+        )?;
+        s.insert_segment_from(
+            sess,
+            5000,
+            6000,
+            "more ROADMAP talk",
+            None,
+            AudioSourceKind::Mic,
+            None,
+        )?;
+        s.insert_segment_from(
+            sess,
+            7000,
+            8000,
+            "unrelated",
+            None,
+            AudioSourceKind::Mic,
+            None,
+        )?;
+        s.insert_episode(
+            0,
+            10,
+            &EpisodeContent {
+                title: "Planning".into(),
+                summary: "nothing".into(),
+                decisions: vec!["Cut the roadmap".into()],
+                ..Default::default()
+            },
+            1,
+        )?;
+        s.insert_episode(
+            20,
+            30,
+            &EpisodeContent {
+                title: "Other".into(),
+                summary: "Reviewed the ROADMAP".into(),
+                ..Default::default()
+            },
+            1,
+        )?;
+        s.insert_episode(
+            40,
+            50,
+            &EpisodeContent {
+                title: "No".into(),
+                ..Default::default()
+            },
+            1,
+        )?;
+        s.upsert_event(
+            &NewEvent {
+                when_start: 5,
+                title: "Roadmap review".into(),
+                ..Default::default()
+            },
+            1,
+        )?;
+        s.upsert_event(
+            &NewEvent {
+                when_start: 9,
+                title: "x".into(),
+                details: "about the roadmap".into(),
+                dedupe_key: Some("k".into()),
+                ..Default::default()
+            },
+            1,
+        )?;
+        let r = s.search("  roadmap ", 200)?;
+        let texts: Vec<&str> = r.segments.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(texts, ["more ROADMAP talk", "The Roadmap is tight"]);
+        let titles: Vec<&str> = r.episodes.iter().map(|x| x.title.as_str()).collect();
+        assert_eq!(titles, ["Other", "Planning"]);
+        assert_eq!(r.events.len(), 2);
+        assert_eq!(r.events[0].title, "x");
+        assert_eq!(s.search("roadmap", 1)?.segments.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn search_blank_query_finds_nothing_and_wildcards_are_literal() -> R {
+        let s = Store::open_in_memory()?;
+        let sess = s.begin_session(0, "t")?;
+        s.insert_segment_from(
+            sess,
+            1000,
+            2000,
+            "fifty percent",
+            None,
+            AudioSourceKind::Mic,
+            None,
+        )?;
+        s.insert_segment_from(
+            sess,
+            3000,
+            4000,
+            "100% done_now",
+            None,
+            AudioSourceKind::Mic,
+            None,
+        )?;
+        assert_eq!(s.search("", 10)?, SearchResults::default());
+        assert_eq!(s.search("   ", 10)?, SearchResults::default());
+        assert_eq!(s.search("%", 10)?.segments.len(), 1);
+        assert_eq!(s.search("_", 10)?.segments.len(), 1);
+        assert_eq!(s.search("f_fty", 10)?.segments.len(), 0);
+        Ok(())
     }
 
     #[test]

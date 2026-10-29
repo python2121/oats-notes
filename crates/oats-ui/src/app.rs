@@ -21,6 +21,7 @@ use oats_status::{StatusAction, StatusItem, StatusState};
 use crate::calendar::{CalendarAction, CalendarState, calendar_view};
 use crate::menu_events::MenuEvents;
 use crate::notes::{BrainStatus, NotesAction, NotesState, node_view, notes_view};
+use crate::search::{BAR_H, SEARCH_LIMIT, SearchAction, SearchState, search_bar, search_results};
 use crate::sidebar::{HeaderIcon, SidebarAction, SidebarState, header_icon, sidebar_panel};
 use crate::theme::Tokens;
 use crate::transcript::{
@@ -138,6 +139,8 @@ pub enum Command {
     /// Open the Preferences window (your name, for now).
     Preferences,
     ToggleSidebar,
+    /// Open the search bar (or re-focus it).
+    Search,
     ShowToday,
     ShowAll,
     ShowNotes,
@@ -171,6 +174,7 @@ pub const SHORTCUTS: &[(KeyboardShortcut, Command)] = &[
     (sc(Modifiers::COMMAND, Key::Num2), Command::ShowAll),
     (sc(Modifiers::COMMAND, Key::Num3), Command::ShowNotes),
     (sc(Modifiers::COMMAND, Key::Num4), Command::ShowCalendar),
+    (sc(Modifiers::COMMAND, Key::F), Command::Search),
     (sc(Modifiers::COMMAND, Key::I), Command::InterpretNow),
     (sc(Modifiers::COMMAND, Key::Comma), Command::Preferences),
 ];
@@ -271,6 +275,8 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
         MenuSection {
             title: "View",
             entries: vec![
+                item("Find…", Command::Search, true),
+                Separator,
                 check("Show Sidebar", Command::ToggleSidebar, s.sidebar_visible),
                 Separator,
                 check("Today", Command::ShowToday, s.view == View::Today),
@@ -339,6 +345,9 @@ pub struct OatsApp {
     sidebar: SidebarState,
     /// The Preferences window, when open.
     prefs_window: Option<PrefsWindow>,
+    /// The search bar and its results, while open (the view underneath is untouched, so
+    /// closing restores it).
+    search: Option<SearchState>,
     /// The status-bar item (menu bar extra), if the platform has one. While it exists, closing
     /// the window only hides it; Quit quits.
     status_item: Option<Box<dyn StatusItem>>,
@@ -419,6 +428,7 @@ impl OatsApp {
             warning: None,
             sidebar: SidebarState::default(),
             prefs_window: None,
+            search: None,
             status_item: status,
             status_shown: None,
             menu_events,
@@ -632,6 +642,13 @@ impl OatsApp {
                 self.prefs_window = Some(PrefsWindow { name, focus: true });
             }
             Command::ToggleSidebar => self.prefs.sidebar_visible = !self.prefs.sidebar_visible,
+            Command::Search => match &mut self.search {
+                Some(s) => {
+                    s.focus = true;
+                    s.select_all = true;
+                }
+                None => self.search = Some(SearchState::opened()),
+            },
             Command::ShowToday => self.set_view(View::Today),
             Command::ShowAll => self.set_view(View::All),
             Command::ShowNotes => self.set_view(View::Notes),
@@ -639,6 +656,65 @@ impl OatsApp {
             Command::InterpretNow => self.brain_send(BrainCommand::InterpretNow),
             Command::ReviewNow => self.brain_send(BrainCommand::ReviewNow),
             Command::Reorganise => self.brain_send(BrainCommand::ReorganiseNow),
+        }
+    }
+
+    /// Whether the search bar is open.
+    pub fn search_open(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Close the search bar (the query goes with it); the view underneath is back.
+    fn close_search(&mut self) {
+        self.search = None;
+    }
+
+    /// Run the open search's query again.
+    fn run_search(&mut self) {
+        let Some(s) = &mut self.search else { return };
+        match self.store.search(&s.query, SEARCH_LIMIT) {
+            Ok(r) => {
+                s.results = r;
+                s.queried = s.query.clone();
+            }
+            Err(e) => {
+                s.results = Default::default();
+                s.queried = s.query.clone();
+                self.store_error(e);
+            }
+        }
+    }
+
+    fn apply_search(&mut self, actions: Vec<SearchAction>) {
+        for a in actions {
+            match a {
+                SearchAction::Close => self.close_search(),
+                SearchAction::Notes(n) => self.apply_notes(vec![n]),
+                SearchAction::OpenEpisode(id) => {
+                    let node = self
+                        .search
+                        .as_ref()
+                        .and_then(|s| s.results.episodes.iter().find(|e| e.id == id))
+                        .and_then(|e| e.node_id);
+                    self.close_search();
+                    match node {
+                        Some(n) => self.set_view(View::Node(n)),
+                        None => self.set_view(View::Notes),
+                    }
+                }
+                SearchAction::OpenSegment(at) => {
+                    self.close_search();
+                    if at >= self.today_start {
+                        self.set_view(View::Today);
+                    } else {
+                        self.set_view(View::All);
+                    }
+                }
+                SearchAction::OpenEvent(_) => {
+                    self.close_search();
+                    self.set_view(View::Calendar);
+                }
+            }
         }
     }
 
@@ -730,6 +806,7 @@ impl OatsApp {
             Ok(n) => self.today_count = n,
             Err(e) => self.store_error(e),
         }
+        self.run_search();
     }
 
     /// Episodes (of the selected subtree in a Node view, else all), events, reminders, the
@@ -778,6 +855,7 @@ impl OatsApp {
         if let Ok(spent) = self.store.cost_since(self.today_start) {
             self.brain_status.spend_today_usd = spent;
         }
+        self.run_search();
     }
 
     /// Whether `node` is `root` or below it.
@@ -962,7 +1040,17 @@ impl OatsApp {
     /// AppKit while the native menu is installed (nothing fires twice).
     fn handle_keys(&mut self, ctx: &egui::Context) -> Vec<Command> {
         let mut cmds = Vec::new();
-        if ctx.egui_wants_keyboard_input() || self.has_native_menu() {
+        if self.has_native_menu() {
+            return cmds;
+        }
+        if ctx.egui_wants_keyboard_input() {
+            // ⌘F still re-focuses the search field while it is being typed in
+            if self.search.is_some()
+                && let Some(s) = menu_shortcut(Command::Search)
+                && ctx.input_mut(|i| i.consume_shortcut(&s))
+            {
+                cmds.push(Command::Search);
+            }
             return cmds;
         }
         ctx.input_mut(|i| {
@@ -1373,6 +1461,15 @@ impl OatsApp {
         true
     }
 
+    /// Selftest only: open the search bar with this query already run.
+    pub(crate) fn selftest_search(&mut self, query: &str) {
+        self.run(Command::Search);
+        if let Some(s) = &mut self.search {
+            s.query = query.to_owned();
+        }
+        self.run_search();
+    }
+
     /// Selftest only: show the Listening state with a fixed input level, no audio opened.
     pub(crate) fn selftest_fake_listening(&mut self, rms_db: f32, in_speech: bool) {
         self.capture = Some(Box::new(()));
@@ -1401,6 +1498,13 @@ impl eframe::App for OatsApp {
         let ctx = ui.ctx().clone();
         let t = Tokens::get(&ctx);
         let mut cmds = self.handle_keys(&ctx);
+        // Escape closes the search, also from the field (taken before the text edit sees it)
+        if self.search.is_some()
+            && self.prefs_window.is_none()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.close_search();
+        }
 
         if !self.has_native_menu() {
             egui::Panel::top("menu-bar")
@@ -1443,6 +1547,7 @@ impl eframe::App for OatsApp {
         let mut transcript_actions = Vec::new();
         let mut notes_actions = Vec::new();
         let mut calendar_actions = Vec::new();
+        let mut search_actions = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.chrome))
             .show(ui, |ui| {
@@ -1475,42 +1580,87 @@ impl eframe::App for OatsApp {
                 );
                 list_ui.painter().rect_filled(list_rect, 0.0, t.canvas);
                 list_ui.set_clip_rect(list_rect);
-                match self.prefs.view {
-                    View::Notes => {
-                        notes_actions = notes_view(
-                            &mut list_ui,
-                            &mut self.notes_state,
-                            &self.brain_status,
-                            &self.episodes,
-                            &self.nodes,
-                            &self.changes,
-                        );
-                    }
-                    View::Calendar => {
-                        calendar_actions = calendar_view(
-                            &mut list_ui,
-                            &mut self.calendar_state,
-                            &self.events,
-                            &self.reminders,
-                            &self.nodes,
-                        );
-                    }
-                    View::Node(id) if self.nodes.iter().any(|n| n.id == id) => {
-                        if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
-                            let out = node_view(
-                                &mut list_ui,
-                                &mut self.notes_state,
-                                node,
-                                &self.episodes,
-                                &self.rows,
-                                &self.nodes,
-                            );
-                            notes_actions = out.notes;
-                            transcript_actions = out.transcript;
+                if self.search.is_some() {
+                    // the search bar (chrome, like the control bar) and its results replace
+                    // the view underneath
+                    let bar = Rect::from_min_size(list_rect.min, vec2(list_rect.width(), BAR_H));
+                    list_ui.painter().rect_filled(bar, 0.0, t.chrome);
+                    list_ui.painter().hline(
+                        bar.x_range(),
+                        bar.bottom() - 0.5,
+                        egui::Stroke::new(1.0, t.divider),
+                    );
+                    let mut field_ui = list_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(bar)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    let mut changed = false;
+                    if let Some(s) = &mut self.search {
+                        let (c, close) = search_bar(&mut field_ui, s);
+                        changed = c;
+                        if close {
+                            search_actions.push(SearchAction::Close);
                         }
                     }
-                    _ => {
-                        transcript_actions = transcript_list(&mut list_ui, &self.rows, &self.nodes);
+                    if changed {
+                        self.run_search();
+                    }
+                    let body =
+                        Rect::from_min_max(pos2(list_rect.left(), bar.bottom()), list_rect.max);
+                    let mut body_ui = list_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(body)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    body_ui.set_clip_rect(body);
+                    if let Some(s) = &self.search {
+                        search_actions.extend(search_results(
+                            &mut body_ui,
+                            s,
+                            &mut self.notes_state,
+                            &self.nodes,
+                        ));
+                    }
+                } else {
+                    match self.prefs.view {
+                        View::Notes => {
+                            notes_actions = notes_view(
+                                &mut list_ui,
+                                &mut self.notes_state,
+                                &self.brain_status,
+                                &self.episodes,
+                                &self.nodes,
+                                &self.changes,
+                            );
+                        }
+                        View::Calendar => {
+                            calendar_actions = calendar_view(
+                                &mut list_ui,
+                                &mut self.calendar_state,
+                                &self.events,
+                                &self.reminders,
+                                &self.nodes,
+                            );
+                        }
+                        View::Node(id) if self.nodes.iter().any(|n| n.id == id) => {
+                            if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
+                                let out = node_view(
+                                    &mut list_ui,
+                                    &mut self.notes_state,
+                                    node,
+                                    &self.episodes,
+                                    &self.rows,
+                                    &self.nodes,
+                                );
+                                notes_actions = out.notes;
+                                transcript_actions = out.transcript;
+                            }
+                        }
+                        _ => {
+                            transcript_actions =
+                                transcript_list(&mut list_ui, &self.rows, &self.nodes);
+                        }
                     }
                 }
 
@@ -1529,6 +1679,7 @@ impl eframe::App for OatsApp {
         self.apply_transcript(transcript_actions);
         self.apply_notes(notes_actions);
         self.apply_calendar(calendar_actions);
+        self.apply_search(search_actions);
         for c in cmds {
             self.run(c);
         }

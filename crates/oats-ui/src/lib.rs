@@ -13,6 +13,7 @@ pub mod menu_events;
 #[cfg(target_os = "macos")]
 pub mod native_menu;
 pub mod notes;
+pub mod search;
 #[cfg(feature = "selftest")]
 pub mod selftest;
 pub mod sidebar;

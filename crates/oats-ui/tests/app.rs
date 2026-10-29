@@ -597,3 +597,35 @@ fn a_hidden_sidebar_has_a_restore_button_in_the_control_bar() {
         "the button shows the sidebar"
     );
 }
+
+#[test]
+fn search_opens_finds_segments_and_episodes_and_escape_restores_the_view() {
+    let dir = TempDir::new("search");
+    seed_projects(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowAll);
+    rig.harness.run_steps(2);
+    assert!(!rig.app().search_open());
+    rig.app().run(Command::Search);
+    rig.harness.run_steps(2);
+    assert!(rig.app().search_open());
+    // the field is focused: typing goes straight in
+    rig.harness.event(egui::Event::Text("exporter".to_owned()));
+    rig.harness.run_steps(3);
+    rig.until_label("the transcript hit", "filed under work");
+    assert!(rig.shows("1 transcript line"));
+    assert!(!rig.shows("loose words"));
+    // an episode title from the seeded notes
+    rig.harness
+        .key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    rig.harness
+        .event(egui::Event::Text("lease renewal".to_owned()));
+    rig.harness.run_steps(3);
+    assert!(rig.shows("1 note"), "episode matched");
+    // Escape, with the field focused, closes the bar and the previous view is back
+    rig.harness.key_press(egui::Key::Escape);
+    rig.harness.run_steps(2);
+    assert!(!rig.app().search_open());
+    assert_eq!(rig.app().prefs().view, View::All);
+    assert!(rig.shows("loose words"));
+}

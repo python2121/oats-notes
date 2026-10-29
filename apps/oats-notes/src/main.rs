@@ -32,7 +32,7 @@
 //! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
 //! `oats_brain::BrainConfig::from_env`).
 //!
-//! `--selftest <out.png> [--listening|--notes|--work|--calendar] [--no-sidebar]` renders the whole window offscreen to a PNG (seeded
+//! `--selftest <out.png> [--listening|--notes|--work|--calendar] [--no-sidebar] [--search <text>]` renders the whole window offscreen to a PNG (seeded
 //! demo content, the null engine, a throwaway database) — the shell verified without a window.
 
 use std::any::Any;
@@ -182,7 +182,7 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--work|--calendar] [--no-sidebar]\n\n\
+        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--work|--calendar] [--no-sidebar] [--search <text>]\n\n\
          --listen       start listening as soon as the speech engine is ready\n\
          --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
          \x20              paced in real time; listening stops when the file ends\n\
@@ -193,7 +193,8 @@ fn usage() -> ExitCode {
          --listening    with --selftest: show the Listening state with a fake input level\n\
          --notes        with --selftest: the Notes view (a seeded interpreted episode)\n\
          --work         with --selftest: the Work category view (projects and their notes)\n\
-         --calendar     with --selftest: the Calendar view (seeded events and a reminder)"
+         --calendar     with --selftest: the Calendar view (seeded events and a reminder)\n\
+         --search TEXT  with --selftest: open the search bar (⌘F) with this query"
     );
     ExitCode::from(2)
 }
@@ -363,8 +364,13 @@ fn main() -> ExitCode {
 fn selftest_cli(args: &[String]) -> ExitCode {
     let mut out: Option<std::path::PathBuf> = None;
     let mut options = oats_ui::selftest::SelftestOptions::default();
-    for a in args {
+    let mut args = args.iter();
+    while let Some(a) = args.next() {
         match a.as_str() {
+            "--search" => match args.next() {
+                Some(q) => options.search = Some(q.clone()),
+                None => return usage(),
+            },
             "--listening" => options.listening = true,
             "--notes" => options.notes = true,
             "--calendar" => options.calendar = true,

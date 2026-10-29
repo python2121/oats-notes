@@ -347,6 +347,8 @@ pub(crate) enum HeaderIcon {
     HideSidebar,
     /// Same panel glyph, for the restore button in the control bar.
     ShowSidebar,
+    /// An ×, for closing a bar (search).
+    Close,
 }
 
 /// A 24 pt frameless icon button: hover/press backdrop, the icon stroked in the secondary text
@@ -377,6 +379,10 @@ pub(crate) fn header_icon(ui: &mut egui::Ui, icon: HeaderIcon) -> egui::Response
         HeaderIcon::Plus => {
             p.line_segment([at(12.0, 6.0), at(12.0, 18.0)], stroke);
             p.line_segment([at(6.0, 12.0), at(18.0, 12.0)], stroke);
+        }
+        HeaderIcon::Close => {
+            p.line_segment([at(7.0, 7.0), at(17.0, 17.0)], stroke);
+            p.line_segment([at(17.0, 7.0), at(7.0, 17.0)], stroke);
         }
         HeaderIcon::HideSidebar | HeaderIcon::ShowSidebar => {
             // a window with its left pane (the sidebar) shaded
