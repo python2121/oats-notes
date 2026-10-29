@@ -39,6 +39,8 @@ pub struct Confirmation {
     pub text: String,
     /// egui time (seconds) it closes at.
     pub expires: f64,
+    /// A failure: the warning colour and a "!" instead of the check.
+    pub error: bool,
 }
 
 /// The confirmations on screen.
@@ -52,6 +54,11 @@ impl ToastState {
     /// Show `text` from `now` (egui time) for [`CONFIRM_SECS`]; newest first, at most
     /// [`MAX_CONFIRMATIONS`].
     pub fn confirm(&mut self, text: String, now: f64) {
+        self.confirm_as(text, now, false);
+    }
+
+    /// [`ToastState::confirm`], as an error when `error`.
+    pub fn confirm_as(&mut self, text: String, now: f64, error: bool) {
         self.next_id += 1;
         self.confirmations.insert(
             0,
@@ -59,6 +66,7 @@ impl ToastState {
                 id: self.next_id,
                 text,
                 expires: now + CONFIRM_SECS,
+                error,
             },
         );
         self.confirmations.truncate(MAX_CONFIRMATIONS);
@@ -197,11 +205,22 @@ fn confirmation_card(
         ui.set_width(WIDTH - 24.0);
         ui.horizontal_top(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-            check_glyph(ui, r, t.accent);
+            let col = if c.error { t.danger } else { t.text };
+            if c.error {
+                ui.painter().text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    "!",
+                    egui::FontId::proportional(14.0),
+                    t.danger,
+                );
+            } else {
+                check_glyph(ui, r, t.accent);
+            }
             let w = ui.available_width() - 24.0;
             ui.add_sized(
                 [w, 16.0],
-                egui::Label::new(RichText::new(&c.text).color(t.text).size(12.5)).wrap(),
+                egui::Label::new(RichText::new(&c.text).color(col).size(12.5)).wrap(),
             );
             if close_button(ui, t, "Dismiss") {
                 dismissed.push(c.id);

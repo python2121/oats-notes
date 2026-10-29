@@ -1889,3 +1889,68 @@ fn the_transcripts_view_hides_media_rows_until_show_media() {
     rig.harness.run_steps(2);
     assert!(!rig.shows("the export ships on Friday"));
 }
+
+/// A fake `claude` that takes a while, so the busy state can be looked at.
+fn slow_cli(dir: &Path) -> ClaudeCli {
+    let cli = fake_cli(dir);
+    let body = std::fs::read_to_string(&cli.binary).unwrap();
+    let body = body.replace("cat > /dev/null", "cat > /dev/null; sleep 1");
+    std::fs::write(&cli.binary, body).unwrap();
+    cli
+}
+
+#[test]
+fn interpret_now_greys_out_with_a_spinner_label_until_the_brain_settles() {
+    let dir = TempDir::new("busy");
+    seed(&dir.db());
+    let brain = Brain {
+        config: BrainConfig {
+            cli: slow_cli(&dir.0),
+            ..BrainConfig::default()
+        },
+        store_path: dir.db(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    let mut rig = build(&dir.db(), None, Some(brain));
+    rig.app().run(Command::ShowNotes);
+    rig.until("the brain to report in", |app| {
+        interpret_enabled(app) == Some(true)
+    });
+    rig.harness.run_steps(2);
+    assert!(rig.shows("Interpret now"));
+    rig.app().run(Command::InterpretNow);
+    // at once: the menu item is disabled, the strip shows the busy label (not the button)
+    assert_eq!(interpret_enabled(rig.harness.state()), Some(false));
+    rig.harness.run_steps(2);
+    assert!(
+        rig.harness
+            .query_by_label_contains("Interpreting…")
+            .is_some()
+    );
+    assert!(rig.harness.query_by_label("Interpret now").is_none());
+    // Review stays enabled
+    assert!(rig.harness.query_by_label("Review now").is_some());
+    // a second trigger does nothing (one run only)
+    rig.app().run(Command::InterpretNow);
+    rig.until_label("the spend", "usage 0.25 today");
+    rig.until("the button to come back", |app| {
+        interpret_enabled(app) == Some(true)
+    });
+    // the run's outcome pops up once
+    assert!(
+        rig.app()
+            .confirmations()
+            .iter()
+            .any(|c| c.text.starts_with("Interpreted:") && !c.error),
+        "{:?}",
+        rig.app().confirmations()
+    );
+    rig.harness.run_steps(2);
+    assert!(rig.harness.query_by_label("Interpret now").is_some());
+    assert!(
+        rig.harness
+            .query_by_label_contains("Interpreting…")
+            .is_none()
+    );
+}

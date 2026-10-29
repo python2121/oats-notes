@@ -49,9 +49,201 @@ pub struct BrainStatus {
     pub spend_today_usd: f64,
     /// The latest `BrainEvent::Backlog`: segments and voice commands waiting for claude.
     pub backlog: Option<(i64, usize)>,
+    /// On-demand commands sent and not yet settled (see [`BrainStatus::queue`]).
+    pub pending: Vec<PendingOp>,
+    /// Kinds whose pending state ran out after [`PENDING_TIMEOUT_S`] (tooltip until re-queued).
+    pub timed_out: Vec<String>,
+    /// The UI clock (seconds, egui's `input.time`), refreshed every frame.
+    pub now: f64,
+    /// Where the running job is (the latest `BrainEvent::Progress`).
+    pub progress: Option<Progress>,
+    /// Kinds that produced a run since they were last queued (a settle without one means
+    /// "nothing to do").
+    pub ran: Vec<String>,
+}
+
+/// A job's position: `step` of `total`, with a short phrase.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Progress {
+    pub kind: String,
+    pub step: usize,
+    pub total: usize,
+    pub label: String,
+}
+
+/// What a finished run says in its pop-up: the text and whether it is an error.
+pub fn run_toast(run: &BrainRun) -> (String, bool) {
+    let name = match run.kind.as_str() {
+        "interpret" => "Interpret",
+        "review" => "Review",
+        "reorganise" => "Reorganise",
+        "summarise" => "Summarise",
+        other => other,
+    };
+    if !run.ok {
+        let why = run.error.clone().unwrap_or_default();
+        let why: String = why.chars().take(120).collect();
+        return (format!("{name} failed: {why}"), true);
+    }
+    let sum = run.summary.trim();
+    let text = match run.kind.as_str() {
+        "interpret" if sum.starts_with("0 of") => "Nothing new to interpret".to_owned(),
+        "interpret" => format!("Interpreted: {sum}"),
+        "review" if sum.starts_with("0 changes") => "Review: nothing to change".to_owned(),
+        "review" => format!("Review: {sum}"),
+        "reorganise" if sum.is_empty() || sum.starts_with("nothing") => {
+            "Nothing to reorganise".to_owned()
+        }
+        "reorganise" => {
+            let short: String = sum.chars().take(110).collect();
+            format!("{short} (see the change log)")
+        }
+        _ if sum.is_empty() => format!("{name}: done"),
+        _ => sum.to_owned(),
+    };
+    (text, false)
+}
+
+/// The pop-up for a command the brain settled without running anything.
+pub fn nothing_toast(kind: &str) -> Option<String> {
+    Some(
+        match kind {
+            "interpret" | "reinterpret" => "Nothing new to interpret",
+            "review" => "Nothing to review",
+            "reorganise" => "Nothing to reorganise",
+            _ => return None,
+        }
+        .to_owned(),
+    )
+}
+
+/// An on-demand brain command the user triggered, waiting for the brain to finish with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingOp {
+    /// "interpret" | "review" | "reorganise" | "reinterpret" | "summarise".
+    pub kind: String,
+    /// The episode, for "reinterpret" and "summarise".
+    pub id: Option<i64>,
+    /// [`BrainStatus::now`] when it was queued.
+    pub since: f64,
+}
+
+/// A button re-enables this long after the click even when the brain never answers.
+pub const PENDING_TIMEOUT_S: f64 = 300.0;
+
+pub const TIMED_OUT_TIP: &str = "Timed out waiting for the brain";
+
+/// The label of a busy action ("Interpreting…"), for a pending / running `kind`.
+pub fn busy_label(kind: &str) -> &'static str {
+    match kind {
+        "interpret" => "Interpreting…",
+        "review" => "Reviewing…",
+        "reorganise" => "Reorganising…",
+        "reinterpret" => "Re-interpreting…",
+        "summarise" => "Summarising…",
+        _ => "Working…",
+    }
 }
 
 impl BrainStatus {
+    /// The user triggered `kind` (for `id`): pending until [`BrainStatus::settle`].
+    pub fn queue(&mut self, kind: &str, id: Option<i64>) {
+        self.timed_out.retain(|k| k != kind);
+        if !self.pending.iter().any(|p| p.kind == kind && p.id == id) {
+            self.pending.push(PendingOp {
+                kind: kind.to_owned(),
+                id,
+                since: self.now,
+            });
+        }
+    }
+
+    /// The brain is done with `kind` (whether or not a run came out of it). A finished
+    /// "interpret" also ends the pending re-interpretations (they run as interpret jobs).
+    pub fn settle(&mut self, kind: &str, id: Option<i64>) {
+        self.pending.retain(|p| {
+            !(p.kind == kind && p.id == id || kind == "interpret" && p.kind == "reinterpret")
+        });
+    }
+
+    /// Give up on commands pending longer than [`PENDING_TIMEOUT_S`].
+    pub fn expire(&mut self) {
+        let now = self.now;
+        let mut gone = Vec::new();
+        self.pending.retain(|p| {
+            let keep = now - p.since < PENDING_TIMEOUT_S;
+            if !keep {
+                gone.push(p.kind.clone());
+            }
+            keep
+        });
+        for k in gone {
+            if !self.timed_out.contains(&k) {
+                self.timed_out.push(k);
+            }
+        }
+    }
+
+    /// `kind` (for `id`, when given) is queued or running right now.
+    pub fn busy(&self, kind: &str, id: Option<i64>) -> bool {
+        self.pending
+            .iter()
+            .any(|p| p.kind == kind && (id.is_none() || p.id == id))
+            || (id.is_none() && self.running.as_deref() == Some(kind))
+    }
+
+    /// Why a button for `kind` is disabled or carries a note: the brain is unavailable, or a
+    /// wait for it ran out.
+    pub fn disabled_reason(&self, kind: &str) -> Option<String> {
+        match &self.availability {
+            None => Some("Checking claude…".to_owned()),
+            Some(Err(_)) => self.backlog_line(),
+            Some(Ok(_)) if self.timed_out.iter().any(|k| k == kind) => {
+                Some(TIMED_OUT_TIP.to_owned())
+            }
+            Some(Ok(_)) => None,
+        }
+    }
+
+    /// "interpret · chunk 2/3" for the running job's latest phase.
+    pub fn progress_text(&self) -> Option<String> {
+        let p = self.progress.as_ref()?;
+        Some(format!("{} · {} {}/{}", p.kind, p.label, p.step, p.total))
+    }
+
+    /// The label of a busy button: "Interpreting 2/3…" when the job reports chunks.
+    pub fn busy_text(&self, kind: &str) -> String {
+        match &self.progress {
+            Some(p) if p.kind == kind && p.label == "chunk" && p.total > 1 => {
+                let base = busy_label(kind).trim_end_matches('…');
+                format!("{base} {}/{}…", p.step, p.total)
+            }
+            _ => busy_label(kind).to_owned(),
+        }
+    }
+
+    /// Whether a user-triggered command of `kind` is waiting (a finishing "interpret" also
+    /// answers a pending "reinterpret").
+    pub fn waiting_for(&self, kind: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|p| p.kind == kind || kind == "interpret" && p.kind == "reinterpret")
+    }
+
+    /// "brain: interpret queued…" for the first queued command that is not the running job.
+    pub fn queued_line(&self) -> Option<String> {
+        let p = self
+            .pending
+            .iter()
+            .find(|p| self.running.as_deref() != Some(p.kind.as_str()))?;
+        let kind = if p.kind == "reinterpret" {
+            "re-interpret"
+        } else {
+            &p.kind
+        };
+        Some(format!("brain: {kind} queued…"))
+    }
+
     /// "last run: interpret · 2 of 2 chunks · $0.03 · 4.1 s" (or the error).
     pub fn last_run_line(&self) -> String {
         match &self.last_run {
@@ -120,6 +312,9 @@ pub struct NotesState {
     pub editing: Option<EditDraft>,
     /// A hand-edited note whose "Re-interpret" awaits the "Replace your edits?" answer.
     pub confirm_reinterpret: Option<i64>,
+    /// The brain's status, refreshed by the app every frame (the cards' Summarise /
+    /// Re-interpret buttons read their busy state from it).
+    pub brain: BrainStatus,
     /// Notes expanded on a project page (collapsed by default; not persisted).
     pub open_notes: std::collections::HashSet<i64>,
     /// The project page lists every next step, not just the first [`NEXT_STEPS_CAP`].
@@ -390,6 +585,64 @@ fn small_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
         .clicked()
 }
 
+/// A brain action button: while `kind` (for `id`) is queued or running it is greyed out with a
+/// spinner and "Interpreting…"; while the brain is unavailable it is greyed out with the reason
+/// as its tooltip. `true` when clicked (never while disabled).
+fn brain_button(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    status: &BrainStatus,
+    kind: &str,
+    id: Option<i64>,
+    label: &str,
+) -> bool {
+    let busy = status.busy(kind, id);
+    let reason = status.disabled_reason(kind);
+    if busy {
+        let text = status.busy_text(kind);
+        let galley = ui.painter().layout_no_wrap(
+            text.clone(),
+            egui::FontId::proportional(11.5),
+            t.text_tertiary,
+        );
+        let size = egui::vec2(galley.size().x + 30.0, galley.size().y + 6.0);
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, t.button_border),
+            egui::StrokeKind::Inside,
+        );
+        egui::Spinner::new()
+            .size(10.0)
+            .color(t.text_secondary)
+            .paint_at(
+                ui,
+                egui::Rect::from_center_size(
+                    egui::pos2(rect.left() + 13.0, rect.center().y),
+                    egui::vec2(10.0, 10.0),
+                ),
+            );
+        ui.painter().galley(
+            egui::pos2(rect.left() + 23.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            t.text_tertiary,
+        );
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, false, &text));
+        return false;
+    }
+    let up = status.available();
+    let r = ui.add_enabled(up, egui::Button::new(RichText::new(label).size(11.5)));
+    match reason {
+        Some(why) if !up => {
+            r.on_disabled_hover_text(why);
+            false
+        }
+        Some(why) => r.on_hover_text(why).clicked(),
+        None => r.clicked(),
+    }
+}
+
 /// The control strip above the list.
 fn brain_strip(
     ui: &mut egui::Ui,
@@ -401,21 +654,27 @@ fn brain_strip(
 ) {
     ui.horizontal_wrapped(|ui| {
         ui.add_space(8.0);
-        let idle = status.running.is_none() && status.available();
-        if small_button(ui, "Interpret now", idle) {
-            actions.push(NotesAction::InterpretNow);
-        }
-        if small_button(ui, "Review now", idle) {
-            actions.push(NotesAction::ReviewNow);
-        }
-        if small_button(ui, "Reorganise…", idle) {
-            actions.push(NotesAction::Reorganise);
+        let up = status.available();
+        for (kind, label, action) in [
+            ("interpret", "Interpret now", NotesAction::InterpretNow),
+            ("review", "Review now", NotesAction::ReviewNow),
+            ("reorganise", "Reorganise…", NotesAction::Reorganise),
+        ] {
+            if brain_button(ui, t, status, kind, None, label) && up {
+                actions.push(action);
+            }
         }
         let line = match (&status.running, &status.availability) {
-            (Some(job), _) => match status.backlog_line() {
-                Some(b) => format!("running: {job}… · {b}"),
-                None => format!("running: {job}…"),
-            },
+            (Some(job), _) => {
+                let what = status.progress_text().unwrap_or_else(|| job.clone());
+                match status.backlog_line() {
+                    Some(b) => format!("running: {what}… · {b}"),
+                    None => format!("running: {what}…"),
+                }
+            }
+            (None, Some(Ok(_))) if status.queued_line().is_some() => {
+                status.queued_line().unwrap_or_default()
+            }
             (None, Some(Err(_))) => status.backlog_line().unwrap_or_default(),
             (None, None) => "checking claude…".to_owned(),
             (None, Some(Ok(_))) => status
@@ -616,10 +875,26 @@ pub(crate) fn episode_card(
                                 .size(11.5),
                         );
                     } else {
-                        if e.is_media() && small_button(ui, "Summarise", true) {
+                        if e.is_media()
+                            && brain_button(
+                                ui,
+                                t,
+                                &state.brain,
+                                "summarise",
+                                Some(e.id),
+                                "Summarise",
+                            )
+                        {
                             actions.push(NotesAction::Summarise(e.id));
                         }
-                        if small_button(ui, "Re-interpret", true) {
+                        if brain_button(
+                            ui,
+                            t,
+                            &state.brain,
+                            "reinterpret",
+                            Some(e.id),
+                            "Re-interpret",
+                        ) {
                             if e.user_edited_at.is_some() {
                                 state.confirm_reinterpret = Some(e.id);
                             } else {
@@ -888,6 +1163,7 @@ pub fn notes_view(
     changes: &[Change],
 ) -> Vec<NotesAction> {
     let t = Tokens::get(ui.ctx());
+    state.brain = status.clone();
     let mut actions = Vec::new();
     ui.add_space(6.0);
     brain_strip(ui, &t, state, status, changes, &mut actions);
@@ -1670,5 +1946,143 @@ mod backlog_tests {
         );
         s.backlog = Some((0, 0));
         assert_eq!(s.backlog_line(), None);
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    fn up() -> BrainStatus {
+        BrainStatus {
+            availability: Some(Ok("2.1".into())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn queue_settle_and_the_queued_line() {
+        let mut s = up();
+        assert!(!s.busy("interpret", None));
+        s.queue("interpret", None);
+        s.queue("interpret", None);
+        assert_eq!(s.pending.len(), 1, "a second click adds nothing");
+        assert!(s.busy("interpret", None));
+        assert!(!s.busy("review", None), "other actions stay enabled");
+        assert_eq!(s.queued_line().as_deref(), Some("brain: interpret queued…"));
+        s.running = Some("interpret".into());
+        assert_eq!(s.queued_line(), None, "running, not queued");
+        assert!(s.busy("interpret", None));
+        s.running = None;
+        s.settle("interpret", None);
+        assert!(!s.busy("interpret", None));
+    }
+
+    #[test]
+    fn cards_are_per_episode_and_an_interpret_settles_reinterprets() {
+        let mut s = up();
+        s.queue("reinterpret", Some(1));
+        s.queue("summarise", Some(2));
+        assert!(s.busy("reinterpret", Some(1)));
+        assert!(!s.busy("reinterpret", Some(2)));
+        s.settle("summarise", Some(2));
+        assert!(!s.busy("summarise", Some(2)));
+        s.settle("interpret", None);
+        assert!(!s.busy("reinterpret", Some(1)));
+    }
+
+    #[test]
+    fn a_wait_that_runs_out_re_enables_with_a_tooltip() {
+        let mut s = up();
+        s.now = 10.0;
+        s.queue("review", None);
+        s.now = 10.0 + PENDING_TIMEOUT_S - 1.0;
+        s.expire();
+        assert!(s.busy("review", None));
+        s.now = 10.0 + PENDING_TIMEOUT_S;
+        s.expire();
+        assert!(!s.busy("review", None));
+        assert_eq!(s.disabled_reason("review").as_deref(), Some(TIMED_OUT_TIP));
+        assert_eq!(s.disabled_reason("interpret"), None);
+        s.queue("review", None);
+        assert_eq!(s.disabled_reason("review"), None);
+    }
+
+    #[test]
+    fn unavailable_says_why() {
+        let s = BrainStatus {
+            availability: Some(Err("offline".into())),
+            ..Default::default()
+        };
+        assert!(s.disabled_reason("interpret").unwrap().contains("offline"));
+    }
+
+    fn run(kind: &str, ok: bool, summary: &str, error: Option<&str>) -> BrainRun {
+        BrainRun {
+            id: 1,
+            tier: 1,
+            kind: kind.into(),
+            started_at: 0,
+            finished_at: Some(1),
+            model: "sonnet".into(),
+            cost_usd: None,
+            duration_ms: None,
+            ok,
+            error: error.map(str::to_owned),
+            summary: summary.into(),
+        }
+    }
+
+    #[test]
+    fn progress_shows_in_the_button_label_and_the_strip_line() {
+        let mut s = up();
+        s.running = Some("interpret".into());
+        assert_eq!(s.busy_text("interpret"), "Interpreting…");
+        s.progress = Some(Progress {
+            kind: "interpret".into(),
+            step: 2,
+            total: 3,
+            label: "chunk".into(),
+        });
+        assert_eq!(s.busy_text("interpret"), "Interpreting 2/3…");
+        assert_eq!(s.progress_text().as_deref(), Some("interpret · chunk 2/3"));
+        assert_eq!(s.busy_text("review"), "Reviewing…");
+    }
+
+    #[test]
+    fn a_finished_run_says_what_it_did() {
+        assert_eq!(
+            run_toast(&run("interpret", true, "2 of 3 chunks", None)),
+            ("Interpreted: 2 of 3 chunks".to_owned(), false)
+        );
+        assert_eq!(
+            run_toast(&run("interpret", true, "0 of 0 chunks", None)).0,
+            "Nothing new to interpret"
+        );
+        assert_eq!(
+            run_toast(&run("review", true, "1 changes over 4 episodes", None)).0,
+            "Review: 1 changes over 4 episodes"
+        );
+        assert_eq!(
+            run_toast(&run("review", true, "0 changes over 4 episodes", None)).0,
+            "Review: nothing to change"
+        );
+        assert_eq!(
+            run_toast(&run("reorganise", true, "Reorganised: a, b", None)).0,
+            "Reorganised: a, b (see the change log)"
+        );
+        assert_eq!(
+            run_toast(&run("reorganise", true, "nothing to reorganise", None)).0,
+            "Nothing to reorganise"
+        );
+        assert_eq!(
+            run_toast(&run("interpret", false, "", Some("offline"))),
+            ("Interpret failed: offline".to_owned(), true)
+        );
+        assert_eq!(
+            nothing_toast("review").as_deref(),
+            Some("Nothing to review")
+        );
+        assert_eq!(nothing_toast("summarise"), None);
     }
 }

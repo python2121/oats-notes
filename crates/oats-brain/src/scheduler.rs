@@ -254,6 +254,28 @@ pub enum BrainEvent {
         waiting_segments: i64,
         waiting_commands: usize,
     },
+    /// An on-demand command was received (`kind`: "interpret", "review", "reorganise",
+    /// "reinterpret", "summarise"; `id` = the episode for the last two). It may wait behind
+    /// another job; the UI shows it as pending until the matching `Settled`.
+    Queued {
+        kind: String,
+        id: Option<i64>,
+    },
+    /// An on-demand command is finished with, whether or not it produced a run (nothing to
+    /// do, budget hit, failure). `kind` as in `Queued`; a re-interpretation settles as
+    /// "interpret" (id `None`) once the interpret job after it has run.
+    Settled {
+        kind: String,
+        id: Option<i64>,
+    },
+    /// Where a job is, at phase boundaries only: `step` of `total` (1-based), `label` a short
+    /// phrase ("chunk", "gathering", "asking claude", "applying").
+    Progress {
+        kind: String,
+        step: usize,
+        total: usize,
+        label: String,
+    },
     RunStarted {
         tier: Tier,
         kind: String,
@@ -836,6 +858,7 @@ impl Worker {
                 if let Err(e) = self.store.reset_episode(id) {
                     self.out
                         .send(BrainEvent::Warning(format!("re-interpret: {e}")));
+                    self.settled("reinterpret", Some(id));
                 } else {
                     self.interpret_force = true;
                     self.interpret_due = Some(now);
@@ -854,6 +877,7 @@ impl Worker {
             } else {
                 if let Some(id) = self.summarise.pop_front() {
                     self.run_summarise(id);
+                    self.settled("summarise", Some(id));
                     continue;
                 }
                 if due(self.categorise_due) {
@@ -865,18 +889,21 @@ impl Worker {
                     self.interpret_due = None;
                     let force = std::mem::take(&mut self.interpret_force);
                     self.run_interpret(force);
+                    self.settled("interpret", None);
                     continue;
                 }
                 if due(self.review_due) {
                     self.review_due = None;
                     let force = std::mem::take(&mut self.review_force);
                     self.run_review(force);
+                    self.settled("review", None);
                     continue;
                 }
                 if due(self.reorganise_due) {
                     self.reorganise_due = None;
                     let force = std::mem::take(&mut self.reorganise_force);
                     self.run_reorganise(force);
+                    self.settled("reorganise", None);
                     continue;
                 }
             }
@@ -916,23 +943,55 @@ impl Worker {
         match cmd {
             BrainCommand::SegmentArrived(row) => self.on_segment(row),
             BrainCommand::InterpretNow => {
+                self.queued("interpret", None);
                 self.interpret_force = true;
                 self.interpret_due = Some(Instant::now());
             }
             BrainCommand::ReviewNow => {
+                self.queued("review", None);
                 self.review_force = true;
                 self.review_due = Some(Instant::now());
             }
             BrainCommand::ReorganiseNow => {
+                self.queued("reorganise", None);
                 self.reorganise_force = true;
                 self.reorganise_due = Some(Instant::now());
             }
-            BrainCommand::Reinterpret(id) => self.reinterpret.push_back(id),
-            BrainCommand::Summarise(id) => self.summarise.push_back(id),
+            BrainCommand::Reinterpret(id) => {
+                self.queued("reinterpret", Some(id));
+                self.reinterpret.push_back(id);
+            }
+            BrainCommand::Summarise(id) => {
+                self.queued("summarise", Some(id));
+                self.summarise.push_back(id);
+            }
             BrainCommand::UndoChange(id) => self.undo.push_back(id),
             BrainCommand::Shutdown => return false,
         }
         true
+    }
+
+    fn progress(&self, kind: &str, label: &str, step: usize, total: usize) {
+        self.out.send(BrainEvent::Progress {
+            kind: kind.to_owned(),
+            step,
+            total,
+            label: label.to_owned(),
+        });
+    }
+
+    fn queued(&self, kind: &str, id: Option<i64>) {
+        self.out.send(BrainEvent::Queued {
+            kind: kind.to_owned(),
+            id,
+        });
+    }
+
+    fn settled(&self, kind: &str, id: Option<i64>) {
+        self.out.send(BrainEvent::Settled {
+            kind: kind.to_owned(),
+            id,
+        });
     }
 
     /// Queue a hotword segment as a command (once).
@@ -1503,6 +1562,12 @@ impl Worker {
                         leftover = true;
                         break;
                     }
+                    w.progress(
+                        "interpret",
+                        "chunk",
+                        (done + 1).min(chunks.len().min(per_run)),
+                        chunks.len().min(per_run),
+                    );
                     let step = w.interpret_chunk(chunk, force, run_id, &model, new_nodes);
                     let step = match step {
                         Ok(s) => s,
@@ -1751,6 +1816,7 @@ impl Worker {
         self.episodes_since_review = 0;
         let model = self.cfg.models.review.clone();
         let _ = self.run_job(Tier::Review, "review", move |w, run_id| {
+            w.progress("review", "gathering", 1, 3);
             let tree = w.store.nodes().map_err(|e| e.to_string())?;
             let events = w
                 .store
@@ -1758,12 +1824,14 @@ impl Worker {
                 .map_err(|e| e.to_string())?;
             let req =
                 interpret::review_request(&tree, &episodes, &events, &Local::now(), Some(model));
+            w.progress("review", "asking claude", 2, 3);
             let resp = w.call(&req).map_err(JobError::from)?;
             let actions: interpret::Actions = resp
                 .structured
                 .as_ref()
                 .ok_or_else(|| "no structured output".to_owned())
                 .and_then(|v| serde_json::from_value(v.clone()).map_err(|e| e.to_string()))?;
+            w.progress("review", "applying", 3, 3);
             let lines = interpret::apply_review(
                 &w.store,
                 &tree,
@@ -1804,6 +1872,7 @@ impl Worker {
         }
         let model = self.cfg.models.reorganise.clone();
         let _ = self.run_job(Tier::Reorganise, "reorganise", move |w, run_id| {
+            w.progress("reorganise", "gathering", 1, 3);
             let usage = w.store.node_usage().map_err(|e| e.to_string())?;
             let episodes = w.store.episodes(60).map_err(|e| e.to_string())?;
             let req = interpret::reorganise_request(
@@ -1813,12 +1882,14 @@ impl Worker {
                 &Local::now(),
                 Some(model),
             );
+            w.progress("reorganise", "asking claude", 2, 3);
             let resp = w.call(&req).map_err(JobError::from)?;
             let actions: interpret::Actions = resp
                 .structured
                 .as_ref()
                 .ok_or_else(|| "no structured output".to_owned())
                 .and_then(|v| serde_json::from_value(v.clone()).map_err(|e| e.to_string()))?;
+            w.progress("reorganise", "applying", 3, 3);
             let lines =
                 interpret::apply_reorganisation(&w.store, &nodes, &actions, Some(run_id), now_ms())
                     .map_err(|e| e.to_string())?;

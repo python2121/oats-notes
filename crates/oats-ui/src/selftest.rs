@@ -27,6 +27,9 @@ pub struct SelftestOptions {
     /// Show the Conversations view (unfiled seeded episodes and a
     /// change-log line) instead of the transcript.
     pub notes: bool,
+    /// With `notes`: the brain mid-work (a review running, an interpret queued): greyed
+    /// buttons with spinners.
+    pub busy: bool,
     /// Show the Work category's view (its projects, their notes, the transcript toggle).
     pub work: bool,
     /// Show the project landing page of "Export rewrite" (next steps, collapsed notes) with its
@@ -146,6 +149,9 @@ pub fn run_with(
     }
     if options.notes {
         harness.state_mut().run(Command::ShowNotes);
+        if options.busy {
+            harness.state_mut().selftest_brain_busy();
+        }
     } else if options.work {
         let app = harness.state_mut();
         if !app.selftest_show_node("Work") {

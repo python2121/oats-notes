@@ -261,8 +261,10 @@ pub struct MenuState {
     pub status: PipelineStatus,
     pub sidebar_visible: bool,
     pub view: View,
-    /// The brain can take a job (claude answered, nothing running).
+    /// The brain can take a job (it exists and claude answered).
     pub brain_ready: bool,
+    /// Interpret / Review / Reorganise queued or running (their menu items grey out).
+    pub brain_busy: [bool; 3],
 }
 
 /// The menu bar as data, from `s` (pure; [`OatsApp::menu_model`] feeds it the app's state).
@@ -342,10 +344,22 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
         MenuSection {
             title: "Brain",
             entries: vec![
-                item("Interpret Now", Command::InterpretNow, s.brain_ready),
-                item("Review Now", Command::ReviewNow, s.brain_ready),
+                item(
+                    "Interpret Now",
+                    Command::InterpretNow,
+                    s.brain_ready && !s.brain_busy[0],
+                ),
+                item(
+                    "Review Now",
+                    Command::ReviewNow,
+                    s.brain_ready && !s.brain_busy[1],
+                ),
                 Separator,
-                item("Reorganise…", Command::Reorganise, s.brain_ready),
+                item(
+                    "Reorganise…",
+                    Command::Reorganise,
+                    s.brain_ready && !s.brain_busy[2],
+                ),
             ],
         },
     ]
@@ -950,16 +964,37 @@ impl OatsApp {
             status: self.status.clone(),
             sidebar_visible: self.prefs.sidebar_visible,
             view: self.prefs.view,
-            brain_ready: self.brain.is_some()
-                && self.brain_status.available()
-                && self.brain_status.running.is_none(),
+            brain_ready: self.brain.is_some() && self.brain_status.available(),
+            brain_busy: [
+                self.brain_status.busy("interpret", None),
+                self.brain_status.busy("review", None),
+                self.brain_status.busy("reorganise", None),
+            ],
         })
     }
 
     fn brain_send(&mut self, cmd: BrainCommand) {
-        match &self.brain {
-            Some(b) => b.send(cmd),
-            None => self.warning = Some("The brain is not running (OATS_BRAIN=off?)".to_owned()),
+        if self.brain.is_none() {
+            self.warning = Some("The brain is not running (OATS_BRAIN=off?)".to_owned());
+            return;
+        }
+        // the click registers at once; the brain's `Queued` / `Settled` events keep it honest
+        let (kind, id) = match &cmd {
+            BrainCommand::InterpretNow => ("interpret", None),
+            BrainCommand::ReviewNow => ("review", None),
+            BrainCommand::ReorganiseNow => ("reorganise", None),
+            BrainCommand::Reinterpret(id) => ("reinterpret", Some(*id)),
+            BrainCommand::Summarise(id) => ("summarise", Some(*id)),
+            _ => ("", None),
+        };
+        if !kind.is_empty() {
+            if self.brain_status.busy(kind, id) {
+                return; // already queued or running: a second click does nothing
+            }
+            self.brain_status.queue(kind, id);
+        }
+        if let Some(b) = &self.brain {
+            b.send(cmd);
         }
     }
 
@@ -1028,9 +1063,17 @@ impl OatsApp {
             Command::ShowNotes => self.set_view(View::Notes),
             Command::ShowCalendar => self.set_view(View::Calendar),
             Command::ShowTodos => self.set_view(View::Todos),
-            Command::InterpretNow => self.brain_send(BrainCommand::InterpretNow),
-            Command::ReviewNow => self.brain_send(BrainCommand::ReviewNow),
-            Command::Reorganise => self.brain_send(BrainCommand::ReorganiseNow),
+            Command::InterpretNow | Command::ReviewNow | Command::Reorganise => {
+                // unavailable: the buttons and menu items are greyed out; the shortcut does nothing
+                if self.brain.is_some() && !self.brain_status.available() {
+                    return;
+                }
+                self.brain_send(match cmd {
+                    Command::InterpretNow => BrainCommand::InterpretNow,
+                    Command::ReviewNow => BrainCommand::ReviewNow,
+                    _ => BrainCommand::ReorganiseNow,
+                });
+            }
         }
     }
 
@@ -1612,7 +1655,41 @@ impl OatsApp {
                     if let Err(e) = &r {
                         log::info!("brain unavailable: {e}");
                     }
+                    if r.is_err() {
+                        // nothing runs while claude is down; the buttons say why instead
+                        self.brain_status.pending.clear();
+                    }
                     self.brain_status.availability = Some(r);
+                }
+                BrainEvent::Queued { kind, id } => {
+                    self.brain_status.ran.retain(|k| *k != kind);
+                    self.brain_status.queue(&kind, id)
+                }
+                BrainEvent::Settled { kind, id } => {
+                    let asked = self.brain_status.waiting_for(&kind);
+                    let ran = self.brain_status.ran.contains(&kind);
+                    self.brain_status.ran.retain(|k| *k != kind);
+                    self.brain_status.settle(&kind, id);
+                    self.brain_status.progress = None;
+                    if asked
+                        && !ran
+                        && let Some(text) = crate::notes::nothing_toast(&kind)
+                    {
+                        self.brain_toast(ctx, text, false);
+                    }
+                }
+                BrainEvent::Progress {
+                    kind,
+                    step,
+                    total,
+                    label,
+                } => {
+                    self.brain_status.progress = Some(crate::notes::Progress {
+                        kind,
+                        step,
+                        total,
+                        label,
+                    })
                 }
                 BrainEvent::Backlog {
                     waiting_segments,
@@ -1625,6 +1702,12 @@ impl OatsApp {
                 BrainEvent::RunStarted { kind, .. } => self.brain_status.running = Some(kind),
                 BrainEvent::RunFinished(run) => {
                     self.brain_status.running = None;
+                    self.brain_status.progress = None;
+                    if self.brain_status.waiting_for(&run.kind) {
+                        let (text, error) = crate::notes::run_toast(&run);
+                        self.brain_toast(ctx, text, error);
+                    }
+                    self.brain_status.ran.push(run.kind.clone());
                     self.brain_status.last_run = Some(run);
                 }
                 BrainEvent::Command {
@@ -1649,6 +1732,16 @@ impl OatsApp {
         if reload {
             self.reload();
         }
+    }
+
+    /// A brain run's outcome as a small pop-up (4 s, no chime).
+    fn brain_toast(&mut self, ctx: &egui::Context, text: String, error: bool) {
+        let now = ctx.input(|i| i.time);
+        self.toasts.confirm_as(text, now, error);
+        ctx.request_repaint();
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+            crate::toast::CONFIRM_SECS,
+        ));
     }
 
     /// Show a voice command's confirmation pop-ups (they close by themselves after 4 s: one
@@ -2330,7 +2423,18 @@ impl OatsApp {
             (Some(_), running) => match (self.brain_status.backlog_line(), running) {
                 // "claude unavailable (not logged in) — 42 segments waiting"
                 (Some(line), _) => format!(" · {line}"),
-                (None, Some(job)) => format!(" · brain: {job}…"),
+                (None, Some(job)) => {
+                    let what = self.brain_status.progress_text().unwrap_or(job.clone());
+                    match self.brain_status.queued_line() {
+                        Some(q) => {
+                            format!(" · brain: {what}… · {}", q.trim_start_matches("brain: "))
+                        }
+                        None => format!(" · brain: {what}…"),
+                    }
+                }
+                (None, None) if self.brain_status.queued_line().is_some() => {
+                    format!(" · {}", self.brain_status.queued_line().unwrap_or_default())
+                }
                 (None, None) => {
                     format!(
                         " · brain usage {:.2} today",
@@ -2624,6 +2728,21 @@ impl OatsApp {
         self.reload();
     }
 
+    /// Selftest only: the brain mid-work: claude answered, a review running, an interpret
+    /// queued behind it.
+    pub fn selftest_brain_busy(&mut self) {
+        self.brain_status.availability = Some(Ok("2.1.312".to_owned()));
+        self.brain_status.running = Some("review".to_owned());
+        self.brain_status.queue("review", None);
+        self.brain_status.queue("interpret", None);
+        self.brain_status.progress = Some(crate::notes::Progress {
+            kind: "review".to_owned(),
+            step: 2,
+            total: 3,
+            label: "asking claude".to_owned(),
+        });
+    }
+
     /// Selftest only: show the Listening state with a fixed input level, no audio opened.
     pub(crate) fn selftest_fake_listening(&mut self, rms_db: f32, in_speech: bool) {
         self.capture = Some(Box::new(()));
@@ -2639,6 +2758,8 @@ impl eframe::App for OatsApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_quit_flag(ctx);
         self.handle_events();
+        self.brain_status.now = ctx.input(|i| i.time);
+        self.brain_status.expire();
         self.handle_brain_events(ctx);
         // a todo came due (or a snooze ended): show its pop-up; then ONE repaint is scheduled
         // for the next due time — no polling
@@ -3111,6 +3232,7 @@ mod tests {
             sidebar_visible: true,
             view: View::Transcripts,
             brain_ready: false,
+            brain_busy: [false; 3],
         };
         assert_eq!(
             listen_item(&build_menu_model(&s)),

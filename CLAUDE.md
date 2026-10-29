@@ -627,6 +627,7 @@ VENDORED.md's list of our modifications current. Attribution: `THIRD_PARTY.md`.
 - The UI shell's look is ported from the SwiftInvert Rust app (same egui/eframe 0.36 stack,
   `craft-ui` theme helpers, SF Pro read from the system with `opsz`/`GRAD` tweaks, `muda` native
   menu generated from the same `menu_model()` as the in-window fallback). Keep that parity.
+- Brain actions give feedback: Interpret / Review / Reorganise (strip, Brain menu, ⌘I) and the cards' Summarise / Re-interpret go pending the moment they are triggered (`BrainStatus::queue`, confirmed by `BrainEvent::Queued`, ended by `Settled`, which the scheduler sends even when no run came out of it), grey out with a spinner and "Interpreting…" etc., ignore further clicks, and re-enable after 5 min with "Timed out waiting for the brain"; unavailable shows the backlog reason as the tooltip. The spinner repaints only while something is pending. `BrainEvent::Progress` (phase boundaries only: interpret "chunk i/n", review / reorganise gathering → asking claude → applying) feeds the strip line and the button label ("Interpreting 2/3…"); a finished user-triggered run pops one 4 s toast (`notes::run_toast`: "Interpreted: …", "Nothing new to interpret", or "<Kind> failed: …" in the danger colour).
 - Never request continuous repaints; the app must idle at ~0 % CPU. The pipeline's and the
   brain's `wake` callbacks and menu clicks (the shared muda handler) are the only things that
   wake the UI; the brain thread itself blocks until its next due job. `Level` events are
