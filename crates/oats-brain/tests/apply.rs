@@ -490,3 +490,130 @@ fn irreversible_or_malformed_changes_are_refused() {
     }
     assert_eq!(s.node(f.work).unwrap().unwrap().name, "Work");
 }
+
+// ---- events across re-interpretation -------------------------------------------------------------
+
+fn call_event(title: &str, details: &str) -> ProposedEvent {
+    ProposedEvent {
+        title: title.into(),
+        date: "2026-10-29".into(),
+        time: Some("12:00".into()),
+        end_date: None,
+        all_day: None,
+        details: details.into(),
+        confidence: Some(0.7),
+    }
+}
+
+fn with_events(f: &Fixture, events: Vec<ProposedEvent>) -> Interpretation {
+    Interpretation {
+        title: "Call".into(),
+        events,
+        ..filed(Some(f.work))
+    }
+}
+
+/// Apply `interp` to `chunk` as a fresh episode (the scheduler's path after `reset_episode`).
+fn apply_to(f: &Fixture, chunk: &Chunk, interp: &Interpretation) -> interpret::Applied {
+    let tree = f.tree();
+    apply_interpretation(&f.s, &tree, chunk, interp, None, "m", None, None, 3, 50).unwrap()
+}
+
+#[test]
+fn reinterpreting_a_reset_episode_keeps_one_event_pointing_at_the_new_episode() {
+    let mut f = fixture();
+    let chunk = f.chunk();
+    let one = with_events(&f, vec![call_event("KPMG call", "first")]);
+    let a = apply_to(&f, &chunk, &one);
+    assert_eq!(
+        a.events[0].dedupe_key.as_deref(),
+        Some("ev:2026-10-29:kpmg call")
+    );
+
+    f.s.reset_episode(a.episode.id).unwrap();
+    let again = with_events(&f, vec![call_event("KPMG  Call", "second")]);
+    let b = apply_to(&f, &chunk, &again);
+    assert_ne!(a.episode.id, b.episode.id);
+    let all = f.s.events_from(i64::MIN, 10).unwrap();
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!(all[0].id, a.events[0].id);
+    assert_eq!(all[0].source_episode_id, Some(b.episode.id));
+    assert_eq!(all[0].details, "second");
+}
+
+#[test]
+fn reinterpreting_with_a_different_set_drops_what_is_no_longer_proposed() {
+    let mut f = fixture();
+    let chunk = f.chunk();
+    let first = with_events(
+        &f,
+        vec![call_event("KPMG call", "x"), call_event("Dentist", "y")],
+    );
+    let a = apply_to(&f, &chunk, &first);
+    // a hotword event on the same episode id is never touched
+    let mine =
+        f.s.upsert_event(
+            &oats_core::NewEvent {
+                when_start: 5,
+                title: "Mine".into(),
+                source: Some(Origin::Hotword),
+                source_episode_id: Some(a.episode.id),
+                dedupe_key: Some("hotword:1:2026-10-29:mine".into()),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+
+    f.s.reset_episode(a.episode.id).unwrap();
+    let second = with_events(&f, vec![call_event("KPMG call", "updated")]);
+    let b = apply_to(&f, &chunk, &second);
+    let all = f.s.events_from(i64::MIN, 10).unwrap();
+    let mut titles: Vec<&str> = all.iter().map(|e| e.title.as_str()).collect();
+    titles.sort_unstable();
+    assert_eq!(titles, ["KPMG call", "Mine"], "{all:?}");
+    let kpmg = all.iter().find(|e| e.title == "KPMG call").unwrap();
+    assert_eq!(kpmg.id, a.events[0].id);
+    assert_eq!(kpmg.details, "updated");
+    assert_eq!(kpmg.source_episode_id, Some(b.episode.id));
+    assert!(all.iter().any(|e| e.id == mine.id));
+}
+
+#[test]
+fn a_second_episode_mentioning_the_same_event_updates_the_one_row() {
+    let mut f = fixture();
+    let c1 = f.chunk();
+    let c2 = f.chunk();
+    let a = apply_to(
+        &f,
+        &c1,
+        &with_events(&f, vec![call_event("KPMG call", "a")]),
+    );
+    let b = apply_to(
+        &f,
+        &c2,
+        &with_events(&f, vec![call_event("kpmg call", "b")]),
+    );
+    assert_ne!(a.episode.id, b.episode.id);
+    let all = f.s.events_from(i64::MIN, 10).unwrap();
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!(all[0].source_episode_id, Some(b.episode.id));
+    assert_eq!(all[0].details, "b");
+    // revising the first episode without the event does not delete the second one's claim
+    let tree = f.tree();
+    let prior = f.s.episode(a.episode.id).unwrap().unwrap();
+    apply_interpretation(
+        &f.s,
+        &tree,
+        &c1,
+        &with_events(&f, vec![]),
+        Some(&prior),
+        "m",
+        None,
+        None,
+        3,
+        60,
+    )
+    .unwrap();
+    assert_eq!(f.s.events_from(i64::MIN, 10).unwrap().len(), 1);
+}

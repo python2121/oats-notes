@@ -13,7 +13,7 @@
 //! Edit the `prompts/*.md` files to change the wording; they are `include_str!`-ed.
 
 use chrono::{DateTime, Local, TimeZone};
-use oats_core::store::name_key;
+use oats_core::store::interpretation_event_key;
 use oats_core::{
     ActionItem, Episode, EpisodeContent, Event, NewEvent, Node, NodeKind, Origin, Store,
     StoreError, TranscriptRow,
@@ -617,8 +617,11 @@ fn apply_interpretation_in_tx(
         }
     };
     store.mark_segments_interpreted(&chunk.segment_ids(), episode_id, now_ms)?;
+    // a re-interpretation (the episode was reset): events the dead episode produced from these
+    // segments become this episode's, so the drop below also covers them
+    store.adopt_orphan_events(episode_id, &chunk.segment_ids())?;
 
-    // events: upsert by (episode, date, normalised title); drop the ones a revision no longer
+    // events: upsert by (date, normalised title) — no episode id in the key; drop the ones a revision no longer
     // proposes (screenpipe's "reuse a stable id, merge duplicates" rule)
     let mut kept = Vec::new();
     let mut events = Vec::new();
@@ -640,11 +643,7 @@ fn apply_interpretation_in_tx(
                 .and_then(dates::parse_date)
                 .and_then(|ed| dates::to_ms(ed, None, &Local))
                 .filter(|end| *end > when_start);
-            let key = format!(
-                "ep:{episode_id}:{}:{}",
-                d.format("%Y-%m-%d"),
-                name_key(&e.title)
-            );
+            let key = interpretation_event_key(&d.format("%Y-%m-%d").to_string(), &e.title);
             kept.push(key.clone());
             let ev = store.upsert_event(
                 &NewEvent {

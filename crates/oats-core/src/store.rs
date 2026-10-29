@@ -2,8 +2,9 @@
 //! pipeline writes segments, the brain writes interpretations, the UI reads). Times are Unix
 //! milliseconds (UTC); the UI formats them in local time.
 //!
-//! Schema version 5 (`meta.schema_version`; v1 to v4 databases are migrated on open; v5 added
-//! `episodes.user_edited_at`, the time the user last edited a note by hand):
+//! Schema version 6 (`meta.schema_version`; v1 to v5 databases are migrated on open; v5 added
+//! `episodes.user_edited_at`, the time the user last edited a note by hand; v6 re-keyed
+//! interpretation events without the episode id, see [`interpretation_event_key`]):
 //! - `sessions(id, started_at, ended_at NULL, engine)` — one per listen start/stop.
 //! - `nodes(id, parent_id NULL, kind, name, description, created_by, position, archived,
 //!   created_at)` — ONE tree: the user's top-level categories (`kind = category`, seeded
@@ -22,7 +23,8 @@
 //!   for TV / music / self-talk, the model and cost, and a `revision` counter bumped by every
 //!   re-interpretation of the rolling window.
 //! - `events(…)` — the calendar: significant dates the brain extracted or the user dictated
-//!   with a hotword; `dedupe_key` keeps re-interpretation from duplicating them.
+//!   with a hotword; `dedupe_key` keeps re-interpretation from duplicating them
+//!   (interpretation events: `ev:<date>:<name_key(title)>`, hotword events: `hotword:…`).
 //! - `reminders(id, event_id NULL, due NULL, text, done, completed_at NULL, snoozed_until NULL,
 //!   source, source_segment_id NULL, node_id NULL, position, dedupe_key, created_at)` — the
 //!   TODOS (the table keeps its v3 name): a reminder is a todo with a `due` time, which pops
@@ -385,7 +387,7 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The v2 schema, first half (meta, sessions, nodes, episodes); every statement is idempotent so
 /// it doubles as the "make sure everything exists" step.
@@ -712,6 +714,14 @@ pub fn name_key(name: &str) -> String {
         .to_lowercase()
 }
 
+/// The `dedupe_key` of an event the brain's interpretation proposed: `ev:<local date
+/// YYYY-MM-DD>:<name_key(title)>`. It carries no episode id, so a re-interpretation, a revision
+/// or a second meeting that mentions the same event on the same day all land on one row.
+/// Hotword events use `hotword:<segment>:…` keys and can never collide with these.
+pub fn interpretation_event_key(date: &str, title: &str) -> String {
+    format!("ev:{date}:{}", name_key(title))
+}
+
 /// The subtree rooted at `?1`, as a CTE named `sub(id)`.
 const SUBTREE_CTE: &str = "WITH RECURSIVE sub(id) AS (
         SELECT ?1 UNION ALL SELECT n.id FROM nodes n JOIN sub ON n.parent_id = sub.id)";
@@ -865,7 +875,8 @@ impl Store {
     /// [`Self::init`]'s body, inside its transaction.
     fn init_locked(&self) -> Result<(), StoreError> {
         let conn = &self.conn;
-        match Self::schema_version(conn)? {
+        let from_version = Self::schema_version(conn)?;
+        match from_version {
             None => {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
@@ -895,6 +906,12 @@ impl Store {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
+            Some(5) => {
+                // v5 → v6 is the event re-key + orphan cleanup, `migrate_event_keys` below
+                log::info!("migrating the database from schema 5 to {SCHEMA_VERSION}");
+                conn.execute_batch(SCHEMA)?;
+                conn.execute_batch(SCHEMA_REST)?;
+            }
             Some(v) if v == SCHEMA_VERSION => {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
@@ -905,6 +922,9 @@ impl Store {
         Self::ensure_episode_edit_column(conn)?;
         Self::episode_ids_never_reused(conn)?;
         Self::ensure_todos_table(conn)?;
+        if from_version.is_some_and(|v| v < 6) {
+            Self::migrate_event_keys(conn)?;
+        }
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -919,6 +939,95 @@ impl Store {
                 self.add_category(name)?;
             }
         }
+        Ok(())
+    }
+
+    /// v6: interpretation events lose the episode id in their key (`ep:<id>:<date>:<key>` →
+    /// `ev:<date>:<key>`). Rows that collapse to one key keep the lowest id (todos pointing at
+    /// the others are repointed) with the details of the most recently updated twin; then
+    /// interpretation events whose episode no longer exists (a re-interpretation orphaned
+    /// them) are deleted. Runs inside `init`'s transaction; logged at info.
+    fn migrate_event_keys(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+        use std::collections::BTreeMap;
+        let rows: Vec<(i64, String, i64)> = conn
+            .prepare(
+                "SELECT id, dedupe_key, updated_at FROM events
+                 WHERE source = 'interpretation' AND dedupe_key LIKE 'ep:%' ORDER BY id",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        // new key → [(id, updated_at)] in id order
+        let mut groups: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
+        for (id, key, updated) in rows {
+            let mut parts = key.splitn(3, ':');
+            let (_, Some(ep), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            if ep.is_empty() || !ep.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            groups
+                .entry(format!("ev:{rest}"))
+                .or_default()
+                .push((id, updated));
+        }
+        let mut merged = 0usize;
+        for (key, members) in &groups {
+            let survivor = members[0].0;
+            // the latest twin (highest updated_at, then id) supplies the details
+            let latest = members
+                .iter()
+                .max_by_key(|(id, updated)| (*updated, *id))
+                .map_or(survivor, |m| m.0);
+            for (id, _) in members.iter().filter(|(id, _)| *id != survivor) {
+                conn.execute(
+                    "UPDATE reminders SET event_id = ?1 WHERE event_id = ?2",
+                    [survivor, *id],
+                )?;
+            }
+            if latest != survivor {
+                conn.execute(
+                    "UPDATE events SET
+                        when_start = l.when_start, when_end = l.when_end, all_day = l.all_day,
+                        title = l.title, details = l.details,
+                        node_id = COALESCE(l.node_id, events.node_id),
+                        source_segment_id = l.source_segment_id,
+                        source_episode_id = l.source_episode_id, confidence = l.confidence,
+                        updated_at = l.updated_at
+                     FROM (SELECT * FROM events WHERE id = ?2) AS l
+                     WHERE events.id = ?1",
+                    [survivor, latest],
+                )?;
+            }
+            for (id, _) in members.iter().filter(|(id, _)| *id != survivor) {
+                conn.execute("DELETE FROM events WHERE id = ?1", [*id])?;
+                merged += 1;
+            }
+            conn.execute(
+                "UPDATE events SET dedupe_key = ?2 WHERE id = ?1",
+                rusqlite::params![survivor, key],
+            )?;
+        }
+        let orphans: Vec<i64> = conn
+            .prepare(
+                "SELECT id FROM events WHERE source = 'interpretation'
+                   AND source_episode_id IS NOT NULL
+                   AND source_episode_id NOT IN (SELECT id FROM episodes)",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for id in &orphans {
+            conn.execute(
+                "UPDATE reminders SET event_id = NULL WHERE event_id = ?1",
+                [id],
+            )?;
+            conn.execute("DELETE FROM events WHERE id = ?1", [id])?;
+        }
+        log::info!(
+            "events re-keyed: {} keys, {merged} duplicates merged, {} orphans removed",
+            groups.len(),
+            orphans.len()
+        );
         Ok(())
     }
 
@@ -1866,7 +1975,9 @@ impl Store {
     }
 
     /// Forget an episode's interpretation: its segments become uninterpreted again (the
-    /// next run re-cuts and re-interprets them) and the row goes; the events it produced stay.
+    /// next run re-cuts and re-interprets them) and the row goes. The events it produced stay,
+    /// pointing at the dead id until the new interpretation of those segments adopts them
+    /// ([`Self::adopt_orphan_events`]) and keeps or drops each one.
     pub fn reset_episode(&self, id: i64) -> Result<(), StoreError> {
         let tx = Savepoint::begin(&self.conn)?;
         tx.execute(
@@ -1874,9 +1985,34 @@ impl Store {
             [id],
         )?;
         // the events keep pointing at the old id, which (AUTOINCREMENT) no later episode gets
+        // by accident: only `adopt_orphan_events` re-points them, by source segment
         tx.execute("DELETE FROM episodes WHERE id = ?1", [id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// After a reset: re-point the interpretation events whose episode no longer exists and
+    /// whose source segment is one of `segment_ids` to `episode_id`, so the new
+    /// interpretation owns them (and can drop the ones it no longer proposes). Hotword and
+    /// user events, and events of live episodes, are never touched. Returns how many moved.
+    pub fn adopt_orphan_events(
+        &self,
+        episode_id: i64,
+        segment_ids: &[i64],
+    ) -> Result<usize, StoreError> {
+        let tx = Savepoint::begin(&self.conn)?;
+        let mut n = 0;
+        for seg in segment_ids {
+            n += tx.execute(
+                "UPDATE events SET source_episode_id = ?1
+                 WHERE source = 'interpretation' AND source_segment_id = ?2
+                   AND source_episode_id IS NOT NULL
+                   AND source_episode_id NOT IN (SELECT id FROM episodes)",
+                rusqlite::params![episode_id, seg],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Fold `from` into `into` (segments move, the row goes); the coherence review's merge.
@@ -2405,6 +2541,17 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// Set (or, with `None`, clear) a todo's due time. A changed due time clears the snooze,
+    /// as re-dictating it does.
+    pub fn set_todo_due(&self, id: i64, due: Option<i64>) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE reminders SET snoozed_until = CASE WHEN due IS ?2 THEN snoozed_until END,
+                 due = ?2 WHERE id = ?1",
+            rusqlite::params![id, due],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2589,7 +2736,7 @@ mod tests {
         let s = Store::open_in_memory()?;
         let names: Vec<String> = s.categories()?.into_iter().map(|c| c.name).collect();
         assert_eq!(names, DEFAULT_CATEGORIES);
-        assert_eq!(version(&s)?, "5");
+        assert_eq!(version(&s)?, "6");
         assert!(s.categories()?.iter().all(|c| c.kind == NodeKind::Category));
         Ok(())
     }
@@ -2618,7 +2765,7 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory()?;
         conn.execute_batch(V1)?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "5");
+        assert_eq!(version(&s)?, "6");
         let cats = s.categories()?;
         assert_eq!(
             cats.iter()
@@ -2675,7 +2822,7 @@ mod tests {
              INSERT INTO segments VALUES (2, 1, 4000, 5000, 'loose', NULL, NULL, NULL, NULL, 0);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "5");
+        assert_eq!(version(&s)?, "6");
         let rows = s.segments(View::All, 0)?;
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -3088,7 +3235,7 @@ mod tests {
             INSERT INTO reminders VALUES (8, NULL, 600, 'old one', 1, 'hotword', NULL, NULL, 20);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "5");
+        assert_eq!(version(&s)?, "6");
         let all = s.todos(TodoFilter::All)?;
         assert_eq!(all.len(), 2);
         let open = &all[0];
@@ -3135,7 +3282,7 @@ mod tests {
                  last_revised_at) VALUES (3, 10, 20, 'Old note', 'old summary', 2, 5, 6);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "5");
+        assert_eq!(version(&s)?, "6");
         let e = s.episode(3)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         assert_eq!(
             (e.title.as_str(), e.revision, e.user_edited_at),
@@ -3510,7 +3657,7 @@ mod tests {
             ))?;
         }
         let s = Store::open(&path)?;
-        assert_eq!(version(&s)?, "5");
+        assert_eq!(version(&s)?, "6");
         assert_eq!(s.episodes(10)?.len(), 1, "rows survive the rebuild");
         let c = s.insert_episode(40, 50, &content, 2)?;
         let events = s.events_from(i64::MIN, 10)?;
@@ -3562,5 +3709,67 @@ mod tests {
         assert!(s.episodes_with_topic("nothing")?.is_empty());
         assert!(s.episodes_with_topic("Q4")?.is_empty(), "whole topic only");
         Ok(())
+    }
+
+    /// v5 → v6: `ep:<id>:…` twins collapse to one `ev:` row (lowest id, the latest details, todos
+    /// repointed), hotword events keep their keys, orphaned interpretation events go.
+    #[test]
+    fn migrates_v5_to_v6_event_keys_and_cleans_orphans() -> R {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(SCHEMA_REST)?;
+        conn.execute_batch(&format!("CREATE TABLE reminders {TODOS_TABLE};"))?;
+        conn.execute_batch(
+            "INSERT INTO meta VALUES ('schema_version', '5');
+             INSERT INTO episodes(id, started_at, ended_at, title, summary, revision, created_at, last_revised_at)
+                 VALUES (2, 10, 20, 'E2', '', 1, 5, 5), (3, 30, 40, 'E3', '', 1, 5, 5);
+             INSERT INTO events(id, when_start, title, details, source, source_episode_id,
+                 dedupe_key, created_at, updated_at) VALUES
+                 (1, 100, 'KPMG call', 'old', 'interpretation', 1, 'ep:1:2026-10-29:kpmg call', 1, 1),
+                 (5, 100, 'KPMG call', 'new', 'interpretation', 2, 'ep:2:2026-10-29:kpmg call', 2, 9),
+                 (6, 200, 'Orphan', '', 'interpretation', 7, 'ep:7:2026-10-30:orphan', 2, 2),
+                 (7, 300, 'Kept', '', 'interpretation', 3, 'ep:3:2026-10-31:kept', 2, 2),
+                 (8, 400, 'Spoken', '', 'hotword', NULL, 'hotword:4:2026-11-01:spoken', 2, 2),
+                 (9, 500, 'By hand', '', 'user', 99, NULL, 2, 2);
+             INSERT INTO reminders(id, event_id, text, source, dedupe_key, created_at)
+                 VALUES (1, 5, 'prep', 'hotword', 'k1', 1), (2, 6, 'orphaned', 'hotword', 'k2', 1);",
+        )?;
+        let s = Store::init(conn)?;
+        assert_eq!(version(&s)?, "6");
+        let events = s.events_from(i64::MIN, 20)?;
+        let by_id = |id: i64| events.iter().find(|e| e.id == id);
+        assert!(by_id(5).is_none() && by_id(6).is_none(), "{events:?}");
+        let kpmg = by_id(1).ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        assert_eq!(kpmg.dedupe_key.as_deref(), Some("ev:2026-10-29:kpmg call"));
+        assert_eq!(
+            (kpmg.details.as_str(), kpmg.source_episode_id),
+            ("new", Some(2))
+        );
+        assert_eq!(
+            by_id(7).and_then(|e| e.dedupe_key.as_deref()),
+            Some("ev:2026-10-31:kept")
+        );
+        assert_eq!(
+            by_id(8).and_then(|e| e.dedupe_key.as_deref()),
+            Some("hotword:4:2026-11-01:spoken")
+        );
+        assert!(by_id(9).is_some(), "user events are never touched");
+        let todos: Vec<(i64, Option<i64>)> = s
+            .conn
+            .prepare("SELECT id, event_id FROM reminders ORDER BY id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(todos, [(1, Some(1)), (2, None)]);
+        // idempotent: a second open changes nothing
+        s.init_locked()?;
+        assert_eq!(s.events_from(i64::MIN, 20)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn interpretation_event_keys_have_no_episode_and_never_look_like_hotword_keys() {
+        let k = interpretation_event_key("2026-10-29", "  KPMG   Call ");
+        assert_eq!(k, "ev:2026-10-29:kpmg call");
+        assert!(!k.starts_with("hotword:"));
     }
 }

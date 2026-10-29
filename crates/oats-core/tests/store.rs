@@ -138,7 +138,7 @@ fn migrates_a_realistic_v1_file_keeping_every_row_and_id() -> R {
     let v1 = write_v1(&path);
 
     let s = Store::open(&path)?;
-    assert_eq!(s.meta("schema_version")?.as_deref(), Some("5"));
+    assert_eq!(s.meta("schema_version")?.as_deref(), Some("6"));
 
     // categories became root nodes with the same ids, in position order; nothing re-seeded
     let cats = s.categories()?;
@@ -333,12 +333,12 @@ fn a_newer_schema_file_is_refused_and_left_alone() -> R {
         let conn = raw(&path);
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES ('schema_version', '6');",
+             INSERT INTO meta VALUES ('schema_version', '7');",
         )?;
     }
     assert!(matches!(
         Store::open(&path),
-        Err(StoreError::SchemaTooNew(6))
+        Err(StoreError::SchemaTooNew(7))
     ));
     let conn = raw(&path);
     assert!(
@@ -350,7 +350,7 @@ fn a_newer_schema_file_is_refused_and_left_alone() -> R {
         [],
         |r| r.get(0),
     )?;
-    assert_eq!(v, "6");
+    assert_eq!(v, "7");
     Ok(())
 }
 
