@@ -94,3 +94,21 @@ Segments (id, lane, echo_of, start, seconds, text):
 ```
 
 Rows 3 and 4 came from the system lane (a video the user played, and a `say` sentence); the microphone's copies 1, 2 and 5 are stored as echoes and hidden from the views. Both the reverse-order path (1 and 2 marked after 3 arrived) and the forward path (5 stored as an echo at insert) were exercised. Harness note: the first `say` sentence never played and the second ran ~4 min late while the user's audio was playing — a `say` quirk, not the app. Still unchecked: AirPods as the output device (none connected).
+
+## 2026-10-29 — echo-cancellation spike (VoiceProcessingIO)
+
+`scripts/aec-spike.sh --output "MacBook Air Speakers"`, quiet room, built-in speakers, a `say` sentence 2 s into a 12 s capture:
+
+| | plain mic | VoiceProcessingIO |
+|---|---:|---:|
+| room (lead-in) | −54.9 dBFS | −60.9 dBFS |
+| during playback | −30.6 dBFS | −51.9 dBFS |
+| playback over room | +24.3 dB | +9.0 dB |
+| envelope correlation peak | 0.157 | 0.178 |
+| unit format | 48 kHz | 44.1 kHz (the unit's choice) |
+
+Verdict: **partial** — VPIO attenuates audio played by other apps by ~15 dB (short of the 20 dB bar) and the
+envelope correlation does not collapse, so a faint echo remains. Decision: the text-level echo rule stays
+the primary mechanism; VoiceProcessing stays opt-in (`OATS_MIC_MODE=vpio`) as a possible attenuation
+add-on. Not yet measured: whether Parakeet still transcribes the −52 dBFS residual, and the effect of
+VPIO's processing on the user's own voice.

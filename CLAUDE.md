@@ -183,6 +183,7 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   system audio carry a small "them" tag under the time; echoes never appear.
   `oats_ui::AudioStarter` = `Fn(Sender<AudioChunk>, AudioRequest { system }) ->
   Result<StartedAudio { guard, system, system_error }, String>`.
+  **Result 2026-10-29 (built-in speakers): partial** — playback by other apps attenuated ~15 dB (+24 dB → +9 dB over the room floor), envelope correlation unchanged; the unit ran the mic at 44.1 kHz. The text-level echo rule stays primary; `OATS_MIC_MODE=vpio` stays opt-in. See `docs/verification-2026-10-28.md`.
 
 ## UI chrome and preferences
 
