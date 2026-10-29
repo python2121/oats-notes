@@ -349,6 +349,11 @@ pub fn install_tokens(ctx: &egui::Context, t: Tokens) {
         s.text_styles
             .insert(egui::TextStyle::Heading, FontId::proportional(15.0));
         s.animation_time = 0.12;
+        // Tooltips: a slightly longer hover before one appears, and NO grace period — moving to
+        // another element hides the tooltip and starts the delay over (egui's default shows the
+        // next tooltip at once within 0.2 s, which reads as a flicker across a row of icons).
+        s.interaction.tooltip_delay = 0.8;
+        s.interaction.tooltip_grace_time = 0.0;
     });
 }
 
