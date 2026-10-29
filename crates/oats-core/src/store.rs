@@ -2,7 +2,8 @@
 //! pipeline writes segments, the brain writes interpretations, the UI reads). Times are Unix
 //! milliseconds (UTC); the UI formats them in local time.
 //!
-//! Schema version 7 (`meta.schema_version`; v1 to v6 databases are migrated on open; v7 added
+//! Schema version 8 (`meta.schema_version`; v1 to v7 databases are migrated on open; v8 added
+//! the per-app classes (`producer_overrides`, `producers_seen`, `segments.media_app`) and v7
 //! the media columns and `media_plays`, see `store_media.rs`; v5 added
 //! `episodes.user_edited_at`, the time the user last edited a note by hand; v6 re-keyed
 //! interpretation events without the episode id, see [`interpretation_event_key`]):
@@ -200,6 +201,30 @@ pub struct Episode {
     /// Set when the user edited the note by hand ([`Store::update_episode_content`]); the
     /// brain then never rewrites its text.
     pub user_edited_at: Option<i64>,
+    /// `episodes.kind`: [`EPISODE_CONVERSATION`] or [`EPISODE_MEDIA`].
+    pub kind: String,
+}
+
+impl Episode {
+    /// A media episode (YouTube, music, a media-class app), filed under Media.
+    pub fn is_media(&self) -> bool {
+        self.kind == EPISODE_MEDIA
+    }
+
+    /// Its content, as [`Store::revise_episode`] takes it.
+    pub fn content(&self) -> EpisodeContent {
+        EpisodeContent {
+            title: self.title.clone(),
+            summary: self.summary.clone(),
+            node_id: self.node_id,
+            decisions: self.decisions.clone(),
+            action_items: self.action_items.clone(),
+            topics: self.topics.clone(),
+            low_signal: self.low_signal,
+            model: self.model.clone(),
+            cost_usd: self.cost_usd,
+        }
+    }
 }
 
 /// The interpreted content of an episode (what a revision writes).
@@ -393,7 +418,7 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// The v2 schema, first half (meta, sessions, nodes, episodes); every statement is idempotent so
 /// it doubles as the "make sure everything exists" step.
@@ -556,6 +581,9 @@ const NEAR_MAX_SEGMENT_MS: i64 = 10 * 60_000;
 
 /// Echoes (see [`crate::echo`]) are never part of a listing.
 const NOT_ECHO: &str = "echo_of IS NULL";
+/// Not a media row: a system segment stamped YouTube, music or a media app.
+const NOT_MEDIA: &str =
+    "NOT (source = 'system' AND COALESCE(media_kind, '') IN ('youtube', 'music', 'app'))";
 
 fn row_to_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRow> {
     Ok(TranscriptRow {
@@ -596,7 +624,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
 
 const EPISODE_COLUMNS: &str = "id, started_at, ended_at, title, summary, node_id, decisions_json, \
      action_items_json, topics_json, low_signal, model, cost_usd, revision, created_at, \
-     last_revised_at, user_edited_at";
+     last_revised_at, user_edited_at, kind";
 
 fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Episode> {
     let json = |i: usize| -> rusqlite::Result<String> { row.get(i) };
@@ -620,6 +648,7 @@ fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Episode> {
         created_at: row.get(13)?,
         last_revised_at: row.get(14)?,
         user_edited_at: row.get(15)?,
+        kind: row.get(16)?,
     })
 }
 
@@ -921,6 +950,13 @@ impl Store {
                 // v6 → v7 is media: `segments.media_kind` / `media_ref`, `episodes.kind` and
                 // `media_plays`, added by `ensure_media_schema` below
                 log::info!("migrating the database from schema 6 to {SCHEMA_VERSION}");
+                conn.execute_batch(SCHEMA)?;
+                conn.execute_batch(SCHEMA_REST)?;
+            }
+            Some(7) => {
+                // v7 → v8 is the per-app classes: `producer_overrides`, `producers_seen` and
+                // `segments.media_app`, added by `ensure_media_schema` below
+                log::info!("migrating the database from schema 7 to {SCHEMA_VERSION}");
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
@@ -1383,11 +1419,23 @@ impl Store {
         before: Option<(i64, i64)>,
         limit: i64,
     ) -> Result<Vec<TranscriptRow>, StoreError> {
+        self.segments_page_with(before, limit, true)
+    }
+
+    /// [`Store::segments_page`], leaving media rows (system segments stamped YouTube / music /
+    /// a media app) out unless `media` — the Transcripts view's "Show media" off.
+    pub fn segments_page_with(
+        &self,
+        before: Option<(i64, i64)>,
+        limit: i64,
+        media: bool,
+    ) -> Result<Vec<TranscriptRow>, StoreError> {
         let (t, id) = before.unwrap_or((i64::MAX, i64::MAX));
+        let filter = if media { "1" } else { NOT_MEDIA };
         let mut rows = self.query_segments(
             &format!(
                 "SELECT {SEGMENT_COLUMNS} FROM segments
-                 WHERE (started_at, id) < (?1, ?2) AND {NOT_ECHO}
+                 WHERE (started_at, id) < (?1, ?2) AND {NOT_ECHO} AND {filter}
                  ORDER BY started_at DESC, id DESC LIMIT ?3"
             ),
             &[t, id, limit],
@@ -1403,10 +1451,21 @@ impl Store {
         after: (i64, i64),
         limit: i64,
     ) -> Result<Vec<TranscriptRow>, StoreError> {
+        self.segments_after_with(after, limit, true)
+    }
+
+    /// [`Store::segments_after`] with media rows left out unless `media`.
+    pub fn segments_after_with(
+        &self,
+        after: (i64, i64),
+        limit: i64,
+        media: bool,
+    ) -> Result<Vec<TranscriptRow>, StoreError> {
+        let filter = if media { "1" } else { NOT_MEDIA };
         self.query_segments(
             &format!(
                 "SELECT {SEGMENT_COLUMNS} FROM segments
-                 WHERE (started_at, id) > (?1, ?2) AND {NOT_ECHO}
+                 WHERE (started_at, id) > (?1, ?2) AND {NOT_ECHO} AND {filter}
                  ORDER BY started_at, id LIMIT ?3"
             ),
             &[after.0, after.1, limit],
@@ -2012,9 +2071,10 @@ impl Store {
         self.query_episodes(
             &format!(
                 "SELECT {EPISODE_COLUMNS} FROM episodes
-                 WHERE node_id IS NULL
+                 WHERE kind != 'media'
+                   AND (node_id IS NULL
                     OR node_id IN (SELECT id FROM nodes WHERE kind = 'category')
-                    OR node_id NOT IN (SELECT id FROM nodes)
+                    OR node_id NOT IN (SELECT id FROM nodes))
                  ORDER BY started_at DESC, id DESC LIMIT ?1"
             ),
             &[limit],
@@ -3853,4 +3913,4 @@ mod tests {
 // `media_plays`) — kept in its own file.
 #[path = "store_media.rs"]
 mod media;
-pub use media::{EPISODE_CONVERSATION, EPISODE_MEDIA, MEDIA_CATEGORY};
+pub use media::{EPISODE_CONVERSATION, EPISODE_MEDIA, MEDIA_CATEGORY, Relabel};

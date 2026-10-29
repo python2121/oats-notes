@@ -38,6 +38,8 @@ use crate::transcript::{
 
 /// eframe storage key for [`AppPrefs`] (RON).
 pub const PREFS_KEY: &str = "oatsnotes.prefs";
+/// Height of the Transcripts view's header strip ("Show media").
+const TRANSCRIPTS_BAR_H: f32 = 30.0;
 /// Sidebar splitter range.
 pub const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 180.0..=360.0;
 
@@ -57,6 +59,9 @@ pub struct AppPrefs {
     pub command_sound: bool,
     /// Projects whose sidebar layer (recent notes) is open; closed by default.
     pub sidebar_episodes_open: Vec<i64>,
+    /// The Transcripts view lists media rows (YouTube, music, media apps); off by default —
+    /// search results always include them, tagged "media".
+    pub show_media: bool,
 }
 
 impl Default for AppPrefs {
@@ -69,6 +74,7 @@ impl Default for AppPrefs {
             capture_system: true,
             command_sound: true,
             sidebar_episodes_open: Vec::new(),
+            show_media: false,
         }
     }
 }
@@ -153,6 +159,11 @@ pub enum Command {
     ToggleListening,
     /// Capture system audio next to the microphone (a pref; restarts listening when on).
     ToggleSystemAudio,
+    /// "On a call" (⇧⌘C): every system-audio app is a meeting until switched off, 10 min of
+    /// silence on system audio, or listening stops. Session-only.
+    ToggleOnCall,
+    /// The Transcripts view's "Show media" (a pref).
+    ToggleShowMedia,
     NewCategory,
     /// Open the Preferences window (your name, for now).
     Preferences,
@@ -187,6 +198,7 @@ const CMD_SHIFT: Modifiers = Modifiers {
 /// Menu shortcuts; checked most-modifiers-first so ⇧⌘S never reads as ⌘S.
 pub const SHORTCUTS: &[(KeyboardShortcut, Command)] = &[
     (sc(CMD_SHIFT, Key::S), Command::ToggleSidebar),
+    (sc(CMD_SHIFT, Key::C), Command::ToggleOnCall),
     (sc(Modifiers::COMMAND, Key::L), Command::ToggleListening),
     (sc(Modifiers::COMMAND, Key::N), Command::NewCategory),
     // ⌘2 was "All Transcripts" before Today went away; the rest keep their numbers
@@ -240,6 +252,12 @@ pub struct MenuState {
     pub listening: bool,
     /// The "Capture System Audio" pref.
     pub capture_system: bool,
+    /// "On a call" is on.
+    pub on_call: bool,
+    /// System audio is captured in this listening session ("On a call" needs it).
+    pub system_on: bool,
+    /// The Transcripts view's "Show media".
+    pub show_media: bool,
     pub status: PipelineStatus,
     pub sidebar_visible: bool,
     pub view: View,
@@ -290,6 +308,12 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                     Command::ToggleSystemAudio,
                     s.capture_system,
                 ),
+                MenuEntry::Item {
+                    label: "On a Call".to_owned(),
+                    cmd: Command::ToggleOnCall,
+                    enabled: s.listening && s.system_on,
+                    checked: Some(s.on_call),
+                },
             ],
         },
         MenuSection {
@@ -307,6 +331,12 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                 check("Conversations", Command::ShowNotes, s.view == View::Notes),
                 check("Calendar", Command::ShowCalendar, s.view == View::Calendar),
                 check("Todos", Command::ShowTodos, s.view == View::Todos),
+                Separator,
+                check(
+                    "Show Media in Transcripts",
+                    Command::ToggleShowMedia,
+                    s.show_media,
+                ),
             ],
         },
         MenuSection {
@@ -326,6 +356,70 @@ struct PrefsWindow {
     name: String,
     /// Focus the field on the first frame.
     focus: bool,
+    /// The "Apps" table (apps seen playing ∪ overridden ones).
+    apps: Vec<AppRow>,
+}
+
+/// One row of the Preferences "Apps" table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppRow {
+    pub bundle_id: String,
+    pub name: String,
+    /// The stored class (Auto when no override).
+    pub class: oats_core::ProducerClass,
+    pub transcribe_anyway: bool,
+    /// A call app (Zoom, Teams, Webex, FaceTime): always Meeting.
+    pub locked: bool,
+    /// What Auto means for it.
+    pub default: oats_core::ProducerClass,
+}
+
+impl AppRow {
+    /// The class it is treated as.
+    pub fn effective(&self) -> oats_core::ProducerClass {
+        if self.locked {
+            oats_core::ProducerClass::Meeting
+        } else if self.class == oats_core::ProducerClass::Auto {
+            self.default
+        } else {
+            self.class
+        }
+    }
+}
+
+/// The Apps table's rows: every app seen playing (most recent first), then overridden apps
+/// never seen.
+pub fn app_rows(store: &Store) -> Result<Vec<AppRow>, oats_core::StoreError> {
+    let overrides = oats_media::ProducerOverrides::new(store.producer_overrides()?);
+    let mut rows: Vec<AppRow> = Vec::new();
+    let mut add = |bundle: &str, name: &str| {
+        if rows
+            .iter()
+            .any(|r| r.bundle_id.eq_ignore_ascii_case(bundle))
+        {
+            return;
+        }
+        let o = overrides.get(bundle);
+        rows.push(AppRow {
+            bundle_id: bundle.to_ascii_lowercase(),
+            name: if name.trim().is_empty() {
+                oats_media::Producer::from_bundle(0, bundle).name
+            } else {
+                name.to_owned()
+            },
+            class: o.map(|o| o.class).unwrap_or_default(),
+            transcribe_anyway: o.is_some_and(|o| o.transcribe_anyway),
+            locked: oats_media::is_locked(bundle),
+            default: oats_media::default_class(bundle),
+        });
+    };
+    for p in store.producers_seen()? {
+        add(&p.bundle_id, &p.name);
+    }
+    for o in store.producer_overrides()? {
+        add(&o.bundle_id, "");
+    }
+    Ok(rows)
 }
 
 /// The app.
@@ -344,6 +438,8 @@ pub struct OatsApp {
     level: Option<(f32, bool)>,
     /// The system-audio lane is running in this listening session.
     system_on: bool,
+    /// "On a call" (session-only; mirrored in the pipeline).
+    on_call: bool,
     /// The system-audio lane delivered only silence since the start (no tap signal).
     system_no_signal: bool,
     /// The Calendar day panel's media plays ("Watched: …") and the day they are for (`None`:
@@ -466,6 +562,7 @@ impl OatsApp {
             engine_name: String::new(),
             level: None,
             system_on: false,
+            on_call: false,
             system_no_signal: false,
             media_plays: Vec::new(),
             media_plays_day: None,
@@ -706,6 +803,117 @@ impl OatsApp {
         self.system_on
     }
 
+    /// "On a call" is on.
+    pub fn on_call(&self) -> bool {
+        self.on_call
+    }
+
+    /// The Preferences window's Apps table, while it is open.
+    pub fn prefs_apps(&self) -> Option<&[AppRow]> {
+        self.prefs_window.as_ref().map(|w| w.apps.as_slice())
+    }
+
+    /// Change an app's class / "transcribe anyway" (the Apps table): stored at once, applied
+    /// by the media watcher at its next look (≤ 5 s).
+    pub fn set_app_class(
+        &mut self,
+        bundle_id: &str,
+        class: oats_core::ProducerClass,
+        transcribe_anyway: bool,
+    ) {
+        if oats_media::is_locked(bundle_id) {
+            return;
+        }
+        match self
+            .store
+            .set_producer_override(bundle_id, class, transcribe_anyway)
+        {
+            Ok(()) => {
+                log::info!(
+                    "app class: {bundle_id} → {}{}",
+                    class.as_str(),
+                    if transcribe_anyway {
+                        " (transcribe anyway)"
+                    } else {
+                        ""
+                    }
+                );
+                if let Some(w) = &mut self.prefs_window
+                    && let Ok(rows) = app_rows(&self.store)
+                {
+                    w.apps = rows;
+                }
+                self.reload_brain_data();
+            }
+            Err(e) => self.warning = Some(format!("Could not save the app's class: {e}")),
+        }
+    }
+
+    /// "Mark as a call" on a media note: a conversation again (out of Media, into the
+    /// Conversations list), its segments stamped as a call, and a re-interpretation queued
+    /// (the meeting hint, none of the media rules).
+    pub fn mark_episode_as_call(&mut self, id: i64) {
+        match self.store.mark_episode_as_call(id) {
+            Ok(true) => {
+                self.brain_send(BrainCommand::Reinterpret(id));
+                self.last_command = Some("Marked as a call: re-interpreting it".to_owned());
+                self.reload();
+            }
+            Ok(false) => self.warning = Some("Not a media note".to_owned()),
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    /// "Mark as media" on a conversation from an app classed Media: filed under Media, and
+    /// re-interpreted by the media rules (no todos, no events).
+    pub fn mark_episode_as_media(&mut self, id: i64) {
+        match self.store.mark_episode_as_media(id) {
+            Ok(true) => {
+                self.brain_send(BrainCommand::Reinterpret(id));
+                self.last_command = Some("Marked as media: filed under Media".to_owned());
+                self.reload();
+            }
+            Ok(false) => self.warning = Some("Already a media note".to_owned()),
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    /// "Mark as a call" on a Calendar play: relabelled ("Call via …"); whatever was
+    /// transcribed during it is re-interpreted as a call. Under Log only nothing was kept,
+    /// and the confirmation says so.
+    pub fn mark_play_as_call(&mut self, id: i64) {
+        match self.store.mark_play_as_call(id) {
+            Ok(Some(r)) => {
+                for ep in &r.episodes {
+                    self.brain_send(BrainCommand::Reinterpret(*ep));
+                }
+                self.last_command = Some(if r.transcribed() {
+                    "Marked as a call: re-interpreting it".to_owned()
+                } else {
+                    let policy = oats_core::MediaPolicy::effective(
+                        self.store
+                            .meta(oats_core::MediaPolicy::META_KEY)
+                            .ok()
+                            .flatten()
+                            .as_deref(),
+                    );
+                    format!(
+                        "Marked as a call. No transcript was kept for this (policy: {})",
+                        policy.label().to_lowercase()
+                    )
+                });
+                self.reload();
+            }
+            Ok(None) => self.warning = Some("That play is gone".to_owned()),
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    /// The status strip's right-hand line (the last command / confirmation).
+    pub fn last_message(&self) -> Option<&str> {
+        self.last_command.as_deref()
+    }
+
     pub fn status(&self) -> &PipelineStatus {
         &self.status
     }
@@ -720,6 +928,9 @@ impl OatsApp {
         build_menu_model(&MenuState {
             listening: self.is_listening(),
             capture_system: self.prefs.capture_system,
+            on_call: self.on_call,
+            system_on: self.system_on,
+            show_media: self.prefs.show_media,
             status: self.status.clone(),
             sidebar_visible: self.prefs.sidebar_visible,
             view: self.prefs.view,
@@ -758,6 +969,19 @@ impl OatsApp {
                     }
                 }
             }
+            Command::ToggleOnCall => {
+                if self.on_call {
+                    self.set_on_call(false);
+                } else if self.is_listening() && self.system_on {
+                    self.set_on_call(true);
+                } else {
+                    self.warning = Some("On a call needs listening with system audio".to_owned());
+                }
+            }
+            Command::ToggleShowMedia => {
+                self.prefs.show_media = !self.prefs.show_media;
+                self.reset_pages();
+            }
             Command::NewCategory => {
                 self.prefs.sidebar_visible = true;
                 self.sidebar.renaming = None;
@@ -766,7 +990,15 @@ impl OatsApp {
             }
             Command::Preferences => {
                 let name = self.store.user_name().ok().flatten().unwrap_or_default();
-                self.prefs_window = Some(PrefsWindow { name, focus: true });
+                let apps = app_rows(&self.store).unwrap_or_else(|e| {
+                    self.warning = Some(format!("Apps: {e}"));
+                    Vec::new()
+                });
+                self.prefs_window = Some(PrefsWindow {
+                    name,
+                    focus: true,
+                    apps,
+                });
             }
             Command::ToggleSidebar => self.prefs.sidebar_visible = !self.prefs.sidebar_visible,
             Command::Search => match &mut self.search {
@@ -957,8 +1189,18 @@ impl OatsApp {
         }
     }
 
+    /// "On a call" on / off (the pipeline treats every system-audio app as a meeting).
+    fn set_on_call(&mut self, on: bool) {
+        if self.on_call != on {
+            log::info!("on a call: {}", if on { "on" } else { "off" });
+        }
+        self.on_call = on;
+        self.pipeline.set_on_call(on);
+    }
+
     /// Detach and close the microphone (the pipeline flushes the open segment).
     fn stop_listening(&mut self) {
+        self.set_on_call(false);
         if self.capture.is_some() {
             self.pipeline.stop();
             self.capture = None;
@@ -1050,7 +1292,10 @@ impl OatsApp {
         before: Option<(i64, i64)>,
         limit: usize,
     ) -> (Vec<TranscriptRow>, bool) {
-        match self.store.segments_page(before, limit as i64 + 1) {
+        match self
+            .store
+            .segments_page_with(before, limit as i64 + 1, self.prefs.show_media)
+        {
             Ok(mut rows) => {
                 let more = rows.len() > limit;
                 if more {
@@ -1067,7 +1312,10 @@ impl OatsApp {
 
     /// The oldest `limit` rows strictly after `after`, and whether newer ones remain.
     fn fetch_after(&mut self, after: (i64, i64), limit: usize) -> (Vec<TranscriptRow>, bool) {
-        match self.store.segments_after(after, limit as i64 + 1) {
+        match self
+            .store
+            .segments_after_with(after, limit as i64 + 1, self.prefs.show_media)
+        {
             Ok(mut rows) => {
                 let more = rows.len() > limit;
                 rows.truncate(limit);
@@ -1178,6 +1426,7 @@ impl OatsApp {
             Ok(e) => self.episodes = e,
             Err(e) => self.store_error(e),
         }
+        self.notes_state.media_convertible = self.media_convertible();
         // the most recent past and the nearest upcoming: a plain oldest-first window would,
         // once 500 events piled up, never show anything upcoming again
         let events = self
@@ -1209,6 +1458,32 @@ impl OatsApp {
             self.brain_status.spend_today_usd = spent;
         }
         self.run_search();
+    }
+
+    /// The listed conversation notes heard (partly) from an app classed Media: "Mark as
+    /// media" is offered on them.
+    fn media_convertible(&mut self) -> std::collections::HashSet<i64> {
+        let ids: Vec<i64> = self
+            .episodes
+            .iter()
+            .filter(|e| !e.is_media())
+            .map(|e| e.id)
+            .collect();
+        let found = self.store.episode_media_apps(&ids).and_then(|apps| {
+            let o = oats_media::ProducerOverrides::new(self.store.producer_overrides()?);
+            Ok(apps
+                .into_iter()
+                .filter(|(_, apps)| {
+                    apps.iter()
+                        .any(|a| o.effective_class(a) == oats_core::ProducerClass::Media)
+                })
+                .map(|(id, _)| id)
+                .collect())
+        });
+        found.unwrap_or_else(|e| {
+            self.store_error(e);
+            Default::default()
+        })
     }
 
     /// Re-read which todos are due now and when the next one comes due.
@@ -1446,10 +1721,14 @@ impl OatsApp {
                     if let Some(b) = &self.brain {
                         b.segment_arrived(row.clone());
                     }
+                    let hidden_media = !self.prefs.show_media
+                        && row.source == oats_core::AudioSourceKind::System
+                        && row.media_kind.is_some_and(|k| k.is_media());
                     if self.prefs.view == View::Transcripts {
                         // live rows join the loaded range when it ends at the newest row (after a
-                        // jump it ends earlier; paging forward gets there)
-                        if !self.pages.has_later {
+                        // jump it ends earlier; paging forward gets there); media rows only
+                        // with "Show media"
+                        if !self.pages.has_later && !hidden_media {
                             self.pages.rows.push(row);
                         }
                     } else if self.in_view(&row) {
@@ -1463,6 +1742,13 @@ impl OatsApp {
                     self.level = None;
                     self.prefs.listening = false;
                     self.warning = Some(format!("Listening did not start: {why}"));
+                }
+                PipelineEvent::OnCallEnded { after_silence } => {
+                    self.on_call = false;
+                    if after_silence {
+                        self.last_command =
+                            Some("On a call ended: 10 minutes without system audio".to_owned());
+                    }
                 }
                 PipelineEvent::SessionStarted(_) | PipelineEvent::SessionEnded(_) => {}
                 PipelineEvent::Warning(w) => {
@@ -1638,6 +1924,12 @@ impl OatsApp {
                 NotesAction::ReviewNow => self.run(Command::ReviewNow),
                 NotesAction::Reorganise => self.run(Command::Reorganise),
                 NotesAction::Reinterpret(id) => self.brain_send(BrainCommand::Reinterpret(id)),
+                NotesAction::MarkAsCall(id) => self.mark_episode_as_call(id),
+                NotesAction::MarkAsMedia(id) => self.mark_episode_as_media(id),
+                NotesAction::Summarise(id) => {
+                    self.brain_send(BrainCommand::Summarise(id));
+                    self.last_command = Some("Summarising the media note…".to_owned());
+                }
                 NotesAction::Undo(id) => self.brain_send(BrainCommand::UndoChange(id)),
                 NotesAction::SelectNode(id) => {
                     self.focus_episode = None;
@@ -1678,6 +1970,7 @@ impl OatsApp {
                     self.jump_to_segment(seg);
                 }
                 CalendarAction::Todo(t) => todo_actions.push(t),
+                CalendarAction::MarkPlayAsCall(id) => self.mark_play_as_call(id),
             }
         }
         self.apply_todos(todo_actions);
@@ -1771,7 +2064,7 @@ impl OatsApp {
     /// " · ▶ <title>" while YouTube or music plays on the system lane (what the pipeline
     /// stamps), else nothing.
     fn media_label(&self) -> String {
-        if !self.is_listening() || !self.system_on {
+        if !self.is_listening() || !self.system_on || self.on_call {
             return String::new();
         }
         match self.pipeline.media_feed().current() {
@@ -1845,6 +2138,24 @@ impl OatsApp {
             cmds.push(Command::ToggleSystemAudio);
         }
         ui.add_space(6.0);
+        let call_enabled = self.on_call || (listening && self.system_on);
+        let tip = if self.on_call {
+            "On a call: every app playing sound is the other side of a call (transcribed as \
+             “them”, never media). Turns off after 10 min without system audio — click to \
+             turn off"
+        } else if call_enabled {
+            "On a call: treat whatever the computer plays (Slack, Discord, …) as a call, \
+             whatever its class and the media policy"
+        } else {
+            "On a call: needs listening with system audio"
+        };
+        if pill(ui, t, "On a call", self.on_call, call_enabled)
+            .on_hover_text(with_shortcut(ui.ctx(), tip, Command::ToggleOnCall))
+            .clicked()
+        {
+            cmds.push(Command::ToggleOnCall);
+        }
+        ui.add_space(6.0);
         level_meter(ui, t, if listening { self.level } else { None });
         ui.add_space(6.0);
         match &self.status {
@@ -1898,12 +2209,13 @@ impl OatsApp {
             .flatten();
         let policy_before = oats_core::MediaPolicy::effective(stored_policy.as_deref());
         let mut policy = policy_before;
+        let mut app_changes: Vec<(String, oats_core::ProducerClass, bool)> = Vec::new();
         egui::Window::new("Preferences")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .collapsible(false)
             .resizable(false)
-            .fixed_size(vec2(320.0, 0.0))
+            .fixed_size(vec2(560.0, 0.0))
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new("Your name").color(t.text_secondary));
                 let resp = ui.add(
@@ -1933,7 +2245,10 @@ impl OatsApp {
                 ui.add_space(8.0);
                 ui.checkbox(&mut sound, "Play a sound for voice commands");
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new("YouTube & music").color(t.text_secondary));
+                ui.label(
+                    egui::RichText::new("Media (YouTube, music, media apps)")
+                        .color(t.text_secondary),
+                );
                 ui.add_enabled_ui(fixed_policy.is_none(), |ui| {
                     ui.horizontal(|ui| {
                         for p in oats_core::MediaPolicy::ALL {
@@ -1946,14 +2261,17 @@ impl OatsApp {
                     egui::RichText::new(if fixed_policy.is_some() {
                         "Set by OATS_MEDIA_POLICY."
                     } else {
-                        "Videos and music the computer plays (recognised from the app and the \
-                         Firefox tab) are never taken for your conversation. Ignore: not \
-                         transcribed. Log only: listed as “Watched: …” in the Calendar. \
-                         Transcribe: also transcribed and filed under Media."
+                        "Never taken for your conversation. Transcribe (default): filed under \
+                         Media without a model call (“Summarise” runs one), hidden from \
+                         Transcripts unless “Show media”. Log only: “Watched: …” in the \
+                         Calendar, no transcript. Ignore: nothing kept."
                     })
                     .color(t.text_tertiary)
                     .size(11.0),
                 );
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Apps").color(t.text_secondary));
+                apps_table(ui, t, &win.apps, policy, &mut app_changes);
             });
         if policy != policy_before {
             match self
@@ -1978,11 +2296,13 @@ impl OatsApp {
         if close {
             self.prefs_window = None;
         }
+        for (bundle, class, anyway) in app_changes {
+            self.set_app_class(&bundle, class, anyway);
+        }
     }
 
-    fn status_line(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
-        let p = ui.painter_at(rect);
-        p.rect_filled(rect, 0.0, t.inset);
+    /// The status strip's left text ("engine · listening · mic + system · on a call · …").
+    pub fn status_text(&self) -> String {
         let engine = if self.engine_name.is_empty() {
             "engine"
         } else {
@@ -2008,12 +2328,23 @@ impl OatsApp {
         } else {
             ""
         };
-        let left = format!(
-            "{engine} · {}{no_signal}{} · {n} segment{} today{brain}",
+        let on_call = if self.on_call && self.is_listening() {
+            " · on a call"
+        } else {
+            ""
+        };
+        format!(
+            "{engine} · {}{no_signal}{on_call}{} · {n} segment{} today{brain}",
             self.state_label(),
             self.media_label(),
             if n == 1 { "" } else { "s" }
-        );
+        )
+    }
+
+    fn status_line(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 0.0, t.inset);
+        let left = self.status_text();
         let left_galley = p.layout_no_wrap(left, t.mono(9.5), t.text_tertiary);
         let left_w = left_galley.size().x;
         p.galley(
@@ -2046,6 +2377,107 @@ impl OatsApp {
     }
 }
 
+/// The Preferences "Apps" table: each app seen playing sound, its class (Auto shows what it
+/// means for that app; call apps are locked to Meeting) and, for a media app while the
+/// policy keeps no transcript (Ignore / Log only), "transcribe anyway". Changes are pushed
+/// to `changes` as `(bundle_id, class, transcribe_anyway)`.
+fn apps_table(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    apps: &[AppRow],
+    policy: oats_core::MediaPolicy,
+    changes: &mut Vec<(String, oats_core::ProducerClass, bool)>,
+) {
+    use oats_core::ProducerClass;
+    if apps.is_empty() {
+        ui.label(
+            egui::RichText::new(
+                "No apps yet: an app shows up here once it plays sound while OatsNotes listens \
+                 with system audio.",
+            )
+            .color(t.text_tertiary)
+            .size(11.0),
+        );
+        return;
+    }
+    let class_label = |row: &AppRow, c: ProducerClass| -> String {
+        if c == ProducerClass::Auto && row.default != ProducerClass::Auto {
+            format!("Auto ({})", row.default.label())
+        } else {
+            c.label().to_owned()
+        }
+    };
+    let anyway_shown = policy.skips_transcription();
+    egui::ScrollArea::vertical()
+        .id_salt("prefs-apps")
+        .max_height(220.0)
+        .min_scrolled_height(160.0)
+        .show(ui, |ui| {
+            egui::Grid::new("prefs-apps-grid")
+                .num_columns(3)
+                .spacing(vec2(12.0, 6.0))
+                .show(ui, |ui| {
+                    for row in apps {
+                        ui.label(egui::RichText::new(&row.name).color(t.text))
+                            .on_hover_text(&row.bundle_id);
+                        if row.locked {
+                            ui.add_enabled(
+                                false,
+                                egui::Label::new(
+                                    egui::RichText::new("Meeting 🔒").color(t.text_disabled),
+                                ),
+                            )
+                            .on_disabled_hover_text(
+                                "A call app: always a meeting (you'd never watch a video \
+                                 through it)",
+                            );
+                        } else {
+                            let mut class = row.class;
+                            egui::ComboBox::from_id_salt(("app-class", row.bundle_id.as_str()))
+                                .selected_text(class_label(row, class))
+                                .width(130.0)
+                                .show_ui(ui, |ui| {
+                                    for c in ProducerClass::ALL {
+                                        ui.selectable_value(&mut class, c, class_label(row, c));
+                                    }
+                                });
+                            if class != row.class {
+                                changes.push((row.bundle_id.clone(), class, row.transcribe_anyway));
+                            }
+                        }
+                        let media = !row.locked && row.effective() == ProducerClass::Media;
+                        if media && anyway_shown {
+                            let mut anyway = row.transcribe_anyway;
+                            if ui
+                                .checkbox(&mut anyway, "transcribe anyway")
+                                .on_hover_text(
+                                    "Transcribe this app's audio even though the media policy \
+                                     keeps no transcript; it is still filed as media (no \
+                                     todos, no events), so “Mark as a call” can recover it",
+                                )
+                                .changed()
+                            {
+                                changes.push((row.bundle_id.clone(), row.class, anyway));
+                            }
+                        } else {
+                            ui.label("");
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "Meeting: transcribed as the other side of a call. Media: follows the policy above, \
+             filed under Media. Ignore: nothing kept. Changes apply within 5 s. In a call on \
+             a media app, turn on “On a call” (⇧⌘C).",
+        )
+        .color(t.text_tertiary)
+        .size(11.0),
+    );
+}
+
 /// The Listen toggle: a pill, accent-filled when on.
 fn pill(ui: &mut egui::Ui, t: &Tokens, label: &str, on: bool, enabled: bool) -> egui::Response {
     let font = crate::theme::font_medium(ui.ctx(), 12.5);
@@ -2064,6 +2496,7 @@ fn pill(ui: &mut egui::Ui, t: &Tokens, label: &str, on: bool, enabled: bool) -> 
         Sense::hover()
     };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, label));
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let radius = rect.height() / 2.0;
@@ -2455,8 +2888,48 @@ impl eframe::App for OatsApp {
                             }
                         }
                         _ => {
+                            // the view header: "Show media" (media rows hidden by default)
+                            let bar = Rect::from_min_size(
+                                list_rect.min,
+                                vec2(list_rect.width(), TRANSCRIPTS_BAR_H),
+                            );
+                            list_ui.painter().rect_filled(bar, 0.0, t.chrome);
+                            list_ui.painter().hline(
+                                bar.x_range(),
+                                bar.bottom() - 0.5,
+                                egui::Stroke::new(1.0, t.divider),
+                            );
+                            let mut head_ui = list_ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(bar)
+                                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                            );
+                            head_ui.add_space(12.0);
+                            let on = self.prefs.show_media;
+                            if pill(&mut head_ui, &t, "Show media", on, true)
+                                .on_hover_text(if on {
+                                    "Showing what the computer played (videos, music, media \
+                                     apps) — click to hide it"
+                                } else {
+                                    "Media rows (videos, music, media apps) are hidden; search \
+                                     still finds them"
+                                })
+                                .clicked()
+                            {
+                                cmds.push(Command::ToggleShowMedia);
+                            }
+                            let body = Rect::from_min_max(
+                                pos2(list_rect.left(), bar.bottom()),
+                                list_rect.max,
+                            );
+                            let mut body_ui = list_ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(body)
+                                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                            );
+                            body_ui.set_clip_rect(body);
                             transcript_actions = transcript_list(
-                                &mut list_ui,
+                                &mut body_ui,
                                 &mut self.pages,
                                 &self.nodes,
                                 &mut self.transcript_focus,
@@ -2535,6 +3008,7 @@ mod tests {
             capture_system: false,
             command_sound: false,
             sidebar_episodes_open: vec![3, 9],
+            show_media: true,
         };
         prefs.store(&mut s);
         assert_eq!(AppPrefs::load(&s), prefs);
@@ -2612,6 +3086,9 @@ mod tests {
         let mut s = MenuState {
             listening: false,
             capture_system: true,
+            on_call: false,
+            system_on: false,
+            show_media: false,
             status: PipelineStatus::Loading("x".to_owned()),
             sidebar_visible: true,
             view: View::Transcripts,

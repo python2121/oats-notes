@@ -68,12 +68,7 @@ fn store_video(s: &Store, at: i64) -> TranscriptRow {
     let play = s
         .begin_media_play(
             at,
-            &MediaStamp {
-                class: MediaClass::YouTube,
-                url: Some(URL.into()),
-                title: TITLE.into(),
-                producer: "Firefox".into(),
-            },
+            &MediaStamp::new(MediaClass::YouTube, Some(URL.into()), TITLE, "Firefox"),
         )
         .unwrap();
     s.update_media_play(play, at + 20_000, 1).unwrap();
@@ -191,7 +186,7 @@ fn fake_cli(dir: &Path) -> ClaudeCli {
     let body = format!(
         r#"#!/bin/sh
 case " $* " in *" --version "*) echo "2.1.312 (Claude Code)"; exit 0;; esac
-cat > /dev/null
+cat >> '{prompts}'
 case "$*" in
   *intent*) echo command >> '{calls}'; echo '{{"type":"result","is_error":false,"result":"","total_cost_usd":0.002,"duration_ms":10,"structured_output":{{"actions":[{{"intent":"add_reminder","title":"call the printer","date":"2030-01-04","time":null,"all_day":true,"relative_to_event":false,"offset_days":null,"text":"call the printer","details":null,"node_name":null,"category_name":null}}]}}}}';;
   *low_signal*) echo interpret >> '{calls}'; echo '{{"type":"result","is_error":false,"result":"","total_cost_usd":0.01,"duration_ms":10,"structured_output":{{"title":"Launch planning call","summary":"- plan a launch","low_signal":false,"node_id":1,"new_project":{{"parent_id":1,"name":"Product launch","description":""}},"new_topic":null,"decisions":["Launch on Friday"],"action_items":[{{"text":"Email the press"}}],"topics":[],"events":[{{"title":"Call the printer","date":"2030-01-04","confidence":0.9}}]}}}}';;
@@ -199,7 +194,8 @@ case "$*" in
   *) echo other >> '{calls}'; echo '{{"type":"result","is_error":false,"result":"","total_cost_usd":0.001,"duration_ms":10,"structured_output":{{"actions":[]}}}}';;
 esac
 "#,
-        calls = dir.join("calls").display()
+        calls = dir.join("calls").display(),
+        prompts = dir.join("prompts").display()
     );
     std::fs::write(&script, body).unwrap();
     {
@@ -232,6 +228,107 @@ fn wait_for(h: &BrainHandle, what: &str, pred: impl Fn(&BrainEvent) -> bool) -> 
         }
     }
     panic!("timed out waiting for {what}; saw {seen:?}");
+}
+
+fn calls(dir: &TempDir) -> String {
+    std::fs::read_to_string(dir.0.join("calls")).unwrap_or_default()
+}
+
+#[test]
+fn media_is_filed_without_a_call_and_summarise_runs_one_on_demand() {
+    let dir = TempDir::new("summarise");
+    let db = dir.0.join("oats.sqlite");
+    let row = store_video(&Store::open(&db).unwrap(), now_ms() - 3_600_000);
+    let h = Brain {
+        config: BrainConfig {
+            cli: fake_cli(&dir.0),
+            ..BrainConfig::default()
+        },
+        store_path: db.clone(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    wait_for(&h, "availability", |e| {
+        matches!(e, BrainEvent::Availability(Ok(_)))
+    });
+    h.send(BrainCommand::InterpretNow);
+    wait_for(
+        &h,
+        "the interpretation",
+        |e| matches!(e, BrainEvent::RunFinished(r) if r.kind == "interpret"),
+    );
+    assert!(
+        !calls(&dir).contains("interpret"),
+        "no model call for media"
+    );
+    let s = Store::open(&db).unwrap();
+    let ep_id = s.segment(row.id).unwrap().unwrap().episode_id.unwrap();
+    let ep = s.episode(ep_id).unwrap().unwrap();
+    assert!(ep.is_media());
+    assert_eq!(ep.title, TITLE);
+    assert_eq!(ep.summary, format!("**Media:** [{TITLE}]({URL})"));
+
+    h.send(BrainCommand::Summarise(ep_id));
+    wait_for(
+        &h,
+        "the summary",
+        |e| matches!(e, BrainEvent::RunFinished(r) if r.kind == "summarise"),
+    );
+    drop(h);
+    assert_eq!(calls(&dir).matches("interpret").count(), 1);
+    let prompts = std::fs::read_to_string(dir.0.join("prompts")).unwrap();
+    assert!(prompts.contains("media: true"), "the media prompt");
+    let ep = s.episode(ep_id).unwrap().unwrap();
+    assert!(ep.is_media());
+    assert_eq!(ep.title, TITLE, "still titled by the video");
+    assert!(ep.summary.contains("- plan a launch"), "{}", ep.summary);
+    assert!(ep.action_items.is_empty() && ep.decisions.is_empty());
+    assert!(s.events_from(i64::MIN, 100).unwrap().is_empty());
+}
+
+#[test]
+fn a_media_episode_marked_as_a_call_is_reinterpreted_as_a_meeting() {
+    let dir = TempDir::new("as-call");
+    let db = dir.0.join("oats.sqlite");
+    let row = store_video(&Store::open(&db).unwrap(), now_ms() - 3_600_000);
+    let h = Brain {
+        config: BrainConfig {
+            cli: fake_cli(&dir.0),
+            ..BrainConfig::default()
+        },
+        store_path: db.clone(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    wait_for(&h, "availability", |e| {
+        matches!(e, BrainEvent::Availability(Ok(_)))
+    });
+    h.send(BrainCommand::InterpretNow);
+    wait_for(
+        &h,
+        "the filing",
+        |e| matches!(e, BrainEvent::RunFinished(r) if r.kind == "interpret"),
+    );
+    let s = Store::open(&db).unwrap();
+    let ep_id = s.segment(row.id).unwrap().unwrap().episode_id.unwrap();
+    assert!(s.mark_episode_as_call(ep_id).unwrap());
+    h.send(BrainCommand::Reinterpret(ep_id));
+    wait_for(
+        &h,
+        "the re-interpretation",
+        |e| matches!(e, BrainEvent::RunFinished(r) if r.kind == "interpret"),
+    );
+    drop(h);
+    assert_eq!(calls(&dir).matches("interpret").count(), 1, "one real call");
+    let prompts = std::fs::read_to_string(dir.0.join("prompts")).unwrap();
+    assert!(prompts.contains("meeting: true"), "the meeting hint");
+    assert!(!prompts.contains("media: true"));
+    assert!(prompts.contains("] them: Hey computer"), "rendered as them");
+    let seg = s.segment(row.id).unwrap().unwrap();
+    let ep = s.episode(seg.episode_id.unwrap()).unwrap().unwrap();
+    assert!(!ep.is_media());
+    assert_eq!(ep.title, "Launch planning call", "the conversation rules");
+    assert_eq!(ep.action_items.len(), 1);
 }
 
 #[test]

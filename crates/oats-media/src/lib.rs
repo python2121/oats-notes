@@ -7,20 +7,26 @@
 //! - when one of them is Firefox, the selected tab of each Firefox window, read from its
 //!   session store ([`firefox`]).
 //!
-//! [`classify_url`] / [`classify_bundle`] map a URL / bundle id to a [`MediaKind`]; the result
-//! is a [`MediaContext`], published to the pipeline as an [`oats_core::MediaStamp`] by the
-//! [`MediaWatcher`] thread.
+//! [`classify_url`] / [`classify_bundle`] map a URL / bundle id to a [`MediaKind`]; the user's
+//! per-app class ([`ProducerOverrides`], from the store's `producer_overrides`) is applied
+//! before them — except for the locked call apps (Zoom, Teams, Webex, FaceTime, and Meet /
+//! Zoom / Teams / Webex pages), which are always meetings. Slack and Discord are media by
+//! default (the user doesn't take calls on them; "On a call" or "Mark as a call" says
+//! otherwise). The result is a [`MediaContext`], published to the pipeline as an
+//! [`oats_core::MediaStamp`] by the [`MediaWatcher`] thread.
 
 #![cfg_attr(
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+use std::collections::HashMap;
+
 pub mod firefox;
 mod watcher;
 
 pub use firefox::{FirefoxSession, Tab, WindowTab};
-pub use oats_core::{MediaClass, MediaStamp};
+pub use oats_core::{MediaClass, MediaPolicy, MediaStamp, ProducerClass, ProducerOverride};
 pub use oats_sources::Producer;
 pub use watcher::{MediaWatcher, OnMediaChange, WatcherConfig};
 
@@ -33,9 +39,9 @@ pub enum MeetingApp {
     Webex,
     Whereby,
     Jitsi,
-    Slack,
     FaceTime,
-    Discord,
+    /// An app the user classes as Meeting (its name is the producer's).
+    App,
 }
 
 impl MeetingApp {
@@ -47,10 +53,15 @@ impl MeetingApp {
             MeetingApp::Webex => "Webex",
             MeetingApp::Whereby => "Whereby",
             MeetingApp::Jitsi => "Jitsi Meet",
-            MeetingApp::Slack => "Slack huddle",
             MeetingApp::FaceTime => "FaceTime",
-            MeetingApp::Discord => "Discord",
+            MeetingApp::App => "Call",
         }
+    }
+
+    /// A built-in call app / page: always a meeting, never overridable ("you'd never watch a
+    /// video through them").
+    pub fn locked(self) -> bool {
+        !matches!(self, MeetingApp::App)
     }
 }
 
@@ -66,6 +77,9 @@ pub enum MediaKind {
     },
     Meeting(MeetingApp),
     Music,
+    /// An app whose sound is media by its class (Slack, Discord by default; any app the user
+    /// classes Media).
+    AppMedia,
     /// A browser plays something unrecognised.
     Browser,
     Other,
@@ -78,6 +92,7 @@ impl MediaKind {
             MediaKind::YouTube { .. } => MediaClass::YouTube,
             MediaKind::Meeting(_) => MediaClass::Meeting,
             MediaKind::Music => MediaClass::Music,
+            MediaKind::AppMedia => MediaClass::App,
             MediaKind::Browser => MediaClass::Browser,
             MediaKind::Other => MediaClass::Other,
         }
@@ -88,12 +103,77 @@ impl MediaKind {
     /// beats music, anything recognised beats a bare browser.
     fn rank(&self) -> u8 {
         match self {
-            MediaKind::Meeting(_) => 4,
-            MediaKind::YouTube { .. } => 3,
-            MediaKind::Music => 2,
-            MediaKind::Browser => 1,
-            MediaKind::Other => 0,
+            MediaKind::Meeting(_) => 5,
+            MediaKind::YouTube { .. } => 4,
+            MediaKind::Music | MediaKind::AppMedia => 3,
+            MediaKind::Browser => 2,
+            MediaKind::Other => 1,
         }
+    }
+
+    /// A built-in call (see [`MeetingApp::locked`]).
+    pub fn is_locked_meeting(&self) -> bool {
+        matches!(self, MediaKind::Meeting(app) if app.locked())
+    }
+
+    /// Media proper (see [`MediaClass::is_media`]).
+    pub fn is_media(&self) -> bool {
+        self.class().is_media()
+    }
+}
+
+/// The user's per-app classes, keyed by lower-case bundle id (see
+/// [`oats_core::Store::producer_overrides`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProducerOverrides {
+    by_bundle: HashMap<String, ProducerOverride>,
+}
+
+impl ProducerOverrides {
+    pub fn new(rows: impl IntoIterator<Item = ProducerOverride>) -> Self {
+        Self {
+            by_bundle: rows
+                .into_iter()
+                .map(|o| (o.bundle_id.to_ascii_lowercase(), o))
+                .collect(),
+        }
+    }
+
+    /// The override for `bundle_id`, if any.
+    pub fn get(&self, bundle_id: &str) -> Option<&ProducerOverride> {
+        self.by_bundle.get(&bundle_id.to_ascii_lowercase())
+    }
+
+    /// The class `bundle_id` is treated as: locked apps are Meeting, else the override,
+    /// else its built-in default ([`default_class`]).
+    pub fn effective_class(&self, bundle_id: &str) -> ProducerClass {
+        if is_locked(bundle_id) {
+            return ProducerClass::Meeting;
+        }
+        match self.get(bundle_id).map(|o| o.class) {
+            Some(c) if c != ProducerClass::Auto => c,
+            _ => default_class(bundle_id),
+        }
+    }
+
+    /// "Transcribe anyway" is set for `bundle_id`.
+    pub fn transcribe_anyway(&self, bundle_id: &str) -> bool {
+        self.get(bundle_id).is_some_and(|o| o.transcribe_anyway)
+    }
+}
+
+/// An app that is always a call (Zoom, Teams, Webex, FaceTime): its class can't be changed.
+pub fn is_locked(bundle_id: &str) -> bool {
+    classify_bundle(bundle_id).is_locked_meeting()
+}
+
+/// What the built-in rules make of an app: Meeting (call apps), Media (Slack, Discord,
+/// music apps), else Auto (a browser is decided by its tab; anything else is not media).
+pub fn default_class(bundle_id: &str) -> ProducerClass {
+    match classify_bundle(bundle_id) {
+        MediaKind::Meeting(_) => ProducerClass::Meeting,
+        MediaKind::AppMedia | MediaKind::Music | MediaKind::YouTube { .. } => ProducerClass::Media,
+        MediaKind::Browser | MediaKind::Other => ProducerClass::Auto,
     }
 }
 
@@ -107,6 +187,10 @@ pub struct MediaContext {
     pub kind: MediaKind,
     /// The tab is a guess: not its window's selected tab (see [`resolve`]).
     pub background: bool,
+    /// The app is classed Ignore: neither transcribed nor logged.
+    pub ignored: bool,
+    /// A media app the user transcribes anyway (whatever the media policy).
+    pub transcribe_anyway: bool,
 }
 
 impl MediaContext {
@@ -117,7 +201,15 @@ impl MediaContext {
             tab: None,
             kind: MediaKind::Other,
             background: false,
+            ignored: false,
+            transcribe_anyway: false,
         }
+    }
+
+    /// How decisive this context is among several producers: an ignored app loses to
+    /// anything (see `MediaKind::rank`).
+    fn rank(&self) -> u8 {
+        if self.ignored { 0 } else { self.kind.rank() }
     }
 
     /// The title to show: the video's, else the tab's, else the app's name.
@@ -130,7 +222,9 @@ impl MediaContext {
         if let Some(tab) = self.tab.as_ref().filter(|t| !t.title.is_empty()) {
             return tab.title.clone();
         }
-        if let MediaKind::Meeting(app) = self.kind {
+        if let MediaKind::Meeting(app) = self.kind
+            && app != MeetingApp::App
+        {
             return app.name().to_string();
         }
         self.producer
@@ -144,8 +238,19 @@ impl MediaContext {
         if self.producer.is_none() && self.tab.is_none() {
             return None;
         }
+        let policy = if self.ignored {
+            Some(MediaPolicy::Ignore)
+        } else if self.transcribe_anyway && self.kind.is_media() {
+            Some(MediaPolicy::Transcribe)
+        } else {
+            None
+        };
         Some(MediaStamp {
-            class: self.kind.class(),
+            class: if self.ignored {
+                MediaClass::App
+            } else {
+                self.kind.class()
+            },
             url: self.tab.as_ref().map(|t| t.url.clone()),
             title: self.title(),
             producer: self
@@ -153,6 +258,12 @@ impl MediaContext {
                 .as_ref()
                 .map(|p| p.name.clone())
                 .unwrap_or_default(),
+            bundle_id: self
+                .producer
+                .as_ref()
+                .map(|p| p.bundle_id.clone())
+                .unwrap_or_default(),
+            policy,
         })
     }
 }
@@ -236,7 +347,13 @@ pub fn classify_url(url: &str) -> MediaKind {
         "meet.jit.si" => MediaKind::Meeting(MeetingApp::Jitsi),
         "open.spotify.com" | "music.apple.com" | "soundcloud.com" | "tidal.com"
         | "listen.tidal.com" | "deezer.com" | "music.amazon.com" => MediaKind::Music,
-        "app.slack.com" if path.contains("/huddle") => MediaKind::Meeting(MeetingApp::Slack),
+        // the user doesn't take calls on Slack / Discord: their pages are media by default
+        "app.slack.com" if path.contains("/huddle") => MediaKind::AppMedia,
+        "discord.com" | "ptb.discord.com" | "canary.discord.com"
+            if path.starts_with("/channels/") =>
+        {
+            MediaKind::AppMedia
+        }
         h if is_domain(h, "zoom.us") || is_domain(h, "zoom.com") => {
             MediaKind::Meeting(MeetingApp::Zoom)
         }
@@ -297,8 +414,8 @@ pub fn classify_bundle(bundle_id: &str) -> MediaKind {
         MediaKind::Meeting(MeetingApp::Webex)
     } else if starts("com.apple.facetime") {
         MediaKind::Meeting(MeetingApp::FaceTime)
-    } else if starts("com.hnc.discord") {
-        MediaKind::Meeting(MeetingApp::Discord)
+    } else if starts("com.hnc.discord") || starts("com.tinyspeck.slackmacgap") {
+        MediaKind::AppMedia
     } else if starts("com.spotify.client")
         || starts("com.apple.music")
         || starts("com.tidal.desktop")
@@ -326,10 +443,18 @@ pub fn classify_bundle(bundle_id: &str) -> MediaKind {
 /// first); else a call in any tab (a Meet tab behind the email being read); else the most
 /// recently shown YouTube / music tab that isn't selected — the video kept playing after the
 /// user switched tabs (`background = true`: the session store has no "this tab plays sound"
-/// flag, so this is a guess); else a bare browser with the front tab. Of several producers
-/// the most decisive kind wins (see `MediaKind::rank`; a call beats a video); ties go to the
-/// first. No producer = nothing playing.
-pub fn resolve(producers: &[Producer], firefox_tabs: &[WindowTab]) -> MediaContext {
+/// flag, so this is a guess); else a bare browser with the front tab.
+///
+/// The user's class for the app (`overrides`) then applies, unless the result is a built-in
+/// call (locked): Meeting makes it a call, Media makes it media (a video / music tab stays
+/// what it is), Ignore marks it ignored; "transcribe anyway" is kept for media. Of several
+/// producers the most decisive kind wins (see `MediaKind::rank`; a call beats a video, an
+/// ignored app loses to anything); ties go to the first. No producer = nothing playing.
+pub fn resolve(
+    producers: &[Producer],
+    firefox_tabs: &[WindowTab],
+    overrides: &ProducerOverrides,
+) -> MediaContext {
     let mut best: Option<MediaContext> = None;
     for p in producers {
         let mut ctx = MediaContext {
@@ -337,18 +462,39 @@ pub fn resolve(producers: &[Producer], firefox_tabs: &[WindowTab]) -> MediaConte
             tab: None,
             kind: classify_bundle(&p.bundle_id),
             background: false,
+            ignored: false,
+            transcribe_anyway: false,
         };
         if is_firefox(&p.bundle_id) {
             firefox_context(&mut ctx, firefox_tabs);
         }
-        if best
-            .as_ref()
-            .is_none_or(|b| ctx.kind.rank() > b.kind.rank())
-        {
+        apply_override(&mut ctx, overrides.get(&p.bundle_id));
+        if best.as_ref().is_none_or(|b| ctx.rank() > b.rank()) {
             best = Some(ctx);
         }
     }
     best.unwrap_or_else(MediaContext::nothing)
+}
+
+/// [`resolve`]'s per-app class.
+fn apply_override(ctx: &mut MediaContext, ov: Option<&ProducerOverride>) {
+    if ctx.kind.is_locked_meeting() {
+        return;
+    }
+    let Some(ov) = ov else {
+        return;
+    };
+    let keep_media = matches!(ctx.kind, MediaKind::YouTube { .. } | MediaKind::Music);
+    match ov.class {
+        ProducerClass::Auto => {}
+        ProducerClass::Meeting => ctx.kind = MediaKind::Meeting(MeetingApp::App),
+        ProducerClass::Media | ProducerClass::Ignore if !keep_media => {
+            ctx.kind = MediaKind::AppMedia;
+        }
+        ProducerClass::Media | ProducerClass::Ignore => {}
+    }
+    ctx.ignored = ov.class == ProducerClass::Ignore;
+    ctx.transcribe_anyway = ov.transcribe_anyway && ctx.kind.is_media() && !ctx.ignored;
 }
 
 /// [`resolve`]'s Firefox rules.
@@ -389,6 +535,104 @@ fn firefox_context(ctx: &mut MediaContext, tabs: &[WindowTab]) {
 mod tests {
     use super::*;
 
+    fn none() -> ProducerOverrides {
+        ProducerOverrides::default()
+    }
+
+    fn ov(bundle: &str, class: ProducerClass, transcribe_anyway: bool) -> ProducerOverrides {
+        ProducerOverrides::new([ProducerOverride {
+            bundle_id: bundle.into(),
+            class,
+            transcribe_anyway,
+        }])
+    }
+
+    #[test]
+    fn slack_and_discord_are_media_by_default_and_call_apps_are_locked() {
+        for b in ["com.hnc.Discord", "com.tinyspeck.slackmacgap"] {
+            assert_eq!(classify_bundle(b), MediaKind::AppMedia);
+            assert_eq!(default_class(b), ProducerClass::Media);
+            assert!(!is_locked(b));
+            let ctx = resolve(&[Producer::from_bundle(1, b)], &[], &none());
+            let stamp = ctx.stamp().unwrap();
+            assert_eq!(stamp.class, MediaClass::App);
+            assert_eq!(stamp.bundle_id, b);
+            assert_eq!(stamp.policy, None);
+        }
+        assert_eq!(
+            classify_url("https://app.slack.com/huddle/T1/C2"),
+            MediaKind::AppMedia
+        );
+        assert_eq!(
+            classify_url("https://discord.com/channels/1/2"),
+            MediaKind::AppMedia
+        );
+        assert_eq!(classify_url("https://discord.com/"), MediaKind::Browser);
+        for b in [
+            "us.zoom.xos",
+            "com.microsoft.teams2",
+            "com.cisco.webexmeetingsapp",
+            "com.apple.FaceTime",
+        ] {
+            assert!(is_locked(b), "{b}");
+            assert_eq!(default_class(b), ProducerClass::Meeting);
+            // an override can't make a call app media
+            let o = ov(b, ProducerClass::Ignore, false);
+            assert_eq!(o.effective_class(b), ProducerClass::Meeting);
+            let ctx = resolve(&[Producer::from_bundle(1, b)], &[], &o);
+            assert!(!ctx.ignored);
+            assert_eq!(ctx.stamp().unwrap().class, MediaClass::Meeting);
+        }
+        // a Meet tab stays a call even in a browser classed Media
+        let ff = Producer::from_bundle(10, "org.mozilla.firefox");
+        let meet = [tab("https://meet.google.com/abc", "Meet", true)];
+        let ctx = resolve(
+            std::slice::from_ref(&ff),
+            &meet,
+            &ov("org.mozilla.firefox", ProducerClass::Media, false),
+        );
+        assert_eq!(ctx.kind, MediaKind::Meeting(MeetingApp::Meet));
+        assert_eq!(default_class("com.example.game"), ProducerClass::Auto);
+    }
+
+    #[test]
+    fn overrides_apply_before_the_built_in_rules() {
+        let discord = Producer::from_bundle(1, "com.hnc.Discord");
+        // Meeting: a call, titled by the app
+        let o = ov("com.hnc.discord", ProducerClass::Meeting, false);
+        assert_eq!(o.effective_class("com.hnc.Discord"), ProducerClass::Meeting);
+        let ctx = resolve(std::slice::from_ref(&discord), &[], &o);
+        assert_eq!(ctx.kind, MediaKind::Meeting(MeetingApp::App));
+        assert_eq!(ctx.title(), "Discord");
+        assert_eq!(ctx.stamp().unwrap().class, MediaClass::Meeting);
+        // transcribe anyway: still media, with its own policy
+        let o = ov("com.hnc.discord", ProducerClass::Auto, true);
+        let stamp = resolve(std::slice::from_ref(&discord), &[], &o)
+            .stamp()
+            .unwrap();
+        assert_eq!(stamp.class, MediaClass::App);
+        assert_eq!(stamp.policy, Some(MediaPolicy::Transcribe));
+        // Ignore: skipped, and it loses to anything else playing
+        let o = ov("com.hnc.discord", ProducerClass::Ignore, true);
+        let ctx = resolve(std::slice::from_ref(&discord), &[], &o);
+        assert!(ctx.ignored);
+        assert_eq!(ctx.stamp().unwrap().policy, Some(MediaPolicy::Ignore));
+        let game = Producer::from_bundle(2, "com.example.game");
+        let ctx = resolve(&[discord.clone(), game], &[], &o);
+        assert_eq!(ctx.kind, MediaKind::Other);
+        // Media: an unknown app becomes media
+        let o = ov("com.example.player", ProducerClass::Media, false);
+        let ctx = resolve(&[Producer::from_bundle(3, "com.example.player")], &[], &o);
+        assert_eq!(ctx.kind, MediaKind::AppMedia);
+        // Auto: the built-in rules
+        let ctx = resolve(std::slice::from_ref(&discord), &[], &none());
+        assert_eq!(ctx.kind, MediaKind::AppMedia);
+        // a call app playing alongside Discord wins
+        let zoom = Producer::from_bundle(4, "us.zoom.xos");
+        let ctx = resolve(&[discord, zoom], &[], &none());
+        assert_eq!(ctx.kind, MediaKind::Meeting(MeetingApp::Zoom));
+    }
+
     fn tab(url: &str, title: &str, front: bool) -> WindowTab {
         WindowTab {
             tab: Tab {
@@ -423,20 +667,20 @@ mod tests {
             ),
             tab("https://www.youtube.com/", "YouTube", true),
         ];
-        let ctx = resolve(std::slice::from_ref(&ff), &tabs);
+        let ctx = resolve(std::slice::from_ref(&ff), &tabs, &none());
         assert!(ctx.background);
         assert_eq!(ctx.title(), "Recent");
         assert_eq!(ctx.kind.class(), MediaClass::YouTube);
         let mut with_call = tabs.to_vec();
         with_call.push(background("https://meet.google.com/abc", "Meet - abc", 50));
-        let ctx = resolve(std::slice::from_ref(&ff), &with_call);
+        let ctx = resolve(std::slice::from_ref(&ff), &with_call, &none());
         assert_eq!(ctx.kind, MediaKind::Meeting(MeetingApp::Meet));
         // a selected video beats a background call guess? no: a selected video is certain
         let selected_video = [
             background("https://meet.google.com/abc", "Meet", 50),
             tab("https://youtu.be/xyz", "Xyz - YouTube", true),
         ];
-        let ctx = resolve(std::slice::from_ref(&ff), &selected_video);
+        let ctx = resolve(std::slice::from_ref(&ff), &selected_video, &none());
         assert!(!ctx.background);
         assert_eq!(ctx.title(), "Xyz");
     }
@@ -544,7 +788,7 @@ mod tests {
                 false,
             ),
         ];
-        let ctx = resolve(std::slice::from_ref(&ff), &tabs);
+        let ctx = resolve(std::slice::from_ref(&ff), &tabs, &none());
         assert_eq!(
             ctx.kind,
             MediaKind::YouTube {
@@ -564,12 +808,12 @@ mod tests {
 
         // the same video while Zoom plays: a call
         let zoom = Producer::from_bundle(20, "us.zoom.xos");
-        let ctx = resolve(&[ff.clone(), zoom], &tabs);
+        let ctx = resolve(&[ff.clone(), zoom], &tabs, &none());
         assert_eq!(ctx.kind, MediaKind::Meeting(MeetingApp::Zoom));
         assert_eq!(ctx.stamp().unwrap().class, MediaClass::Meeting);
 
         // Firefox on a page that explains nothing: a browser, the front tab kept
-        let ctx = resolve(std::slice::from_ref(&ff), &tabs[..1]);
+        let ctx = resolve(std::slice::from_ref(&ff), &tabs[..1], &none());
         assert_eq!(ctx.kind, MediaKind::Browser);
         assert_eq!(
             ctx.tab.as_ref().map(|t| t.url.as_str()),
@@ -577,12 +821,20 @@ mod tests {
         );
 
         // Spotify alone; nothing at all
-        let ctx = resolve(&[Producer::from_bundle(5, "com.spotify.client")], &tabs);
+        let ctx = resolve(
+            &[Producer::from_bundle(5, "com.spotify.client")],
+            &tabs,
+            &none(),
+        );
         assert_eq!(ctx.kind, MediaKind::Music);
         assert_eq!(ctx.stamp().unwrap().title, "Spotify");
-        assert!(resolve(&[], &tabs).stamp().is_none());
+        assert!(resolve(&[], &tabs, &none()).stamp().is_none());
         // a Chrome producer never borrows Firefox's tabs
-        let ctx = resolve(&[Producer::from_bundle(6, "com.google.Chrome")], &tabs);
+        let ctx = resolve(
+            &[Producer::from_bundle(6, "com.google.Chrome")],
+            &tabs,
+            &none(),
+        );
         assert_eq!(ctx.kind, MediaKind::Browser);
         assert!(ctx.tab.is_none());
     }

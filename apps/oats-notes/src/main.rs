@@ -38,7 +38,7 @@
 //! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
 //! `oats_brain::BrainConfig::from_env`).
 //!
-//! `--selftest <out.png> [--listening|--notes|--work|--project [--expanded]|--calendar|--todos|--toast] [--no-sidebar] [--search <text>] [--topic <text>]` renders the whole window offscreen to a PNG (seeded
+//! `--selftest <out.png> [--listening|--notes|--work|--project [--expanded]|--calendar|--todos|--toast] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>]` renders the whole window offscreen to a PNG (seeded
 //! demo content, the null engine, a throwaway database) — the shell verified without a window.
 
 use std::any::Any;
@@ -102,10 +102,12 @@ impl Drop for MediaActive {
 }
 
 /// The media watcher feeding `feed` (what plays on the system lane), unless `OATS_MEDIA=off`.
-/// `wake` runs on every change (the status strip shows "▶ <title>").
+/// `wake` runs on every change (the status strip shows "▶ <title>"). `db`: where the per-app
+/// classes are read (every 5 s) and the apps seen playing are recorded.
 fn media_watcher(
     feed: oats_core::MediaFeed,
     wake: Box<dyn Fn() + Send>,
+    db: std::path::PathBuf,
 ) -> Option<std::sync::Arc<oats_media::MediaWatcher>> {
     if std::env::var("OATS_MEDIA").is_ok_and(|v| v.eq_ignore_ascii_case("off") || v == "0") {
         log::info!("OATS_MEDIA=off: no media detection");
@@ -117,6 +119,7 @@ fn media_watcher(
         feed,
         Box::new(move |_| wake()),
         oats_media::WatcherConfig::default(),
+        Some(db),
     );
     Some(std::sync::Arc::new(watcher))
 }
@@ -227,7 +230,7 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--work|--project [--expanded]|--calendar|--todos|--toast] [--no-sidebar] [--search <text>] [--topic <text>]\n\n\
+        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--work|--project [--expanded]|--calendar|--todos|--toast] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>]\n\n\
          --listen       start listening as soon as the speech engine is ready\n\
          --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
          \x20              paced in real time; listening stops when the file ends\n\
@@ -242,6 +245,7 @@ fn usage() -> ExitCode {
          --calendar     with --selftest: the month Calendar (seeded events and todos)\n\
          --todos        with --selftest: the Todos view (open, snoozed, undated, completed)\n\
          --toast        with --selftest: a due reminder and a voice-command confirmation pop-up\n\
+         --prefs        with --selftest: Preferences open over seeded apps (the Apps table)\n\
          --search TEXT  with --selftest: open the search bar (⌘F) with this query\n\
          --topic TEXT   with --selftest: open the Topic view for this topic"
     );
@@ -389,7 +393,7 @@ fn main() -> ExitCode {
             let ctx = cc.egui_ctx.clone();
             let brain = oats_brain::Brain {
                 config: brain_config,
-                store_path: db,
+                store_path: db.clone(),
                 wake: Box::new(move || ctx.request_repaint()),
             }
             .spawn();
@@ -400,6 +404,7 @@ fn main() -> ExitCode {
             let media = media_watcher(
                 pipeline.media_feed(),
                 Box::new(move || ctx.request_repaint()),
+                db,
             );
             let audio = audio_starter(
                 audio_samples,
@@ -477,6 +482,7 @@ fn selftest_cli(args: &[String]) -> ExitCode {
             "--project" => options.project = true,
             "--expanded" => options.expanded = true,
             "--no-sidebar" => options.no_sidebar = true,
+            "--prefs" => options.prefs = true,
             f if !f.starts_with("--") && out.is_none() => out = Some(f.into()),
             _ => return usage(),
         }

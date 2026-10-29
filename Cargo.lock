@@ -2658,6 +2658,7 @@ dependencies = [
  "muda",
  "oats-brain",
  "oats-core",
+ "oats-media",
  "oats-status",
  "serde",
  "serde_json",

@@ -229,8 +229,14 @@ pub enum BrainCommand {
     InterpretNow,
     ReviewNow,
     ReorganiseNow,
-    /// Forget an episode's interpretation and redo it.
+    /// Forget an episode's interpretation and redo it. After "Mark as a call" / "Mark as
+    /// media" the episode's segments carry the new stamps, so the redo follows the new kind
+    /// (a call: the conversation prompt with the meeting hint; media: filed without a call).
     Reinterpret(i64),
+    /// Summarise a media episode now: one interpretation with the media prompt (summary
+    /// only; no decisions, action items or events). Media is otherwise filed without a model
+    /// call.
+    Summarise(i64),
     UndoChange(i64),
     Shutdown,
 }
@@ -507,6 +513,7 @@ struct Worker {
     last_backlog: Option<(i64, usize)>,
     pending_commands: VecDeque<PendingCommand>,
     reinterpret: VecDeque<i64>,
+    summarise: VecDeque<i64>,
     undo: VecDeque<i64>,
     categorise_due: Option<Instant>,
     interpret_due: Option<Instant>,
@@ -606,6 +613,7 @@ impl Worker {
             last_backlog: None,
             pending_commands: VecDeque::new(),
             reinterpret: VecDeque::new(),
+            summarise: VecDeque::new(),
             undo: VecDeque::new(),
             categorise_due: None,
             interpret_due: None,
@@ -844,6 +852,10 @@ impl Worker {
                     continue;
                 }
             } else {
+                if let Some(id) = self.summarise.pop_front() {
+                    self.run_summarise(id);
+                    continue;
+                }
                 if due(self.categorise_due) {
                     self.categorise_due = None;
                     self.run_categorise();
@@ -916,6 +928,7 @@ impl Worker {
                 self.reorganise_due = Some(Instant::now());
             }
             BrainCommand::Reinterpret(id) => self.reinterpret.push_back(id),
+            BrainCommand::Summarise(id) => self.summarise.push_back(id),
             BrainCommand::UndoChange(id) => self.undo.push_back(id),
             BrainCommand::Shutdown => return false,
         }
@@ -1344,6 +1357,92 @@ impl Worker {
 
     // ---- tier 1: rolling-window interpretation --------------------------------------------
 
+    /// "Summarise" on a media episode: one interpretation of its transcript with the media
+    /// prompt, revising it in place (the media rules apply: title, Media, nothing actionable).
+    fn run_summarise(&mut self, id: i64) {
+        let ep = match self.store.episode(id) {
+            Ok(Some(ep)) if ep.is_media() => ep,
+            Ok(_) => {
+                return self.out.send(BrainEvent::Warning(format!(
+                    "summarise: episode {id} is not a media note"
+                )));
+            }
+            Err(e) => {
+                return self
+                    .out
+                    .send(BrainEvent::Warning(format!("summarise: {e}")));
+            }
+        };
+        if ep.user_edited_at.is_some() {
+            return self.out.send(BrainEvent::Warning(
+                "summarise: you edited this note; its text is left alone".to_owned(),
+            ));
+        }
+        let segments = match self.store.segments_of_episode(id) {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                return self.out.send(BrainEvent::Warning(
+                    "summarise: no transcript was kept for this media".to_owned(),
+                ));
+            }
+            Err(e) => {
+                return self
+                    .out
+                    .send(BrainEvent::Warning(format!("summarise: {e}")));
+            }
+        };
+        if !self.within_budget(Tier::Rolling) {
+            return;
+        }
+        let chunk = Chunk {
+            started_at: ep.started_at,
+            ended_at: ep.ended_at,
+            segments,
+        };
+        let model = self.cfg.models.rolling.clone();
+        let _ = self.run_job(Tier::Rolling, "summarise", |w, run_id| {
+            let now = now_ms();
+            let tree = w.store.nodes().map_err(|e| e.to_string())?;
+            let titles = interpret::media_titles(&w.store, chunk.started_at, chunk.ended_at);
+            let req = interpret::interpret_request_with(
+                &tree,
+                &chunk,
+                Some(&ep),
+                &Local::now(),
+                Some(model.clone()),
+                &titles,
+            );
+            let resp = w.call(&req).map_err(JobError::from)?;
+            let interp = resp
+                .structured
+                .as_ref()
+                .ok_or_else(|| "no structured output".to_owned())
+                .and_then(|v| interpret::parse_interpretation(v).map_err(|e| e.to_string()))?;
+            let model_name = resp.model.clone().unwrap_or_else(|| model.clone());
+            let applied = interpret::apply_interpretation(
+                &w.store,
+                &tree,
+                &chunk,
+                &interp,
+                Some(&ep),
+                &model_name,
+                resp.cost_usd,
+                Some(run_id),
+                0,
+                now,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(JobOutput {
+                summary: format!("summarised '{}'", applied.episode.title),
+                cost_usd: resp.cost_usd,
+                duration_ms: resp.duration_ms,
+                model: resp.model.clone(),
+                lines: vec![format!("Summarised '{}'", applied.episode.title)],
+                changed: true,
+            })
+        });
+    }
+
     fn run_interpret(&mut self, force: bool) {
         let rows = match self.store.uninterpreted_segments(2_000) {
             Ok(r) => r,
@@ -1547,16 +1646,18 @@ impl Worker {
                 prior = Some(p);
             }
         }
+        // media is filed under Media by its title / URL without a model call (continuing the
+        // same media's episode); "Summarise" on its note runs one on demand
+        if let Some(media) = interpret::media_of(&self.store, chunk) {
+            interpret::file_media_without_call(&self.store, chunk, &media, prior.as_ref(), now)
+                .map_err(|e| e.to_string())?;
+            return Ok(ChunkStep::Fragment);
+        }
         // tiny fragments aren't worth a call: a closed one is filed as low-signal, an open one
         // waits for more speech (or for a forced run)
         if prior.is_none() && full.text_len() < self.cfg.min_chunk_chars {
             if chunk.is_open(now, &rule) && !force {
                 return Ok(ChunkStep::Waiting);
-            }
-            if let Some(media) = interpret::media_of(&self.store, chunk) {
-                interpret::file_media_without_call(&self.store, chunk, &media, now)
-                    .map_err(|e| e.to_string())?;
-                return Ok(ChunkStep::Fragment);
             }
             let content = EpisodeContent {
                 title: "Fragments".into(),

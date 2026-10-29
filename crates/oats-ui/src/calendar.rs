@@ -10,7 +10,8 @@
 //! Events and todos come from the brain's interpretation (significant dates) or from voice
 //! commands; the source is shown so the user can audit. Under them the panel lists what the
 //! computer played that day ("Watched: <title> 10:12–10:40", from `media_plays`); a click
-//! opens the video in the browser.
+//! opens the video in the browser, and the right-click "Mark as a call" relabels a play that
+//! was really a call ("Call via Discord 10:12–10:40").
 
 use std::collections::BTreeMap;
 
@@ -29,6 +30,8 @@ pub enum CalendarAction {
     /// Show where the event was said in the transcript.
     ShowEvent(i64),
     Todo(TodoAction),
+    /// "Mark as a call" on a media play (`media_plays.id`).
+    MarkPlayAsCall(i64),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -418,11 +421,38 @@ fn day_panel(
             DayItem::Todo(td) => todo_row(ui, t, td, nodes, actions),
         }
     }
-    media_section(ui, t, media_plays);
+    media_section(ui, t, media_plays, actions);
 }
 
-/// "Watched: <title> 10:12–10:40" / "Listened: …" per play of the day; a click opens the URL.
-fn media_section(ui: &mut egui::Ui, t: &Tokens, plays: &[MediaPlay]) {
+/// What a play row reads: "Watched: <title>", "Listened: <title>", "Call via <app>".
+pub fn play_label(p: &MediaPlay) -> String {
+    let title = if p.title.trim().is_empty() {
+        p.url.as_deref().unwrap_or("something")
+    } else {
+        p.title.as_str()
+    };
+    match p.kind {
+        MediaClass::Call => {
+            let via = if p.producer.trim().is_empty() {
+                title
+            } else {
+                p.producer.as_str()
+            };
+            format!("Call via {via}")
+        }
+        MediaClass::Music | MediaClass::App => format!("Listened: {title}"),
+        _ => format!("Watched: {title}"),
+    }
+}
+
+/// "Watched: <title> 10:12–10:40" / "Listened: …" / "Call via …" per play of the day; a
+/// click opens the URL; right-click "Mark as a call".
+fn media_section(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    plays: &[MediaPlay],
+    actions: &mut Vec<CalendarAction>,
+) {
     if plays.is_empty() {
         return;
     }
@@ -438,22 +468,13 @@ fn media_section(ui: &mut egui::Ui, t: &Tokens, plays: &[MediaPlay]) {
     for p in plays {
         ui.horizontal(|ui| {
             ui.add_space(MARGIN);
-            let verb = match p.kind {
-                MediaClass::Music => "Listened",
-                _ => "Watched",
-            };
-            let title = if p.title.trim().is_empty() {
-                p.url.as_deref().unwrap_or("something")
-            } else {
-                p.title.as_str()
-            };
             let when = format!(
                 "{}–{}",
                 clock(p.started_at, &Local),
                 clock(p.ended_at, &Local)
             );
-            let text = RichText::new(format!("{verb}: {title}")).size(12.5);
-            match &p.url {
+            let text = RichText::new(play_label(p)).size(12.5);
+            let resp = match &p.url {
                 Some(url) => {
                     let link = ui
                         .add(
@@ -465,10 +486,25 @@ fn media_section(ui: &mut egui::Ui, t: &Tokens, plays: &[MediaPlay]) {
                     if link.clicked() {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                     }
+                    link
                 }
-                None => {
-                    ui.add(egui::Label::new(text.color(t.text)).truncate());
-                }
+                None => ui.add(
+                    egui::Label::new(text.color(t.text))
+                        .sense(Sense::click())
+                        .truncate(),
+                ),
+            };
+            if p.kind.is_media() {
+                resp.context_menu(|ui| {
+                    if ui
+                        .button("Mark as a call")
+                        .on_hover_text("This was a conversation, not media")
+                        .clicked()
+                    {
+                        actions.push(CalendarAction::MarkPlayAsCall(p.id));
+                        ui.close();
+                    }
+                });
             }
             ui.label(RichText::new(when).color(t.text_tertiary).size(11.5));
         });

@@ -135,12 +135,104 @@ fn send_system(tx: &Sender<AudioChunk>, amp: f32, ms: usize) {
 }
 
 fn stamp(class: MediaClass, url: &str, title: &str) -> MediaStamp {
-    MediaStamp {
-        class,
-        url: Some(url.into()),
-        title: title.into(),
-        producer: "Firefox".into(),
-    }
+    MediaStamp::new(class, Some(url.into()), title, "Firefox")
+}
+
+/// Discord as the resolver stamps it by default (a media app, no URL).
+fn discord(transcribe_anyway: bool) -> MediaStamp {
+    let mut s = MediaStamp::new(MediaClass::App, None, "Discord", "Discord");
+    s.bundle_id = "com.hnc.discord".into();
+    s.policy = transcribe_anyway.then_some(MediaPolicy::Transcribe);
+    s
+}
+
+fn plays(db: &std::path::Path) -> Vec<oats_core::MediaPlay> {
+    Store::open(db)
+        .unwrap()
+        .media_plays_between(0, i64::MAX)
+        .unwrap()
+}
+
+#[test]
+fn discord_under_log_only_is_logged_not_transcribed() {
+    let rig = rig("discord-log", MediaPolicy::LogOnly);
+    play(&rig, Some(discord(false)));
+    assert!(system_rows(&rig.db).is_empty(), "nothing transcribed");
+    let p = plays(&rig.db);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0].kind, MediaClass::App);
+    assert_eq!(p[0].producer, "Discord");
+    assert_eq!(p[0].url, None);
+}
+
+#[test]
+fn discord_with_transcribe_anyway_is_transcribed_as_media_under_log_only() {
+    let rig = rig("discord-anyway", MediaPolicy::LogOnly);
+    play(&rig, Some(discord(true)));
+    let rows = system_rows(&rig.db);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].media_kind, Some(MediaClass::App), "filed as media");
+    let p = plays(&rig.db);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].segments_count, 1);
+    // the app recorded on the segment (what "Mark as media" looks at)
+    let s = Store::open(&rig.db).unwrap();
+    let ep = s
+        .insert_episode(0, i64::MAX / 2, &oats_core::EpisodeContent::default(), 0)
+        .unwrap()
+        .id;
+    s.mark_segments_interpreted(&[rows[0].id], ep, 0).unwrap();
+    assert_eq!(
+        s.episode_media_apps(&[ep]).unwrap().get(&ep).cloned(),
+        Some(vec!["com.hnc.discord".to_string()])
+    );
+}
+
+#[test]
+fn an_app_classed_ignore_is_skipped_even_under_transcribe() {
+    let rig = rig("discord-ignore", MediaPolicy::Transcribe);
+    let mut s = discord(false);
+    s.policy = Some(MediaPolicy::Ignore);
+    play(&rig, Some(s));
+    assert!(system_rows(&rig.db).is_empty());
+    assert!(plays(&rig.db).is_empty());
+}
+
+#[test]
+fn on_a_call_discord_is_transcribed_as_them_whatever_the_policy() {
+    let rig = rig("discord-call", MediaPolicy::Ignore);
+    rig.h.set_on_call(true);
+    play(&rig, Some(discord(false)));
+    let rows = system_rows(&rig.db);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].media_kind, Some(MediaClass::Meeting));
+    assert!(plays(&rig.db).is_empty(), "a call is no media play");
+    // the session ended: the switch is off again
+    assert!(!rig.h.on_call());
+}
+
+#[test]
+fn on_a_call_ends_after_silence_on_the_system_lane() {
+    let rig = rig("call-quiet", MediaPolicy::LogOnly);
+    wait_for(&rig.h, "idle", |e| {
+        matches!(e, PipelineEvent::Status(PipelineStatus::Idle))
+    });
+    rig.h.set_on_call_timeout(Duration::from_secs(5));
+    rig.h.set_on_call(true);
+    let (tx, rx) = channel();
+    rig.h.start_lanes(rx, ListenOptions::default());
+    send_system(&tx, 0.3, 2_000);
+    send_system(&tx, 0.0, 7_000);
+    wait_for(&rig.h, "on a call to end", |e| {
+        matches!(
+            e,
+            PipelineEvent::OnCallEnded {
+                after_silence: true
+            }
+        )
+    });
+    assert!(!rig.h.on_call());
+    drop(tx);
 }
 
 /// Play 4 s of "speech" on the system lane while `stamp` is in the feed, then stop.

@@ -574,10 +574,18 @@ pub fn media_of(store: &Store, chunk: &Chunk) -> Option<MediaInfo> {
     let key = chunk.media_key()?;
     let first = chunk.segments.iter().find(|s| s.echo_of.is_none())?;
     let url = first.media_ref.clone();
-    let title = url
-        .as_ref()
-        .and_then(|u| media_titles(store, chunk.started_at, chunk.ended_at).remove(u))
-        .unwrap_or_else(|| key.clone());
+    let title = match &url {
+        Some(u) => media_titles(store, chunk.started_at, chunk.ended_at).remove(u),
+        // an app with no page (Discord, Spotify): the title of its play ("Discord")
+        None => store
+            .media_plays_between(chunk.started_at - 60_000, chunk.ended_at + 60_000)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.url.is_none() && Some(p.kind) == first.media_kind)
+            .map(|p| p.title)
+            .rfind(|t| !t.trim().is_empty()),
+    }
+    .unwrap_or_else(|| key.clone());
     Some(MediaInfo {
         class: first.media_kind.unwrap_or(MediaClass::YouTube),
         url,
@@ -618,15 +626,35 @@ fn media_content(content: &mut EpisodeContent, media: &MediaInfo, media_node: i6
     content.action_items.clear();
 }
 
-/// File a media chunk too short to be worth a call: a media episode titled by the video,
-/// under Media, the URL in its summary — no model involved.
+/// File a media chunk without a model call (the default for all media): a media episode
+/// titled by the video / app, under Media, the URL in its summary. With `prior` (the same
+/// media's episode, ended within the gap) that episode is extended instead and keeps its
+/// content (a summary the user asked for stays).
 pub fn file_media_without_call(
     store: &Store,
     chunk: &Chunk,
     media: &MediaInfo,
+    prior: Option<&Episode>,
     now_ms: i64,
 ) -> Result<Episode, StoreError> {
     store.with_savepoint(|store| {
+        if let Some(p) = prior {
+            let content = EpisodeContent {
+                cost_usd: None,
+                ..p.content()
+            };
+            store.revise_episode(
+                p.id,
+                p.started_at.min(chunk.started_at),
+                p.ended_at.max(chunk.ended_at),
+                &content,
+                now_ms,
+            )?;
+            store.mark_segments_interpreted(&chunk.segment_ids(), p.id, now_ms)?;
+            return store
+                .episode(p.id)?
+                .ok_or_else(|| StoreError::Io(std::io::Error::other("episode vanished")));
+        }
         let node = store.media_category()?;
         let mut content = EpisodeContent {
             model: "none".into(),
@@ -1701,6 +1729,7 @@ mod tests {
             created_at: 0,
             last_revised_at: 0,
             user_edited_at: None,
+            kind: oats_core::store::EPISODE_CONVERSATION.into(),
         };
         let req = interpret_request(&tree, &chunk, Some(&prior), &now, None);
         assert!(req.user_prompt.contains("Previous interpretation"));

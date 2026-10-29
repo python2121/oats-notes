@@ -74,6 +74,11 @@ struct Rig {
 }
 
 fn build(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>) -> Rig {
+    build_with(db, item, brain, false)
+}
+
+/// [`build`]; `system`: the starter reports system audio running next to the microphone.
+fn build_with(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>, system: bool) -> Rig {
     let store = Store::open(db).unwrap();
     let pipeline = Pipeline {
         engine: Box::new(|| Ok(Box::new(NullEngine) as Box<dyn SpeechEngine>)),
@@ -86,7 +91,10 @@ fn build(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>) -> Rig {
     let m = mic.clone();
     let audio: AudioStarter = Box::new(move |tx, _request| {
         *m.borrow_mut() = Some(tx);
-        Ok(StartedAudio::mic(Box::new(())))
+        Ok(StartedAudio {
+            system,
+            ..StartedAudio::mic(Box::new(()))
+        })
     });
     let harness = Harness::builder()
         .with_size(egui::vec2(1100.0, 720.0))
@@ -1486,4 +1494,333 @@ fn a_search_hit_from_far_back_loads_a_window_around_it_and_paging_forward_reache
         steps += 1;
     }
     assert_eq!(rig.app().loaded_rows().2, Some(ids[599]));
+}
+
+// ---- per-app classes, On a call, Mark as a call / media, Show media ------------------------------
+
+/// A Discord media note: two system segments stamped as a media app, filed under Media.
+fn seed_discord_episode(db: &Path) -> i64 {
+    use oats_core::{AudioSourceKind, EpisodeContent, MediaClass, MediaStamp};
+    let s = Store::open(db).unwrap();
+    let sid = s.begin_session(now_ms() - 600_000, "seed").unwrap();
+    let media = s.media_category().unwrap();
+    let mut discord = MediaStamp::new(MediaClass::App, None, "Discord", "Discord");
+    discord.bundle_id = "com.hnc.discord".into();
+    let t = now_ms() - 300_000;
+    let mut ids = Vec::new();
+    for (i, text) in [
+        "so we agreed the export ships on Friday after the last round of testing",
+        "and Dana sends the release notes to the whole team on Thursday evening",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = t + i as i64 * 10_000;
+        let row = s
+            .insert_segment_from(
+                sid,
+                at,
+                at + 5_000,
+                text,
+                None,
+                AudioSourceKind::System,
+                None,
+            )
+            .unwrap();
+        s.stamp_segment_media(row.id, &discord).unwrap();
+        s.set_segment_node(row.id, Some(media.id)).unwrap();
+        ids.push(row.id);
+    }
+    let ep = s
+        .insert_episode(
+            t,
+            t + 15_000,
+            &EpisodeContent {
+                title: "Discord".into(),
+                summary: "**Media:** Discord".into(),
+                node_id: Some(media.id),
+                model: "none".into(),
+                ..Default::default()
+            },
+            t + 20_000,
+        )
+        .unwrap()
+        .id;
+    s.set_episode_kind(ep, oats_core::store::EPISODE_MEDIA)
+        .unwrap();
+    s.mark_segments_interpreted(&ids, ep, t + 20_000).unwrap();
+    ep
+}
+
+#[test]
+fn the_apps_table_lists_a_seen_app_and_a_class_change_writes_the_override() {
+    use oats_core::ProducerClass;
+    let dir = TempDir::new("apps");
+    {
+        let s = Store::open(&dir.db()).unwrap();
+        s.note_producers_seen(
+            &[
+                ("com.hnc.Discord".into(), "Discord".into()),
+                ("us.zoom.xos".into(), "Zoom".into()),
+            ],
+            now_ms(),
+        )
+        .unwrap();
+    }
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::Preferences);
+    rig.harness.run_steps(2);
+    assert!(rig.shows("Discord"));
+    assert!(rig.shows("Meeting 🔒"), "Zoom is locked");
+    let apps = rig.app().prefs_apps().unwrap().to_vec();
+    let discord = apps.iter().find(|a| a.name == "Discord").unwrap();
+    assert_eq!(
+        discord.effective(),
+        ProducerClass::Media,
+        "media by default"
+    );
+    assert!(apps.iter().find(|a| a.name == "Zoom").unwrap().locked);
+    // pick "Meeting" in Discord's class menu
+    rig.harness.get_by_value("Auto (Media)").click();
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Meeting").click();
+    rig.harness.run_steps(2);
+    let o = Store::open(&dir.db())
+        .unwrap()
+        .producer_overrides()
+        .unwrap();
+    assert_eq!(o.len(), 1, "{o:?}");
+    assert_eq!(o[0].bundle_id, "com.hnc.discord");
+    assert_eq!(o[0].class, ProducerClass::Meeting);
+    let apps = rig.app().prefs_apps().unwrap().to_vec();
+    assert_eq!(
+        apps.iter().find(|a| a.name == "Discord").unwrap().class,
+        ProducerClass::Meeting
+    );
+    // a locked app can't be changed
+    rig.app()
+        .set_app_class("us.zoom.xos", ProducerClass::Media, false);
+    assert_eq!(
+        Store::open(&dir.db())
+            .unwrap()
+            .producer_overrides()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn transcribe_anyway_shows_only_while_the_policy_keeps_no_transcript() {
+    let dir = TempDir::new("anyway");
+    Store::open(&dir.db())
+        .unwrap()
+        .note_producers_seen(&[("com.hnc.Discord".into(), "Discord".into())], now_ms())
+        .unwrap();
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::Preferences);
+    rig.harness.run_steps(2);
+    assert!(
+        !rig.shows("transcribe anyway"),
+        "the default policy transcribes"
+    );
+    rig.harness.get_by_label("Log only").click();
+    rig.harness.run_steps(2);
+    assert!(rig.shows("transcribe anyway"));
+    rig.harness.get_by_label("transcribe anyway").click();
+    rig.harness.run_steps(2);
+    let o = Store::open(&dir.db())
+        .unwrap()
+        .producer_overrides()
+        .unwrap();
+    assert!(o[0].transcribe_anyway, "{o:?}");
+}
+
+#[test]
+fn the_on_a_call_pill_toggles_and_stopping_turns_it_off() {
+    let dir = TempDir::new("on-call");
+    let mut rig = build_with(&dir.db(), None, None, true);
+    rig.app().run(Command::ToggleListening);
+    rig.until("listening", |app| {
+        *app.status() == PipelineStatus::Listening
+    });
+    assert!(rig.app().system_audio_on());
+    assert!(!rig.app().on_call());
+    rig.harness.get_by_label("On a call").click();
+    rig.harness.run_steps(2);
+    assert!(rig.app().on_call());
+    assert!(rig.app().status_text().contains("· on a call"));
+    let checked = rig
+        .app()
+        .menu_model()
+        .iter()
+        .flat_map(|s| s.entries.clone())
+        .find_map(|e| match e {
+            MenuEntry::Item {
+                cmd: Command::ToggleOnCall,
+                checked,
+                ..
+            } => checked,
+            _ => None,
+        });
+    assert_eq!(checked, Some(true));
+    rig.harness.get_by_label("On a call").click();
+    rig.harness.run_steps(2);
+    assert!(!rig.app().on_call());
+    rig.app().run(Command::ToggleOnCall);
+    assert!(rig.app().on_call());
+    rig.app().run(Command::ToggleListening);
+    assert!(!rig.app().on_call(), "listening stopped: off");
+}
+
+#[test]
+fn on_a_call_needs_system_audio() {
+    let dir = TempDir::new("on-call-mic");
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ToggleListening);
+    rig.until("listening", |app| {
+        *app.status() == PipelineStatus::Listening
+    });
+    rig.app().run(Command::ToggleOnCall);
+    assert!(!rig.app().on_call());
+    assert!(rig.app().warning().unwrap().contains("system audio"));
+}
+
+/// A fake `claude` that interprets any transcript as "Release planning" (and logs the prompt).
+fn fake_cli_logging(dir: &Path) -> ClaudeCli {
+    let script = dir.join("claude");
+    let body = format!(
+        r#"#!/bin/sh
+case " $* " in *" --version "*) echo "2.1.312 (Claude Code)"; exit 0;; esac
+cat >> '{prompts}'
+case "$*" in
+  *low_signal*) echo '{{"type":"result","is_error":false,"result":"","total_cost_usd":0.01,"duration_ms":10,"structured_output":{{"title":"Release planning","summary":"- ship Friday","low_signal":false,"node_id":null,"new_project":null,"new_topic":null,"decisions":[],"action_items":[],"topics":[],"events":[]}}}}';;
+  *) echo '{{"type":"result","is_error":false,"result":"","total_cost_usd":0.0,"duration_ms":10,"structured_output":{{"items":[],"actions":[]}}}}';;
+esac
+"#,
+        prompts = dir.join("prompts").display()
+    );
+    std::fs::write(&script, body).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    ClaudeCli {
+        binary: script,
+        model: None,
+        timeout: Duration::from_secs(10),
+        max_budget_usd: None,
+        work_dir: Some(dir.join("work")),
+        isolate: true,
+    }
+}
+
+#[test]
+fn mark_as_a_call_moves_a_media_note_to_conversations_and_reinterprets_it_as_a_meeting() {
+    let dir = TempDir::new("mark-call");
+    let ep = seed_discord_episode(&dir.db());
+    let brain = Brain {
+        config: BrainConfig {
+            cli: fake_cli_logging(&dir.0),
+            ..BrainConfig::default()
+        },
+        store_path: dir.db(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    let mut rig = build(&dir.db(), None, Some(brain));
+    rig.app().run(Command::ShowNotes);
+    rig.until("the brain to report in", |app| {
+        interpret_enabled(app) == Some(true)
+    });
+    assert!(
+        rig.app().listed_episodes().iter().all(|e| e.id != ep),
+        "a media note is filed under Media, not in Conversations"
+    );
+    rig.app().mark_episode_as_call(ep);
+    let s = Store::open(&dir.db()).unwrap();
+    // at once: a conversation, unfiled (or already re-interpreted into a new one)
+    if let Some(e) = s.episode(ep).unwrap() {
+        assert!(!e.is_media());
+        assert_eq!(e.node_id, None);
+    }
+    // the re-interpretation lands in Conversations
+    rig.until_label("the re-interpreted note", "Release planning");
+    let listed = rig.app().listed_episodes().to_vec();
+    let note = listed
+        .iter()
+        .find(|e| e.title == "Release planning")
+        .unwrap();
+    assert!(!note.is_media());
+    assert_eq!(note.node_id, None);
+    let prompts = std::fs::read_to_string(dir.0.join("prompts")).unwrap();
+    assert!(prompts.contains("meeting: true"), "the meeting hint");
+    assert!(!prompts.contains("media: true"));
+}
+
+#[test]
+fn mark_as_media_files_a_media_app_call_under_media() {
+    let dir = TempDir::new("mark-media");
+    let ep = seed_discord_episode(&dir.db());
+    let s = Store::open(&dir.db()).unwrap();
+    assert!(s.mark_episode_as_call(ep).unwrap());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowNotes);
+    rig.harness.run_steps(2);
+    assert!(rig.app().listed_episodes().iter().any(|e| e.id == ep));
+    rig.app().mark_episode_as_media(ep);
+    rig.harness.run_steps(2);
+    let e = s.episode(ep).unwrap().unwrap();
+    assert!(e.is_media());
+    assert_eq!(e.node_id, Some(s.media_category().unwrap().id));
+    assert!(rig.app().listed_episodes().iter().all(|e| e.id != ep));
+}
+
+#[test]
+fn a_log_only_play_marked_as_a_call_says_no_transcript_was_kept() {
+    use oats_core::{MediaClass, MediaPolicy, MediaStamp};
+    let dir = TempDir::new("mark-play");
+    let play = {
+        let s = Store::open(&dir.db()).unwrap();
+        s.set_meta(MediaPolicy::META_KEY, "log").unwrap();
+        let p = s
+            .begin_media_play(
+                now_ms() - 600_000,
+                &MediaStamp::new(MediaClass::App, None, "Discord", "Discord"),
+            )
+            .unwrap();
+        s.update_media_play(p, now_ms() - 60_000, 0).unwrap();
+        p
+    };
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowCalendar);
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Listened: Discord"));
+    rig.app().mark_play_as_call(play);
+    rig.harness.run_steps(3);
+    assert!(
+        rig.app()
+            .last_message()
+            .unwrap()
+            .contains("No transcript was kept for this (policy: log only)")
+    );
+    assert!(rig.shows("Call via Discord"));
+}
+
+#[test]
+fn the_transcripts_view_hides_media_rows_until_show_media() {
+    let dir = TempDir::new("show-media");
+    seed_discord_episode(&dir.db());
+    seed(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.harness.run_steps(3);
+    assert!(rig.shows("loose words about the weather"));
+    assert!(!rig.shows("the export ships on Friday"), "media hidden");
+    rig.harness.get_by_label("Show media").click();
+    rig.harness.run_steps(3);
+    assert!(rig.app().prefs().show_media);
+    assert!(rig.shows("the export ships on Friday"));
+    rig.harness.get_by_label("Show media").click();
+    rig.harness.run_steps(2);
+    assert!(!rig.shows("the export ships on Friday"));
 }

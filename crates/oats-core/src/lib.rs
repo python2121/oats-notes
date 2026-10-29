@@ -37,7 +37,10 @@ pub use engine::{
     AudioChunk, AudioSourceKind, EngineError, EngineFactory, NullEngine, SAMPLE_RATE, SpeechEngine,
     Transcription, VadFrame,
 };
-pub use media::{MediaClass, MediaFeed, MediaPlay, MediaPolicy, MediaStamp};
+pub use media::{
+    MediaClass, MediaFeed, MediaPlay, MediaPolicy, MediaStamp, ProducerClass, ProducerOverride,
+    ProducerSeen,
+};
 pub use pipeline::{Pipeline, PipelineEvent, PipelineHandle, PipelineStatus};
 pub use segmenter::{Segment, Segmenter, SegmenterConfig};
 pub use store::{

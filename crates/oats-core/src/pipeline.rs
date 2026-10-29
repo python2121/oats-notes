@@ -41,7 +41,7 @@ use crate::echo_audio::{self, EchoAudioMode, SystemRing};
 use crate::engine::{
     AudioChunk, AudioSourceKind, EnergyVad, EngineFactory, SAMPLE_RATE, SpeechEngine,
 };
-use crate::media::{FeedReader, MediaFeed, MediaPolicy};
+use crate::media::{FeedReader, MediaClass, MediaFeed, MediaPolicy, MediaStamp};
 use crate::segmenter::{Segment, Segmenter, SegmenterConfig};
 use crate::store::{Store, TranscriptRow};
 
@@ -63,6 +63,8 @@ const MEDIA_PAUSE_CLOSES_MS: i64 = 120_000;
 const MEDIA_FLUSH_MS: i64 = 30_000;
 /// Plays shorter than this (a preview, a tab switch) are not kept.
 const MEDIA_MIN_PLAY_MS: i64 = 3_000;
+/// "On a call" turns itself off after this long of silence on the system lane.
+pub const ON_CALL_QUIET_MS: u64 = 10 * 60 * 1000;
 /// How long dropping the handle waits for the worker before detaching it (a model load can
 /// take minutes and can't be interrupted; quitting must not wait for it).
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -118,6 +120,11 @@ pub enum PipelineEvent {
     ListenFailed(String),
     /// A non-fatal problem (one transcription failed, the store refused a write).
     Warning(String),
+    /// "On a call" ([`PipelineHandle::set_on_call`]) turned itself off: the system lane was
+    /// silent for [`ON_CALL_QUIET_MS`] (`after_silence`), or the session ended.
+    OnCallEnded {
+        after_silence: bool,
+    },
 }
 
 /// Per-session echo counters (logged at info when the session ends; the last ended session's
@@ -172,6 +179,9 @@ pub struct PipelineHandle {
     /// What plays on the system lane (written by the media resolver).
     media_feed: MediaFeed,
     media_policy: Arc<AtomicU8>,
+    /// "On a call": every system-audio producer is a meeting (session-only).
+    on_call: Arc<AtomicBool>,
+    on_call_quiet_ms: Arc<AtomicU64>,
 }
 
 /// The audio a session reads: the plain microphone-only stream (every chunk is the
@@ -233,6 +243,8 @@ impl Pipeline {
         let echo_stats = Arc::new(Mutex::new(EchoStats::default()));
         let media_feed = MediaFeed::new();
         let media_policy = Arc::new(AtomicU8::new(MediaPolicy::default().to_u8()));
+        let on_call = Arc::new(AtomicBool::new(false));
+        let on_call_quiet_ms = Arc::new(AtomicU64::new(ON_CALL_QUIET_MS));
         let out = Outbox {
             tx: event_tx,
             wake,
@@ -243,6 +255,8 @@ impl Pipeline {
             echo_stats: echo_stats.clone(),
             media_feed: media_feed.clone(),
             media_policy: media_policy.clone(),
+            on_call: on_call.clone(),
+            on_call_quiet_ms: on_call_quiet_ms.clone(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
@@ -277,6 +291,8 @@ impl Pipeline {
             echo_stats,
             media_feed,
             media_policy,
+            on_call,
+            on_call_quiet_ms,
         }
     }
 }
@@ -361,6 +377,25 @@ impl PipelineHandle {
         MediaPolicy::from_u8(self.media_policy.load(Ordering::Relaxed))
     }
 
+    /// "On a call" (session-only, nothing persisted): while on, whatever plays on the system
+    /// lane is treated as a meeting — transcribed as `them`, stamped `meeting` (the brain's
+    /// meeting hint), never media, whatever the app's class and the media policy. Turns
+    /// itself off after [`ON_CALL_QUIET_MS`] of silence on the system lane and when the
+    /// session ends ([`PipelineEvent::OnCallEnded`]).
+    pub fn set_on_call(&self, on: bool) {
+        self.on_call.store(on, Ordering::Relaxed);
+    }
+
+    pub fn on_call(&self) -> bool {
+        self.on_call.load(Ordering::Relaxed)
+    }
+
+    /// How long of system-lane silence ends "On a call" (default [`ON_CALL_QUIET_MS`]; tests).
+    pub fn set_on_call_timeout(&self, quiet: Duration) {
+        self.on_call_quiet_ms
+            .store(quiet.as_millis() as u64, Ordering::Relaxed);
+    }
+
     /// Drain pending events (call once per UI frame).
     pub fn poll(&self) -> Vec<PipelineEvent> {
         self.events.try_iter().collect()
@@ -408,6 +443,8 @@ struct Outbox {
     echo_stats: Arc<Mutex<EchoStats>>,
     media_feed: MediaFeed,
     media_policy: Arc<AtomicU8>,
+    on_call: Arc<AtomicBool>,
+    on_call_quiet_ms: Arc<AtomicU64>,
 }
 
 impl Outbox {
@@ -673,6 +710,9 @@ struct MediaState {
     /// segment.
     skip_system: bool,
     open: Option<OpenPlay>,
+    /// While "On a call" is on: the system lane's time (ms) of its last sound (or of the
+    /// moment the switch was first seen on).
+    on_call_quiet_since: Option<i64>,
 }
 
 impl MediaState {
@@ -681,6 +721,7 @@ impl MediaState {
             reader: FeedReader::new(feed),
             skip_system: false,
             open: None,
+            on_call_quiet_since: None,
         }
     }
 }
@@ -780,7 +821,9 @@ impl Session<'_> {
                     if lane.kind == AudioSourceKind::System
                         && let Some(clock) = lane.clock
                     {
-                        self.track_media(clock.ms_at(lane.received), !silent);
+                        let at = clock.ms_at(lane.received);
+                        self.watch_on_call(at, !silent);
+                        self.track_media(at, !silent);
                     }
 
                     // an all-zero system chunk (nothing playing) wakes nobody
@@ -844,6 +887,12 @@ impl Session<'_> {
         }
         self.expire_pending(i64::MAX);
         self.close_play();
+        if self.out.on_call.swap(false, Ordering::Relaxed) {
+            log::info!("on a call: off (the session ended)");
+            self.out.send(PipelineEvent::OnCallEnded {
+                after_silence: false,
+            });
+        }
         self.end_echo_stats(session_id);
         if let Err(e) = self.store.end_session(session_id, now_ms()) {
             self.out.send(PipelineEvent::Warning(format!(
@@ -1157,22 +1206,60 @@ impl Session<'_> {
         MediaPolicy::from_u8(self.out.media_policy.load(Ordering::Relaxed))
     }
 
-    /// YouTube / music plays and the policy doesn't transcribe it.
+    /// What plays on the system lane as the pipeline treats it: the resolver's stamp, or —
+    /// while "On a call" is on — that stamp as a call (a bare call stamp when nothing is
+    /// known).
+    fn stamp_now(&mut self) -> Option<MediaStamp> {
+        let stamp = self.media.reader.get().cloned();
+        if !self.out.on_call.load(Ordering::Relaxed) {
+            return stamp;
+        }
+        Some(match stamp {
+            Some(s) => s.as_call(),
+            None => MediaStamp::new(MediaClass::Meeting, None, "Call", ""),
+        })
+    }
+
+    /// Media plays and its policy (the app's own, else the global one) doesn't transcribe it.
     fn media_skips(&mut self) -> bool {
         let policy = self.media_policy();
-        policy.skips_transcription() && self.media.reader.get().is_some_and(|m| m.is_media())
+        self.stamp_now()
+            .is_some_and(|m| m.skips_transcription(policy))
+    }
+
+    /// "On a call" ends after [`ON_CALL_QUIET_MS`] of silence on the system lane (`at_ms`:
+    /// the end of the system chunk just fed; `signal`: it had sound).
+    fn watch_on_call(&mut self, at_ms: i64, signal: bool) {
+        if !self.out.on_call.load(Ordering::Relaxed) {
+            self.media.on_call_quiet_since = None;
+            return;
+        }
+        let quiet = self.media.on_call_quiet_since.get_or_insert(at_ms);
+        if signal {
+            *quiet = at_ms;
+        }
+        let limit = self.out.on_call_quiet_ms.load(Ordering::Relaxed) as i64;
+        if at_ms - *quiet >= limit {
+            self.media.on_call_quiet_since = None;
+            if self.out.on_call.swap(false, Ordering::Relaxed) {
+                log::info!(
+                    "on a call: off after {} s of silence on system audio",
+                    limit / 1000
+                );
+                self.out.send(PipelineEvent::OnCallEnded {
+                    after_silence: true,
+                });
+            }
+        }
     }
 
     /// Stamp a stored system segment with what was playing when it closed (and count it
     /// toward the open play).
     fn stamp_media(&mut self, row: &mut TranscriptRow) {
-        let Some(stamp) = self.media.reader.get().cloned() else {
+        let Some(stamp) = self.stamp_now() else {
             return;
         };
-        if let Err(e) =
-            self.store
-                .set_segment_media(row.id, Some(stamp.class), stamp.url.as_deref())
-        {
+        if let Err(e) = self.store.stamp_segment_media(row.id, &stamp) {
             return log::warn!("could not stamp segment {} with its media: {e}", row.id);
         }
         row.media_kind = Some(stamp.class);
@@ -1192,11 +1279,8 @@ impl Session<'_> {
     fn track_media(&mut self, at_ms: i64, signal: bool) {
         let policy = self.media_policy();
         let stamp = self
-            .media
-            .reader
-            .get()
-            .filter(|m| m.is_media() && policy.logs_plays())
-            .cloned();
+            .stamp_now()
+            .filter(|m| m.is_media() && m.policy_under(policy).logs_plays());
         let Some(stamp) = stamp else {
             return self.close_play();
         };

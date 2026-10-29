@@ -2,15 +2,20 @@
 //! Firefox is one of them, its session store every few seconds; publishes what plays to the
 //! pipeline's [`MediaFeed`] and tells the host on every change. Idle (blocked, no timer)
 //! while not active — the host activates it while listening with system audio.
+//!
+//! With a database path it also re-reads the user's per-app classes (`producer_overrides`)
+//! every few seconds — a change in Preferences takes effect at the next look, no restart —
+//! and records every app it sees playing (`producers_seen`, the Preferences "Apps" table).
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use oats_core::MediaFeed;
+use oats_core::{MediaFeed, Store};
 use oats_sources::{AudioProducers, ProducerWatch};
 
 use crate::firefox::FirefoxSession;
-use crate::{MediaContext, WindowTab, is_firefox, resolve};
+use crate::{MediaContext, ProducerOverrides, WindowTab, is_firefox, resolve};
 
 /// How often the watcher looks.
 #[derive(Clone, Copy, Debug)]
@@ -19,6 +24,8 @@ pub struct WatcherConfig {
     pub producers_every: Duration,
     /// Firefox's session file (a directory scan + `stat`; parsed only when rewritten).
     pub firefox_every: Duration,
+    /// The per-app classes in the store (one small SELECT).
+    pub overrides_every: Duration,
 }
 
 impl Default for WatcherConfig {
@@ -26,6 +33,7 @@ impl Default for WatcherConfig {
         Self {
             producers_every: Duration::from_secs(2),
             firefox_every: Duration::from_secs(5),
+            overrides_every: Duration::from_secs(5),
         }
     }
 }
@@ -45,13 +53,15 @@ pub struct MediaWatcher {
 }
 
 impl MediaWatcher {
-    /// Start the thread (inactive until [`Self::set_active`]).
+    /// Start the thread (inactive until [`Self::set_active`]). `store`: the database the
+    /// per-app classes are read from and the seen apps written to (`None`: no overrides).
     pub fn spawn(
         producers: Box<dyn AudioProducers>,
         firefox: FirefoxSession,
         feed: MediaFeed,
         on_change: OnMediaChange,
         config: WatcherConfig,
+        store: Option<PathBuf>,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -68,6 +78,10 @@ impl MediaWatcher {
                     tabs: Vec::new(),
                     last_firefox: None,
                     current: None,
+                    store_path: store,
+                    store: None,
+                    overrides: ProducerOverrides::default(),
+                    last_overrides: None,
                 };
                 w.run(&rx);
             })
@@ -102,6 +116,11 @@ struct Worker {
     tabs: Vec<WindowTab>,
     last_firefox: Option<Instant>,
     current: Option<MediaContext>,
+    store_path: Option<PathBuf>,
+    /// Opened on first use, on this thread.
+    store: Option<Store>,
+    overrides: ProducerOverrides,
+    last_overrides: Option<Instant>,
 }
 
 impl Worker {
@@ -140,14 +159,62 @@ impl Worker {
         }
     }
 
+    /// The store, opened on first use (`None` without a path, or when it can't be opened).
+    fn store(&mut self) -> Option<&Store> {
+        if self.store.is_none() {
+            let path = self.store_path.take()?;
+            match Store::open(&path) {
+                Ok(s) => self.store = Some(s),
+                Err(e) => log::warn!("media watcher: cannot open the store: {e}"),
+            }
+        }
+        self.store.as_ref()
+    }
+
+    /// Re-read the per-app classes when due; `true` when they changed.
+    fn reload_overrides(&mut self) -> bool {
+        let due = self
+            .last_overrides
+            .is_none_or(|t| t.elapsed() >= self.config.overrides_every);
+        if !due {
+            return false;
+        }
+        self.last_overrides = Some(Instant::now());
+        let Some(store) = self.store() else {
+            return false;
+        };
+        match store.producer_overrides() {
+            Ok(rows) => {
+                let next = ProducerOverrides::new(rows);
+                if next != self.overrides {
+                    log::debug!("per-app classes changed");
+                    self.overrides = next;
+                    return true;
+                }
+            }
+            Err(e) => log::warn!("media watcher: per-app classes: {e}"),
+        }
+        false
+    }
+
     /// One look: producers, Firefox when it plays, resolve, publish changes.
     fn tick(&mut self) {
-        let mut changed = false;
+        let mut changed = self.reload_overrides();
         if let Some(now) = self.watch.poll(self.producers.as_mut()) {
             log::debug!(
                 "audio producers: {:?}",
                 now.iter().map(|p| p.bundle_id.as_str()).collect::<Vec<_>>()
             );
+            let seen: Vec<(String, String)> = now
+                .iter()
+                .map(|p| (p.bundle_id.clone(), p.name.clone()))
+                .collect();
+            if !seen.is_empty()
+                && let Some(store) = self.store()
+                && let Err(e) = store.note_producers_seen(&seen, now_ms())
+            {
+                log::warn!("media watcher: recording the apps seen: {e}");
+            }
             self.playing = now;
             changed = true;
         }
@@ -170,7 +237,7 @@ impl Worker {
             changed = true;
         }
         if changed {
-            let ctx = resolve(&self.playing, &self.tabs);
+            let ctx = resolve(&self.playing, &self.tabs, &self.overrides);
             let ctx = ctx.stamp().is_some().then_some(ctx);
             self.publish(ctx);
         }
@@ -198,6 +265,13 @@ impl Worker {
         (self.on_change)(ctx.as_ref());
         self.current = ctx;
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -233,7 +307,9 @@ mod tests {
             WatcherConfig {
                 producers_every: Duration::from_millis(10),
                 firefox_every: Duration::from_millis(10),
+                overrides_every: Duration::from_millis(10),
             },
+            None,
         );
         fixed.set(vec![Producer::from_bundle(42, "org.mozilla.firefox")]);
         watcher.set_active(true);
@@ -254,5 +330,58 @@ mod tests {
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen, vec![Some("A talk".to_string()), None]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn wait(what: &str, pred: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pred() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn records_seen_apps_and_follows_a_class_change_without_a_restart() {
+        let dir = std::env::temp_dir().join(format!("oats-mw-ov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oats.sqlite");
+        Store::open(&db).unwrap();
+        let fixed = FixedProducers::default();
+        let feed = MediaFeed::new();
+        let watcher = MediaWatcher::spawn(
+            Box::new(fixed.clone()),
+            FirefoxSession::with_roots(vec![]),
+            feed.clone(),
+            Box::new(|_| {}),
+            WatcherConfig {
+                producers_every: Duration::from_millis(10),
+                firefox_every: Duration::from_millis(10),
+                overrides_every: Duration::from_millis(10),
+            },
+            Some(db.clone()),
+        );
+        fixed.set(vec![Producer::from_bundle(7, "com.hnc.Discord")]);
+        watcher.set_active(true);
+        wait("Discord as media", || {
+            feed.current().is_some_and(|s| s.class == MediaClass::App)
+        });
+        let store = Store::open(&db).unwrap();
+        wait("Discord recorded as seen", || {
+            store
+                .producers_seen()
+                .unwrap()
+                .iter()
+                .any(|p| p.bundle_id == "com.hnc.discord")
+        });
+        store
+            .set_producer_override("com.hnc.discord", oats_core::ProducerClass::Meeting, false)
+            .unwrap();
+        wait("Discord as a call", || {
+            feed.current()
+                .is_some_and(|s| s.class == MediaClass::Meeting)
+        });
+        drop(watcher);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

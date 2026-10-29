@@ -674,20 +674,61 @@ from a video creates nothing), and what was watched is recorded.
   extension), same path layout on Linux (`~/.mozilla/firefox`, snap, flatpak). Firefox rewrites
   it at most every 15 s and only when something changed, so a tab switch shows up with ≤ 15 s
   delay; the store has no "tab is playing" flag.
-- `oats_media::resolve(producers, tabs)` (pure): per producer its bundle kind (Spotify/Music →
-  Music, Zoom/Teams/FaceTime/Webex → Meeting, browsers → Browser); for Firefox: a selected tab
+- `oats_media::resolve(producers, tabs, overrides)` (pure): per producer its bundle kind
+  (Spotify/Music → Music, Zoom/Teams/FaceTime/Webex → Meeting, Slack
+  `com.tinyspeck.slackmacgap` / Discord `com.hnc.discord` → AppMedia (`MediaClass::App`, media:
+  the user doesn't take calls on them), browsers → Browser); for Firefox: a selected tab
   that explains the sound (youtube.com/watch|shorts|live, youtu.be → YouTube{video_id, title};
   meet.google.com, *.zoom.us, teams.microsoft.com, whereby, meet.jit.si, … → Meeting;
-  open.spotify.com, music.youtube.com, … → Music), else a call in ANY tab, else the most
-  recently shown non-selected YouTube/music tab (`background = true`, a guess), else Browser.
-  Several producers: Meeting > YouTube > Music > Browser > Other. Meetings are never media.
+  open.spotify.com, music.youtube.com, … → Music; app.slack.com/…/huddle, discord.com/channels/…
+  → AppMedia), else a call in ANY tab, else the most recently shown non-selected YouTube/music
+  tab (`background = true`, a guess), else Browser. Several producers: Meeting > YouTube >
+  Music = AppMedia > Browser > Other > an ignored app. Meetings are never media.
+- Per-app classes (schema v8): `oats_core::ProducerClass { Auto, Meeting, Media, Ignore }` per
+  bundle id in `producer_overrides(bundle_id PK, class, transcribe_anyway)` (lower-case ids; Auto
+  without transcribe-anyway = no row), applied in `resolve` AFTER the built-in kind but before
+  it counts, except for locked calls: the built-in meeting apps / pages (Zoom, Teams, Webex,
+  FaceTime, Meet, Whereby, Jitsi — `MeetingApp::locked`, `oats_media::is_locked`) are always
+  Meeting. Meeting → `MeetingApp::App` (a call titled by the app); Media → AppMedia (a YouTube /
+  music tab stays itself); Ignore → `ignored` (stamp `policy = Some(Ignore)`, ranks last).
+  `transcribe_anyway` (media apps only) stamps `policy = Some(Transcribe)`: transcribed and
+  filed as media even under Log only / Ignore (so "Mark as a call" can recover it).
+  `MediaStamp` carries `bundle_id` (stored in `segments.media_app`) and `policy` (the app's
+  own, overriding the global one: `MediaStamp::skips_transcription(global)`). The watcher
+  (`MediaWatcher::spawn(…, Some(db))`) re-reads the overrides every 5 s
+  (`WatcherConfig::overrides_every`; a change applies without a restart) and records every app
+  it sees playing in `producers_seen(bundle_id PK, name, last_seen)`.
+- "On a call" (`PipelineHandle::set_on_call`, session-only, nothing persisted): every
+  system-audio stamp becomes a call (`MediaStamp::as_call`; a bare "Call" stamp when nothing is
+  known) — transcribed as `them`, stamped `meeting` (the brain's meeting hint), no media play —
+  whatever the class and policy. Off after `ON_CALL_QUIET_MS` (10 min) of silence on the system
+  lane (system-lane audio time; logged; `PipelineEvent::OnCallEnded { after_silence: true }`),
+  when the session ends (`after_silence: false`), or when the UI stops listening. UI: "On a
+  call" pill in the control bar (enabled while listening with system audio), Listen → "On a
+  Call" (⇧⌘C, `Command::ToggleOnCall`), status strip "· on a call".
+- Retroactive relabels (`store_media.rs`): `Store::mark_episode_as_call` (media episode →
+  `kind = conversation`, out of Media (node NULL → Conversations), `**Media:**` header dropped,
+  its system segments re-stamped `media_kind = meeting` and unfiled from Media, overlapping
+  plays → `kind = call`), then the UI sends `BrainCommand::Reinterpret` (the stamps now make
+  it a conversation chunk with the meeting hint; no media rules). `mark_episode_as_media` (the
+  inverse, offered on a conversation whose `segments.media_app` is classed Media:
+  `Store::episode_media_apps` + `ProducerOverrides::effective_class`) → `kind = media`, under
+  Media, segments `media_kind = app`, calls → `app`, Reinterpret. `mark_play_as_call` (a
+  Calendar play) → `kind = call` ("Call via Discord 10:12–10:40"), transcribed segments of
+  the play re-stamped and their episodes converted; under Log only nothing was kept and the
+  confirmation says "No transcript was kept for this (policy: log only)". UI: right-click on a
+  media note's title ("Mark as a call", "Summarise"), on a convertible conversation ("Mark as
+  media"), on a Calendar play row ("Mark as a call"). Conversations (`episodes_unfiled`)
+  never lists media episodes.
 - `MediaWatcher` (thread "oats-media", in the binary): active only while system audio is
   captured (its guard is part of the capture guard; blocked, no timer, otherwise); producers
   every 2 s, Firefox every 5 s while Firefox plays; publishes `MediaStamp { class, url, title,
   producer }` into the pipeline's `MediaFeed` (`PipelineHandle::media_feed()`; read per system
   chunk via an atomic version) and wakes the UI on change. `OATS_MEDIA=off` disables it.
-- Policy `oats_core::MediaPolicy { Ignore, LogOnly (default), Transcribe }`, YouTube/Music only:
-  stored in `meta.media_policy`, read at each session start, `OATS_MEDIA_POLICY` overrides,
+- Policy `oats_core::MediaPolicy { Ignore, LogOnly, Transcribe (default since 2026-10-29) }`,
+  media only (YouTube / music / media apps; an app's own `policy` wins): stored in
+  `meta.media_policy` (nothing ever seeded it, so an absent key = never chosen = the default; a
+  user's explicit "log" stays), read at each session start, `OATS_MEDIA_POLICY` overrides,
   `PipelineHandle::set_media_policy` for a live change. Ignore / LogOnly: no VAD and no
   transcription on the system lane while media plays (the system ring still feeds the mic's
   audio-level echo check, so the room copy is dropped); LogOnly and Transcribe log
@@ -695,28 +736,39 @@ from a video creates nothing), and what was watched is recorded.
   or a pause > 2 min; < 3 s blips dropped; end flushed every 30 s). Transcribe: segments
   stamped and counted in the play. Every stored system segment gets `media_kind` / `media_ref`
   when something is known (calls too: `meeting`).
-- Store v7 (`store_media.rs`, idempotent `ensure_media_schema`): `segments.media_kind`,
-  `segments.media_ref`, `episodes.kind` ('conversation' | 'media'), `media_plays(id,
-  started_at, ended_at, kind, url, title, producer, segments_count)`; `set_segment_media`,
+- Store v8 (`store_media.rs`, idempotent `ensure_media_schema`; v8 = `producer_overrides`,
+  `producers_seen`, `segments.media_app`; v7 below): `segments.media_kind`,
+  `segments.media_ref`, `episodes.kind` ('conversation' | 'media'; `Episode::kind`,
+  `Episode::is_media`), `media_plays(id, started_at, ended_at, kind, url, title, producer,
+  segments_count)` (kind also 'app' and 'call'); `stamp_segment_media`, `set_segment_media`,
   `begin_media_play` / `update_media_play` / `media_plays_between`, `episode_kind` /
   `set_episode_kind`, `media_category()` (top-level **Media**, `created_by = auto`, on first use).
 - Brain: `episodes::cut` never mixes media with conversation (nor two videos); media segments
   render as `[HH:MM] media: …` under `Media: <title> <url>` (titles from `media_plays`); the
   interpret prompt says media is informational (no decisions/actions/todos/reminders/events,
   never the user's words); a media chunk gets a `media: true` hint, a known call a stronger
-  `meeting: true`. `apply_interpretation` enforces it for media chunks: title = the video,
-  node = Media, summary header `**Media:** [title](url)`, no decisions/action items/events/new
-  projects, `episodes.kind = media`; a tiny media chunk is filed without a call; the review
+  `meeting: true`. Media chunks are filed WITHOUT a model call (`file_media_without_call`,
+  continuing the same media's episode within the gap; title from the play, else the URL / app);
+  `BrainCommand::Summarise(id)` ("Summarise" on a media note) runs one interpretation with the
+  media prompt, revising the note in place. `apply_interpretation` enforces the media rules
+  for media chunks: title = the video, node = Media, summary header `**Media:** [title](url)`,
+  no decisions/action items/events/new projects, `episodes.kind = media`; the review
   never merges media with conversation nor re-files a media episode; categorisation files
   media segments under Media without a call; hotwords stay mic-only (`can_command`).
-- UI: Preferences "YouTube & music: Ignore / Log only / Transcribe"; the status strip shows
-  "▶ <title>" while media plays; the Calendar day panel lists "Watched: <title> 10:12–10:40"
-  (click opens the URL); media rows are tagged "media" instead of "them".
+- UI: Preferences "Media: Ignore / Log only / Transcribe" and the "Apps" table (`app_rows`:
+  producers seen ∪ overrides; class dropdown "Auto (Media)" / Meeting / Media / Ignore, locked
+  rows "Meeting 🔒" greyed, "transcribe anyway" for Media rows only while the policy is Ignore /
+  Log only; `OatsApp::set_app_class`); the status strip shows "▶ <title>" while media plays;
+  the Calendar day panel lists "Watched: <title>" / "Listened: …" / "Call via …" 10:12–10:40
+  (click opens the URL); media rows are tagged "media" instead of "them"; the Transcripts view
+  hides media rows unless its header's "Show media" pill (`AppPrefs::show_media`, persisted;
+  `Store::segments_page_with` / `segments_after_with`) is on — search still lists them.
 - Checks: `cargo run -p oats-media --example firefox_tabs -- --watch 60` (Firefox tabs, session
   rewrites), `cargo run --manifest-path crates/oats-sources-macos/Cargo.toml --example producers
   -- 20` (what plays). Roadmap: Linux producers (PipeWire), Chrome/Safari tabs, a "Video" class
   for TV/IINA/VLC, channel names.
 
 Commands block — add:
-OATS_MEDIA_POLICY=ignore|log|transcribe …  # YouTube / music on system audio (default log; Preferences sets meta.media_policy)
+OATS_MEDIA_POLICY=ignore|log|transcribe …  # media on system audio (default transcribe; Preferences sets meta.media_policy)
+cargo run -p oats-notes -- --selftest out.png --prefs   # Preferences over seeded apps (the Apps table)
 OATS_MEDIA=off …                            # no media detection (no producer polling, no Firefox reads)

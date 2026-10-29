@@ -43,10 +43,37 @@ pub struct SelftestOptions {
     pub toast: bool,
     /// Start with the sidebar hidden (the control bar then shows the restore button).
     pub no_sidebar: bool,
+    /// Open Preferences over seeded apps (Discord, Slack, Zoom, Spotify, Firefox, a game; the
+    /// policy at Log only so "transcribe anyway" shows).
+    pub prefs: bool,
     /// Open the search bar with this query over the seeded data.
     pub search: Option<String>,
     /// Open the Topic view for this topic over the seeded data.
     pub topic: Option<String>,
+}
+
+/// Apps seen playing sound, a couple of classes set, the policy at Log only.
+fn seed_apps(store: &Store) -> Result<(), oats_core::StoreError> {
+    use oats_core::{MediaPolicy, ProducerClass};
+    let now = Local::now().timestamp_millis();
+    let apps = [
+        ("com.hnc.Discord", "Discord"),
+        ("com.tinyspeck.slackmacgap", "Slack"),
+        ("us.zoom.xos", "Zoom"),
+        ("com.spotify.client", "Spotify"),
+        ("org.mozilla.firefox", "Firefox"),
+        ("com.example.game", "Moonlight Racer"),
+    ];
+    for (i, (b, n)) in apps.iter().enumerate() {
+        store.note_producers_seen(
+            &[((*b).to_owned(), (*n).to_owned())],
+            now - i as i64 * 60_000,
+        )?;
+    }
+    store.set_producer_override("com.hnc.discord", ProducerClass::Auto, true)?;
+    store.set_producer_override("com.example.game", ProducerClass::Ignore, false)?;
+    store.set_meta(MediaPolicy::META_KEY, MediaPolicy::LogOnly.as_str())?;
+    Ok(())
 }
 
 /// [`run_with`] with the default options (Transcripts view, not listening).
@@ -68,6 +95,9 @@ pub fn run_with(
     options: SelftestOptions,
 ) -> Result<[u32; 2], String> {
     seed(&store, options.toast).map_err(|e| format!("seeding the store: {e}"))?;
+    if options.prefs {
+        seed_apps(&store).map_err(|e| format!("seeding the apps: {e}"))?;
+    }
     let mut harness = Harness::builder()
         .with_size(egui::vec2(SIZE[0], SIZE[1]))
         .with_pixels_per_point(PIXELS_PER_POINT)
@@ -105,6 +135,9 @@ pub fn run_with(
     }
     if options.no_sidebar {
         harness.state_mut().run(Command::ToggleSidebar);
+    }
+    if options.prefs {
+        harness.state_mut().run(Command::Preferences);
     }
     if options.listening {
         let app = harness.state_mut();

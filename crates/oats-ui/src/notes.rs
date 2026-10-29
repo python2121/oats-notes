@@ -30,6 +30,12 @@ pub enum NotesAction {
     /// Scroll to this note in the page being viewed and flash it (a next step's source link);
     /// leaves any single-note view.
     GoToNote(i64),
+    /// "Mark as a call" on a media note: a conversation again, re-interpreted as a meeting.
+    MarkAsCall(i64),
+    /// "Mark as media" on a call in an app classed Media: filed under Media.
+    MarkAsMedia(i64),
+    /// "Summarise" a media note (one model call with the media prompt).
+    Summarise(i64),
 }
 
 /// What the strip shows about the brain.
@@ -120,6 +126,9 @@ pub struct NotesState {
     pub show_all_steps: bool,
     /// The card flashing right now and the egui time the flash started.
     pub flash: Option<(i64, f64)>,
+    /// Conversation notes heard (partly) from an app classed Media — "Mark as media" is
+    /// offered on them.
+    pub media_convertible: std::collections::HashSet<i64>,
 }
 
 /// The text fields of a note being edited. Decisions: one per line. Action items: one per
@@ -533,15 +542,48 @@ pub(crate) fn episode_card(
                         ..Default::default()
                     },
                 );
-                let mut resp = ui.add(
-                    egui::Label::new(title_job)
-                        .sense(if e.low_signal || open.is_some() {
-                            Sense::click()
-                        } else {
-                            Sense::hover()
-                        })
-                        .truncate(),
-                );
+                // clickable for its context menu (Mark as a call / Mark as media / Summarise)
+                let mut resp = ui.add(egui::Label::new(title_job).sense(Sense::click()).truncate());
+                let convertible = state.media_convertible.contains(&e.id);
+                if e.is_media() || convertible {
+                    resp = resp.on_hover_text(if e.is_media() {
+                        "Right-click: Mark as a call, Summarise"
+                    } else {
+                        "Right-click: Mark as media"
+                    });
+                }
+                if e.is_media() || convertible {
+                    resp.context_menu(|ui| {
+                        if e.is_media() {
+                            if ui
+                                .button("Mark as a call")
+                                .on_hover_text(
+                                    "This was a conversation, not media: file it with your \
+                                 conversations and re-interpret it as a meeting",
+                                )
+                                .clicked()
+                            {
+                                actions.push(NotesAction::MarkAsCall(e.id));
+                                ui.close();
+                            }
+                            if ui.button("Summarise").clicked() {
+                                actions.push(NotesAction::Summarise(e.id));
+                                ui.close();
+                            }
+                        } else if convertible
+                            && ui
+                                .button("Mark as media")
+                                .on_hover_text(
+                                    "Not a conversation of yours: file it under Media (no \
+                                     todos, no events)",
+                                )
+                                .clicked()
+                        {
+                            actions.push(NotesAction::MarkAsMedia(e.id));
+                            ui.close();
+                        }
+                    });
+                }
                 if let Some(open) = open {
                     resp = resp
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -574,6 +616,9 @@ pub(crate) fn episode_card(
                                 .size(11.5),
                         );
                     } else {
+                        if e.is_media() && small_button(ui, "Summarise", true) {
+                            actions.push(NotesAction::Summarise(e.id));
+                        }
                         if small_button(ui, "Re-interpret", true) {
                             if e.user_edited_at.is_some() {
                                 state.confirm_reinterpret = Some(e.id);
