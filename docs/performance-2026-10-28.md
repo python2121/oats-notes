@@ -288,3 +288,25 @@ What the user can expect today: **about 2 % of one core while listening to a qui
 about 5 % during continuous speech, 0 % when not listening**. Memory is around 150–170 MB, the
 ANE is used only in short bursts per segment, and the GPU is essentially idle. Recommendations
 1–3 together should take idle-listening below 1 %.
+
+## Addendum (later on 2026-10-28): stateful VAD
+
+Recommendation 2(a) is done: `fluidaudio-rs` is vendored (`vendor/fluidaudio-rs`, see its
+`VENDORED.md`) with a stateful Silero stream over FluidAudio 0.14.8's public
+`VadManager.processStreamingChunk`. `FluidAudioEngine::vad` now runs **one inference per
+256 ms chunk: 3.9 inferences/s while listening, down from 11.7/s**, with 4 096 samples copied
+per call instead of 12 288. The pipeline calls the engine once per frame again; the 2(b)
+batching stop-gap (`VAD_BATCH_FRAMES`) and the quiet-room gate (`QUIET_FLOOR_DB`,
+`QUIET_HANGOVER_BATCHES`) are removed, so there is no added decision latency.
+
+- **Parity:** `cargo run --release -p oats-engine-fluidaudio --example vad_parity -- long.wav`
+  — the stream reproduces FluidAudio's batch VAD on all 1 278 chunks of `long.wav`: 100 %
+  `is_speech` agreement, max probability delta 0.0 (thresholds 0.6 and 0.85). About 0.22 ms per
+  chunk either way (CPU/BNNS).
+- **CPU** (`scripts/perf.sh idle idle-null`, archived as
+  `docs/perf/2026-10-28-stateful-vad-8045a3c`): idle 2.1 %, idle-null 1.8 %, so the Silero
+  path now costs **≈ 0.3 points, down from ≈ 1.1** in run 2 above. The machine was busy
+  during this run (another app at ~70 % CPU; WindowServer ~10 %, GPU ~2 % even for
+  idle-null), which inflates both absolute numbers. Compare the delta, not the totals. Two
+  more idle-only runs under the same load gave 2.0 % and 2.7 %. Re-measure on a quiet machine
+  before quoting a new headline.

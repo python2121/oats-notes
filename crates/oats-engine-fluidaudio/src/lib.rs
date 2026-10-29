@@ -1,5 +1,6 @@
 //! The macOS speech engine: Parakeet TDT v3 (ASR) and Silero VAD, both on CoreML / the Neural
-//! Engine, through FluidAudio (`fluidaudio-rs`). On other platforms this crate still exports
+//! Engine, through FluidAudio (`fluidaudio-rs`, vendored in `vendor/fluidaudio-rs` with a
+//! stateful VAD stream added; see its `VENDORED.md`). On other platforms this crate still exports
 //! [`factory`], whose engine is [`oats_core::EngineError::Unavailable`], so the app compiles everywhere.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -28,33 +29,29 @@ pub fn factory() -> EngineFactory {
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use fluidaudio_rs::FluidAudio;
+    use fluidaudio_rs::{FluidAudio, VadStream};
     use oats_core::{EngineError, SpeechEngine, Transcription, VadFrame};
 
     /// Silero VAD chunk in FluidAudio: `VadManager.chunkSize = 4096` (256 ms at 16 kHz), from
-    /// `Sources/FluidAudio/VAD/VadManager.swift` in FluidAudio 0.14.8; `fluidaudio-rs` documents
-    /// the same ("one VadFrame per 4096-sample chunk").
-    pub const VAD_CHUNK: usize = 4096;
+    /// `Sources/FluidAudio/VAD/VadManager.swift` in FluidAudio 0.14.8; the vendored bridge's
+    /// [`VadStream::CHUNK`] takes exactly one such chunk per call.
+    pub const VAD_CHUNK: usize = VadStream::CHUNK;
 
     /// VAD threshold. FluidAudio's default (0.85) misses quiet speech; 0.6 is a better
     /// balance for ambient capture, and the segmenter's hangover absorbs the odd false positive.
     const VAD_THRESHOLD: f32 = 0.6;
 
-    /// FluidAudio's `VadManager.process(samples)` starts every call from a fresh LSTM state,
-    /// so calling it one 256 ms chunk at a time would throw the recurrent context away. We
-    /// re-feed this many previous chunks ahead of each call (and drop their results) so the
-    /// state is warm when the new chunks arrive. Costs this many extra chunk inferences per
-    /// call; Silero on the ANE takes ~1 ms per chunk.
-    const WARMUP_CHUNKS: usize = 2;
-
     pub struct FluidAudioEngine {
+        /// Stateful Silero stream: the LSTM state is carried from chunk to chunk, one
+        /// inference per 256 ms chunk. Created by `load` (or lazily by the first `vad`).
+        /// The `SpeechEngine` contract has no session boundary, so the state also carries
+        /// across a listen stop/start; that is harmless (the model re-converges within a few
+        /// chunks of new audio).
+        vad_stream: Option<VadStream>,
         fluid: FluidAudio,
         chip: String,
         vad_loaded: bool,
         asr_loaded: bool,
-        /// The last up-to-`WARMUP_CHUNKS` chunks fed to VAD, plus scratch for the next call.
-        vad_context: Vec<f32>,
-        vad_input: Vec<f32>,
     }
 
     impl std::fmt::Debug for FluidAudioEngine {
@@ -73,13 +70,26 @@ mod mac {
             let fluid = FluidAudio::new().map_err(|e| EngineError::Load(e.to_string()))?;
             let chip = fluid.system_info().chip_name.trim().to_owned();
             Ok(Self {
+                vad_stream: None,
                 fluid,
                 chip,
                 vad_loaded: false,
                 asr_loaded: false,
-                vad_context: Vec::with_capacity(WARMUP_CHUNKS * VAD_CHUNK),
-                vad_input: Vec::new(),
             })
+        }
+
+        /// The VAD stream, created on first use (needs `init_vad`, done by `load`).
+        fn vad_stream(&mut self) -> Result<&mut VadStream, EngineError> {
+            if self.vad_stream.is_none() {
+                let stream = self
+                    .fluid
+                    .vad_stream_start()
+                    .map_err(|e| EngineError::Vad(e.to_string()))?;
+                self.vad_stream = Some(stream);
+            }
+            self.vad_stream
+                .as_mut()
+                .ok_or_else(|| EngineError::Vad("no VAD stream".to_owned()))
         }
     }
 
@@ -100,6 +110,8 @@ mod mac {
                     .init_vad(VAD_THRESHOLD)
                     .map_err(|e| EngineError::Load(format!("VAD: {e}")))?;
                 self.vad_loaded = true;
+                self.vad_stream()
+                    .map_err(|e| EngineError::Load(format!("VAD stream: {e}")))?;
                 log::info!("FluidAudio VAD loaded (threshold {VAD_THRESHOLD})");
             }
             if !self.asr_loaded {
@@ -121,32 +133,24 @@ mod mac {
             if samples.is_empty() {
                 return Ok(Vec::new());
             }
-            let new_chunks = samples.len().div_ceil(VAD_CHUNK);
-
-            self.vad_input.clear();
-            self.vad_input.extend_from_slice(&self.vad_context);
-            self.vad_input.extend_from_slice(samples);
-            let frames = self
-                .fluid
-                .vad_process_samples(&self.vad_input)
+            let stream = self.vad_stream()?;
+            let mut frames = Vec::with_capacity(samples.len().div_ceil(VAD_CHUNK));
+            for chunk in samples.chunks(VAD_CHUNK) {
+                let frame = if chunk.len() == VAD_CHUNK {
+                    stream.process_chunk(chunk)
+                } else {
+                    // a final partial chunk is zero-padded
+                    let mut padded = chunk.to_vec();
+                    padded.resize(VAD_CHUNK, 0.0);
+                    stream.process_chunk(&padded)
+                }
                 .map_err(|e| EngineError::Vad(e.to_string()))?;
-
-            // Keep the tail as warm-up context for the next call (whole chunks only, so chunk
-            // boundaries stay aligned with the caller's frames).
-            let whole = self.vad_input.len() / VAD_CHUNK * VAD_CHUNK;
-            let keep = (WARMUP_CHUNKS * VAD_CHUNK).min(whole);
-            self.vad_context.clear();
-            self.vad_context
-                .extend_from_slice(&self.vad_input[whole - keep..whole]);
-
-            let skip = frames.len().saturating_sub(new_chunks);
-            Ok(frames[skip..]
-                .iter()
-                .map(|f| VadFrame {
-                    probability: f.probability,
-                    is_speech: f.is_voice_active,
-                })
-                .collect())
+                frames.push(VadFrame {
+                    probability: frame.probability,
+                    is_speech: frame.is_voice_active,
+                });
+            }
+            Ok(frames)
         }
 
         fn transcribe(&mut self, samples: &[f32]) -> Result<Transcription, EngineError> {

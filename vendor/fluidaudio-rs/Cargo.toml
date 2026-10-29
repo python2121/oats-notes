@@ -1,0 +1,27 @@
+[package]
+name = "fluidaudio-rs"
+version = "0.14.8"
+edition = "2021"
+description = "Rust bindings for FluidAudio - ASR, VAD, Speaker Diarization, and TTS on Apple platforms"
+license = "MIT"
+repository = "https://github.com/FluidInference/fluidaudio-rs"
+keywords = ["audio", "speech-recognition", "asr", "vad", "diarization"]
+categories = ["multimedia::audio", "api-bindings"]
+
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+thiserror = "1.0"
+
+[features]
+default = ["asr", "vad", "diarization"]
+asr = []
+vad = []
+diarization = []
+tts = []
+
+# OatsNotes: clippy lints path dependencies uncapped, and our CI runs it with `-D warnings`.
+# This is vendored upstream code; don't lint it (see VENDORED.md).
+[lints.clippy]
+all = { level = "allow", priority = -1 }

@@ -12,3 +12,4 @@ difference next to the numbers. `docs/performance-<date>.md` holds the narrative
 
 Runs:
 - `2026-10-28-baseline-e678c2c` — first pass: at rest 0.0 %, idle-listening 2.1 %, speech 4.6 %, stress 14.7 % CPU (one core).
+- `2026-10-28-stateful-vad-8045a3c` — stateful VAD stream (vendored fluidaudio-rs, uncommitted tree on 8045a3c), stop-gaps removed: idle 2.1 %, idle-null 1.8 % → Silero path ≈ 0.3 points (baseline A/B: 1.1). Busy machine (a Firefox plugin process at ~70 % CPU; WindowServer ~10 %, GPU ~2 %), so compare the idle − idle-null delta, not the absolute numbers.

@@ -318,10 +318,6 @@ fn listen_while_listening_flushes_and_closes_the_previous_session() {
     let (tx1, s1) = start(&rig.h, &mut seen);
     // a second of speech with no trailing silence: the segment is still open
     send(&tx1, SPEECH, 1_000);
-    // verdicts arrive in batches, so the first Level (sent before any verdict) reports no
-    // speech; a later chunk past the Level interval reports the open segment
-    std::thread::sleep(Duration::from_millis(300));
-    send(&tx1, SPEECH, 100);
     wait_for(&rig.h, &mut seen, "in speech", |e| {
         matches!(
             e,
@@ -542,9 +538,6 @@ fn dropping_the_handle_while_listening_shuts_down_promptly_and_saves() {
     wait_idle(&rig.h, &mut seen);
     let (tx, sid) = start(&rig.h, &mut seen);
     send(&tx, SPEECH, 1_500);
-    // see listen_while_listening_...: the first Level precedes any batched verdict
-    std::thread::sleep(Duration::from_millis(300));
-    send(&tx, SPEECH, 100);
     wait_for(&rig.h, &mut seen, "in speech", |e| {
         matches!(
             e,
@@ -606,7 +599,8 @@ fn null_engine_long_speech_is_split_at_the_max_length() {
     assert!(segs[0].text.contains("30.0 s"), "{}", segs[0].text);
 }
 
-/// Like [`Scripted`] but with 100 ms frames, recording the sample count of every `vad` call.
+/// An engine VAD with 100 ms frames (speech = peak above 0.1) that records the sample count
+/// of every `vad` call.
 struct Recording(Arc<std::sync::Mutex<Vec<usize>>>);
 
 impl SpeechEngine for Recording {
@@ -621,20 +615,16 @@ impl SpeechEngine for Recording {
     }
     fn vad(&mut self, samples: &[f32]) -> Result<Vec<VadFrame>, EngineError> {
         self.0.lock().unwrap().push(samples.len());
-        Scripted(Faults::default()).vad(samples).map(|v| {
-            // Scripted chunks by 512; re-derive per 1600-sample frame instead
-            let _ = v;
-            samples
-                .chunks(1_600)
-                .map(|f| {
-                    let peak = f.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-                    VadFrame {
-                        probability: peak.min(1.0),
-                        is_speech: peak > 0.1,
-                    }
-                })
-                .collect()
-        })
+        Ok(samples
+            .chunks(1_600)
+            .map(|f| {
+                let peak = f.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                VadFrame {
+                    probability: peak.min(1.0),
+                    is_speech: peak > 0.1,
+                }
+            })
+            .collect())
     }
     fn transcribe(&mut self, samples: &[f32]) -> Result<Transcription, EngineError> {
         Scripted(Faults::default()).transcribe(samples)
@@ -660,15 +650,15 @@ fn stop_and_wait(rig: &Rig, seen: &mut Vec<PipelineEvent>, sid: i64) {
 }
 
 #[test]
-fn engine_vad_is_called_with_batches_of_four_frames() {
-    let (rig, calls) = recording("batch");
+fn engine_vad_is_called_once_per_frame() {
+    let (rig, calls) = recording("per-frame");
     let mut seen = Vec::new();
     wait_idle(&rig.h, &mut seen);
     let (tx, sid) = start(&rig.h, &mut seen);
     send(&tx, SPEECH, 4_000);
     stop_and_wait(&rig, &mut seen, sid);
     let calls = calls.lock().unwrap().clone();
-    assert_eq!(calls, vec![6_400; 10], "4 s = 40 frames = 10 batches of 4");
+    assert_eq!(calls, vec![1_600; 40], "4 s = 40 frames, one call each");
     let segs = segments(&seen);
     assert_eq!(segs.len(), 1, "{seen:?}");
     let (session_start, _) = session_row(&rig.db, sid);
@@ -679,20 +669,24 @@ fn engine_vad_is_called_with_batches_of_four_frames() {
 }
 
 #[test]
-fn a_quiet_room_stops_calling_the_engine_after_the_hangover() {
+fn a_quiet_room_still_reaches_the_engine_every_frame() {
     let (rig, calls) = recording("quiet");
     let mut seen = Vec::new();
     wait_idle(&rig.h, &mut seen);
     let (tx, sid) = start(&rig.h, &mut seen);
     send(&tx, 0.0, 10_000);
     stop_and_wait(&rig, &mut seen, sid);
-    let n = calls.lock().unwrap().len();
-    assert_eq!(n, 3, "only the hangover batches reach the engine");
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![1_600; 100],
+        "no gate: every frame is classified"
+    );
     assert!(segments(&seen).is_empty(), "{seen:?}");
 }
 
 #[test]
-fn speech_after_a_gated_quiet_period_reaches_the_engine_again() {
+fn speech_after_a_quiet_period_is_one_segment() {
     let (rig, calls) = recording("wake");
     let mut seen = Vec::new();
     wait_idle(&rig.h, &mut seen);
@@ -701,24 +695,13 @@ fn speech_after_a_gated_quiet_period_reaches_the_engine_again() {
     send(&tx, SPEECH, 2_000);
     send(&tx, 0.0, 2_000);
     stop_and_wait(&rig, &mut seen, sid);
-    let n = calls.lock().unwrap().len();
-    assert!(n > 3, "engine consulted again for the speech: {n}");
-    assert_eq!(segments(&seen).len(), 1, "{seen:?}");
-}
-
-#[test]
-fn a_partial_batch_is_classified_at_stop() {
-    let (rig, calls) = recording("partial");
-    let mut seen = Vec::new();
-    wait_idle(&rig.h, &mut seen);
-    let (tx, sid) = start(&rig.h, &mut seen);
-    send(&tx, SPEECH, 2_500);
-    stop_and_wait(&rig, &mut seen, sid);
-    let calls = calls.lock().unwrap().clone();
-    assert_eq!(
-        calls,
-        vec![6_400, 6_400, 6_400, 6_400, 6_400, 6_400, 1_600],
-        "25 frames: 4+4+... partial"
+    assert_eq!(calls.lock().unwrap().len(), 120, "12 s = 120 frames");
+    let segs = segments(&seen);
+    assert_eq!(segs.len(), 1, "{seen:?}");
+    let (session_start, _) = session_row(&rig.db, sid);
+    let offset = segs[0].started_at - session_start;
+    assert!(
+        (7_600..=8_400).contains(&offset),
+        "segment starts with the speech: {offset} ms"
     );
-    assert_eq!(segments(&seen).len(), 1, "{seen:?}");
 }

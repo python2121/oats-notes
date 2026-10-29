@@ -23,22 +23,6 @@ use crate::store::{Store, TranscriptRow};
 const AUDIO_POLL: Duration = Duration::from_millis(100);
 /// Minimum spacing of `Level` events (~4 Hz).
 const LEVEL_INTERVAL: Duration = Duration::from_millis(250);
-/// Frames of engine-VAD audio classified per `engine.vad` call. Engines that supply their own
-/// VAD (FluidAudio) re-feed the previous chunks as context on every call, so one call per
-/// frame costs 3 inferences per frame; a batch of 4 costs 6 for 4 frames. The price is that a
-/// verdict is delayed by up to `VAD_BATCH_FRAMES - 1` frames (750 ms at 256 ms frames);
-/// segment timing is unaffected because the verdicts are fed to the segmenter in order. `1`
-/// restores frame-by-frame classification.
-const VAD_BATCH_FRAMES: usize = 4;
-/// Quiet-room gate threshold in dBFS. A batch is "quiet" when every frame's RMS is below this.
-/// Deliberately conservative: well below quiet speech (about -45 dBFS and up at a laptop
-/// microphone) so soft speech always reaches the model.
-const QUIET_FLOOR_DB: f32 = -55.0;
-/// Consecutive quiet batches (with the segmenter idle) required before the engine VAD is skipped.
-/// With 1 s batches the room must have been quiet for at least 3 s. The engine is skipped
-/// only in a room that has been quiet for seconds, never while a segment is open, so
-/// hangover and closing logic is unaffected.
-const QUIET_HANGOVER_BATCHES: usize = 3;
 /// How long dropping the handle waits for the worker before detaching it (a model load can
 /// take minutes and can't be interrupted; quitting must not wait for it).
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -383,16 +367,6 @@ enum AfterListen {
     Shutdown,
 }
 
-/// Per-session state for batched engine VAD and the quiet-room gate.
-#[derive(Default)]
-struct VadGate {
-    /// Consecutive batches whose frames were all below [`QUIET_FLOOR_DB`].
-    quiet_streak: usize,
-    gated: u64,
-    sent: u64,
-    warned: bool,
-}
-
 /// One listening session's borrowed context.
 struct Session<'a> {
     engine: &'a mut dyn SpeechEngine,
@@ -430,13 +404,7 @@ impl Session<'_> {
         let mut segmenter = Segmenter::new(config);
         let mut pending: Vec<f32> = Vec::new();
         let mut last_level: Option<Instant> = None;
-        let mut gate = VadGate::default();
-        let batch_frames = if energy_vad.is_some() {
-            1
-        } else {
-            VAD_BATCH_FRAMES.max(1)
-        };
-        let batch_len = frame_len * batch_frames;
+        let mut vad_warned = false;
         let mut clock = SampleClock::new(started_ms, Instant::now());
         let mut received: u64 = 0;
 
@@ -447,18 +415,25 @@ impl Session<'_> {
                     received += chunk.len() as u64;
                     pending.extend_from_slice(&chunk);
                     let mut offset = 0;
-                    while pending.len() - offset >= batch_len {
-                        let batch = &pending[offset..offset + batch_len];
-                        offset += batch_len;
-                        self.classify_and_push(
-                            batch,
-                            frame_len,
-                            energy_vad.as_mut(),
-                            &mut gate,
-                            &mut segmenter,
-                            session_id,
-                            &clock,
-                        );
+                    while pending.len() - offset >= frame_len {
+                        let frame = &pending[offset..offset + frame_len];
+                        offset += frame_len;
+                        let is_speech = match energy_vad.as_mut() {
+                            Some(vad) => vad.classify(frame).is_speech,
+                            None => match self.engine.vad(frame) {
+                                Ok(v) => v.first().is_some_and(|f| f.is_speech),
+                                Err(e) => {
+                                    if !vad_warned {
+                                        vad_warned = true;
+                                        self.out.send(PipelineEvent::Warning(e.to_string()));
+                                    }
+                                    false
+                                }
+                            },
+                        };
+                        if let Some(seg) = segmenter.push(frame, is_speech) {
+                            self.finish_segment(session_id, &clock, &seg);
+                        }
                     }
                     pending.drain(..offset);
 
@@ -485,24 +460,6 @@ impl Session<'_> {
             }
         };
 
-        // classify the partial batch (whole frames only) before flushing the segmenter
-        let whole = pending.len() / frame_len * frame_len;
-        if whole > 0 {
-            self.classify_and_push(
-                &pending[..whole],
-                frame_len,
-                energy_vad.as_mut(),
-                &mut gate,
-                &mut segmenter,
-                session_id,
-                &clock,
-            );
-        }
-        log::debug!(
-            "engine VAD batches: {} sent to the engine, {} skipped by the quiet-room gate",
-            gate.sent,
-            gate.gated
-        );
         if let Some(seg) = segmenter.flush() {
             self.finish_segment(session_id, &clock, &seg);
         }
@@ -517,63 +474,6 @@ impl Session<'_> {
     }
 
     /// Transcribe a closed segment, store it and report it.
-    /// Classify `batch` (a whole number of frames) and feed the verdicts to the segmenter in
-    /// order. The built-in energy VAD classifies frame by frame; an engine VAD gets the whole
-    /// batch in one call unless the quiet-room gate skips it.
-    #[allow(clippy::too_many_arguments)]
-    fn classify_and_push(
-        &mut self,
-        batch: &[f32],
-        frame_len: usize,
-        mut energy_vad: Option<&mut EnergyVad>,
-        gate: &mut VadGate,
-        segmenter: &mut Segmenter,
-        session_id: i64,
-        clock: &SampleClock,
-    ) {
-        let frames = batch.len() / frame_len;
-        let mut verdicts: Vec<bool> = Vec::with_capacity(frames);
-        if let Some(vad) = energy_vad.as_mut() {
-            verdicts.extend(
-                batch
-                    .chunks_exact(frame_len)
-                    .map(|f| vad.classify(f).is_speech),
-            );
-        } else {
-            let quiet = batch
-                .chunks_exact(frame_len)
-                .all(|f| EnergyVad::rms_db(f) < QUIET_FLOOR_DB);
-            if quiet && !segmenter.in_speech() && gate.quiet_streak >= QUIET_HANGOVER_BATCHES {
-                gate.gated += 1;
-                verdicts.resize(frames, false);
-            } else {
-                gate.sent += 1;
-                match self.engine.vad(batch) {
-                    Ok(v) => {
-                        verdicts.extend((0..frames).map(|i| v.get(i).is_some_and(|f| f.is_speech)))
-                    }
-                    Err(e) => {
-                        if !gate.warned {
-                            gate.warned = true;
-                            self.out.send(PipelineEvent::Warning(e.to_string()));
-                        }
-                        verdicts.resize(frames, false);
-                    }
-                }
-            }
-            gate.quiet_streak = if quiet {
-                gate.quiet_streak.saturating_add(1)
-            } else {
-                0
-            };
-        }
-        for (frame, is_speech) in batch.chunks_exact(frame_len).zip(verdicts) {
-            if let Some(seg) = segmenter.push(frame, is_speech) {
-                self.finish_segment(session_id, clock, &seg);
-            }
-        }
-    }
-
     fn finish_segment(&mut self, session_id: i64, clock: &SampleClock, seg: &Segment) {
         let started_at = clock.ms_at(seg.start_sample);
         let ended_at = clock.ms_at(seg.start_sample + seg.samples.len() as u64);

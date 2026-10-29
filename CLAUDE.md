@@ -33,11 +33,12 @@ never changes.
 crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, paths  (no platform code)
 crates/oats-brain              the brain: `claude` CLI wrapper, episode cutting, prompts (prompts/*.md), hotword commands, tiered scheduler  (no platform code)
 crates/oats-audio              cpal microphone capture → 16 kHz mono f32 chunks + own FIR resampler
-crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD on CoreML/ANE via fluidaudio-rs (THE swappable crate)
+crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
 crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Notes / Calendar views
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
+vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
 ```
 
 ## The status item (`crates/oats-status/src/lib.rs`)
@@ -190,7 +191,11 @@ through the REAL CLI (a few cents) — the end-to-end check.
 `vad_frame_len()` / `vad(samples)` (cheap, runs all day; `None` = the core's energy VAD is used),
 `transcribe(samples)` (one closed segment, ≤ ~30 s, stateless between calls). Engines are built
 on the pipeline's own thread via an `EngineFactory`, so they need not be `Send`
-(`fluidaudio_rs::FluidAudio` isn't). `NullEngine` runs the whole app without a model
+(`fluidaudio_rs::VadStream` isn't). The pipeline calls `vad` once per `vad_frame_len()` frame
+as audio arrives. FluidAudio's engine runs each 4096-sample frame through a stateful Silero
+stream (`FluidAudio::vad_stream_start`, LSTM state carried across calls): one inference per
+256 ms, no context re-feed. The contract has no session boundary, so that state also carries
+across a listen stop/start (harmless: Silero re-converges within a few chunks). `NullEngine` runs the whole app without a model
 (`OATS_ENGINE=null`): energy VAD, placeholder "transcripts".
 
 ## Commands
@@ -211,12 +216,15 @@ OATS_DATA_DIR=/path …                     # database location override (defaul
 OATS_BRAIN=off …                          # no claude calls (the brain thread idles)
 OATS_CLAUDE_BIN=/path/claude OATS_CLAUDE_MODEL=haiku OATS_INTERPRET_EVERY_MIN=5 OATS_BRAIN_BUDGET_USD=1 OATS_BRAIN_TIER0_PER_HOUR=30 …   # brain knobs
 OATS_CLAUDE_PASS_PROXY=1 …                # pass HTTPS_PROXY / HTTP_PROXY / NO_PROXY / ANTHROPIC_BASE_URL through to claude (off by default)
+cargo run --release -p oats-engine-fluidaudio --example vad_parity -- long.wav   # stateful VAD stream vs FluidAudio's batch VAD, chunk by chunk (expect 100 % / delta 0)
+cargo run -p oats-engine-fluidaudio --example transcribe_wav -- speech.wav        # engine end to end on a WAV (load, VAD, transcribe)
 cargo run -p oats-brain --example interpret_demo   # real claude call: a fake meeting + "hey computer" command, prints the structured results and cost
 swift scripts/generate_icon.swift         # regenerate assets/icon_1024.png
 ```
 
-Build notes: `oats-engine-fluidaudio` → `fluidaudio-rs` → its build.rs runs `swift build` of
-the FluidAudio Swift package (minutes the first time; needs Xcode). The binary needs the Swift
+Build notes: `oats-engine-fluidaudio` → `fluidaudio-rs` (vendored, `vendor/fluidaudio-rs`) →
+its build.rs runs `swift build` of the FluidAudio Swift package (minutes the first time; needs
+Xcode; fetches FluidAudio from GitHub at the pinned tag). The binary needs the Swift
 runtime at run time: `apps/oats-notes/build.rs` adds `-rpath /usr/lib/swift` (without it dyld
 fails with "no LC_RPATH's found"). Microphone access: run from a terminal, macOS prompts for
 the terminal's mic permission; a bundled .app will need `NSMicrophoneUsageDescription`.
@@ -247,6 +255,22 @@ summary, node, decisions / action items / topics JSON, `low_signal`, model, cost
 `brain_runs` (tier, kind, model, cost, duration, ok/error, summary); `changes` (kind,
 description, before/after JSON, `undone`). `View::Node(id)` means the subtree (recursive CTE).
 
+## Vendored fluidaudio-rs (`vendor/fluidaudio-rs`)
+
+Why: upstream's VAD FFI resets Silero's recurrent state on every call, which forced a
+two-chunk context re-feed (3 inferences per 256 ms). We vendor the crate (pinned, under our
+control, nothing upstreamed) and added a stateful stream (`swift/VadStream_ffi.swift` over
+FluidAudio's public `VadManager.processStreamingChunk`, plus `VadStream` in `src/lib.rs`).
+It is referenced by path from the root `Cargo.toml` and excluded from the workspace
+(`exclude = ["vendor"]`), so our workspace lints (`unsafe_code = "forbid"`, …) don't apply;
+its own `rustfmt.toml` (formatting disabled) and `[lints.clippy]` (allow) keep `cargo fmt
+--all` and `./ci.sh`'s clippy, which both follow path dependencies, off it. Keep its own style
+when editing. FluidAudio is pinned by `Package.swift`
+(`exact: "0.14.8"`) and `Package.resolved`; the crate version tracks that pin. To update the
+pin: follow "Updating" in `vendor/fluidaudio-rs/VENDORED.md` (bump `Package.swift` + crate
+version, fix the Swift bridge, run `vad_parity` and `transcribe_wav`, `./ci.sh`), and keep
+VENDORED.md's list of our modifications current. Attribution: `THIRD_PARTY.md`.
+
 ## Conventions
 
 - Workspace lints: `unsafe_code = "forbid"`; clippy `-D warnings`; `oats-core` and
@@ -265,19 +289,8 @@ description, before/after JSON, `undone`). `View::Node(id)` means the subtree (r
 
 ## Roadmap (not yet built)
 
-### PRIORITY TODO: stateful VAD (drop the context re-feed)
-
-The FluidAudio engine re-feeds the previous two 256 ms chunks on every Silero VAD call because
-the `fluidaudio-rs` bridge resets the model's recurrent state per call (3 inferences per chunk,
-~12/s; about a quarter of idle-listening CPU). FluidAudio 0.14.8 has a stateful VAD API the
-bridge does not expose. The real fix: patch the Swift bridge (`FluidAudioBridge.swift` +
-`src/ffi/bridge.rs` in fluidaudio-rs; vendor or fork it pinned) to expose a stateful
-`vad_process_chunk` that keeps state across calls, then make `FluidAudioEngine::vad` one
-inference per chunk with no re-feed and no batching delay. Stop-gaps APPLIED in `oats-core::pipeline` (2026-10-28): 1 s VAD batches (`VAD_BATCH_FRAMES`,
-halves the cost, ≤ 750 ms decision delay) and a quiet-room gate (`QUIET_FLOOR_DB` −55 dBFS,
-`QUIET_HANGOVER_BATCHES` 3) that skips Silero when no segment is open and the room has been
-quiet for 3 s. Remove both when the stateful VAD lands.
-See `docs/performance-2026-10-28.md`.
+Stateful VAD (drop the context re-feed): done 2026-10-28, see `vendor/fluidaudio-rs/VENDORED.md`.
+Performance notes: `docs/performance-2026-10-28.md`.
 
 Brain: a month-grid calendar view, undo for node merges (recorded, not reversible yet),
 reminders that notify (they are only listed), prompt editing without a rebuild, per-tier

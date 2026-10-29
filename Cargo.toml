@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*"]
+# vendor/ holds third-party crates referenced by path; they are not members, so the workspace
+# lints (`unsafe_code = "forbid"`, …) don't apply to them.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -48,7 +51,8 @@ craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "d27646a5f7c
 tray-icon = "0.26"
 
 # speech (macOS only — the one component that is swapped on Linux)
-fluidaudio-rs = "0.14.8"
+# Vendored and pinned (FluidAudio 0.14.8) with our stateful-VAD FFI; see vendor/fluidaudio-rs/VENDORED.md.
+fluidaudio-rs = { path = "vendor/fluidaudio-rs" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
