@@ -677,13 +677,16 @@ from a video creates nothing), and what was watched is recorded.
 - `oats_media::resolve(producers, tabs, overrides)` (pure): per producer its bundle kind
   (Spotify/Music → Music, Zoom/Teams/FaceTime/Webex → Meeting, Slack
   `com.tinyspeck.slackmacgap` / Discord `com.hnc.discord` → AppMedia (`MediaClass::App`, media:
-  the user doesn't take calls on them), browsers → Browser); for Firefox: a selected tab
-  that explains the sound (youtube.com/watch|shorts|live, youtu.be → YouTube{video_id, title};
-  meet.google.com, *.zoom.us, teams.microsoft.com, whereby, meet.jit.si, … → Meeting;
-  open.spotify.com, music.youtube.com, … → Music; app.slack.com/…/huddle, discord.com/channels/…
-  → AppMedia), else a call in ANY tab, else the most recently shown non-selected YouTube/music
-  tab (`background = true`, a guess), else Browser. Several producers: Meeting > YouTube >
-  Music = AppMedia > Browser > Other > an ignored app. Meetings are never media.
+  the user doesn't take calls on them), browsers → Browser); for Firefox ONLY the selected tab
+  decides (no background-tab guessing: the store has no "playing" flag): the front window's
+  (`selectedWindow`), else the first window's. youtube.com/watch|shorts|live, youtu.be →
+  YouTube{video_id, title}; meet.google.com, *.zoom.us, teams.microsoft.com, whereby, meet.jit.si,
+  … → Meeting (locked); open.spotify.com, music.youtube.com, … → Music; ANY app.slack.com /
+  discord.com page → AppMedia, with the per-app class/override of the desktop app
+  (`web_app_bundle`: com.tinyspeck.slackmacgap / com.hnc.discord); anything else → Browser
+  (transcribed as "them", no meeting hint, not media). Debug log carries the URL host only.
+  Several producers: Meeting > YouTube > Music = AppMedia > Browser > Other > an ignored app.
+  Meetings are never media.
 - Per-app classes (schema v8): `oats_core::ProducerClass { Auto, Meeting, Media, Ignore }` per
   bundle id in `producer_overrides(bundle_id PK, class, transcribe_anyway)` (lower-case ids; Auto
   without transcribe-anyway = no row), applied in `resolve` AFTER the built-in kind but before

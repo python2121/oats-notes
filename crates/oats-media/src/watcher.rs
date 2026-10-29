@@ -249,14 +249,9 @@ impl Worker {
         }
         match &ctx {
             Some(c) => log::info!(
-                "media: {} {:?}{}",
+                "media: {} {:?}",
                 c.kind.class().as_str(),
-                c.producer.as_ref().map(|p| p.name.as_str()).unwrap_or(""),
-                if c.background {
-                    " (background tab)"
-                } else {
-                    ""
-                }
+                c.producer.as_ref().map(|p| p.name.as_str()).unwrap_or("")
             ),
             None => log::debug!("media: nothing playing"),
         }

@@ -185,8 +185,6 @@ pub struct MediaContext {
     /// The browser tab, when the producer is Firefox and a tab explains the sound.
     pub tab: Option<Tab>,
     pub kind: MediaKind,
-    /// The tab is a guess: not its window's selected tab (see [`resolve`]).
-    pub background: bool,
     /// The app is classed Ignore: neither transcribed nor logged.
     pub ignored: bool,
     /// A media app the user transcribes anyway (whatever the media policy).
@@ -200,7 +198,6 @@ impl MediaContext {
             producer: None,
             tab: None,
             kind: MediaKind::Other,
-            background: false,
             ignored: false,
             transcribe_anyway: false,
         }
@@ -347,11 +344,9 @@ pub fn classify_url(url: &str) -> MediaKind {
         "meet.jit.si" => MediaKind::Meeting(MeetingApp::Jitsi),
         "open.spotify.com" | "music.apple.com" | "soundcloud.com" | "tidal.com"
         | "listen.tidal.com" | "deezer.com" | "music.amazon.com" => MediaKind::Music,
-        // the user doesn't take calls on Slack / Discord: their pages are media by default
-        "app.slack.com" if path.contains("/huddle") => MediaKind::AppMedia,
-        "discord.com" | "ptb.discord.com" | "canary.discord.com"
-            if path.starts_with("/channels/") =>
-        {
+        // the user doesn't take calls on Slack / Discord: any of their pages is media by default
+        // (the class of the desktop app, see `web_app_bundle`)
+        "app.slack.com" | "discord.com" | "ptb.discord.com" | "canary.discord.com" => {
             MediaKind::AppMedia
         }
         h if is_domain(h, "zoom.us") || is_domain(h, "zoom.com") => {
@@ -360,6 +355,17 @@ pub fn classify_url(url: &str) -> MediaKind {
         h if is_domain(h, "webex.com") => MediaKind::Meeting(MeetingApp::Webex),
         h if is_domain(h, "bandcamp.com") => MediaKind::Music,
         _ => MediaKind::Browser,
+    }
+}
+
+/// The desktop app a web page stands for (its per-app class applies to the page): any
+/// `app.slack.com` / `discord.com` page.
+pub fn web_app_bundle(url: &str) -> Option<&'static str> {
+    let (host, _) = split_url(url)?;
+    match host.as_str() {
+        "app.slack.com" => Some("com.tinyspeck.slackmacgap"),
+        "discord.com" | "ptb.discord.com" | "canary.discord.com" => Some("com.hnc.discord"),
+        _ => None,
     }
 }
 
@@ -437,13 +443,14 @@ pub fn classify_bundle(bundle_id: &str) -> MediaKind {
     }
 }
 
-/// Decide what is playing from the producers and Firefox's open tabs (front window first).
+/// Decide what is playing from the producers and Firefox's open tabs.
 ///
-/// For a Firefox producer: a selected tab that explains the sound wins (front window
-/// first); else a call in any tab (a Meet tab behind the email being read); else the most
-/// recently shown YouTube / music tab that isn't selected — the video kept playing after the
-/// user switched tabs (`background = true`: the session store has no "this tab plays sound"
-/// flag, so this is a guess); else a bare browser with the front tab.
+/// For a Firefox producer ONLY the selected tab decides (the session store has no "this tab
+/// plays sound" flag, so guessing from background tabs was wrong more often than right): the
+/// selected tab of the most recently focused window (`selectedWindow`), else of the first
+/// window. YouTube / music → media; a call URL (Meet, Whereby, Jitsi, Zoom, Teams, Webex) →
+/// Meeting; a Slack / Discord page → the class of the desktop app (`web_app_bundle`, with its
+/// override); anything else → Browser (transcribed as "them", not media).
 ///
 /// The user's class for the app (`overrides`) then applies, unless the result is a built-in
 /// call (locked): Meeting makes it a call, Media makes it media (a video / music tab stays
@@ -461,14 +468,16 @@ pub fn resolve(
             producer: Some(p.clone()),
             tab: None,
             kind: classify_bundle(&p.bundle_id),
-            background: false,
             ignored: false,
             transcribe_anyway: false,
         };
-        if is_firefox(&p.bundle_id) {
-            firefox_context(&mut ctx, firefox_tabs);
+        let mut override_id = p.bundle_id.as_str();
+        if is_firefox(&p.bundle_id)
+            && let Some(app) = firefox_context(&mut ctx, firefox_tabs)
+        {
+            override_id = app;
         }
-        apply_override(&mut ctx, overrides.get(&p.bundle_id));
+        apply_override(&mut ctx, overrides.get(override_id));
         if best.as_ref().is_none_or(|b| ctx.rank() > b.rank()) {
             best = Some(ctx);
         }
@@ -497,38 +506,23 @@ fn apply_override(ctx: &mut MediaContext, ov: Option<&ProducerOverride>) {
     ctx.transcribe_anyway = ov.transcribe_anyway && ctx.kind.is_media() && !ctx.ignored;
 }
 
-/// [`resolve`]'s Firefox rules.
-fn firefox_context(ctx: &mut MediaContext, tabs: &[WindowTab]) {
-    let classified: Vec<(&WindowTab, MediaKind)> =
-        tabs.iter().map(|w| (w, classify_tab(&w.tab))).collect();
-    let browser = MediaKind::Browser.rank();
-    // 1. a selected tab that explains the sound (front window first on equal rank)
-    let selected = classified
+/// [`resolve`]'s Firefox rules: the selected tab of the front window decides. Returns the
+/// desktop bundle id whose class applies when the tab is a Slack / Discord page.
+fn firefox_context(ctx: &mut MediaContext, tabs: &[WindowTab]) -> Option<&'static str> {
+    let selected = tabs
         .iter()
-        .filter(|(w, _)| w.selected)
-        .max_by_key(|(w, kind)| (kind.rank(), w.front_window));
-    if let Some((w, kind)) = selected.filter(|(_, k)| k.rank() > browser) {
-        ctx.kind = kind.clone();
-        ctx.tab = Some(w.tab.clone());
-        return;
-    }
-    // 2. a call in any tab; 3. the most recently shown video / music tab
-    let meeting = classified
-        .iter()
-        .filter(|(_, k)| matches!(k, MediaKind::Meeting(_)))
-        .max_by_key(|(w, _)| w.last_accessed_ms);
-    let media = classified
-        .iter()
-        .filter(|(w, k)| !w.selected && matches!(k, MediaKind::YouTube { .. } | MediaKind::Music))
-        .max_by_key(|(w, _)| w.last_accessed_ms);
-    if let Some((w, kind)) = meeting.or(media) {
-        ctx.kind = kind.clone();
-        ctx.tab = Some(w.tab.clone());
-        ctx.background = true;
-        return;
-    }
-    // 4. a browser playing something: the front tab, for the record
-    ctx.tab = selected.map(|(w, _)| w.tab.clone());
+        .filter(|w| w.selected)
+        .min_by_key(|w| (!w.front_window, w.window));
+    let w = selected?;
+    ctx.kind = classify_tab(&w.tab);
+    ctx.tab = Some(w.tab.clone());
+    let app = web_app_bundle(&w.tab.url);
+    log::debug!(
+        "media: firefox selected tab host {:?} -> {}",
+        split_url(&w.tab.url).map(|(h, _)| h).unwrap_or_default(),
+        ctx.kind.class().as_str()
+    );
+    app
 }
 
 #[cfg(test)]
@@ -567,7 +561,11 @@ mod tests {
             classify_url("https://discord.com/channels/1/2"),
             MediaKind::AppMedia
         );
-        assert_eq!(classify_url("https://discord.com/"), MediaKind::Browser);
+        assert_eq!(classify_url("https://discord.com/"), MediaKind::AppMedia);
+        assert_eq!(
+            classify_url("https://app.slack.com/client/T1/C2"),
+            MediaKind::AppMedia
+        );
         for b in [
             "us.zoom.xos",
             "com.microsoft.teams2",
@@ -654,35 +652,74 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_video_left_playing_in_a_background_tab_is_a_guess_and_a_background_call_wins() {
+    fn ff_ctx(tabs: &[WindowTab], o: &ProducerOverrides) -> MediaContext {
         let ff = Producer::from_bundle(10, "org.mozilla.firefox");
-        // what the spike found: the YouTube home page selected, watch tabs behind it
-        let tabs = [
-            background("https://www.youtube.com/watch?v=old", "Old - YouTube", 100),
-            background(
-                "https://www.youtube.com/watch?v=recent",
-                "Recent - YouTube",
-                900,
-            ),
-            tab("https://www.youtube.com/", "YouTube", true),
-        ];
-        let ctx = resolve(std::slice::from_ref(&ff), &tabs, &none());
-        assert!(ctx.background);
-        assert_eq!(ctx.title(), "Recent");
+        resolve(std::slice::from_ref(&ff), tabs, o)
+    }
+
+    #[test]
+    fn only_the_selected_tab_decides_for_a_browser() {
+        let idle_meet = background("https://meet.google.com/abc", "Meet - abc", 50);
+        let idle_video = background("https://www.youtube.com/watch?v=old", "Old - YouTube", 900);
+        // Slack channel page selected: media by default (the desktop app's class)
+        let slack = tab(
+            "https://app.slack.com/client/T1/C2",
+            "general - Slack",
+            true,
+        );
+        let ctx = ff_ctx(&[idle_meet.clone(), slack.clone()], &none());
+        assert_eq!(ctx.kind, MediaKind::AppMedia);
+        assert_eq!(ctx.stamp().unwrap().class, MediaClass::App);
+        // ... with Slack classed Meeting (keyed by the desktop bundle id): a call
+        let o = ov("com.tinyspeck.slackmacgap", ProducerClass::Meeting, false);
+        let ctx = ff_ctx(std::slice::from_ref(&slack), &o);
+        assert_eq!(ctx.kind, MediaKind::Meeting(MeetingApp::App));
+        // Discord likewise
+        let discord = tab("https://discord.com/app", "Discord", true);
+        assert_eq!(
+            ff_ctx(std::slice::from_ref(&discord), &none()).kind,
+            MediaKind::AppMedia
+        );
+        let o = ov("com.hnc.discord", ProducerClass::Ignore, false);
+        assert!(ff_ctx(&[discord], &o).ignored);
+        // an idle Meet tab behind a selected YouTube video: media
+        let video = tab("https://youtu.be/xyz", "Xyz - YouTube", true);
+        let ctx = ff_ctx(&[idle_meet.clone(), video], &none());
         assert_eq!(ctx.kind.class(), MediaClass::YouTube);
-        let mut with_call = tabs.to_vec();
-        with_call.push(background("https://meet.google.com/abc", "Meet - abc", 50));
-        let ctx = resolve(std::slice::from_ref(&ff), &with_call, &none());
-        assert_eq!(ctx.kind, MediaKind::Meeting(MeetingApp::Meet));
-        // a selected video beats a background call guess? no: a selected video is certain
-        let selected_video = [
-            background("https://meet.google.com/abc", "Meet", 50),
-            tab("https://youtu.be/xyz", "Xyz - YouTube", true),
-        ];
-        let ctx = resolve(std::slice::from_ref(&ff), &selected_video, &none());
-        assert!(!ctx.background);
         assert_eq!(ctx.title(), "Xyz");
+        // an idle Meet tab (and a video) behind a news page: just a browser
+        let news = tab("https://news.example/", "News", true);
+        let ctx = ff_ctx(&[idle_meet.clone(), idle_video.clone(), news], &none());
+        assert_eq!(ctx.kind, MediaKind::Browser);
+        assert_eq!(ctx.stamp().unwrap().class, MediaClass::Browser);
+        // a background video alone is not a guess any more
+        let home = tab("https://www.youtube.com/", "YouTube", true);
+        assert_eq!(
+            ff_ctx(&[idle_video, home], &none()).kind,
+            MediaKind::Browser
+        );
+        // the Meet tab selected: a call
+        let meet = tab("https://meet.google.com/abc", "Meet - abc", true);
+        assert_eq!(
+            ff_ctx(&[meet], &none()).kind,
+            MediaKind::Meeting(MeetingApp::Meet)
+        );
+    }
+
+    #[test]
+    fn several_windows_use_the_front_windows_selected_tab_else_the_first() {
+        let front = tab("https://news.example/", "News", true);
+        let other = tab("https://meet.google.com/abc", "Meet", false);
+        assert_eq!(
+            ff_ctx(&[other.clone(), front.clone()], &none()).kind,
+            MediaKind::Browser
+        );
+        // no window flagged as front: the first window's
+        let mut a = tab("https://news.example/", "News", false);
+        a.window = 0;
+        let mut b = tab("https://meet.google.com/abc", "Meet", false);
+        b.window = 1;
+        assert_eq!(ff_ctx(&[b, a], &none()).kind, MediaKind::Browser);
     }
 
     #[test]
@@ -781,11 +818,11 @@ mod tests {
     fn resolves_firefox_youtube_and_prefers_a_call() {
         let ff = Producer::from_bundle(10, "org.mozilla.firefox");
         let tabs = [
-            tab("https://news.example/", "News", true),
+            tab("https://news.example/", "News", false),
             tab(
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 "(1) Never Gonna Give You Up - YouTube",
-                false,
+                true,
             ),
         ];
         let ctx = resolve(std::slice::from_ref(&ff), &tabs, &none());
