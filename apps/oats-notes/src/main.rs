@@ -203,6 +203,12 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+fn chrono_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -275,6 +281,26 @@ fn main() -> ExitCode {
         .with_min_inner_size([800.0, 520.0]),
         ..Default::default()
     };
+    // SIGINT / SIGTERM: ask the app to quit the ordinary way (stops the pipeline, closes the
+    // session row, saves prefs); a second signal exits at once
+    let quit_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ctx_slot: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>> = Default::default();
+    {
+        let (flag, slot) = (quit_flag.clone(), ctx_slot.clone());
+        if let Err(e) = ctrlc::set_handler(move || {
+            if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::process::exit(130);
+            }
+            log::info!("quit requested by signal");
+            if let Ok(g) = slot.lock()
+                && let Some(ctx) = g.as_ref()
+            {
+                ctx.request_repaint();
+            }
+        }) {
+            log::warn!("signal handler not installed: {e}");
+        }
+    }
     let result = eframe::run_native(
         APP_NAME,
         options,
@@ -293,6 +319,15 @@ fn main() -> ExitCode {
                 }
             };
             log::info!("database: {}", db.display());
+            // sessions a crashed or killed run left open: closed before the pipeline opens its own
+            match store.close_dangling_sessions(chrono_now_ms()) {
+                Ok(0) => {}
+                Ok(n) => log::info!("closed {n} dangling session(s)"),
+                Err(e) => log::warn!("closing dangling sessions: {e}"),
+            }
+            if let Ok(mut g) = ctx_slot.lock() {
+                *g = Some(cc.egui_ctx.clone());
+            }
             let ctx = cc.egui_ctx.clone();
             let pipeline = oats_core::Pipeline {
                 engine: engine_factory(),
@@ -343,6 +378,7 @@ fn main() -> ExitCode {
                 status_item(&cc.egui_ctx),
                 Some(brain),
             );
+            app.set_quit_flag(quit_flag.clone());
             // the voice-command ding (the Preferences window turns it off)
             app.set_chime(Box::new(oats_audio::chime::play));
             #[cfg(target_os = "macos")]

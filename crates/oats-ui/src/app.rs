@@ -400,6 +400,8 @@ pub struct OatsApp {
     menu_events: Option<MenuEvents>,
     /// Quit was asked for (⌘Q, the status item's Quit): let the window close for real.
     quit_requested: bool,
+    /// Set by the binary's SIGINT / SIGTERM handler; `logic` turns it into `request_quit`.
+    quit_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl OatsApp {
@@ -485,6 +487,7 @@ impl OatsApp {
             status_shown: None,
             menu_events,
             quit_requested: false,
+            quit_flag: None,
         };
         app.reload();
         app
@@ -539,6 +542,24 @@ impl OatsApp {
     pub fn request_quit(&mut self, ctx: &egui::Context) {
         self.quit_requested = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Share a flag that, once set (a termination signal), makes the app quit gracefully the
+    /// same way ⌘Q does.
+    pub fn set_quit_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.quit_flag = Some(flag);
+    }
+
+    /// Start quitting when the shared flag is set (once).
+    fn poll_quit_flag(&mut self, ctx: &egui::Context) {
+        if !self.quit_requested
+            && self
+                .quit_flag
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            self.request_quit(ctx);
+        }
     }
 
     /// Whether a status item is installed (closing the window then hides it).
@@ -1909,6 +1930,7 @@ impl eframe::App for OatsApp {
     // Runs every frame, and also while the window is hidden (eframe then runs no ui pass), so
     // everything the status item drives lives here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_quit_flag(ctx);
         self.handle_events();
         self.handle_brain_events(ctx);
         // a todo came due (or a snooze ended): show its pop-up; then ONE repaint is scheduled
@@ -2466,6 +2488,15 @@ mod tests {
                 .map(|s| (s.enabled, s.tooltip.as_str())),
             Some((true, "OatsNotes — Idle"))
         );
+        // a termination signal (the shared flag) quits the same way
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.set_quit_flag(flag.clone());
+        app.poll_quit_flag(&cc.egui_ctx);
+        assert!(!app.quit_requested);
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.poll_quit_flag(&cc.egui_ctx);
+        assert!(app.quit_requested);
+        app.quit_requested = false;
         // its Quit really quits (closing the window would only hide it)
         queue.borrow_mut().push(StatusAction::Quit);
         assert!(!app.quit_requested);

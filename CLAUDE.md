@@ -106,7 +106,10 @@ engine; two lanes, VAD every frame per lane, the model only on closed speech seg
 segment is forwarded to the `oats-brain` worker (`BrainCommand::SegmentArrived`), which runs
 the `claude` CLI on its own thread and reports `BrainEvent`s back (the UI reloads on `Changed`).
 
-Failure edges: a lost microphone arrives on cpal's error callback; a terminal error
+Failure edges: SIGINT / SIGTERM quit gracefully (the `ctrlc` handler sets a flag that
+`logic` turns into `request_quit`: pipeline stopped, session closed, prefs saved; a second signal
+exits at once), and sessions a crash left open are closed at startup
+(`Store::close_dangling_sessions`, called once before the pipeline spawns). A lost microphone arrives on cpal's error callback; a terminal error
 (device / host gone, permission revoked, stream invalidated) drops that capture's sender. A
 lane error closes only that lane: the session runs on while the other capture's sender lives
 (the system capture rebuilds itself, see below; a microphone that stops delivering while

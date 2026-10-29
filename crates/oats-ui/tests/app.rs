@@ -1021,13 +1021,8 @@ fn the_project_page_lists_next_steps_over_collapsed_notes_and_links_back_to_them
     rig.harness.get_by_label("Collapse all").click();
     rig.harness.run_steps(3);
     assert!(!rig.shows("pricing detail alpha"));
-    let links = rig
-        .harness
-        .query_all_by_label_contains("from Launch review")
-        .count();
-    assert_eq!(links, 1);
     rig.harness
-        .get_by_label_contains("from Launch review")
+        .get_by_label_contains("Book the launch room")
         .click();
     rig.harness.run_steps(4);
     assert_eq!(rig.app().pending_focus(), None, "focus consumed");

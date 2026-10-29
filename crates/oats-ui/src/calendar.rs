@@ -1,4 +1,4 @@
-//! The Calendar view (⌘4): a month grid — ‹ month year › and Today; weeks Monday to Sunday;
+//! The Calendar view (⌘4): a month grid — ‹ month year › and Today; weeks Sunday to Saturday;
 //! days outside the month dimmed, today outlined in the accent; each day lists up to three
 //! items as one-line chips (events in the accent tint, dated todos in the button grey,
 //! completed todos crossed through) and "+N" when there are more. Clicking a day selects it;
@@ -48,13 +48,13 @@ pub fn add_months(first: NaiveDate, n: i32) -> NaiveDate {
     NaiveDate::from_ymd_opt(m.div_euclid(12), m.rem_euclid(12) as u32 + 1, 1).unwrap_or(first)
 }
 
-/// The days the grid shows for the month starting at `first`: whole weeks, Monday to Sunday,
+/// The days the grid shows for the month starting at `first`: whole weeks, Sunday to Saturday,
 /// from the week containing the 1st to the week containing the last day (28–42 days).
 pub fn grid_days(first: NaiveDate) -> Vec<NaiveDate> {
     let first = month_of(first);
-    let start = first - chrono::Days::new(u64::from(first.weekday().num_days_from_monday()));
+    let start = first - chrono::Days::new(u64::from(first.weekday().num_days_from_sunday()));
     let last = add_months(first, 1).pred_opt().unwrap_or(first);
-    let end = last + chrono::Days::new(u64::from(6 - last.weekday().num_days_from_monday()));
+    let end = last + chrono::Days::new(u64::from(6 - last.weekday().num_days_from_sunday()));
     start.iter_days().take_while(|d| *d <= end).collect()
 }
 
@@ -144,7 +144,7 @@ pub fn calendar_view(
             // weekday names
             let (names, _) =
                 ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
-            for (i, name) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            for (i, name) in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
                 .iter()
                 .enumerate()
             {
@@ -560,15 +560,15 @@ mod tests {
     }
 
     #[test]
-    fn the_grid_is_whole_weeks_from_monday() {
+    fn the_grid_is_whole_weeks_from_sunday() {
         // October 2026 starts on a Thursday and ends on a Saturday
         let days = grid_days(d(2026, 10, 15));
-        assert_eq!(days.first(), Some(&d(2026, 9, 28)));
-        assert_eq!(days.last(), Some(&d(2026, 11, 1)));
+        assert_eq!(days.first(), Some(&d(2026, 9, 27)));
+        assert_eq!(days.last(), Some(&d(2026, 10, 31)));
         assert_eq!(days.len(), 35);
-        // February 2027 starts on a Monday: four whole weeks
+        // February 2027 starts on a Monday and ends on a Sunday: five weeks
         let feb = grid_days(d(2027, 2, 1));
-        assert_eq!((feb.len(), feb[0]), (28, d(2027, 2, 1)));
+        assert_eq!((feb.len(), feb[0]), (35, d(2027, 1, 31)));
         // a six-week month: August 2026 (Sat 1st, Mon 31st)
         assert_eq!(grid_days(d(2026, 8, 1)).len(), 42);
         assert_eq!(add_months(d(2026, 12, 1), 1), d(2027, 1, 1));

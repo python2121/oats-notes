@@ -26,5 +26,6 @@ oats-status-macos = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "persistence", "wayland", "x11"] }
 egui = { workspace = true }
 log = { workspace = true }
+ctrlc = { workspace = true }
 env_logger = { workspace = true }
 image = { workspace = true }

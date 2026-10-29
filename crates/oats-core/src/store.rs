@@ -1090,6 +1090,18 @@ impl Store {
         Ok(())
     }
 
+    /// Close sessions a dead process left open (`ended_at` NULL, started before `before`):
+    /// their end becomes the last segment's end, or their start when they have none. Call once
+    /// at startup, before the pipeline opens a session of its own; returns how many were closed.
+    pub fn close_dangling_sessions(&self, before: i64) -> Result<usize, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE sessions SET ended_at = COALESCE(
+                 (SELECT MAX(ended_at) FROM segments WHERE session_id = sessions.id), started_at)
+             WHERE ended_at IS NULL AND started_at < ?1",
+            rusqlite::params![before],
+        )?)
+    }
+
     // ---- segments ---------------------------------------------------------------------
 
     /// Insert a microphone segment; returns the full row.
@@ -2407,6 +2419,29 @@ mod tests {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    #[test]
+    fn dangling_sessions_are_closed_at_their_last_segment_or_start() -> Result<(), StoreError> {
+        let s = Store::open_in_memory()?;
+        let with_seg = s.begin_session(1_000, "t")?;
+        s.insert_segment(with_seg, 1_500, 2_500, "hello there", None)?;
+        let empty = s.begin_session(3_000, "t")?;
+        let done = s.begin_session(4_000, "t")?;
+        s.end_session(done, 4_100)?;
+        let live = s.begin_session(9_000, "t")?;
+        assert_eq!(s.close_dangling_sessions(5_000)?, 2);
+        let end = |id: i64| -> Result<Option<i64>, StoreError> {
+            Ok(s.conn
+                .query_row("SELECT ended_at FROM sessions WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })?)
+        };
+        assert_eq!(end(with_seg)?, Some(2_500));
+        assert_eq!(end(empty)?, Some(3_000));
+        assert_eq!(end(done)?, Some(4_100));
+        assert_eq!(end(live)?, None);
+        Ok(())
     }
 
     #[test]

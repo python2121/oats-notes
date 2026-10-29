@@ -1229,12 +1229,26 @@ fn next_steps(
                     },
                 );
             }
-            ui.add(egui::Label::new(job).selectable(false));
-            let src = format!("from {} · {}", s.episode_title, short_date(s.started_at));
-            if link(ui, t, &src, 11.0)
-                .on_hover_text("Show this note")
-                .clicked()
-            {
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let resp = ui
+                .add(
+                    egui::Label::new(job)
+                        .sense(Sense::click())
+                        .selectable(false),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!(
+                    "from {} · {}",
+                    s.episode_title,
+                    short_date(s.started_at)
+                ));
+            if resp.hovered() {
+                ui.painter().set(
+                    bg,
+                    egui::Shape::rect_filled(resp.rect.expand2(vec2(4.0, 1.0)), 4.0, t.hover),
+                );
+            }
+            if resp.clicked() {
                 actions.push(NotesAction::GoToNote(s.episode_id));
             }
         });
