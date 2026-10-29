@@ -8,7 +8,9 @@
 
 use chrono::Local;
 use egui::{Align2, Rect, RichText, Sense, vec2};
-use oats_core::{ActionItem, BrainRun, Change, Episode, EpisodeContent, Node, TranscriptRow};
+use oats_core::{
+    ActionItem, BrainRun, Change, Decision, Episode, EpisodeContent, Node, NoteItem, TranscriptRow,
+};
 
 use crate::theme::Tokens;
 use crate::transcript::{TranscriptAction, clock, day_heading, day_of, transcript_rows};
@@ -36,6 +38,19 @@ pub enum NotesAction {
     MarkAsMedia(i64),
     /// "Summarise" a media note (one model call with the media prompt).
     Summarise(i64),
+    /// A note's decision / action item was clicked: the transcript at the segment it was said.
+    ShowSegment(i64),
+    /// "Move to ▸" on a note: refile the episode under this node.
+    MoveNote {
+        episode: i64,
+        node: i64,
+    },
+    /// "New project…" on a note: create a project (the user's own) under the note's category
+    /// (else Work) and move the note there.
+    MoveToNewProject {
+        episode: i64,
+        name: String,
+    },
 }
 
 /// What the strip shows about the brain.
@@ -324,6 +339,8 @@ pub struct NotesState {
     /// Conversation notes heard (partly) from an app classed Media — "Mark as media" is
     /// offered on them.
     pub media_convertible: std::collections::HashSet<i64>,
+    /// "New project…" on a note: the inline name field (episode id, name, focus pending).
+    pub new_project: Option<(i64, String, bool)>,
 }
 
 /// The text fields of a note being edited. Decisions: one per line. Action items: one per
@@ -345,7 +362,12 @@ impl EditDraft {
             episode_id: e.id,
             title: e.title.clone(),
             summary: e.summary.clone(),
-            decisions: e.decisions.join("\n"),
+            decisions: e
+                .decisions
+                .iter()
+                .map(|d| d.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
             action_items: e
                 .action_items
                 .iter()
@@ -374,7 +396,10 @@ impl EditDraft {
                 title.to_owned()
             },
             summary: self.summary.trim().to_owned(),
-            decisions: lines(&self.decisions),
+            decisions: lines(&self.decisions)
+                .into_iter()
+                .map(Decision::plain)
+                .collect(),
             action_items: self
                 .action_items
                 .lines()
@@ -389,6 +414,27 @@ impl EditDraft {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// [`Self::to_content`], keeping the filing and provenance (`node_id`, `at_ms`,
+    /// `segment_id`) of every decision / action item whose text is unchanged from `old`.
+    pub fn to_content_keeping(&self, old: &Episode) -> EpisodeContent {
+        let mut c = self.to_content();
+        for d in &mut c.decisions {
+            if let Some(o) = old.decisions.iter().find(|o| o.text.trim() == d.text) {
+                d.node_id = o.node_id;
+                d.at_ms = o.at_ms;
+                d.segment_id = o.segment_id;
+            }
+        }
+        for a in &mut c.action_items {
+            if let Some(o) = old.action_items.iter().find(|o| o.text.trim() == a.text) {
+                a.node_id = o.node_id;
+                a.at_ms = o.at_ms;
+                a.segment_id = o.segment_id;
+            }
+        }
+        c
     }
 }
 
@@ -412,6 +458,7 @@ pub fn parse_action_item(line: &str) -> Option<ActionItem> {
         text: text.to_owned(),
         owner: some(parts.next()),
         due: some(parts.next()),
+        ..Default::default()
     })
 }
 
@@ -506,6 +553,186 @@ fn rich_line(ui: &mut egui::Ui, t: &Tokens, text: &str, size: f32, color: egui::
         );
     }
     ui.add(egui::Label::new(job).wrap().selectable(false));
+}
+
+/// A note's decision / action item: with a source (`segment_id`) the text is a link to the
+/// transcript at that moment ("Show in transcript at 2:31 pm"); filed under another project
+/// than the note (`filed`), a small chip after it names that project (a click opens it).
+#[allow(clippy::too_many_arguments)]
+fn item_line(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    text: &str,
+    hl: &str,
+    (segment, at): (Option<i64>, Option<i64>),
+    filed: Option<i64>,
+    nodes: &[Node],
+    actions: &mut Vec<NotesAction>,
+) {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    for (span, bold) in bold_spans(text) {
+        let font = if bold {
+            crate::theme::font_medium(ui.ctx(), 12.5)
+        } else {
+            t.font(12.5)
+        };
+        crate::search::append_marked(
+            &mut job,
+            t,
+            &span,
+            hl,
+            egui::TextFormat {
+                font_id: font,
+                color: t.text,
+                ..Default::default()
+            },
+        );
+    }
+    let chip = |ui: &mut egui::Ui, actions: &mut Vec<NotesAction>| {
+        if let Some(n) = filed.and_then(|id| nodes.iter().find(|n| n.id == id)) {
+            let r = ui
+                .add(
+                    egui::Label::new(
+                        RichText::new(format!("→ {}", n.name))
+                            .color(t.accent)
+                            .size(11.0),
+                    )
+                    .sense(Sense::click())
+                    .selectable(false),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("Filed under {}", node_path(nodes, n.id)));
+            if r.clicked() {
+                actions.push(NotesAction::SelectNode(n.id));
+            }
+        }
+    };
+    if filed.is_some() {
+        job.wrap.max_width = (ui.available_width() - 140.0).max(80.0);
+    }
+    let Some(seg) = segment else {
+        ui.add(egui::Label::new(job).wrap().selectable(false));
+        chip(ui, actions);
+        return;
+    };
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let when = at
+        .map(|ms| crate::timefmt::clock(ms, &Local).trim().to_owned())
+        .map(|c| format!("Show in transcript at {c}"))
+        .unwrap_or_else(|| "Show in transcript".to_owned());
+    let resp = ui
+        .add(
+            egui::Label::new(job)
+                .wrap()
+                .sense(Sense::click())
+                .selectable(false),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(when);
+    if resp.hovered() {
+        ui.painter().set(
+            bg,
+            egui::Shape::rect_filled(resp.rect.expand2(vec2(4.0, 1.0)), 4.0, t.hover),
+        );
+    }
+    if resp.clicked() {
+        actions.push(NotesAction::ShowSegment(seg));
+    }
+    chip(ui, actions);
+}
+
+/// "Move to ▸" (every node, full paths; the note's own node checked) and "New project…" on a
+/// note's context menu.
+fn move_menu(
+    ui: &mut egui::Ui,
+    e: &Episode,
+    nodes: &[Node],
+    state: &mut NotesState,
+    actions: &mut Vec<NotesAction>,
+) {
+    ui.menu_button("Move to", |ui| {
+        let mut list: Vec<(String, i64)> = nodes
+            .iter()
+            .filter(|n| !n.archived)
+            .map(|n| (node_path(nodes, n.id), n.id))
+            .collect();
+        list.sort();
+        for (path, id) in list {
+            let here = e.node_id == Some(id);
+            let label = if here { format!("✔ {path}") } else { path };
+            if ui.add_enabled(!here, egui::Button::new(label)).clicked() {
+                actions.push(NotesAction::MoveNote {
+                    episode: e.id,
+                    node: id,
+                });
+                ui.close();
+            }
+        }
+    });
+    if ui.button("New project…").clicked() {
+        state.new_project = Some((e.id, String::new(), true));
+        ui.close();
+    }
+}
+
+/// The inline "New project" name field under a note's title (after "New project…"): Enter or
+/// Create makes the project and moves the note there; Escape or Cancel closes it.
+fn new_project_field(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    e: &Episode,
+    state: &mut NotesState,
+    actions: &mut Vec<NotesAction>,
+) {
+    let Some((id, name, focus)) = state.new_project.as_mut() else {
+        return;
+    };
+    if *id != e.id {
+        return;
+    }
+    let mut create = false;
+    let mut cancel = false;
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("New project")
+                .color(t.text_secondary)
+                .size(11.5),
+        );
+        let r = ui.add(
+            egui::TextEdit::singleline(name)
+                .desired_width(220.0)
+                .hint_text("Project name")
+                .font(t.font(12.5)),
+        );
+        if *focus {
+            r.request_focus();
+            *focus = false;
+        }
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            create = true;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if small_button(ui, "Create", !name.trim().is_empty()) {
+            create = true;
+        }
+        if small_button(ui, "Cancel", true) {
+            cancel = true;
+        }
+    });
+    if create && let Some((episode, name, _)) = state.new_project.take() {
+        if !name.trim().is_empty() {
+            actions.push(NotesAction::MoveToNewProject {
+                episode,
+                name: name.trim().to_owned(),
+            });
+        }
+    } else if cancel {
+        state.new_project = None;
+    }
 }
 
 fn summary_block(ui: &mut egui::Ui, t: &Tokens, summary: &str, hl: &str) {
@@ -811,8 +1038,12 @@ pub(crate) fn episode_card(
                         "Right-click: Mark as media"
                     });
                 }
-                if e.is_media() || convertible {
-                    resp.context_menu(|ui| {
+                resp.context_menu(|ui| {
+                    move_menu(ui, e, nodes, state, actions);
+                    if e.is_media() || convertible {
+                        ui.separator();
+                    }
+                    {
                         if e.is_media() {
                             if ui
                                 .button("Mark as a call")
@@ -841,8 +1072,8 @@ pub(crate) fn episode_card(
                             actions.push(NotesAction::MarkAsMedia(e.id));
                             ui.close();
                         }
-                    });
-                }
+                    }
+                });
                 if let Some(open) = open {
                     resp = resp
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -907,6 +1138,7 @@ pub(crate) fn episode_card(
                     }
                 });
             });
+            new_project_field(ui, t, e, state, actions);
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(12.0);
                 ui.label(
@@ -955,7 +1187,16 @@ pub(crate) fn episode_card(
                                 ui.horizontal_top(|ui| {
                                     ui.add_space(6.0);
                                     ui.label(RichText::new("✓").color(t.accent).size(12.0));
-                                    rich_line(ui, t, d, 12.5, t.text, hl);
+                                    item_line(
+                                        ui,
+                                        t,
+                                        &d.text,
+                                        hl,
+                                        (d.segment_id, d.at_ms),
+                                        d.node_id.filter(|n| Some(*n) != e.node_id),
+                                        nodes,
+                                        actions,
+                                    );
                                 });
                             }
                         }
@@ -977,7 +1218,16 @@ pub(crate) fn episode_card(
                                     if let Some(d) = &a.due {
                                         text.push_str(&format!(" (due {d})"));
                                     }
-                                    rich_line(ui, t, &text, 12.5, t.text, hl);
+                                    item_line(
+                                        ui,
+                                        t,
+                                        &text,
+                                        hl,
+                                        (a.segment_id, a.at_ms),
+                                        a.node_id.filter(|n| Some(*n) != e.node_id),
+                                        nodes,
+                                        actions,
+                                    );
                                 });
                             }
                         }
@@ -1102,7 +1352,7 @@ fn edit_card(
         })
         .response;
     if save && let Some(d) = state.editing.take() {
-        actions.push(NotesAction::SaveEdit(e.id, d.to_content()));
+        actions.push(NotesAction::SaveEdit(e.id, d.to_content_keeping(e)));
     } else if cancel {
         state.editing = None;
     }
@@ -1263,13 +1513,16 @@ pub struct NodeViewOut {
 }
 
 /// A category, project or topic selected in the sidebar: its path as the header, the child
-/// projects (or topics) as clickable rows, the notes (episodes) of the subtree newest first,
+/// projects (or topics) as clickable rows (a project: "Next steps" first, with the items filed
+/// here from notes homed elsewhere — `filed` — inline), the notes (episodes) of the subtree
+/// newest first,
 /// and the raw transcript segments filed there behind a toggle (collapsed by default).
 pub fn node_view(
     ui: &mut egui::Ui,
     state: &mut NotesState,
     node: &Node,
     episodes: &[Episode],
+    filed: &[(Episode, NoteItem)],
     rows: &[TranscriptRow],
     nodes: &[Node],
 ) -> NodeViewOut {
@@ -1310,7 +1563,7 @@ pub fn node_view(
             ui.add_space(8.0);
             let is_project = node.kind == oats_core::NodeKind::Project;
             if is_project {
-                next_steps(ui, &t, state, episodes, &mut out.notes);
+                next_steps(ui, &t, state, episodes, filed, &mut out.notes);
                 project_notes(ui, &t, state, episodes, nodes, &mut out.notes);
                 children_section(ui, &t, node, &children, &mut out);
             } else {
@@ -1468,23 +1721,42 @@ pub struct NextStep {
     pub started_at: i64,
 }
 
-/// The action items of `episodes` (newest first, as given; low-signal notes left out), each
-/// tagged with its source note.
-pub fn collect_next_steps(episodes: &[Episode]) -> Vec<NextStep> {
-    episodes
+/// A project page's next steps: the action items of its own `episodes` (low-signal notes
+/// left out) and, inline among them, the action items filed under the project from notes
+/// homed elsewhere (`filed`, [`oats_core::Store::items_filed_under`]); one list, newest note
+/// first, each item once (by note and text), each tagged with its source note.
+pub fn collect_next_steps(episodes: &[Episode], filed: &[(Episode, NoteItem)]) -> Vec<NextStep> {
+    let step = |e: &Episode, a: &ActionItem| NextStep {
+        text: a.text.clone(),
+        owner: a.owner.clone(),
+        due: a.due.clone(),
+        episode_id: e.id,
+        episode_title: e.title.clone(),
+        started_at: e.started_at,
+    };
+    let mut steps: Vec<NextStep> = episodes
         .iter()
         .filter(|e| !e.low_signal)
-        .flat_map(|e| {
-            e.action_items.iter().map(|a| NextStep {
-                text: a.text.clone(),
-                owner: a.owner.clone(),
-                due: a.due.clone(),
-                episode_id: e.id,
-                episode_title: e.title.clone(),
-                started_at: e.started_at,
-            })
-        })
-        .collect()
+        .flat_map(|e| e.action_items.iter().map(move |a| step(e, a)))
+        .collect();
+    for (e, item) in filed {
+        if let NoteItem::Action(a) = item
+            && !e.low_signal
+            && !steps
+                .iter()
+                .any(|s| s.episode_id == e.id && s.text == a.text)
+        {
+            steps.push(step(e, a));
+        }
+    }
+    // stable: a note's items keep their order
+    steps.sort_by_key(|s| {
+        (
+            std::cmp::Reverse(s.started_at),
+            std::cmp::Reverse(s.episode_id),
+        )
+    });
+    steps
 }
 
 /// A text link (accent colour, pointing hand).
@@ -1499,9 +1771,10 @@ fn next_steps(
     t: &Tokens,
     state: &mut NotesState,
     episodes: &[Episode],
+    filed: &[(Episode, NoteItem)],
     actions: &mut Vec<NotesAction>,
 ) {
-    let steps = collect_next_steps(episodes);
+    let steps = collect_next_steps(episodes, filed);
     section_label(ui, t, "Next steps");
     if steps.is_empty() {
         ui.horizontal(|ui| {
@@ -1644,8 +1917,16 @@ fn project_notes(
     }
     ui.add_space(2.0);
     for e in episodes {
+        // "New project…" from a closed row: its name field lives in the open card
+        if state
+            .new_project
+            .as_ref()
+            .is_some_and(|(id, _, _)| *id == e.id)
+        {
+            state.open_notes.insert(e.id);
+        }
         let open = state.open_notes.contains(&e.id);
-        if note_row(ui, t, e, open, actions) {
+        if note_row(ui, t, e, nodes, state, open, actions) {
             if open {
                 state.open_notes.remove(&e.id);
             } else {
@@ -1664,10 +1945,15 @@ fn note_row(
     ui: &mut egui::Ui,
     t: &Tokens,
     e: &Episode,
+    nodes: &[Node],
+    state: &mut NotesState,
     open: bool,
     actions: &mut Vec<NotesAction>,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+    resp.context_menu(|ui| {
+        move_menu(ui, e, nodes, state, actions);
+    });
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Note: {}", e.title))
@@ -1838,6 +2124,64 @@ fn section_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {
 mod tests {
     use super::*;
     use oats_core::{NodeKind, Origin};
+
+    #[test]
+    fn an_edit_keeps_the_filing_and_source_of_unchanged_items_and_steps_merge_inline() {
+        let old = Episode {
+            id: 1,
+            started_at: 10,
+            ended_at: 20,
+            title: "Dev call".into(),
+            summary: String::new(),
+            node_id: Some(5),
+            decisions: vec![Decision {
+                text: "Ship it".into(),
+                node_id: Some(7),
+                at_ms: Some(11),
+                segment_id: Some(3),
+            }],
+            action_items: vec![ActionItem {
+                text: "Do x".into(),
+                node_id: Some(7),
+                segment_id: Some(3),
+                ..Default::default()
+            }],
+            topics: vec![],
+            low_signal: false,
+            model: String::new(),
+            cost_usd: None,
+            revision: 1,
+            created_at: 0,
+            last_revised_at: 0,
+            user_edited_at: None,
+            kind: "conversation".into(),
+        };
+        let mut d = EditDraft::from_episode(&old);
+        d.action_items.push_str("\nDo y | Ana");
+        let c = d.to_content_keeping(&old);
+        assert_eq!(c.decisions[0].segment_id, Some(3));
+        assert_eq!(c.action_items[0].node_id, Some(7));
+        assert_eq!(c.action_items[1].node_id, None);
+
+        // the project's own note (older) and the item filed here from the dev call (newer)
+        let own = Episode {
+            id: 2,
+            started_at: 5,
+            action_items: vec![ActionItem {
+                text: "Own step".into(),
+                ..Default::default()
+            }],
+            ..old.clone()
+        };
+        let filed = vec![(old.clone(), NoteItem::Action(old.action_items[0].clone()))];
+        let steps = collect_next_steps(std::slice::from_ref(&own), &filed);
+        let texts: Vec<&str> = steps.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["Do x", "Own step"]);
+        assert_eq!(steps[0].episode_id, 1);
+        // a note both homed here and cross-filed lists its item once
+        let both = collect_next_steps(std::slice::from_ref(&old), &filed);
+        assert_eq!(both.len(), 1);
+    }
 
     #[test]
     fn markdown_subset() {

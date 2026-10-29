@@ -485,6 +485,33 @@ impl Store {
         Ok(rows)
     }
 
+    /// Episodes that started before `before` and contain a system segment of the call
+    /// `meeting_ref` (the meeting page's URL, `segments.media_ref` of a `meeting`-stamped
+    /// segment), newest first, at most `limit`. A link that recurs on earlier days is a
+    /// standing meeting (a series).
+    pub fn episodes_with_meeting_ref(
+        &self,
+        meeting_ref: &str,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<super::Episode>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM episodes WHERE started_at < ?2 AND id IN (
+                 SELECT episode_id FROM segments
+                 WHERE episode_id IS NOT NULL AND source = 'system'
+                   AND media_kind = 'meeting' AND media_ref = ?1)
+             ORDER BY started_at DESC, id DESC LIMIT ?3",
+            super::EPISODE_COLUMNS
+        ))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![meeting_ref, before, limit],
+                super::row_to_episode,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Relabel a play (`MediaClass::Call` for "Mark as a call").
     pub fn set_media_play_kind(&self, id: i64, kind: MediaClass) -> Result<(), StoreError> {
         self.conn.execute(

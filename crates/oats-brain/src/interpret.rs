@@ -12,10 +12,10 @@
 //! first) for the anti-sprawl filing rule, screenpipe's commitments pipe for reconciliation.
 //! Edit the `prompts/*.md` files to change the wording; they are `include_str!`-ed.
 
-use chrono::{DateTime, Local, TimeZone};
-use oats_core::store::interpretation_event_key;
+use chrono::{DateTime, Local, TimeZone, Timelike};
+use oats_core::store::{interpretation_event_key, name_key};
 use oats_core::{
-    ActionItem, Episode, EpisodeContent, Event, NewEvent, Node, NodeKind, Origin, Store,
+    ActionItem, Decision, Episode, EpisodeContent, Event, NewEvent, Node, NodeKind, Origin, Store,
     StoreError, TranscriptRow,
 };
 use serde::Deserialize;
@@ -230,6 +230,71 @@ pub struct ProposedEvent {
     pub confidence: Option<f64>,
 }
 
+/// An action item as the model returns it: the stored [`ActionItem`] fields plus `project`
+/// (the name of the existing project / topic it concerns, `None` = the note's home) and `at`
+/// (the `[HH:MM]` of the transcript line it came from).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ProposedAction {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub due: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub at: Option<String>,
+}
+
+/// A decision as the model returns it (a bare string is accepted too: older canned output).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProposedDecision {
+    pub text: String,
+    pub project: Option<String>,
+    pub at: Option<String>,
+}
+
+impl From<&str> for ProposedDecision {
+    fn from(text: &str) -> Self {
+        ProposedDecision {
+            text: text.to_owned(),
+            ..Default::default()
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProposedDecision {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Obj {
+            #[serde(default)]
+            text: String,
+            #[serde(default)]
+            project: Option<String>,
+            #[serde(default)]
+            at: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            Obj(Obj),
+        }
+        Ok(match Repr::deserialize(d)? {
+            Repr::Text(text) => ProposedDecision {
+                text,
+                ..Default::default()
+            },
+            Repr::Obj(o) => ProposedDecision {
+                text: o.text,
+                project: o.project,
+                at: o.at,
+            },
+        })
+    }
+}
+
 /// What the model returns for an episode.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Interpretation {
@@ -246,9 +311,9 @@ pub struct Interpretation {
     #[serde(default)]
     pub new_topic: Option<NodeProposal>,
     #[serde(default)]
-    pub decisions: Vec<String>,
+    pub decisions: Vec<ProposedDecision>,
     #[serde(default)]
-    pub action_items: Vec<ActionItem>,
+    pub action_items: Vec<ProposedAction>,
     #[serde(default)]
     pub topics: Vec<String>,
     #[serde(default)]
@@ -282,7 +347,25 @@ pub fn interpret_schema() -> Value {
             "node_id": nullable("integer"),
             "new_project": proposal_schema(),
             "new_topic": proposal_schema(),
-            "decisions": { "type": "array", "items": { "type": "string" } },
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string" },
+                        "project": {
+                            "type": ["string", "null"],
+                            "description": "name of the existing project/topic it concerns; null = the note's home"
+                        },
+                        "at": {
+                            "type": ["string", "null"],
+                            "description": "HH:MM of the transcript line it came from"
+                        }
+                    },
+                    "required": ["text", "project", "at"],
+                    "additionalProperties": false
+                }
+            },
             "action_items": {
                 "type": "array",
                 "items": {
@@ -290,9 +373,17 @@ pub fn interpret_schema() -> Value {
                     "properties": {
                         "text": { "type": "string" },
                         "owner": nullable("string"),
-                        "due": nullable("string")
+                        "due": nullable("string"),
+                        "project": {
+                            "type": ["string", "null"],
+                            "description": "name of the existing project/topic it concerns; null = the note's home"
+                        },
+                        "at": {
+                            "type": ["string", "null"],
+                            "description": "HH:MM of the transcript line it came from"
+                        }
                     },
-                    "required": ["text", "owner", "due"],
+                    "required": ["text", "owner", "due", "project", "at"],
                     "additionalProperties": false
                 }
             },
@@ -322,7 +413,7 @@ pub fn interpret_schema() -> Value {
 }
 
 /// The previous interpretation, rendered for a revision.
-fn render_prior(prior: Option<&Episode>) -> String {
+fn render_prior(prior: Option<&Episode>, tree: &[Node]) -> String {
     let Some(p) = prior else {
         return String::new();
     };
@@ -336,17 +427,28 @@ fn render_prior(prior: Option<&Episode>) -> String {
         p.low_signal,
         p.summary
     ));
+    // where an item was filed and said, so a revision keeps it
+    let refs = |node: Option<i64>, at: Option<i64>| {
+        let mut r = String::new();
+        if let Some(n) = node.and_then(|id| tree.iter().find(|n| n.id == id)) {
+            r.push_str(&format!(" (project: {})", n.name));
+        }
+        if let Some(at) = at {
+            r.push_str(&format!(" (at: {})", clock(at, &Local)));
+        }
+        r
+    };
     if !p.decisions.is_empty() {
         s.push_str("\nDecisions:\n");
         for d in &p.decisions {
-            s.push_str(&format!("- {d}\n"));
+            s.push_str(&format!("- {}{}\n", d.text, refs(d.node_id, d.at_ms)));
         }
     }
     if !p.action_items.is_empty() {
         s.push_str("\nAction items:\n");
         for a in &p.action_items {
             s.push_str(&format!(
-                "- {}{}{}\n",
+                "- {}{}{}{}\n",
                 a.text,
                 a.owner
                     .as_ref()
@@ -355,7 +457,8 @@ fn render_prior(prior: Option<&Episode>) -> String {
                 a.due
                     .as_ref()
                     .map(|d| format!(" (due: {d})"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                refs(a.node_id, a.at_ms)
             ));
         }
     }
@@ -388,6 +491,54 @@ pub fn meeting_hint(chunk: &Chunk) -> &'static str {
     }
 }
 
+/// The series hint: when the chunk is a call whose meeting link (the page URL of its
+/// `meeting`-stamped system segments) was also heard on EARLIER days, it is a recurring
+/// meeting — the earlier notes and where they are filed are listed, so the note joins the
+/// series' project. Empty otherwise (no call, an app with no link, a first occurrence).
+pub fn series_hint(store: &Store, tree: &[Node], chunk: &Chunk) -> String {
+    let Some(key) = chunk.meeting_key().filter(|k| !k.trim().is_empty()) else {
+        return String::new();
+    };
+    // earlier DAYS: before the local midnight of the chunk's start
+    let day_start = Local
+        .timestamp_millis_opt(chunk.started_at)
+        .single()
+        .and_then(|d| d.date_naive().and_hms_opt(0, 0, 0))
+        .and_then(|d| Local.from_local_datetime(&d).earliest())
+        .map(|d| d.timestamp_millis())
+        .unwrap_or(chunk.started_at);
+    let earlier: Vec<Episode> = store
+        .episodes_with_meeting_ref(&key, day_start, 5)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| !e.low_signal && !e.is_media())
+        .collect();
+    if earlier.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "# Series\n\nseries: true — the same meeting link was used on earlier days, so this is \
+         a recurring meeting (a series). File the note under the project of the series (where \
+         the earlier notes below are filed, when that project is named for the series), else \
+         propose a new project named for the series; file each item under the project it \
+         concerns.\n\nEarlier notes of this meeting:\n",
+    );
+    for e in &earlier {
+        let filed = e
+            .node_id
+            .and_then(|id| tree.iter().find(|n| n.id == id))
+            .map(|n| format!("filed under [{}] {}", n.id, n.name))
+            .unwrap_or_else(|| "not filed".to_owned());
+        s.push_str(&format!(
+            "- {} — {} — {filed}\n",
+            date(e.started_at, &Local),
+            e.title.replace('\n', " ")
+        ));
+    }
+    s.push('\n');
+    s
+}
+
 /// Build the interpretation request for a chunk (`prior` = the episode being revised).
 pub fn interpret_request(
     tree: &[Node],
@@ -409,6 +560,19 @@ pub fn interpret_request_with(
     model: Option<String>,
     media_titles: &HashMap<String, String>,
 ) -> Request {
+    interpret_request_full(tree, chunk, prior, now, model, media_titles, "")
+}
+
+/// [`interpret_request_with`] plus the [`series_hint`] (the scheduler's request).
+pub fn interpret_request_full(
+    tree: &[Node],
+    chunk: &Chunk,
+    prior: Option<&Episode>,
+    now: &DateTime<Local>,
+    model: Option<String>,
+    media_titles: &HashMap<String, String>,
+    series: &str,
+) -> Request {
     let user = render(
         INTERPRET_USER,
         &[
@@ -417,8 +581,9 @@ pub fn interpret_request_with(
             ("episode_start", &clock(chunk.started_at, &Local)),
             ("episode_end", &clock(chunk.ended_at, &Local)),
             ("tree", &render_tree(tree, None)),
-            ("prior", &render_prior(prior)),
+            ("prior", &render_prior(prior, tree)),
             ("meeting", meeting_hint(chunk)),
+            ("series", series),
             (
                 "transcript",
                 &strip_delimiters(&render_transcript_titled(
@@ -528,6 +693,95 @@ fn resolve_node(
         }
     }
     Ok((node_id, created))
+}
+
+/// The node an item's `project` names: an existing, unarchived project or topic matched by
+/// [`name_key`] (or cited as `[id] name`, the way the tree is shown). Items never create
+/// nodes: an unknown name, a category, or the note's own `home` is `None` (= filed with the
+/// note).
+pub fn resolve_item_node(tree: &[Node], project: Option<&str>, home: Option<i64>) -> Option<i64> {
+    let raw = project?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let filable = |n: &&Node| !n.archived && n.kind != NodeKind::Category;
+    // "[12] Commerce project" / "12": the id the tree shows
+    let (cited_id, name) = match raw.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        Some((id, rest)) => (id.trim().parse::<i64>().ok(), rest.trim()),
+        None => (raw.parse::<i64>().ok(), raw),
+    };
+    let found = cited_id
+        .and_then(|id| tree.iter().filter(filable).find(|n| n.id == id))
+        .or_else(|| {
+            // "Commerce project (project)" — the kind the tree prints after the name
+            let name = name
+                .strip_suffix("(project)")
+                .or_else(|| name.strip_suffix("(topic)"))
+                .unwrap_or(name);
+            let key = name_key(name);
+            if key.is_empty() {
+                return None;
+            }
+            // a project over a topic of the same name
+            let mut hits: Vec<&Node> = tree
+                .iter()
+                .filter(filable)
+                .filter(|n| name_key(&n.name) == key)
+                .collect();
+            hits.sort_by_key(|n| (n.kind != NodeKind::Project, n.id));
+            hits.first().copied()
+        })?;
+    (Some(found.id) != home).then_some(found.id)
+}
+
+/// The moment an item was said, from the `[HH:MM]` the model cited (`"14:31"`, `"[14:31]"`,
+/// `"2:31 pm"`): the first segment of the chunk that started in that local minute, else the
+/// nearest one within 10 minutes. Returns `(at_ms, segment_id)` (the segment's start).
+pub fn resolve_at<Tz: TimeZone>(chunk: &Chunk, at: Option<&str>, tz: &Tz) -> Option<(i64, i64)> {
+    let wanted = parse_minute_of_day(at?)?;
+    let minute = |ms: i64| {
+        tz.timestamp_millis_opt(ms)
+            .single()
+            .map(|d| d.hour() as i64 * 60 + d.minute() as i64)
+    };
+    let mut best: Option<(i64, i64, i64)> = None; // (distance, at, id)
+    for s in chunk.segments.iter().filter(|s| s.echo_of.is_none()) {
+        let Some(m) = minute(s.started_at) else {
+            continue;
+        };
+        let d = (m - wanted).rem_euclid(1440);
+        let d = d.min(1440 - d);
+        if best.is_none_or(|(bd, _, _)| d < bd) {
+            best = Some((d, s.started_at, s.id));
+        }
+    }
+    best.filter(|(d, _, _)| *d <= 10)
+        .map(|(_, at, id)| (at, id))
+}
+
+/// `"14:31"`, `"[14:31]"`, `"2:31 pm"` → minutes since midnight.
+fn parse_minute_of_day(at: &str) -> Option<i64> {
+    let t = at
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    let lower = t.to_ascii_lowercase();
+    let (clock, pm) = if let Some(c) = lower.strip_suffix("pm") {
+        (c.trim().to_owned(), Some(true))
+    } else if let Some(c) = lower.strip_suffix("am") {
+        (c.trim().to_owned(), Some(false))
+    } else {
+        (lower.clone(), None)
+    };
+    let (h, m) = clock.split_once(':')?;
+    let (mut h, m): (i64, i64) = (h.trim().parse().ok()?, m.trim().get(..2)?.parse().ok()?);
+    match pm {
+        Some(true) if h < 12 => h += 12,
+        Some(false) if h == 12 => h = 0,
+        _ => {}
+    }
+    ((0..24).contains(&h) && (0..60).contains(&m)).then_some(h * 60 + m)
 }
 
 /// The top-level category above a node.
@@ -753,14 +1007,32 @@ fn apply_interpretation_in_tx(
         decisions: interp
             .decisions
             .iter()
-            .map(|d| d.trim().to_owned())
-            .filter(|d| !d.is_empty())
+            .filter(|d| !d.text.trim().is_empty())
+            .map(|d| {
+                let (at_ms, segment_id) = resolve_at(chunk, d.at.as_deref(), &Local).unzip();
+                Decision {
+                    text: d.text.trim().to_owned(),
+                    node_id: resolve_item_node(tree, d.project.as_deref(), node_id),
+                    at_ms,
+                    segment_id,
+                }
+            })
             .collect(),
         action_items: interp
             .action_items
             .iter()
             .filter(|a| !a.text.trim().is_empty())
-            .cloned()
+            .map(|a| {
+                let (at_ms, segment_id) = resolve_at(chunk, a.at.as_deref(), &Local).unzip();
+                ActionItem {
+                    text: a.text.trim().to_owned(),
+                    owner: a.owner.clone().filter(|o| !o.trim().is_empty()),
+                    due: a.due.clone().filter(|d| !d.trim().is_empty()),
+                    node_id: resolve_item_node(tree, a.project.as_deref(), node_id),
+                    at_ms,
+                    segment_id,
+                }
+            })
             .collect(),
         topics: interp
             .topics
@@ -1509,7 +1781,7 @@ pub fn undo_change(store: &Store, change_id: i64) -> Result<bool, StoreError> {
             }
             _ => false,
         },
-        "episode_node" => match id("episode_id") {
+        "episode_node" | "episode_move" => match id("episode_id") {
             Some(e) => {
                 store.set_episode_node(e, id("node_id"))?;
                 true
@@ -1720,6 +1992,7 @@ mod tests {
                 text: "do x".into(),
                 owner: Some("Sam".into()),
                 due: None,
+                ..Default::default()
             }],
             topics: vec![],
             low_signal: false,

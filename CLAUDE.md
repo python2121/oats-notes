@@ -63,13 +63,32 @@ title, topic chips); a click toggles the full `episode_card` inline (`NotesState
 not persisted; "Expand all · Collapse all"). Topics and the transcript toggle follow.
 Categories and topics keep the flat view.
 
+**Cross-filed items and the click chain**: "Next steps" also lists, INLINE in the same list
+(sorted newest note first, deduped by note + text), the action items filed under this project
+from notes homed elsewhere (`Store::items_filed_under(node)`, loaded into
+`OatsApp::filed_items` for a Node view). A row's click (`GoToNote`) on such an item opens the
+note's own page (its home node, or Conversations when unfiled) with the note focused. Inside a
+note card each decision / action item with a `segment_id` is a link ("Show in transcript at
+2:31 pm", `timefmt`) → `NotesAction::ShowSegment` → `jump_to_segment`; an item filed under
+another project than its note carries a "→ Commerce project" chip (opens that project). So:
+Commerce page → dev-call note → transcript line. Editing a note keeps the filing / source of
+items whose text is unchanged (`EditDraft::to_content_keeping`).
+
+**Move to… on notes**: a note card's title and a project page's note row have a context menu
+with "Move to ▸" (every node by full path) and "New project…" (an inline name field in the
+card; parent = the note's category unless Media, else Work, else the first category; created
+`created_by = user` + a `node_create` change), both via `Store::move_episode` (an
+`episode_move` change, undoable like `episode_node`).
+
 **Sidebar notes layer**: a project's row has a triangle (closed by default, persisted as
 `AppPrefs::sidebar_episodes_open`) listing its last `SIDEBAR_EPISODES` = 5 non-low-signal notes
 (newest first, 22 pt rows: truncated title, "29 Oct" at the right), then its topics (the
 triangle now folds both). Clicking one sets `OatsApp::focus_episode` (a UI mode, not a `View`):
 `notes::episode_view` shows that note's card under a breadcrumb "Work › Commerce project ›
 29 Oct" (node names are links). Escape, the project's sidebar row, any other navigation, or a
-breadcrumb link returns to the project page. `--selftest out.png --project [--expanded]`.
+breadcrumb link returns to the project page. `--selftest out.png --project [--expanded]
+[--project-name "Development team call"]` (the seed has a dev-call note with an item and a
+decision filed under Export rewrite).
 
 **Editing notes**: every card has Edit next to Re-interpret. Edit mode (`notes::edit_card`)
 shows title, summary (markdown source), decisions (one per line), action items (one per line,
@@ -410,6 +429,25 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   `created_by = user` — that becomes a `proposal_*` entry in `changes` ("Needs
   confirmation", nothing changed, no Undo). Undo of a `node_move` the store would refuse
   (the tree changed since) is reported as not undoable, not marked done.
+  **Item filing and provenance**: every decision and action item in the output has `project`
+  (the name of an EXISTING project/topic it concerns, null = the note's home) and `at` (the
+  `HH:MM` of its transcript line). `apply_interpretation` maps `project` →
+  `interpret::resolve_item_node` (by `name_key`, or `[id] name`; unknown names, categories and
+  the note's own home → `None`; items never create nodes) and `at` → `interpret::resolve_at`
+  (the first non-echo segment of the chunk in that local minute, else the nearest within
+  10 min → `at_ms` = its start, `segment_id`). Stored in the episode JSON: action items
+  `{text, owner?, due?, node_id?, at_ms?, segment_id?}`; decisions a plain string when bare
+  (older rows, still read) else `{text, node_id?, at_ms?, segment_id?}` (`oats_core::Decision`).
+  A revision's prior shows each item's `(project: …) (at: HH:MM)`. `merge_nodes` refiles items
+  to the survivor, `delete_node` back to their note's home. **Series rule** (prompt): a
+  recurring or named meeting series (standing team call, weekly sync, 1:1 with a named
+  person, a committee) files the NOTE under a project named for the series ("Development
+  team call", "1:1 with Priya"; existing, else `new_project`) and its ITEMS under the
+  projects they concern; a one-off conversation about one project files under that project.
+  `interpret::series_hint` adds `series: true` + the earlier notes and where they are filed
+  when the chunk's meeting link (`meeting_key`, non-empty) was heard on an EARLIER local day
+  (`Store::episodes_with_meeting_ref`); the scheduler builds requests with
+  `interpret_request_full(…, series)`.
 - `hotword`: "hey computer" / "hey oats" (`OATS_HOTWORDS`) detected on segment TEXT,
   punctuation-insensitive, and only on the user's own microphone (`hotword::can_command`: a
   `them:` segment or a mic echo never commands this computer); the command text goes to

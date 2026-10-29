@@ -1171,7 +1171,7 @@ fn seed_project_notes(db: &Path) -> (i64, i64, i64) {
                         .map(|(text, owner)| ActionItem {
                             text: text.into(),
                             owner: owner.map(str::to_owned),
-                            due: None,
+                            ..Default::default()
                         })
                         .collect(),
                     model: "m".into(),
@@ -1217,6 +1217,144 @@ fn the_project_page_lists_next_steps_over_collapsed_notes_and_links_back_to_them
     assert!(rig.app().open_notes().contains(&launch));
     assert!(rig.shows("launch detail beta"));
     assert!(!rig.shows("pricing detail alpha"));
+}
+
+/// A "Development team call" note (homed under its own project) with one action item filed
+/// under the Commerce project, said at a transcript line. Returns (commerce, devcall, note,
+/// segment).
+fn seed_cross_filed(db: &Path) -> (i64, i64, i64, i64) {
+    use oats_core::{ActionItem, EpisodeContent, NodeKind, Origin};
+    let (work, commerce, _lease) = seed_projects(db);
+    let s = Store::open(db).unwrap();
+    let devcall = s
+        .add_node(
+            Some(work),
+            NodeKind::Project,
+            "Development team call",
+            "",
+            Origin::User,
+        )
+        .unwrap()
+        .id;
+    let t = now_ms() - 3_600_000;
+    let sid = s.begin_session(t, "e").unwrap();
+    let seg = s
+        .insert_segment(
+            sid,
+            t,
+            t + 5_000,
+            "the checkout needs a progress spinner",
+            None,
+        )
+        .unwrap();
+    let ep = s
+        .insert_episode(
+            t,
+            t + 600_000,
+            &EpisodeContent {
+                title: "Dev call notes".into(),
+                summary: "- devcall detail gamma".into(),
+                node_id: Some(devcall),
+                action_items: vec![
+                    ActionItem {
+                        text: "Add a checkout spinner".into(),
+                        owner: Some("Sam".into()),
+                        node_id: Some(commerce),
+                        at_ms: Some(t),
+                        segment_id: Some(seg.id),
+                        ..Default::default()
+                    },
+                    ActionItem {
+                        text: "Rotate the on-call rota".into(),
+                        ..Default::default()
+                    },
+                ],
+                model: "m".into(),
+                ..Default::default()
+            },
+            t + 700_000,
+        )
+        .unwrap();
+    s.mark_segments_interpreted(&[seg.id], ep.id, t + 700_000)
+        .unwrap();
+    (commerce, devcall, ep.id, seg.id)
+}
+
+#[test]
+fn an_item_filed_elsewhere_shows_inline_and_its_click_chain_reaches_the_transcript() {
+    let dir = TempDir::new("cross-filed");
+    let (commerce, devcall, note, _seg) = seed_cross_filed(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(3);
+    // inline in Commerce's own next steps; the note's other item is not
+    assert!(rig.shows("Next steps"));
+    assert!(rig.shows("Add a checkout spinner"));
+    assert!(!rig.shows("Rotate the on-call rota"));
+    assert!(
+        !rig.shows("Note: Dev call notes"),
+        "the note itself lives elsewhere"
+    );
+    // its source: the dev call's page, the note opened and focused
+    rig.harness
+        .get_by_label_contains("Add a checkout spinner")
+        .click();
+    rig.harness.run_steps(4);
+    assert_eq!(rig.app().prefs().view, View::Node(devcall));
+    assert_eq!(rig.app().pending_focus(), None, "focus consumed");
+    assert!(rig.app().open_notes().contains(&note));
+    assert!(rig.shows("devcall detail gamma"));
+    // inside the note the item links to the transcript at the line it was said
+    rig.harness
+        .get_all_by_label_contains("Add a checkout spinner")
+        .last()
+        .unwrap()
+        .click();
+    rig.harness.step();
+    assert_eq!(rig.app().prefs().view, View::Transcripts);
+    rig.harness.run_steps(3);
+    assert_eq!(
+        rig.app().pending_segment_focus(),
+        None,
+        "the row took the focus"
+    );
+    assert!(rig.shows("the checkout needs a progress spinner"));
+}
+
+#[test]
+fn move_to_a_new_project_creates_it_and_moves_the_note() {
+    let dir = TempDir::new("move-new-project");
+    let (commerce, pricing, _launch) = seed_project_notes(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(3);
+    rig.harness
+        .get_by_label("Note: Pricing sync")
+        .click_secondary();
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("New project…").click();
+    rig.harness.run_steps(3);
+    rig.harness
+        .get_by_role(egui::accesskit::Role::TextInput)
+        .type_text("Pricing committee");
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Create").click();
+    rig.harness.run_steps(3);
+    let s = Store::open(&dir.db()).unwrap();
+    let work = s.categories().unwrap()[0].id;
+    let p = s
+        .find_node(Some(work), "Pricing committee")
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.created_by, oats_core::Origin::User);
+    assert_eq!(s.episode(pricing).unwrap().unwrap().node_id, Some(p.id));
+    assert!(
+        s.changes(10)
+            .unwrap()
+            .iter()
+            .any(|c| c.kind == "episode_move")
+    );
+    assert!(!rig.shows("Note: Pricing sync"), "moved off this page");
 }
 
 #[test]

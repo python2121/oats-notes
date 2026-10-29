@@ -37,6 +37,9 @@ pub struct SelftestOptions {
     pub project: bool,
     /// With `project`: every note expanded.
     pub expanded: bool,
+    /// With `project`: this project instead of "Export rewrite" (e.g. "Development team call",
+    /// whose note has an item filed under Export rewrite).
+    pub project_name: Option<String>,
     /// Show the Calendar view (the month grid with seeded events and todos, today selected).
     pub calendar: bool,
     /// Show the Todos view (open, snoozed, undated and completed todos).
@@ -159,9 +162,10 @@ pub fn run_with(
         }
     } else if options.project {
         let app = harness.state_mut();
-        app.selftest_open_project_layer("Export rewrite");
-        if !app.selftest_show_node("Export rewrite") {
-            return Err("no Export rewrite project in the seeded store".to_owned());
+        let name = options.project_name.as_deref().unwrap_or("Export rewrite");
+        app.selftest_open_project_layer(name);
+        if !app.selftest_show_node(name) {
+            return Err(format!("no {name} project in the seeded store"));
         }
         if options.expanded {
             app.selftest_expand_notes();
@@ -311,8 +315,8 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
                 node_id: Some(project.id),
                 decisions: vec!["Drop the PDF templates from the Q4 scope".into()],
                 action_items: vec![
-                    ActionItem { text: "Send the updated estimate".into(), owner: Some("Priya".into()), due: Some("Thursday".into()) },
-                    ActionItem { text: "Book the design review".into(), owner: Some("Marco".into()), due: Some("early next week".into()) },
+                    ActionItem { text: "Send the updated estimate".into(), owner: Some("Priya".into()), due: Some("Thursday".into()), ..Default::default() },
+                    ActionItem { text: "Book the design review".into(), owner: Some("Marco".into()), due: Some("early next week".into()), ..Default::default() },
                 ],
                 topics: vec!["export rewrite".into(), "Q4 roadmap".into()],
                 low_signal: false,
@@ -360,8 +364,8 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
                 node_id: Some(project.id),
                 decisions: vec!["Ship CSV first, Excel a week later".into()],
                 action_items: vec![
-                    ActionItem { text: "Add an ISO 8601 date option to the exporter".into(), owner: Some("Sam".into()), due: Some("Friday".into()) },
-                    ActionItem { text: "Share sample files with finance".into(), owner: None, due: None },
+                    ActionItem { text: "Add an ISO 8601 date option to the exporter".into(), owner: Some("Sam".into()), due: Some("Friday".into()), ..Default::default() },
+                    ActionItem { text: "Share sample files with finance".into(), owner: None, due: None, ..Default::default() },
                 ],
                 topics: vec!["export rewrite".into(), "finance".into()],
                 low_signal: false,
@@ -392,6 +396,53 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
             },
             now,
         )?;
+        // the standing development call: its own project (the series), one item filed under
+        // Export rewrite (inline on that project's next steps), said at a transcript line
+        let devcall = store.add_node(
+            Some(work.id),
+            NodeKind::Project,
+            "Development team call",
+            "the weekly development call",
+            Origin::User,
+        )?;
+        let said_at = today + 9 * H + 41 * M;
+        let said = store.insert_segment_from(
+            session,
+            said_at,
+            said_at + 8_000,
+            "For the export, long files need a progress bar. Sam, can you take that this week?",
+            Some(0.91),
+            oats_core::AudioSourceKind::Mic,
+            None,
+        )?;
+        let dev = store.insert_episode(
+            today + 9 * H + 30 * M,
+            today + 9 * H + 55 * M,
+            &EpisodeContent {
+                title: "Development team call: release train and export".into(),
+                summary: "- The release train moves to Tuesdays from next month.\n- Long exports need a **progress bar**; Sam takes it this week.".into(),
+                node_id: Some(devcall.id),
+                decisions: vec![
+                    oats_core::Decision::plain("Release train on Tuesdays"),
+                    oats_core::Decision {
+                        text: "Exports over 10k rows show a progress bar".into(),
+                        node_id: Some(project.id),
+                        at_ms: Some(said_at),
+                        segment_id: Some(said.id),
+                    },
+                ],
+                action_items: vec![
+                    ActionItem { text: "Add a progress bar to long exports".into(), owner: Some("Sam".into()), due: Some("this week".into()), node_id: Some(project.id), at_ms: Some(said_at), segment_id: Some(said.id) },
+                    ActionItem { text: "Move the release calendar to Tuesdays".into(), owner: Some("Priya".into()), due: None, ..Default::default() },
+                ],
+                topics: vec!["release train".into()],
+                model: "claude-sonnet-4-5".into(),
+                cost_usd: Some(0.018),
+                ..Default::default()
+            },
+            now,
+        )?;
+        store.mark_segments_interpreted(&[said.id], dev.id, now)?;
         store.upsert_event(
             &NewEvent {
                 when_start: today + 2 * 24 * H + 10 * H,

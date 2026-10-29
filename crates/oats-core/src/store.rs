@@ -169,7 +169,11 @@ pub struct Node {
     pub archived: bool,
 }
 
-/// An action item inside an episode.
+/// An action item inside an episode. Besides its text, owner and due date it carries where it
+/// belongs and where it was said (all optional, absent in older rows): `node_id` = the
+/// project / topic it concerns when that is not the note's home (`None` = the note's home),
+/// `at_ms` = the moment it was said (from the `[HH:MM]` the model cited) and `segment_id` =
+/// the transcript segment at that moment.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActionItem {
     pub text: String,
@@ -177,7 +181,136 @@ pub struct ActionItem {
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<i64>,
 }
+
+/// A decision inside an episode, with the same filing and provenance as an [`ActionItem`].
+/// Stored as a plain JSON string when it has none of them (the shape older rows have, and
+/// still read), else as `{text, node_id, at_ms, segment_id}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Decision {
+    pub text: String,
+    pub node_id: Option<i64>,
+    pub at_ms: Option<i64>,
+    pub segment_id: Option<i64>,
+}
+
+impl Decision {
+    /// A decision with no filing or provenance.
+    pub fn plain(text: impl Into<String>) -> Self {
+        Decision {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&str> for Decision {
+    fn from(text: &str) -> Self {
+        Decision::plain(text)
+    }
+}
+
+impl std::fmt::Display for Decision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DecisionObject {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    segment_id: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum DecisionRepr {
+    Text(String),
+    Object(DecisionObject),
+}
+
+impl serde::Serialize for Decision {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.node_id.is_none() && self.at_ms.is_none() && self.segment_id.is_none() {
+            s.serialize_str(&self.text)
+        } else {
+            DecisionObject {
+                text: self.text.clone(),
+                node_id: self.node_id,
+                at_ms: self.at_ms,
+                segment_id: self.segment_id,
+            }
+            .serialize(s)
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Decision {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match DecisionRepr::deserialize(d)? {
+            DecisionRepr::Text(text) => Decision::plain(text),
+            DecisionRepr::Object(o) => Decision {
+                text: o.text,
+                node_id: o.node_id,
+                at_ms: o.at_ms,
+                segment_id: o.segment_id,
+            },
+        })
+    }
+}
+
+/// An item of a note, as [`Store::items_filed_under`] returns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoteItem {
+    Action(ActionItem),
+    Decision(Decision),
+}
+
+impl NoteItem {
+    pub fn text(&self) -> &str {
+        match self {
+            NoteItem::Action(a) => &a.text,
+            NoteItem::Decision(d) => &d.text,
+        }
+    }
+
+    /// The node the item is filed under (`None`: the note's home).
+    pub fn node_id(&self) -> Option<i64> {
+        match self {
+            NoteItem::Action(a) => a.node_id,
+            NoteItem::Decision(d) => d.node_id,
+        }
+    }
+
+    pub fn segment_id(&self) -> Option<i64> {
+        match self {
+            NoteItem::Action(a) => a.segment_id,
+            NoteItem::Decision(d) => d.segment_id,
+        }
+    }
+
+    pub fn at_ms(&self) -> Option<i64> {
+        match self {
+            NoteItem::Action(a) => a.at_ms,
+            NoteItem::Decision(d) => d.at_ms,
+        }
+    }
+}
+
+/// Episodes [`Store::items_filed_under`] scans (newest first): item filing is read from the
+/// episodes' JSON, so the scan is bounded.
+pub const ITEMS_SCAN_EPISODES: i64 = 500;
 
 /// An interpreted episode (a meeting / conversation).
 #[derive(Clone, Debug, PartialEq)]
@@ -189,7 +322,7 @@ pub struct Episode {
     /// Markdown.
     pub summary: String,
     pub node_id: Option<i64>,
-    pub decisions: Vec<String>,
+    pub decisions: Vec<Decision>,
     pub action_items: Vec<ActionItem>,
     pub topics: Vec<String>,
     pub low_signal: bool,
@@ -233,7 +366,7 @@ pub struct EpisodeContent {
     pub title: String,
     pub summary: String,
     pub node_id: Option<i64>,
-    pub decisions: Vec<String>,
+    pub decisions: Vec<Decision>,
     pub action_items: Vec<ActionItem>,
     pub topics: Vec<String>,
     pub low_signal: bool,
@@ -628,7 +761,7 @@ const EPISODE_COLUMNS: &str = "id, started_at, ended_at, title, summary, node_id
 
 fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Episode> {
     let json = |i: usize| -> rusqlite::Result<String> { row.get(i) };
-    let decisions: Vec<String> = serde_json::from_str(&json(6)?).unwrap_or_default();
+    let decisions: Vec<Decision> = serde_json::from_str(&json(6)?).unwrap_or_default();
     let action_items: Vec<ActionItem> = serde_json::from_str(&json(7)?).unwrap_or_default();
     let topics: Vec<String> = serde_json::from_str(&json(8)?).unwrap_or_default();
     Ok(Episode {
@@ -1816,6 +1949,7 @@ impl Store {
             "UPDATE nodes SET parent_id = ?2 WHERE parent_id = ?1",
             [from, into],
         )?;
+        self.refile_items(from, Some(into))?;
         tx.execute("DELETE FROM nodes WHERE id = ?1", [from])?;
         tx.commit()?;
         Ok(())
@@ -1832,6 +1966,7 @@ impl Store {
                     [nid],
                 )?;
             }
+            self.refile_items(*nid, None)?;
             tx.execute("DELETE FROM nodes WHERE id = ?1", [nid])?;
         }
         tx.commit()?;
@@ -1984,6 +2119,30 @@ impl Store {
         Ok(())
     }
 
+    /// The user moves a note (an episode) to another node: refiled and recorded as an
+    /// `episode_move` change (before / after node, undoable). `false` when the episode or
+    /// the node doesn't exist, or it is already there.
+    pub fn move_episode(&self, id: i64, node_id: i64, now: i64) -> Result<bool, StoreError> {
+        self.with_savepoint(|s| {
+            let (Some(e), Some(n)) = (s.episode(id)?, s.node(node_id)?) else {
+                return Ok(false);
+            };
+            if e.node_id == Some(node_id) {
+                return Ok(false);
+            }
+            s.set_episode_node(id, Some(node_id))?;
+            s.record_change(
+                None,
+                "episode_move",
+                &format!("Moved '{}' to '{}'", e.title, n.name),
+                &serde_json::json!({"episode_id": id, "node_id": e.node_id}),
+                &serde_json::json!({"episode_id": id, "node_id": node_id}),
+                now,
+            )?;
+            Ok(true)
+        })
+    }
+
     pub fn episode(&self, id: i64) -> Result<Option<Episode>, StoreError> {
         use rusqlite::OptionalExtension;
         Ok(self
@@ -2090,6 +2249,95 @@ impl Store {
             ),
             &[node_id, limit],
         )
+    }
+
+    /// The action items and decisions filed under `node_id` or anything below it by their own
+    /// `node_id` (a note homed elsewhere that has an item concerning this project), newest
+    /// note first, items in note order. Scans the JSON of the last [`ITEMS_SCAN_EPISODES`]
+    /// episodes (`json_each`; no index — the episode volume is small). Media and low-signal
+    /// notes have no items. Items without their own `node_id` (filed with their note) are not
+    /// returned: they come with the note ([`Self::episodes_under`]).
+    pub fn items_filed_under(&self, node_id: i64) -> Result<Vec<(Episode, NoteItem)>, StoreError> {
+        let sub: std::collections::HashSet<i64> = self.subtree_ids(node_id)?.into_iter().collect();
+        let episodes = self.query_episodes(
+            &format!(
+                "{SUBTREE_CTE} SELECT {EPISODE_COLUMNS} FROM (
+                     SELECT * FROM episodes ORDER BY started_at DESC, id DESC LIMIT ?2) e
+                 WHERE EXISTS (SELECT 1 FROM json_each(e.action_items_json) j
+                         WHERE json_extract(e.action_items_json, j.fullkey || '.node_id')
+                               IN (SELECT id FROM sub))
+                    OR EXISTS (SELECT 1 FROM json_each(e.decisions_json) j
+                         WHERE j.type = 'object'
+                           AND json_extract(e.decisions_json, j.fullkey || '.node_id')
+                               IN (SELECT id FROM sub))
+                 ORDER BY e.started_at DESC, e.id DESC"
+            ),
+            &[node_id, ITEMS_SCAN_EPISODES],
+        )?;
+        let mut out = Vec::new();
+        for e in episodes {
+            let filed = |n: Option<i64>| n.is_some_and(|n| sub.contains(&n));
+            let actions: Vec<NoteItem> = e
+                .action_items
+                .iter()
+                .filter(|a| filed(a.node_id))
+                .cloned()
+                .map(NoteItem::Action)
+                .collect();
+            let decisions: Vec<NoteItem> = e
+                .decisions
+                .iter()
+                .filter(|d| filed(d.node_id))
+                .cloned()
+                .map(NoteItem::Decision)
+                .collect();
+            for item in actions.into_iter().chain(decisions) {
+                out.push((e.clone(), item));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Items filed under `from` (their own `node_id`) are refiled to `to` (`None`: back to
+    /// their note's home). Part of a node merge / delete.
+    fn refile_items(&self, from: i64, to: Option<i64>) -> Result<(), StoreError> {
+        let pat = format!("%\"node_id\":{from}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT id, decisions_json, action_items_json FROM episodes
+             WHERE decisions_json LIKE ?1 OR action_items_json LIKE ?1",
+        )?;
+        let rows = stmt
+            .query_map([&pat], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (id, d, a) in rows {
+            let mut decisions: Vec<Decision> = serde_json::from_str(&d).unwrap_or_default();
+            let mut actions: Vec<ActionItem> = serde_json::from_str(&a).unwrap_or_default();
+            for x in &mut decisions {
+                if x.node_id == Some(from) {
+                    x.node_id = to;
+                }
+            }
+            for x in &mut actions {
+                if x.node_id == Some(from) {
+                    x.node_id = to;
+                }
+            }
+            self.conn.execute(
+                "UPDATE episodes SET decisions_json = ?2, action_items_json = ?3 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    serde_json::to_string(&decisions)?,
+                    serde_json::to_string(&actions)?
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     /// Episodes overlapping `[from, to)`, oldest first.
@@ -3230,6 +3478,7 @@ mod tests {
                 text: "write tests".into(),
                 owner: Some("Sam".into()),
                 due: None,
+                ..Default::default()
             }],
             topics: vec!["tests".into()],
             model: "haiku".into(),
@@ -3430,6 +3679,7 @@ mod tests {
                     text: "a".into(),
                     owner: Some("Me".into()),
                     due: None,
+                    ..Default::default()
                 }],
                 topics: vec!["t".into()],
                 node_id: Some(999),

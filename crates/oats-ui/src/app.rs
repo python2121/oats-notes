@@ -495,6 +495,9 @@ pub struct OatsApp {
     /// The last executed voice command, for the status strip.
     last_command: Option<String>,
     episodes: Vec<Episode>,
+    /// A project page's items filed there from notes homed elsewhere
+    /// ([`Store::items_filed_under`]); empty outside a Node view.
+    filed_items: Vec<(Episode, oats_core::NoteItem)>,
     events: Vec<Event>,
     /// Every todo, in display order (open, then completed).
     todos: Vec<Todo>,
@@ -610,6 +613,7 @@ impl OatsApp {
             brain_status: BrainStatus::default(),
             last_command: None,
             episodes: Vec::new(),
+            filed_items: Vec::new(),
             events: Vec::new(),
             todos: Vec::new(),
             due_now: Vec::new(),
@@ -1489,6 +1493,14 @@ impl OatsApp {
             Ok(e) => self.episodes = e,
             Err(e) => self.store_error(e),
         }
+        // a project page also lists the items filed there from notes homed elsewhere
+        self.filed_items = match self.prefs.view {
+            View::Node(id) => self.store.items_filed_under(id).unwrap_or_else(|e| {
+                self.store_error(e);
+                Vec::new()
+            }),
+            _ => Vec::new(),
+        };
         self.notes_state.media_convertible = self.media_convertible();
         // the most recent past and the nearest upcoming: a plain oldest-first window would,
         // once 500 events piled up, never show anything upcoming again
@@ -2051,7 +2063,23 @@ impl OatsApp {
                 NotesAction::GoToNote(id) => {
                     self.focus_episode = None;
                     self.topic = None;
+                    // a note homed elsewhere (an item filed here from it): its own page
+                    if !self.episodes.iter().any(|e| e.id == id) {
+                        match self.store.episode(id) {
+                            Ok(Some(e)) => self.set_view(match e.node_id {
+                                Some(n) if self.nodes.iter().any(|x| x.id == n) => View::Node(n),
+                                _ => View::Notes,
+                            }),
+                            Ok(None) => {}
+                            Err(e) => self.store_error(e),
+                        }
+                    }
                     self.notes_state.pending_focus = Some(id);
+                }
+                NotesAction::ShowSegment(seg) => self.jump_to_segment(Some(seg)),
+                NotesAction::MoveNote { episode, node } => self.move_note(episode, node),
+                NotesAction::MoveToNewProject { episode, name } => {
+                    self.move_note_to_new_project(episode, &name)
                 }
                 NotesAction::SaveEdit(id, content) => {
                     let now = chrono::Local::now().timestamp_millis();
@@ -2062,6 +2090,98 @@ impl OatsApp {
                 }
                 NotesAction::OpenTopic(topic) => self.open_topic(topic),
             }
+        }
+    }
+
+    /// "Move to ▸" on a note: refiled (an `episode_move` change); a note open on its own
+    /// follows to its new place.
+    fn move_note(&mut self, episode: i64, node: i64) {
+        let now = chrono::Local::now().timestamp_millis();
+        match self.store.move_episode(episode, node, now) {
+            Ok(true) => {
+                let name = self
+                    .store
+                    .node(node)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.name)
+                    .unwrap_or_default();
+                self.last_command = Some(format!("Moved the note to {name}"));
+                if self.focus_episode == Some(episode) {
+                    self.set_view(View::Node(node));
+                    self.focus_episode = Some(episode);
+                }
+                self.reload();
+            }
+            Ok(false) => {}
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    /// "New project…" on a note: a project of the user's own under the note's category (else
+    /// Work, else the first category), then the note moves there.
+    fn move_note_to_new_project(&mut self, episode: i64, name: &str) {
+        let home = self
+            .store
+            .episode(episode)
+            .ok()
+            .flatten()
+            .and_then(|e| e.node_id);
+        let root = |id: i64| {
+            let mut cur = self.nodes.iter().find(|n| n.id == id)?;
+            for _ in 0..16 {
+                match cur.parent_id {
+                    None => return Some(cur.id),
+                    Some(p) => cur = self.nodes.iter().find(|n| n.id == p)?,
+                }
+            }
+            None
+        };
+        let categories = || {
+            self.nodes
+                .iter()
+                .filter(|n| n.kind == oats_core::NodeKind::Category && !n.archived)
+        };
+        let parent = home
+            .and_then(root)
+            .filter(|c| {
+                self.nodes
+                    .iter()
+                    .any(|n| n.id == *c && n.name != oats_core::store::MEDIA_CATEGORY)
+            })
+            .or_else(|| {
+                categories()
+                    .find(|n| oats_core::store::name_key(&n.name) == "work")
+                    .map(|n| n.id)
+            })
+            .or_else(|| categories().map(|n| n.id).next());
+        let Some(parent) = parent else {
+            self.warning = Some("No category to create the project in".to_owned());
+            return;
+        };
+        let created = self.store.add_node(
+            Some(parent),
+            oats_core::NodeKind::Project,
+            name,
+            "",
+            oats_core::Origin::User,
+        );
+        match created {
+            Ok(node) => {
+                let now = chrono::Local::now().timestamp_millis();
+                if let Err(e) = self.store.record_change(
+                    None,
+                    "node_create",
+                    &format!("Created project '{}'", node.name),
+                    &serde_json::json!(null),
+                    &serde_json::json!(node),
+                    now,
+                ) {
+                    self.store_error(e);
+                }
+                self.move_note(episode, node.id);
+            }
+            Err(e) => self.store_error(e),
         }
     }
 
@@ -3028,6 +3148,7 @@ impl eframe::App for OatsApp {
                                     &mut self.notes_state,
                                     node,
                                     &self.episodes,
+                                    &self.filed_items,
                                     &self.rows,
                                     &self.nodes,
                                 );

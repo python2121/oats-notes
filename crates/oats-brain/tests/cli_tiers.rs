@@ -276,7 +276,10 @@ fn every_tier_runs_through_the_isolated_cli() {
         Some(topic.id),
         "filed at the most specific node"
     );
-    assert_eq!(ep.decisions, vec!["Ship on Friday".to_owned()]);
+    assert_eq!(
+        ep.decisions,
+        vec![oats_core::Decision::plain("Ship on Friday")]
+    );
     assert_eq!(ep.action_items[0].owner.as_deref(), Some("Sam"));
     assert_eq!(ep.model, "claude-sonnet-test");
     assert_eq!(ep.cost_usd, Some(0.0125));

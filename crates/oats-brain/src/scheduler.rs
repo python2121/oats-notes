@@ -1463,13 +1463,15 @@ impl Worker {
             let now = now_ms();
             let tree = w.store.nodes().map_err(|e| e.to_string())?;
             let titles = interpret::media_titles(&w.store, chunk.started_at, chunk.ended_at);
-            let req = interpret::interpret_request_with(
+            let series = interpret::series_hint(&w.store, &tree, &chunk);
+            let req = interpret::interpret_request_full(
                 &tree,
                 &chunk,
                 Some(&ep),
                 &Local::now(),
                 Some(model.clone()),
                 &titles,
+                &series,
             );
             let resp = w.call(&req).map_err(JobError::from)?;
             let interp = resp
@@ -1750,13 +1752,15 @@ impl Worker {
         }
         let tree = self.store.nodes().map_err(|e| e.to_string())?;
         let titles = interpret::media_titles(&self.store, full.started_at, full.ended_at);
-        let req = interpret::interpret_request_with(
+        let series = interpret::series_hint(&self.store, &tree, &full);
+        let req = interpret::interpret_request_full(
             &tree,
             &full,
             prior.as_ref(),
             &Local::now(),
             Some(model.to_owned()),
             &titles,
+            &series,
         );
         let resp = match self.call(&req) {
             Ok(r) => r,
