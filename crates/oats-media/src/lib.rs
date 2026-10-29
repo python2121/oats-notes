@@ -408,6 +408,19 @@ pub fn is_firefox(bundle_id: &str) -> bool {
     b.starts_with("org.mozilla.") || b == "firefox" || b.starts_with("firefox")
 }
 
+/// The well-known apps the classifier maps web pages (and desktop apps) to, as
+/// `(bundle id, name, web too)`: the locked call apps first, then Slack and Discord (whose
+/// web pages take the desktop app's class). The Preferences Apps table always lists them, so
+/// an app the user only runs in the browser can still be viewed and changed.
+pub const KNOWN_APPS: &[(&str, &str, bool)] = &[
+    ("us.zoom.xos", "Zoom", false),
+    ("com.microsoft.teams2", "Microsoft Teams", false),
+    ("com.cisco.webexmeetingsapp", "Webex", false),
+    ("com.apple.facetime", "FaceTime", false),
+    ("com.tinyspeck.slackmacgap", "Slack", true),
+    ("com.hnc.discord", "Discord", true),
+];
+
 /// What an app is, from its bundle id alone.
 pub fn classify_bundle(bundle_id: &str) -> MediaKind {
     let b = bundle_id.to_ascii_lowercase();

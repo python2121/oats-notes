@@ -372,6 +372,8 @@ pub struct AppRow {
     pub locked: bool,
     /// What Auto means for it.
     pub default: oats_core::ProducerClass,
+    /// Its web pages take this class too (Slack, Discord): shown as "web + app".
+    pub web_too: bool,
 }
 
 impl AppRow {
@@ -387,8 +389,10 @@ impl AppRow {
     }
 }
 
-/// The Apps table's rows: every app seen playing (most recent first), then overridden apps
-/// never seen.
+/// The Apps table's rows: the well-known apps (`oats_media::KNOWN_APPS`: call apps, then
+/// Slack / Discord, listed even when never seen: they may only run in the browser), merged
+/// with every app seen playing and every overridden one (a seen row replaces the fixed row
+/// with the same bundle id), then the rest alphabetically.
 pub fn app_rows(store: &Store) -> Result<Vec<AppRow>, oats_core::StoreError> {
     let overrides = oats_media::ProducerOverrides::new(store.producer_overrides()?);
     let mut rows: Vec<AppRow> = Vec::new();
@@ -411,6 +415,9 @@ pub fn app_rows(store: &Store) -> Result<Vec<AppRow>, oats_core::StoreError> {
             transcribe_anyway: o.is_some_and(|o| o.transcribe_anyway),
             locked: oats_media::is_locked(bundle),
             default: oats_media::default_class(bundle),
+            web_too: oats_media::KNOWN_APPS
+                .iter()
+                .any(|(b, _, web)| *web && b.eq_ignore_ascii_case(bundle)),
         });
     };
     for p in store.producers_seen()? {
@@ -419,6 +426,15 @@ pub fn app_rows(store: &Store) -> Result<Vec<AppRow>, oats_core::StoreError> {
     for o in store.producer_overrides()? {
         add(&o.bundle_id, "");
     }
+    for (bundle, name, _) in oats_media::KNOWN_APPS {
+        add(bundle, name);
+    }
+    let group = |r: &AppRow| match (r.locked, r.web_too) {
+        (true, _) => 0,
+        (_, true) => 1,
+        _ => 2,
+    };
+    rows.sort_by_cached_key(|r| (group(r), r.name.to_lowercase()));
     Ok(rows)
 }
 
@@ -2390,14 +2406,6 @@ fn apps_table(
 ) {
     use oats_core::ProducerClass;
     if apps.is_empty() {
-        ui.label(
-            egui::RichText::new(
-                "No apps yet: an app shows up here once it plays sound while OatsNotes listens \
-                 with system audio.",
-            )
-            .color(t.text_tertiary)
-            .size(11.0),
-        );
         return;
     }
     let class_label = |row: &AppRow, c: ProducerClass| -> String {
@@ -2418,8 +2426,18 @@ fn apps_table(
                 .spacing(vec2(12.0, 6.0))
                 .show(ui, |ui| {
                     for row in apps {
-                        ui.label(egui::RichText::new(&row.name).color(t.text))
-                            .on_hover_text(&row.bundle_id);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&row.name).color(t.text))
+                                .on_hover_text(&row.bundle_id);
+                            if row.web_too {
+                                ui.label(
+                                    egui::RichText::new("web + app")
+                                        .color(t.text_tertiary)
+                                        .size(11.0),
+                                )
+                                .on_hover_text("Its web pages (in a browser) take this class too");
+                            }
+                        });
                         if row.locked {
                             ui.add_enabled(
                                 false,

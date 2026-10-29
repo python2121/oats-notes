@@ -1580,8 +1580,12 @@ fn the_apps_table_lists_a_seen_app_and_a_class_change_writes_the_override() {
         "media by default"
     );
     assert!(apps.iter().find(|a| a.name == "Zoom").unwrap().locked);
-    // pick "Meeting" in Discord's class menu
-    rig.harness.get_by_value("Auto (Media)").click();
+    // pick "Meeting" in Discord's class menu (Slack's, listed after it, also says Auto (Media))
+    rig.harness
+        .get_all_by_value("Auto (Media)")
+        .next()
+        .unwrap()
+        .click();
     rig.harness.run_steps(2);
     rig.harness.get_by_label("Meeting").click();
     rig.harness.run_steps(2);
@@ -1611,6 +1615,62 @@ fn the_apps_table_lists_a_seen_app_and_a_class_change_writes_the_override() {
 }
 
 #[test]
+fn the_apps_table_always_lists_slack_discord_and_the_call_apps() {
+    use oats_core::ProducerClass;
+    let dir = TempDir::new("apps-known");
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::Preferences);
+    rig.harness.run_steps(2);
+    let apps = rig.app().prefs_apps().unwrap().to_vec();
+    let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "FaceTime",
+            "Microsoft Teams",
+            "Webex",
+            "Zoom",
+            "Discord",
+            "Slack"
+        ]
+    );
+    assert!(apps[..4].iter().all(|a| a.locked));
+    assert!(apps[4..].iter().all(|a| a.web_too && !a.locked));
+    assert!(rig.shows("web + app"));
+    // Discord, then Slack (alphabetical): Slack is the second "Auto (Media)" menu
+    rig.harness
+        .get_all_by_value("Auto (Media)")
+        .nth(1)
+        .unwrap()
+        .click();
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Meeting").click();
+    rig.harness.run_steps(2);
+    let o = Store::open(&dir.db())
+        .unwrap()
+        .producer_overrides()
+        .unwrap();
+    assert_eq!(o.len(), 1, "{o:?}");
+    assert_eq!(o[0].bundle_id, "com.tinyspeck.slackmacgap");
+    assert_eq!(o[0].class, ProducerClass::Meeting);
+    // Slack later seen playing: still one row, the override intact
+    Store::open(&dir.db())
+        .unwrap()
+        .note_producers_seen(
+            &[("com.tinyspeck.slackmacgap".into(), "Slack".into())],
+            now_ms(),
+        )
+        .unwrap();
+    rig.app()
+        .set_app_class("com.tinyspeck.slackmacgap", ProducerClass::Meeting, false);
+    let apps = rig.app().prefs_apps().unwrap().to_vec();
+    let slack: Vec<_> = apps.iter().filter(|a| a.name == "Slack").collect();
+    assert_eq!(slack.len(), 1);
+    assert_eq!(slack[0].class, ProducerClass::Meeting);
+    assert_eq!(apps.len(), 6);
+}
+
+#[test]
 fn transcribe_anyway_shows_only_while_the_policy_keeps_no_transcript() {
     let dir = TempDir::new("anyway");
     Store::open(&dir.db())
@@ -1627,7 +1687,12 @@ fn transcribe_anyway_shows_only_while_the_policy_keeps_no_transcript() {
     rig.harness.get_by_label("Log only").click();
     rig.harness.run_steps(2);
     assert!(rig.shows("transcribe anyway"));
-    rig.harness.get_by_label("transcribe anyway").click();
+    // Discord's row comes before Slack's fixed one
+    rig.harness
+        .get_all_by_label("transcribe anyway")
+        .next()
+        .unwrap()
+        .click();
     rig.harness.run_steps(2);
     let o = Store::open(&dir.db())
         .unwrap()

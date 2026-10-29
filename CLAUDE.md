@@ -759,7 +759,10 @@ from a video creates nothing), and what was watched is recorded.
   never merges media with conversation nor re-files a media episode; categorisation files
   media segments under Media without a call; hotwords stay mic-only (`can_command`).
 - UI: Preferences "Media: Ignore / Log only / Transcribe" and the "Apps" table (`app_rows`:
-  producers seen ∪ overrides; class dropdown "Auto (Media)" / Meeting / Media / Ignore, locked
+  fixed rows for `oats_media::KNOWN_APPS` (locked call apps, then Slack / Discord tagged "web + app":
+  their web pages take the desktop bundle's class, so a browser-only user can still change it)
+  ∪ producers seen ∪ overrides, deduped by bundle id (a seen row replaces the fixed one);
+  order locked, Slack/Discord, rest alphabetical; class dropdown "Auto (Media)" / Meeting / Media / Ignore, locked
   rows "Meeting 🔒" greyed, "transcribe anyway" for Media rows only while the policy is Ignore /
   Log only; `OatsApp::set_app_class`); the status strip shows "▶ <title>" while media plays;
   the Calendar day panel lists "Watched: <title>" / "Listened: …" / "Call via …" 10:12–10:40
