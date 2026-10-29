@@ -544,3 +544,37 @@ fn without_a_status_item_closing_quits() {
         "{cmds:?}"
     );
 }
+
+#[test]
+fn the_preferences_command_opens_the_window_and_enter_saves_the_name() {
+    let dir = TempDir::new("prefs");
+    let mut rig = build(&dir.db(), None, None);
+    Store::open(&dir.db())
+        .unwrap()
+        .set_user_name("Ale")
+        .unwrap();
+    assert!(!rig.shows("Your name"));
+    rig.app().run(Command::Preferences);
+    rig.harness.step();
+    rig.harness.step();
+    assert!(rig.shows("Your name"));
+    // the current value is shown; typing appends to it
+    rig.harness
+        .get_all_by_value("Ale")
+        .next()
+        .unwrap()
+        .type_text("x");
+    rig.harness.step();
+    rig.harness.key_press(egui::Key::Enter);
+    rig.harness.step();
+    rig.harness.step();
+    assert_eq!(
+        Store::open(&dir.db())
+            .unwrap()
+            .user_name()
+            .unwrap()
+            .as_deref(),
+        Some("Alex")
+    );
+    assert!(!rig.shows("Your name"), "Enter closes the window");
+}

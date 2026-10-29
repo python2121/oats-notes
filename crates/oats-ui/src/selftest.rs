@@ -72,9 +72,6 @@ pub fn run_with(
                 None,
             )
         });
-    harness
-        .state_mut()
-        .selftest_set_data_dir("selftest database (seeded demo content)".to_owned());
     // let the engine report ready (the null engine loads at once)
     let deadline = Instant::now() + Duration::from_secs(20);
     while !matches!(

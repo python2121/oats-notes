@@ -142,6 +142,10 @@ pub struct BrainConfig {
     pub command_tries: u32,
     /// Delay before a failed command's first retry (doubles per try).
     pub command_retry: Duration,
+    /// The user's own name, for the prompts. Refreshed from the store (`meta.user_name`) at
+    /// the start of every job, so a change in the preferences applies without a restart;
+    /// `OATS_USER_NAME` overrides the store.
+    pub user_name: Option<String>,
 }
 
 impl Default for BrainConfig {
@@ -170,6 +174,7 @@ impl Default for BrainConfig {
             catchup_pause: Duration::from_secs(2),
             command_tries: 3,
             command_retry: Duration::from_secs(60),
+            user_name: None,
         }
     }
 }
@@ -999,13 +1004,23 @@ impl Worker {
     /// Run one CLI request. Unavailability (missing, logged out, offline, rate limited) marks
     /// the brain unavailable and starts the re-probe backoff; a success resets the backoff.
     fn call(&mut self, req: &Request) -> Result<crate::claude_cli::Response, CliError> {
-        let r = self.cfg.cli.run_cancellable(req, &self.cancel);
+        let req = interpret::personalise(req.clone(), self.cfg.user_name.as_deref());
+        let r = self.cfg.cli.run_cancellable(&req, &self.cancel);
         match &r {
             Ok(_) => self.probe_backoff = self.cfg.probe_backoff_min,
             Err(e) if e.unavailable_reason().is_some() => self.mark_down(e),
             Err(_) => {}
         }
         r
+    }
+
+    /// Re-read the user's name: `OATS_USER_NAME`, else the store's `meta.user_name`.
+    fn refresh_user_name(&mut self) {
+        let env = std::env::var("OATS_USER_NAME")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty());
+        self.cfg.user_name = env.or_else(|| self.store.user_name().ok().flatten());
     }
 
     /// Bookkeeping around a job: the `brain_runs` row, events, spend. A panic inside the job
@@ -1016,6 +1031,7 @@ impl Worker {
         kind: &str,
         job: impl FnOnce(&mut Worker, i64) -> Result<JobOutput, JobError>,
     ) -> Result<(), JobError> {
+        self.refresh_user_name();
         let model = self.cfg.models.for_tier(tier).to_owned();
         let started = now_ms();
         let run_id = match self.store.begin_run(tier.number(), kind, &model, started) {

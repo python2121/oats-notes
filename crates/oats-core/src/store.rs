@@ -912,6 +912,26 @@ impl Store {
         Ok(())
     }
 
+    /// The user's own name (`meta.user_name`), `None` when unset or blank.
+    pub fn user_name(&self) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .meta("user_name")?
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty()))
+    }
+
+    /// Set the user's name; a blank name clears it.
+    pub fn set_user_name(&self, name: &str) -> Result<(), StoreError> {
+        let name = name.trim();
+        if name.is_empty() {
+            self.conn
+                .execute("DELETE FROM meta WHERE key = 'user_name'", [])?;
+            Ok(())
+        } else {
+            self.set_meta("user_name", name)
+        }
+    }
+
     // ---- sessions ---------------------------------------------------------------------
 
     pub fn begin_session(&self, started_at: i64, engine: &str) -> Result<i64, StoreError> {
@@ -2046,6 +2066,17 @@ mod tests {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    #[test]
+    fn user_name_round_trips_and_clears() -> R {
+        let s = Store::open_in_memory()?;
+        assert_eq!(s.user_name()?, None);
+        s.set_user_name("  Alex ")?;
+        assert_eq!(s.user_name()?.as_deref(), Some("Alex"));
+        s.set_user_name("   ")?;
+        assert_eq!(s.user_name()?, None);
+        Ok(())
     }
 
     #[test]

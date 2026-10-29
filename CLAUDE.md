@@ -184,6 +184,25 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   `oats_ui::AudioStarter` = `Fn(Sender<AudioChunk>, AudioRequest { system }) ->
   Result<StartedAudio { guard, system, system_error }, String>`.
 
+## UI chrome and preferences
+
+Control bar (34 pt): Listen pill, "System audio" pill, level meter, and the engine loading /
+failure line only (the engine name is in the status strip, not repeated). Status strip (18 pt):
+left = engine · state · segment count · brain line; right = the warning, else the last voice
+command, else EMPTY (the data-directory path is no longer shown).
+
+Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui::Window` anchored
+centre with one field, "Your name", saved on Enter / blur / close via `Store::set_user_name`
+(a blank name clears it). Stored in the database, `meta` key `user_name`
+(`Store::user_name()` / `set_user_name()`). The brain re-reads it at the start of every job
+(`BrainConfig::user_name`, `Worker::refresh_user_name`), so no restart or plumbing is needed;
+`OATS_USER_NAME` overrides the stored value for scripted runs. It is injected by
+`interpret::personalise` (called in `Worker::call`) into the system prompts of interpret,
+categorise, review and command through the `{{user_name_note}}` placeholder, which expands
+`prompts/user_name.md` (with `{{user_name}}`: "The person using this app is …; `me:` is …;
+action items for them are owner \"me\"") or, with no name, a neutral sentence. It is NOT a
+hotword; hotwords are unchanged.
+
 ## The brain (`crates/oats-brain`)
 
 Design and sources: `docs/research-claude-cli-and-interpretation.md`. Four modules plus the
@@ -283,7 +302,7 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   descriptions, episode re-filing; merges are recorded but not undoable).
   Env: `OATS_BRAIN=off`, `OATS_CLAUDE_BIN` (default `~/.local/bin/claude`, then PATH),
   `OATS_CLAUDE_MODEL` (every tier), `OATS_BRAIN_MODEL_0..3` (per tier),
-  `OATS_CLAUDE_PASS_PROXY=1` (let proxy variables through to `claude`).
+  `OATS_CLAUDE_PASS_PROXY=1` (let proxy variables through to `claude`), `OATS_USER_NAME` (the user's name for the prompts; overrides the Preferences value).
 
 ### Offline resilience (built)
 
@@ -341,6 +360,7 @@ OATS_NO_STATUS_ITEM=1 …                   # no menu bar extra (closing the win
 OATS_FONT=bundled …                       # Inter instead of the system font
 OATS_DATA_DIR=/path …                     # database location override (default ~/Library/Application Support/OatsNotes/oats.sqlite)
 OATS_BRAIN=off …                          # no claude calls (the brain thread idles)
+OATS_USER_NAME=Alex …                   # your name for the brain's prompts (overrides the Preferences window)
 OATS_CLAUDE_BIN=/path/claude OATS_CLAUDE_MODEL=haiku OATS_INTERPRET_EVERY_MIN=5 OATS_BRAIN_BUDGET_USD=1 OATS_BRAIN_TIER0_PER_HOUR=30 …   # brain knobs
 OATS_CLAUDE_PASS_PROXY=1 …                # pass HTTPS_PROXY / HTTP_PROXY / NO_PROXY / ANTHROPIC_BASE_URL through to claude (off by default)
 cargo run --release -p oats-engine-fluidaudio --example vad_parity -- long.wav   # stateful VAD stream vs FluidAudio's batch VAD, chunk by chunk (expect 100 % / delta 0)

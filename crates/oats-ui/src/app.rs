@@ -135,6 +135,8 @@ pub enum Command {
     /// Capture system audio next to the microphone (a pref; restarts listening when on).
     ToggleSystemAudio,
     NewCategory,
+    /// Open the Preferences window (your name, for now).
+    Preferences,
     ToggleSidebar,
     ShowToday,
     ShowAll,
@@ -170,6 +172,7 @@ pub const SHORTCUTS: &[(KeyboardShortcut, Command)] = &[
     (sc(Modifiers::COMMAND, Key::Num3), Command::ShowNotes),
     (sc(Modifiers::COMMAND, Key::Num4), Command::ShowCalendar),
     (sc(Modifiers::COMMAND, Key::I), Command::InterpretNow),
+    (sc(Modifiers::COMMAND, Key::Comma), Command::Preferences),
 ];
 
 /// The menu key equivalent of a command.
@@ -239,7 +242,11 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
     vec![
         MenuSection {
             title: "File",
-            entries: vec![item("New Category…", Command::NewCategory, true)],
+            entries: vec![
+                item("New Category…", Command::NewCategory, true),
+                Separator,
+                item("Preferences…", Command::Preferences, true),
+            ],
         },
         MenuSection {
             title: "Listen",
@@ -284,6 +291,13 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
     ]
 }
 
+/// The open Preferences window.
+struct PrefsWindow {
+    name: String,
+    /// Focus the field on the first frame.
+    focus: bool,
+}
+
 /// The app.
 pub struct OatsApp {
     pipeline: PipelineHandle,
@@ -323,7 +337,8 @@ pub struct OatsApp {
     /// Start listening as soon as the engine reports Idle (prefs said we were listening).
     auto_listen: bool,
     sidebar: SidebarState,
-    data_dir: String,
+    /// The Preferences window, when open.
+    prefs_window: Option<PrefsWindow>,
     /// The status-bar item (menu bar extra), if the platform has one. While it exists, closing
     /// the window only hides it; Quit quits.
     status_item: Option<Box<dyn StatusItem>>,
@@ -403,7 +418,7 @@ impl OatsApp {
             calendar_state: CalendarState::default(),
             warning: None,
             sidebar: SidebarState::default(),
-            data_dir: oats_core::paths::data_dir().display().to_string(),
+            prefs_window: None,
             status_item: status,
             status_shown: None,
             menu_events,
@@ -611,6 +626,10 @@ impl OatsApp {
                 self.sidebar.renaming = None;
                 self.sidebar.adding = Some(String::new());
                 self.sidebar.focus = true;
+            }
+            Command::Preferences => {
+                let name = self.store.user_name().ok().flatten().unwrap_or_default();
+                self.prefs_window = Some(PrefsWindow { name, focus: true });
             }
             Command::ToggleSidebar => self.prefs.sidebar_visible = !self.prefs.sidebar_visible,
             Command::ShowToday => self.set_view(View::Today),
@@ -1088,7 +1107,7 @@ impl OatsApp {
         }
     }
 
-    /// The 34 pt control bar: Listen pill, level meter, loading/failure line, engine name.
+    /// The 34 pt control bar: Listen pill, level meter, loading/failure line.
     fn control_bar(&self, ui: &mut egui::Ui, t: &Tokens) -> Vec<Command> {
         let mut cmds = Vec::new();
         ui.add_space(12.0);
@@ -1136,18 +1155,63 @@ impl OatsApp {
             }
             _ => {}
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(12.0);
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(&self.engine_name)
-                        .color(t.text_tertiary)
-                        .size(11.0),
-                )
-                .truncate(),
-            );
-        });
         cmds
+    }
+
+    /// The Preferences window: "Your name", saved on Enter or when the field loses focus.
+    fn preferences_window(&mut self, ctx: &egui::Context, t: &Tokens) {
+        let Some(win) = &mut self.prefs_window else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut close = false;
+        egui::Window::new("Preferences")
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(vec2(320.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Your name").color(t.text_secondary));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut win.name)
+                        .hint_text("e.g. Alex")
+                        .desired_width(f32::INFINITY),
+                );
+                if win.focus {
+                    resp.request_focus();
+                    win.focus = false;
+                }
+                if resp.lost_focus() {
+                    save = true;
+                    if ui.input(|i| i.key_pressed(Key::Enter)) {
+                        close = true;
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "The notes recognise when people say it: action items for you are \
+                         yours, and summaries can use your name.",
+                    )
+                    .color(t.text_tertiary)
+                    .size(11.0),
+                );
+            });
+        if !open || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            save = true;
+            close = true;
+        }
+        if save {
+            let name = win.name.clone();
+            if let Err(e) = self.store.set_user_name(&name) {
+                self.warning = Some(format!("Could not save your name: {e}"));
+            }
+        }
+        if close {
+            self.prefs_window = None;
+        }
     }
 
     fn status_line(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {
@@ -1196,11 +1260,11 @@ impl OatsApp {
         let (right, col) = match (&self.warning, &self.last_command) {
             (Some(w), _) => (w.as_str(), t.danger.gamma_multiply(0.9)),
             (None, Some(c)) => (c.as_str(), t.accent.gamma_multiply(0.9)),
-            (None, None) => (self.data_dir.as_str(), t.text_tertiary),
+            (None, None) => ("", t.text_tertiary),
         };
         // the right text never runs over the left
         let room = rect.width() - left_w - 32.0;
-        if room > 40.0 {
+        if room > 40.0 && !right.is_empty() {
             let galley = p.layout(right.to_owned(), t.mono(9.5), col, f32::INFINITY);
             let clip = Rect::from_min_max(pos2(rect.right() - 8.0 - room, rect.top()), rect.max);
             p.with_clip_rect(clip).galley(
@@ -1287,11 +1351,6 @@ fn level_meter(ui: &mut egui::Ui, t: &Tokens, level: Option<(f32, bool)>) {
 
 #[cfg(feature = "selftest")]
 impl OatsApp {
-    /// Selftest only: what the status line names as the data location.
-    pub(crate) fn selftest_set_data_dir(&mut self, label: String) {
-        self.data_dir = label;
-    }
-
     /// Selftest only: select the node with this name; `false` when there is none.
     pub(crate) fn selftest_show_node(&mut self, name: &str) -> bool {
         let Some(id) = self.nodes.iter().find(|n| n.name == name).map(|n| n.id) else {
@@ -1452,6 +1511,7 @@ impl eframe::App for OatsApp {
                 ui.advance_cursor_after_rect(full);
             });
 
+        self.preferences_window(&ctx, &t);
         self.apply_sidebar(sidebar_actions, &mut cmds);
         self.apply_transcript(transcript_actions);
         self.apply_notes(notes_actions);
@@ -1523,6 +1583,7 @@ mod tests {
         for cmd in [
             Command::ToggleListening,
             Command::NewCategory,
+            Command::Preferences,
             Command::ToggleSidebar,
             Command::ShowToday,
             Command::ShowAll,
