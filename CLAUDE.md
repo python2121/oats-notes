@@ -258,10 +258,25 @@ description, before/after JSON, `undone`). `View::Node(id)` means the subtree (r
   menu generated from the same `menu_model()` as the in-window fallback). Keep that parity.
 - Never request continuous repaints; the app must idle at ~0 % CPU. The pipeline's and the
   brain's `wake` callbacks and menu clicks (the shared muda handler) are the only things that
-  wake the UI; the brain thread itself blocks until its next due job.
+  wake the UI; the brain thread itself blocks until its next due job. `Level` events are
+  rate-limited to 4 Hz and suppressed (`PipelineHandle::set_levels_wanted(false)`) while the
+  window is hidden or minimized.
 - Commit independently as features land; don't add AI co-author lines.
 
 ## Roadmap (not yet built)
+
+### PRIORITY TODO: stateful VAD (drop the context re-feed)
+
+The FluidAudio engine re-feeds the previous two 256 ms chunks on every Silero VAD call because
+the `fluidaudio-rs` bridge resets the model's recurrent state per call (3 inferences per chunk,
+~12/s; about a quarter of idle-listening CPU). FluidAudio 0.14.8 has a stateful VAD API the
+bridge does not expose. The real fix: patch the Swift bridge (`FluidAudioBridge.swift` +
+`src/ffi/bridge.rs` in fluidaudio-rs; vendor or fork it pinned) to expose a stateful
+`vad_process_chunk` that keeps state across calls, then make `FluidAudioEngine::vad` one
+inference per chunk with no re-feed and no batching delay. Stop-gap options, not yet applied:
+batch 1 s per call (halves the cost, adds ≤ 750 ms segment latency) and a conservative
+loudness gate (≈ −55 dBFS with hangover) that skips Silero in a quiet room.
+See `docs/performance-2026-10-28.md`.
 
 Brain: a month-grid calendar view, undo for node merges (recorded, not reversible yet),
 reminders that notify (they are only listed), prompt editing without a rebuild, per-tier
