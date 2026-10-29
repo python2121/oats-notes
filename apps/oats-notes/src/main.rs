@@ -26,7 +26,8 @@
 //! `OATS_NO_STATUS_ITEM=1` (no menu bar extra; closing the window then quits),
 //! `OATS_FONT=bundled` (Inter instead of the system font), `OATS_FONT_GRADE` (SF Pro grade),
 //! `OATS_DATA_DIR` (where the database lives), `OATS_INPUT_DEVICE` (a microphone by name),
-//! `OATS_SYSTEM_DEDUP` (the echo rule), `RUST_LOG`; the brain's `OATS_BRAIN=off`,
+//! `OATS_SYSTEM_DEDUP` (the echo rule), `OATS_MIC_MODE=plain|vpio` (the voice-processing
+//! microphone spike, default plain), `RUST_LOG`; the brain's `OATS_BRAIN=off`,
 //! `OATS_CLAUDE_BIN`, `OATS_CLAUDE_MODEL`, `OATS_INTERPRET_EVERY_MIN`, `OATS_BRAIN_BUDGET_USD`,
 //! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
 //! `oats_brain::BrainConfig::from_env`).
@@ -118,9 +119,15 @@ fn audio_starter(
         }),
         None => {
             let policy = oats_audio::InputPolicy::default().with_env();
+            let mic_mode = oats_audio::MicMode::from_env();
             Box::new(move |tx, request| {
-                let mic = oats_audio::Capture::start_mic(tx.clone(), &policy)
-                    .map_err(|e| e.to_string())?;
+                let mic = oats_audio::Capture::start_mic_with(
+                    tx.clone(),
+                    &policy,
+                    mic_mode,
+                    oats_audio::VoiceProcessingOptions::default(),
+                )
+                .map_err(|e| e.to_string())?;
                 let mut system_error = None;
                 let system = if request.system {
                     // until the output is known: on unless the mode says never

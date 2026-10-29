@@ -20,7 +20,10 @@ use coreaudio::audio_unit::{
     AudioUnit, Element, SampleFormat as CoreAudioSampleFormat, Scope, StreamFormat,
 };
 use objc2_audio_toolbox::{
-    kAudioOutputUnitProperty_CurrentDevice, kAudioUnitProperty_StreamFormat,
+    kAUVoiceIOProperty_OtherAudioDuckingConfiguration,
+    kAUVoiceIOProperty_VoiceProcessingEnableAGC, kAudioOutputUnitProperty_CurrentDevice,
+    kAudioOutputUnitProperty_EnableIO, kAudioUnitProperty_StreamFormat,
+    AUVoiceIOOtherAudioDuckingConfiguration, AUVoiceIOOtherAudioDuckingLevel,
 };
 use objc2_core_audio::{
     kAudioAggregateDeviceClassID, kAudioDevicePropertyAvailableNominalSampleRates,
@@ -719,6 +722,234 @@ impl Device {
             timeout,
             true,
         )
+    }
+
+    /// OatsNotes addition (see VENDORED.md): record this input device through Apple's
+    /// voice-processing I/O unit (`kAudioUnitSubType_VoiceProcessingIO`: echo cancellation,
+    /// noise suppression, optional AGC) instead of the plain HAL input unit. A spike: whether
+    /// it cancels what OTHER apps play through the speakers is what the caller measures.
+    ///
+    /// - Input is enabled on bus 1 and pinned to this device (`CurrentDevice`, global scope,
+    ///   input element); the output (bus 0) stays on the system default output. With
+    ///   `render_silence` the output bus is kept enabled and fed zeros (the unit is designed
+    ///   as full duplex; its echo reference may need a running output), otherwise it is
+    ///   disabled.
+    /// - The unit's own client format is honoured: its sample rate and channel count are read
+    ///   back and only the layout is set (interleaved packed f32), so the data callback always
+    ///   gets `SampleFormat::F32`. The format in effect after initialisation is returned —
+    ///   never assume 48 kHz stereo.
+    /// - `enable_agc`: `Some(_)` sets `kAUVoiceIOProperty_VoiceProcessingEnableAGC`; `None`
+    ///   leaves the unit's default (on).
+    ///   `kAUVoiceIOProperty_BypassVoiceProcessing` is never touched (processing stays on).
+    /// - Ducking of other audio is turned down as far as the API allows
+    ///   (`kAUVoiceIOProperty_OtherAudioDuckingConfiguration`, macOS 14+: advanced ducking
+    ///   off, level Min). Older systems refuse it; that is reported, not fatal.
+    ///
+    /// Returns the stream, the unit's client format (`channels`, `sample_rate`) and notes on
+    /// what each optional property did (for logging). The stream starts paused.
+    #[allow(clippy::cast_ptr_alignment)]
+    pub fn build_voice_processing_input_stream_raw<D, E>(
+        &self,
+        enable_agc: Option<bool>,
+        render_silence: bool,
+        mut data_callback: D,
+        error_callback: E,
+    ) -> Result<(Stream, StreamConfig, Vec<String>), Error>
+    where
+        D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        let mut notes = Vec::new();
+        let mut audio_unit =
+            AudioUnit::new_uninitialized(coreaudio::audio_unit::IOType::VoiceProcessingIO)?;
+
+        let enable_input = 1u32;
+        audio_unit.set_property(
+            kAudioOutputUnitProperty_EnableIO,
+            Scope::Input,
+            Element::Input,
+            Some(&enable_input),
+        )?;
+        let enable_output = u32::from(render_silence);
+        audio_unit.set_property(
+            kAudioOutputUnitProperty_EnableIO,
+            Scope::Output,
+            Element::Output,
+            Some(&enable_output),
+        )?;
+        audio_unit.set_property(
+            kAudioOutputUnitProperty_CurrentDevice,
+            Scope::Global,
+            Element::Input,
+            Some(&self.audio_device_id),
+        )?;
+
+        if let Some(enable_agc) = enable_agc {
+            let agc = u32::from(enable_agc);
+            match audio_unit.set_property(
+                kAUVoiceIOProperty_VoiceProcessingEnableAGC,
+                Scope::Global,
+                Element::Input,
+                Some(&agc),
+            ) {
+                Ok(()) => notes.push(format!("AGC {}", if enable_agc { "on" } else { "off" })),
+                Err(e) => notes.push(format!("AGC property refused ({e}); unit default kept")),
+            }
+        } else {
+            notes.push("AGC: unit default".to_owned());
+        }
+        let ducking = AUVoiceIOOtherAudioDuckingConfiguration {
+            mEnableAdvancedDucking: 0,
+            mDuckingLevel: AUVoiceIOOtherAudioDuckingLevel::Min,
+        };
+        match audio_unit.set_property(
+            kAUVoiceIOProperty_OtherAudioDuckingConfiguration,
+            Scope::Global,
+            Element::Output,
+            Some(&ducking),
+        ) {
+            Ok(()) => notes.push("other-audio ducking: advanced off, level min".to_owned()),
+            Err(e) => notes.push(format!(
+                "other-audio ducking config refused ({e}; macOS < 14?): other apps may be ducked"
+            )),
+        }
+
+        // The unit's client-side format of the input element, as it stands.
+        let unit_format = |unit: &AudioUnit| -> Result<AudioStreamBasicDescription, Error> {
+            Ok(unit.get_property::<AudioStreamBasicDescription>(
+                kAudioUnitProperty_StreamFormat,
+                Scope::Output,
+                Element::Input,
+            )?)
+        };
+        let before = unit_format(&audio_unit)?;
+        let fallback_rate = self
+            .default_input_config()
+            .map(|c| c.sample_rate())
+            .unwrap_or(48_000);
+        let sample_rate = if before.mSampleRate >= 1.0 {
+            before.mSampleRate.round() as SampleRate
+        } else {
+            fallback_rate
+        };
+        let channels = (before.mChannelsPerFrame.max(1)) as ChannelCount;
+        notes.push(format!(
+            "unit client format before setup: {} Hz, {} ch, flags {:#x}, {} bits",
+            before.mSampleRate, before.mChannelsPerFrame, before.mFormatFlags, before.mBitsPerChannel
+        ));
+        let wanted = StreamConfig {
+            channels,
+            sample_rate,
+            buffer_size: BufferSize::Default,
+        };
+        let asbd = asbd_from_config(wanted, SampleFormat::F32);
+        if let Err(e) =
+            audio_unit.set_property(kAudioUnitProperty_StreamFormat, Scope::Output, Element::Input, Some(&asbd))
+        {
+            // Some configurations only accept mono: retry once at the same rate.
+            notes.push(format!("interleaved f32 x{channels} refused ({e}); trying mono"));
+            let mono = StreamConfig { channels: 1, ..wanted };
+            let asbd = asbd_from_config(mono, SampleFormat::F32);
+            audio_unit.set_property(
+                kAudioUnitProperty_StreamFormat,
+                Scope::Output,
+                Element::Input,
+                Some(&asbd),
+            )?;
+        }
+
+        let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
+        let error_callback_disconnect = error_callback.clone();
+        let bytes_per_channel = SampleFormat::F32.sample_size();
+
+        type Args = render_callback::Args<data::Raw>;
+        audio_unit.set_input_callback(move |args: Args| unsafe {
+            // SAFETY: the client format is interleaved packed f32 (set above), so there is one
+            // buffer holding every channel.
+            let AudioBuffer {
+                mDataByteSize: data_byte_size,
+                mData: data,
+                ..
+            } = (*args.data.data).mBuffers[0];
+            let data = data as *mut ();
+            let len = data_byte_size as usize / bytes_per_channel;
+            let data = Data::from_parts(data, len, SampleFormat::F32);
+            let callback = match host_time_to_stream_instant(args.time_stamp.mHostTime) {
+                Err(err) => {
+                    let _ = try_emit_error(&error_callback, err);
+                    return Err(());
+                }
+                Ok(cb) => cb,
+            };
+            // The unit adds its own processing latency; capture time is approximate.
+            let timestamp = InputStreamTimestamp {
+                callback,
+                capture: callback,
+            };
+            data_callback(&data, &InputCallbackInfo { timestamp });
+            Ok(())
+        })?;
+
+        if render_silence {
+            audio_unit.set_render_callback(move |args: render_callback::Args<data::Raw>| unsafe {
+                // SAFETY: CoreAudio hands us a valid buffer list for this render cycle.
+                let list = &mut *args.data.data;
+                let buffers = std::slice::from_raw_parts_mut(
+                    list.mBuffers.as_mut_ptr(),
+                    list.mNumberBuffers as usize,
+                );
+                for b in buffers {
+                    if !b.mData.is_null() {
+                        std::ptr::write_bytes(b.mData as *mut u8, 0, b.mDataByteSize as usize);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        audio_unit.initialize()?;
+
+        let after = unit_format(&audio_unit)?;
+        let config = StreamConfig {
+            channels: (after.mChannelsPerFrame.max(1)) as ChannelCount,
+            sample_rate: if after.mSampleRate >= 1.0 {
+                after.mSampleRate.round() as SampleRate
+            } else {
+                sample_rate
+            },
+            buffer_size: BufferSize::Default,
+        };
+        if after.mFormatFlags & objc2_core_audio_types::kAudioFormatFlagIsFloat == 0
+            || after.mBitsPerChannel != 32
+        {
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedConfig,
+                format!(
+                    "voice-processing unit settled on a non-f32 client format (flags {:#x}, {} bits)",
+                    after.mFormatFlags, after.mBitsPerChannel
+                ),
+            ));
+        }
+        notes.push(format!(
+            "unit client format in effect: {} Hz, {} ch, f32 interleaved",
+            config.sample_rate, config.channels
+        ));
+
+        let inner_arc = Arc::new(Mutex::new(StreamInner {
+            playing: false,
+            audio_unit,
+            _device_id: self.audio_device_id,
+            _loopback_device: None,
+        }));
+        let weak_inner = Arc::downgrade(&inner_arc);
+        let monitor: Box<dyn Monitor> = Box::new(DisconnectManager::new(
+            self.audio_device_id,
+            weak_inner,
+            error_callback_disconnect,
+        )?);
+        let stream = Stream::new(inner_arc, monitor);
+        stream.signal_ready();
+        Ok((stream, config, notes))
     }
 
     #[allow(clippy::cast_ptr_alignment)]

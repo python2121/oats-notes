@@ -10,6 +10,10 @@
 //!   Recording Only" permission) and the sink monitor on Linux (PipeWire host) — through the
 //!   same mix-down and resampler.
 //!
+//! The microphone has two [`MicMode`]s: `Plain` (the HAL input unit, the default) and
+//! `VoiceProcessing` (macOS: Apple's voice-processing I/O unit — echo cancellation, noise
+//! suppression — a spike, see `examples/aec_spike.rs`; `OATS_MIC_MODE=vpio`).
+//!
 //! The cpal callback does the minimum: convert to f32 and mix down to mono, run the
 //! [`resample::Resampler`], and send full chunks. All scratch buffers are reused; the only
 //! allocation in steady state is the `Vec` handed to the channel, ten times a second.
@@ -25,6 +29,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod file_source;
+pub mod measure;
 pub mod resample;
 pub mod system;
 
@@ -59,12 +64,79 @@ pub enum CaptureError {
     Spawn(std::io::Error),
 }
 
-/// The device capture is running on, with its native (pre-resampling) config.
+/// The device capture is running on, with its native (pre-resampling) config — for
+/// [`MicMode::VoiceProcessing`], the voice-processing unit's client format.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub name: String,
     pub sample_rate: u32,
     pub channels: u16,
+}
+
+/// How the microphone is recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MicMode {
+    /// The device's plain input (cpal's HAL input unit): what the microphone hears.
+    #[default]
+    Plain,
+    /// macOS: Apple's voice-processing I/O unit (`kAudioUnitSubType_VoiceProcessingIO`):
+    /// echo cancellation, noise suppression, optional AGC. A SPIKE, not the default: whether
+    /// it removes what OTHER apps play through the speakers is measured by
+    /// `examples/aec_spike.rs`. Elsewhere it falls back to [`MicMode::Plain`] with a warning.
+    VoiceProcessing,
+}
+
+impl MicMode {
+    /// `plain` / `hal` → Plain; `vpio` / `voice` / `voice-processing` → VoiceProcessing
+    /// (case-insensitive, surrounding whitespace ignored). `None` for anything else.
+    pub fn parse(s: &str) -> Option<MicMode> {
+        match s.trim().to_lowercase().as_str() {
+            "plain" | "hal" => Some(MicMode::Plain),
+            "vpio" | "voice" | "voice-processing" | "voiceprocessing" => {
+                Some(MicMode::VoiceProcessing)
+            }
+            _ => None,
+        }
+    }
+
+    /// `OATS_MIC_MODE` (see [`MicMode::parse`]); unset or empty → Plain, unknown → Plain
+    /// with a warning.
+    pub fn from_env() -> MicMode {
+        match std::env::var("OATS_MIC_MODE") {
+            Ok(v) if !v.trim().is_empty() => MicMode::parse(&v).unwrap_or_else(|| {
+                log::warn!("OATS_MIC_MODE=\"{v}\" not understood (plain | vpio); using plain");
+                MicMode::Plain
+            }),
+            _ => MicMode::Plain,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MicMode::Plain => "plain",
+            MicMode::VoiceProcessing => "vpio",
+        }
+    }
+}
+
+/// Knobs for [`MicMode::VoiceProcessing`] (ignored for `Plain`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VoiceProcessingOptions {
+    /// `Some(_)` sets the unit's AGC (`kAUVoiceIOProperty_VoiceProcessingEnableAGC`); `None`
+    /// keeps Apple's default (on).
+    pub agc: Option<bool>,
+    /// Keep the unit's output bus running, fed silence (the unit is full duplex; its echo
+    /// reference may need a running output). `false` disables the output bus.
+    pub render_silence: bool,
+}
+
+impl Default for VoiceProcessingOptions {
+    fn default() -> Self {
+        VoiceProcessingOptions {
+            agc: None,
+            render_silence: true,
+        }
+    }
 }
 
 /// Which microphone to open.
@@ -196,12 +268,14 @@ fn pick_input(policy: &InputPolicy) -> Result<(cpal::Device, String), CaptureErr
 pub struct Capture {
     _stream: Stream,
     device: DeviceInfo,
+    mode: MicMode,
 }
 
 impl std::fmt::Debug for Capture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Capture")
             .field("device", &self.device)
+            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
@@ -216,7 +290,32 @@ impl Capture {
         sink: Sender<AudioChunk>,
         policy: &InputPolicy,
     ) -> Result<Capture, CaptureError> {
+        Capture::start_mic_with(
+            sink,
+            policy,
+            MicMode::Plain,
+            VoiceProcessingOptions::default(),
+        )
+    }
+
+    /// [`Capture::start_mic`] in the given [`MicMode`] (the caller applies `OATS_MIC_MODE`
+    /// through [`MicMode::from_env`]). Both modes go through the same mix-down and resampler.
+    pub fn start_mic_with(
+        sink: Sender<AudioChunk>,
+        policy: &InputPolicy,
+        mode: MicMode,
+        vp: VoiceProcessingOptions,
+    ) -> Result<Capture, CaptureError> {
         let (device, name) = pick_input(policy)?;
+        if mode == MicMode::VoiceProcessing {
+            if cfg!(target_os = "macos") {
+                return start_voice_processing(sink, policy, device, name, vp);
+            }
+            log::warn!(
+                "audio input: voice processing (OATS_MIC_MODE=vpio) is macOS only; using the \
+                 plain input"
+            );
+        }
         let supported = device
             .default_input_config()
             .map_err(|e| CaptureError::Cpal(e.to_string()))?;
@@ -228,7 +327,7 @@ impl Capture {
             channels: config.channels,
         };
         log::info!(
-            "audio input ({policy:?}): \"{}\" at {} Hz, {} channel(s), {:?} → {} Hz mono",
+            "audio input ({policy:?}, mode plain): \"{}\" at {} Hz, {} channel(s), {:?} → {} Hz mono",
             info.name,
             info.sample_rate,
             info.channels,
@@ -249,12 +348,102 @@ impl Capture {
         Ok(Capture {
             _stream: stream,
             device: info,
+            mode: MicMode::Plain,
         })
     }
 
     pub fn device(&self) -> &DeviceInfo {
         &self.device
     }
+
+    /// The mode in effect (a `VoiceProcessing` request falls back to `Plain` off macOS).
+    pub fn mode(&self) -> MicMode {
+        self.mode
+    }
+}
+
+/// macOS: the microphone through the voice-processing I/O unit (vendored cpal's
+/// `build_voice_processing_input_stream_raw`); the unit's own client format (interleaved f32
+/// at its rate and channel count) is read back and fed to the usual converter.
+#[cfg(target_os = "macos")]
+fn start_voice_processing(
+    sink: Sender<AudioChunk>,
+    policy: &InputPolicy,
+    device: cpal::Device,
+    name: String,
+    vp: VoiceProcessingOptions,
+) -> Result<Capture, CaptureError> {
+    let sink = Sink::new(sink, AudioSourceKind::Mic);
+    let on_error = sink.clone();
+    // The converter needs the unit's format, known only once the unit is built: the callback
+    // creates it on first use from the shared cell.
+    let format: Arc<Mutex<Option<(u32, u16)>>> = Arc::new(Mutex::new(None));
+    let cell = format.clone();
+    let mut conv: Option<Converter> = None;
+    let mut pending: Option<Sink> = Some(sink);
+    let data = move |data: &cpal::Data, _: &cpal::InputCallbackInfo| {
+        if conv.is_none() {
+            let fmt = cell.lock().ok().and_then(|g| *g);
+            if let (Some((rate, ch)), Some(s)) = (fmt, pending.take()) {
+                conv = Some(Converter::new(rate, ch, s));
+            }
+        }
+        if let (Some(c), Some(samples)) = (conv.as_mut(), data.as_slice::<f32>()) {
+            c.push(samples);
+        }
+    };
+    #[allow(unreachable_patterns)]
+    let (stream, config, notes) = match device.as_inner() {
+        cpal::platform::DeviceInner::CoreAudio(d) => d
+            .build_voice_processing_input_stream_raw(vp.agc, vp.render_silence, data, move |err| {
+                on_stream_error(&on_error, &err)
+            })
+            .map_err(|e| CaptureError::Cpal(format!("voice-processing input: {e}")))?,
+        _ => {
+            return Err(CaptureError::Cpal(
+                "voice processing needs the CoreAudio host".to_owned(),
+            ));
+        }
+    };
+    if let Ok(mut g) = format.lock() {
+        *g = Some((config.sample_rate, config.channels));
+    }
+    let info = DeviceInfo {
+        name,
+        sample_rate: config.sample_rate,
+        channels: config.channels,
+    };
+    log::info!(
+        "audio input ({policy:?}, mode vpio): \"{}\" through the voice-processing unit at {} Hz, \
+         {} channel(s), f32 → {} Hz mono; {}",
+        info.name,
+        info.sample_rate,
+        info.channels,
+        SAMPLE_RATE,
+        notes.join("; ")
+    );
+    let stream = Stream::from(stream);
+    stream
+        .play()
+        .map_err(|e| CaptureError::Cpal(e.to_string()))?;
+    Ok(Capture {
+        _stream: stream,
+        device: info,
+        mode: MicMode::VoiceProcessing,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_voice_processing(
+    _sink: Sender<AudioChunk>,
+    _policy: &InputPolicy,
+    _device: cpal::Device,
+    _name: String,
+    _vp: VoiceProcessingOptions,
+) -> Result<Capture, CaptureError> {
+    Err(CaptureError::Cpal(
+        "voice processing is macOS only".to_owned(),
+    ))
 }
 
 pub(crate) fn build<T>(
@@ -490,6 +679,31 @@ mod tests {
         assert!(is_terminal(cpal::ErrorKind::DeviceNotAvailable));
         assert!(!is_terminal(cpal::ErrorKind::DeviceChanged));
         assert!(!is_terminal(cpal::ErrorKind::Xrun));
+    }
+
+    #[test]
+    fn mic_mode_parses_and_defaults_to_plain() {
+        assert_eq!(MicMode::default(), MicMode::Plain);
+        assert_eq!(MicMode::parse("vpio"), Some(MicMode::VoiceProcessing));
+        assert_eq!(MicMode::parse(" VPIO "), Some(MicMode::VoiceProcessing));
+        assert_eq!(
+            MicMode::parse("voice-processing"),
+            Some(MicMode::VoiceProcessing)
+        );
+        assert_eq!(MicMode::parse("plain"), Some(MicMode::Plain));
+        assert_eq!(MicMode::parse("Hal"), Some(MicMode::Plain));
+        assert_eq!(MicMode::parse("aec"), None);
+        assert_eq!(MicMode::parse(""), None);
+        for m in [MicMode::Plain, MicMode::VoiceProcessing] {
+            assert_eq!(MicMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(
+            VoiceProcessingOptions::default(),
+            VoiceProcessingOptions {
+                agc: None,
+                render_silence: true
+            }
+        );
     }
 
     fn names(n: &[&str]) -> Vec<String> {

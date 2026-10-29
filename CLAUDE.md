@@ -32,14 +32,14 @@ never changes.
 ```
 crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, paths  (no platform code)
 crates/oats-brain              the brain: `claude` CLI wrapper, episode cutting, prompts (prompts/*.md), hotword commands, tiered scheduler  (no platform code)
-crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mic/system + own FIR resampler: microphone (InputPolicy) and system audio (SystemCapture)
+crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mic/system + own FIR resampler: microphone (InputPolicy, MicMode plain | voice processing) and system audio (SystemCapture)
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
 crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Notes / Calendar views
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
 vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
-vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream (macOS); NOT a workspace member
+vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream and a voice-processing input stream (macOS); NOT a workspace member
 ```
 
 ## The status item (`crates/oats-status/src/lib.rs`)
@@ -148,6 +148,22 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   rule only while the default output is speakers (`OutputInfo::speakers`), i.e. skips it on
   headphones/AirPods. The binary sets `PipelineHandle::set_echo_dedup` from the system
   capture's `on_output`; with `--system-audio-file` (no device) auto counts as speakers.
+- **Echo cancellation spike** (built 2026-10-29, NOT run on hardware yet): does Apple's
+  voice-processing microphone (`kAudioUnitSubType_VoiceProcessingIO`: AEC, noise suppression,
+  AGC) remove what OTHER apps play through the speakers? `oats_audio::MicMode { Plain,
+  VoiceProcessing }` (`Capture::start_mic_with(sink, policy, mode, VoiceProcessingOptions {
+  agc, render_silence })`; `OATS_MIC_MODE=plain|vpio`, default plain; off macOS vpio falls
+  back to plain with a warn) goes through the vendored cpal's
+  `build_voice_processing_input_stream_raw` (the unit's own rate / channel count read back
+  and logged; other-audio ducking off on macOS 14+) and the same mix-down/resampler. The
+  measurement: `scripts/aec-spike.sh` (renders the sentence with `say -o`, runs
+  `examples/aec_spike.rs --mode plain` then `--mode vpio`, each recording 12 s while `say`
+  plays the sentence after a 2 s lead, and prints room / playback dBFS, their difference and
+  waveform + envelope cross-correlation peaks against the reference side by side). It plays
+  sound and opens the mic: never during a call. Outcome: vpio passes when its playback −
+  room difference is ≥ 20 dB below plain's and the correlation peaks collapse; then it can
+  replace (or back) the text-level echo rule on speakers. VoiceProcessing is NOT the
+  default until the spike passes. Pure helpers: `oats_audio::measure` (tested).
 - **UI**: "Capture System Audio" (Listen menu, checked) and a "System audio" pill in the
   control bar toggle the `AppPrefs::capture_system` pref (persisted, default on; toggling while
   listening reopens the captures). The status strip reads "listening · mic + system" /
@@ -296,6 +312,7 @@ across a listen stop/start (harmless: Silero re-converges within a few chunks). 
 cargo run -p oats-notes                   # the app (first run downloads the Parakeet CoreML model, ~600 MB, into ~/Library/Application Support/FluidAudio)
 OATS_ENGINE=null cargo run -p oats-notes  # the app without a model (UI work; speech detected, not transcribed)
 cargo run -p oats-audio --example levels  # mic sanity check: prints input level for 5 s
+scripts/aec-spike.sh [--output "MacBook Air Speakers"]   # echo-cancellation spike: plain vs voice-processing mic while `say` plays (plays sound; not during a call)
 cargo run -p oats-audio --example levels -- --system   # both lanes for 10 s (grants/prompts the System Audio Recording permission; "all zeros" = no grant)
 cargo run -p oats-notes -- --listen --audio-file speech.wav [--audio-speed 4] [--audio-loop]   # deterministic input instead of the mic (16 kHz mono i16 WAV)
 cargo run -p oats-notes -- --listen --audio-file mic.wav --system-audio-file them.wav           # two lanes from two WAVs (the echo rule end to end)
@@ -361,10 +378,12 @@ description, before/after JSON, `undone`). `View::Node(id)` means the subtree (r
 
 cpal 0.18.2 from crates.io, swapped in by `[patch.crates-io] cpal = { path = "vendor/cpal" }`
 (the workspace still says `cpal = "0.18"`), excluded from the workspace, formatting and clippy
-off like fluidaudio-rs. One change, in `src/host/coreaudio/macos/device.rs`: a public
+off like fluidaudio-rs. Two additions, in `src/host/coreaudio/macos/device.rs`: a public
 `Device::build_loopback_stream_raw` that always builds the process-tap path, because stock
 cpal taps an output device only when it has NO input — on AirPods (output + microphone) it
-would open the headset microphone and switch it to the call profile. Details, evidence and
+would open the headset microphone and switch it to the call profile; and
+`Device::build_voice_processing_input_stream_raw` (the echo-cancellation spike: the input
+through the VoiceProcessingIO unit, its format read back). Details, evidence and
 the update procedure: `vendor/cpal/VENDORED.md`; attribution: `THIRD_PARTY.md`.
 
 ## Vendored fluidaudio-rs (`vendor/fluidaudio-rs`)
