@@ -984,3 +984,333 @@ fn a_microphone_that_stops_while_system_audio_flows_is_reported() {
         "reported once"
     );
 }
+
+// ---- the audio-level echo check -------------------------------------------------------------
+
+use oats_core::EchoAudioMode;
+use oats_core::echo_audio::synth::{burst, delayed, mix, noise, silence};
+use oats_core::pipeline::EchoStats;
+
+/// What every segment "says": the same sentence on both lanes, so the text rule matches
+/// whenever it gets the chance.
+const SENTENCE: &str = "the quarterly numbers look good and we should ship on friday";
+
+/// An engine for real-looking signals: VAD = frame RMS above −40 dBFS (on the system lane
+/// never, when `system_deaf`); records the length of every segment it transcribes.
+struct Acoustic {
+    transcribed: Arc<std::sync::Mutex<Vec<usize>>>,
+    system_deaf: bool,
+}
+
+impl SpeechEngine for Acoustic {
+    fn name(&self) -> String {
+        "acoustic".into()
+    }
+    fn load(&mut self, _status: &mut dyn FnMut(String)) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn vad_frame_len(&self) -> Option<usize> {
+        Some(FRAME)
+    }
+    fn vad(&mut self, _samples: &[f32]) -> Result<Vec<VadFrame>, EngineError> {
+        Err(EngineError::Vad("only vad_lane is used".into()))
+    }
+    fn vad_lane(
+        &mut self,
+        lane: AudioSourceKind,
+        samples: &[f32],
+    ) -> Result<Vec<VadFrame>, EngineError> {
+        let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+        let deaf = self.system_deaf && lane == AudioSourceKind::System;
+        Ok(vec![VadFrame {
+            probability: (rms * 10.0).min(1.0),
+            is_speech: !deaf && rms > 0.01,
+        }])
+    }
+    fn transcribe(&mut self, samples: &[f32]) -> Result<Transcription, EngineError> {
+        self.transcribed.lock().unwrap().push(samples.len());
+        Ok(Transcription {
+            text: SENTENCE.into(),
+            confidence: Some(0.9),
+            processing_ms: 1.0,
+        })
+    }
+}
+
+fn acoustic(tag: &str, system_deaf: bool) -> (Rig, Arc<std::sync::Mutex<Vec<usize>>>) {
+    let transcribed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let t = transcribed.clone();
+    let rig = spawn_with(
+        tag,
+        Box::new(move || {
+            Ok(Box::new(Acoustic {
+                transcribed: t,
+                system_deaf,
+            }) as Box<dyn SpeechEngine>)
+        }),
+    );
+    (rig, transcribed)
+}
+
+/// Both lanes, chunk by chunk (mic first), the shorter one padded with silence.
+fn send_signals(tx: &Sender<AudioChunk>, mic: &[f32], system: &[f32]) {
+    let n = mic.len().max(system.len());
+    let mut at = 0;
+    while at < n {
+        let end = (at + 1_600).min(n);
+        let piece = |v: &[f32]| -> Vec<f32> {
+            (at..end)
+                .map(|i| v.get(i).copied().unwrap_or(0.0))
+                .collect()
+        };
+        tx.send(AudioChunk::mic(piece(mic))).unwrap();
+        tx.send(AudioChunk::system(piece(system))).unwrap();
+        at = end;
+    }
+}
+
+/// 500 ms lead, the system playing `played` while the microphone carries `heard` (plus room
+/// noise at −45 dBFS throughout), then `tail_ms` of quiet.
+fn scene(heard: &[f32], played: &[f32], tail_ms: u32) -> (Vec<f32>, Vec<f32>) {
+    let mic_clean = [silence(500), heard.to_vec(), silence(tail_ms)].concat();
+    let mic = mix(&mic_clean, &noise(42, mic_clean.len(), -45.0));
+    let system = [silence(500), played.to_vec(), silence(tail_ms)].concat();
+    (mic, system)
+}
+
+struct Outcome {
+    seen: Vec<PipelineEvent>,
+    transcribed: Vec<usize>,
+    stats: EchoStats,
+    /// Every stored row: (source, echo_of, text, id).
+    rows: Vec<(String, Option<i64>, String, i64)>,
+    db: PathBuf,
+    _rig: Rig,
+}
+
+/// Run one two-lane session over `mic` / `system` with the given switches.
+fn run_scene(
+    tag: &str,
+    system_deaf: bool,
+    mode: EchoAudioMode,
+    dedup: bool,
+    mic: &[f32],
+    system: &[f32],
+) -> Outcome {
+    let (rig, transcribed) = acoustic(tag, system_deaf);
+    rig.h.set_echo_dedup(dedup);
+    rig.h.set_echo_audio(mode);
+    let mut seen = Vec::new();
+    wait_idle(&rig.h, &mut seen);
+    let (tx, sid) = start_lanes(&rig.h, &mut seen, ListenOptions::default());
+    send_signals(&tx, mic, system);
+    stop_and_wait(&rig, &mut seen, sid);
+    let conn = rusqlite::Connection::open(&rig.db).unwrap();
+    let rows = conn
+        .prepare("SELECT source, echo_of, text, id FROM segments ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let stats = rig.h.echo_stats();
+    let transcribed = transcribed.lock().unwrap().clone();
+    Outcome {
+        seen,
+        transcribed,
+        stats,
+        rows,
+        db: rig.db.clone(),
+        _rig: rig,
+    }
+}
+
+/// The speakers heard by the microphone (the burst 60 ms later at ×0.3): the system segment
+/// is transcribed, the microphone's is not — it is stored empty, as the system row's echo, and
+/// never reported.
+#[test]
+fn an_acoustic_echo_is_not_transcribed_and_is_linked_to_its_system_segment() {
+    let played = burst(1, 3_000, 0.3);
+    let (mic, system) = scene(&delayed(&played, 60, 0.3), &played, 2_000);
+    let o = run_scene(
+        "audio-echo",
+        false,
+        EchoAudioMode::Auto,
+        true,
+        &mic,
+        &system,
+    );
+    assert_eq!(
+        o.transcribed.len(),
+        1,
+        "only the system segment: {:?}",
+        o.rows
+    );
+    assert_eq!(o.rows.len(), 2, "{:?}", o.rows);
+    let sys = o.rows.iter().find(|r| r.0 == "system").unwrap();
+    let mic_row = o.rows.iter().find(|r| r.0 == "mic").unwrap();
+    assert_eq!(sys.1, None);
+    assert_eq!(sys.2, SENTENCE);
+    assert_eq!(mic_row.1, Some(sys.3), "linked to the system row");
+    assert_eq!(mic_row.2, "", "never transcribed");
+    assert_eq!(
+        o.stats,
+        EchoStats {
+            mic_transcribed: 0,
+            echo_skipped_by_audio: 1,
+            echo_linked: 1,
+            echo_discarded: 0,
+            echo_marked_by_text: 0,
+        }
+    );
+    let reported = segments(&o.seen);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert_eq!(reported[0].source, AudioSourceKind::System);
+}
+
+/// A different voice on the microphone at the same time (the user, while the other side
+/// talks): transcribed. The check runs (always), the text rule is off.
+#[test]
+fn independent_speech_at_the_same_time_is_transcribed() {
+    let played = burst(1, 3_000, 0.3);
+    let own = burst(5, 3_000, 0.3);
+    let (mic, system) = scene(&own, &played, 2_000);
+    let o = run_scene(
+        "audio-independent",
+        false,
+        EchoAudioMode::Always,
+        false,
+        &mic,
+        &system,
+    );
+    assert_eq!(o.transcribed.len(), 2, "{:?}", o.rows);
+    assert_eq!(o.stats.echo_skipped_by_audio, 0, "{:?}", o.stats);
+    assert_eq!(o.stats.mic_transcribed, 1);
+    assert!(o.rows.iter().all(|r| r.1.is_none() && r.2 == SENTENCE));
+}
+
+/// The user talking over the call: the echo (×0.3) plus their own voice at full level. The
+/// audio check must not take it (the text rule may, here: same sentence — not asserted).
+#[test]
+fn talking_over_an_echo_is_transcribed() {
+    let played = burst(1, 3_000, 0.3);
+    let heard = mix(&delayed(&played, 60, 0.3), &burst(5, 3_000, 0.3));
+    let (mic, system) = scene(&heard, &played, 2_000);
+    let o = run_scene(
+        "audio-talkover",
+        false,
+        EchoAudioMode::Auto,
+        true,
+        &mic,
+        &system,
+    );
+    assert_eq!(o.transcribed.len(), 2, "{:?}", o.rows);
+    assert_eq!(o.stats.echo_skipped_by_audio, 0, "{:?}", o.stats);
+    assert_eq!(o.stats.mic_transcribed, 1);
+}
+
+/// The microphone's segment closes first (the system plays 500 ms longer than the mic hears):
+/// it waits, and is linked when the system segment is stored.
+#[test]
+fn an_echo_that_closes_before_its_system_segment_waits_and_is_linked() {
+    let played = burst(1, 3_500, 0.3);
+    let n = 3 * SAMPLE_RATE as usize;
+    let heard = delayed(&played[..n], 60, 0.3);
+    let (mic, system) = scene(&heard, &played, 2_000);
+    let o = run_scene(
+        "audio-order",
+        false,
+        EchoAudioMode::Auto,
+        true,
+        &mic,
+        &system,
+    );
+    assert_eq!(o.transcribed.len(), 1, "{:?}", o.rows);
+    // the mic row was inserted after the system row although it closed first
+    assert_eq!(o.rows.len(), 2, "{:?}", o.rows);
+    assert_eq!(o.rows[0].0, "system");
+    assert_eq!(o.rows[1].0, "mic");
+    assert_eq!(o.rows[1].1, Some(o.rows[0].3));
+    assert_eq!(o.rows[1].2, "");
+    assert_eq!(o.stats.echo_linked, 1, "{:?}", o.stats);
+    // it waited: its segment ended (and so closed, the lanes being fed in step) ≥ 400 ms
+    // before the system one
+    let ends: Vec<i64> = rusqlite::Connection::open(&o.db)
+        .unwrap()
+        .prepare("SELECT ended_at FROM segments ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(ends[1] + 400 <= ends[0], "{ends:?}");
+}
+
+/// System audio that never makes a system segment (its VAD hears no speech: music, a
+/// chime): the suspected echo is discarded after the pending timeout, nothing is stored.
+#[test]
+fn a_suspected_echo_without_a_system_segment_is_discarded_after_the_timeout() {
+    let played = burst(1, 3_000, 0.3);
+    // 6 s of quiet after the burst: past the 2 s timeout while still listening
+    let (mic, system) = scene(&delayed(&played, 60, 0.3), &played, 6_000);
+    let (rig, transcribed) = acoustic("audio-timeout", true);
+    rig.h.set_echo_pending_timeout(Duration::from_secs(2));
+    let mut seen = Vec::new();
+    wait_idle(&rig.h, &mut seen);
+    let (tx, sid) = start_lanes(&rig.h, &mut seen, ListenOptions::default());
+    send_signals(&tx, &mic, &system);
+    // discarded while the session still runs (not by the end-of-session sweep)
+    let deadline = Instant::now() + TIMEOUT;
+    while rig.h.echo_stats().echo_discarded == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        rig.h.echo_stats(),
+        EchoStats {
+            mic_transcribed: 0,
+            echo_skipped_by_audio: 1,
+            echo_linked: 0,
+            echo_discarded: 1,
+            echo_marked_by_text: 0,
+        }
+    );
+    stop_and_wait(&rig, &mut seen, sid);
+    assert!(transcribed.lock().unwrap().is_empty());
+    let rows: i64 = rusqlite::Connection::open(&rig.db)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+    assert_eq!(rig.h.echo_stats().echo_discarded, 1);
+}
+
+/// `OATS_ECHO_AUDIO=never`: the old behaviour — the echo is transcribed and the text rule
+/// marks it.
+#[test]
+fn with_the_audio_check_off_the_echo_is_transcribed_and_marked_by_text() {
+    let played = burst(1, 3_000, 0.3);
+    let (mic, system) = scene(&delayed(&played, 60, 0.3), &played, 2_000);
+    let o = run_scene(
+        "audio-never",
+        false,
+        EchoAudioMode::Never,
+        true,
+        &mic,
+        &system,
+    );
+    assert_eq!(o.transcribed.len(), 2, "{:?}", o.rows);
+    let sys = o.rows.iter().find(|r| r.0 == "system").unwrap();
+    let mic_row = o.rows.iter().find(|r| r.0 == "mic").unwrap();
+    assert_eq!(mic_row.1, Some(sys.3));
+    assert_eq!(mic_row.2, SENTENCE);
+    assert_eq!(
+        o.stats,
+        EchoStats {
+            mic_transcribed: 1,
+            echo_skipped_by_audio: 0,
+            echo_linked: 0,
+            echo_discarded: 0,
+            echo_marked_by_text: 1,
+        }
+    );
+}

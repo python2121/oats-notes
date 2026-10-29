@@ -10,6 +10,8 @@
 //!   segmentation → transcription, writes to the store and reports events to the UI.
 //! - [`echo`]: the text-level rule that marks a microphone segment as the echo of a
 //!   system-audio segment (speakers heard by the microphone) — pure.
+//! - [`echo_audio`]: the audio-level pre-check that recognises such an echo by correlating
+//!   loudness envelopes BEFORE the model runs, and the system-audio ring it reads — pure.
 //! - [`paths`]: where the database and logs live.
 //!
 //! The engine implementation (`oats-engine-fluidaudio` on macOS) and the audio capture
@@ -18,6 +20,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod echo;
+pub mod echo_audio;
 pub mod engine;
 pub mod paths;
 pub mod pipeline;
@@ -25,6 +28,7 @@ pub mod segmenter;
 pub mod store;
 
 pub use echo::DedupMode;
+pub use echo_audio::EchoAudioMode;
 pub use engine::{
     AudioChunk, AudioSourceKind, EngineError, EngineFactory, NullEngine, SAMPLE_RATE, SpeechEngine,
     Transcription, VadFrame,

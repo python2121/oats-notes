@@ -12,6 +12,15 @@
 //! repeats a system segment (speakers heard by the microphone) is stored as its echo
 //! ([`crate::echo`]) while the echo rule is on ([`PipelineHandle::set_echo_dedup`]).
 //!
+//! Before that, while the audio-level check is on ([`EchoAudioMode`], `OATS_ECHO_AUDIO`), a
+//! closing microphone segment is compared with the system audio played over the same span
+//! (the session keeps the last [`echo_audio::ECHO_RING_SECS`] of it): a suspected echo
+//! ([`echo_audio::analyse`]) is never transcribed. It is stored as an empty mic row with
+//! `echo_of` set once its system segment is stored (at once when that is already in the store;
+//! overlap ± [`echo_audio::LINK_SLACK_MS`]), or discarded when none arrives within the pending
+//! timeout (the computer played something that wasn't speech). Counts per session:
+//! [`EchoStats`].
+//!
 //! Efficiency rules (the app runs all day on an M2 Air):
 //! - The worker blocks on the audio channel; nothing spins. With no audio channel attached
 //!   (not listening) it blocks on the command channel.
@@ -22,11 +31,13 @@
 //!   (`wake` is called after each event is queued).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::echo;
+use crate::echo_audio::{self, EchoAudioMode, SystemRing};
 use crate::engine::{
     AudioChunk, AudioSourceKind, EnergyVad, EngineFactory, SAMPLE_RATE, SpeechEngine,
 };
@@ -102,6 +113,22 @@ pub enum PipelineEvent {
     Warning(String),
 }
 
+/// Per-session echo counters (logged at info when the session ends; the last ended session's
+/// are [`PipelineHandle::echo_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EchoStats {
+    /// Microphone segments that went through the model.
+    pub mic_transcribed: u32,
+    /// Microphone segments the audio-level check took for an echo: not transcribed.
+    pub echo_skipped_by_audio: u32,
+    /// …of which stored as an (empty) echo row of a system segment.
+    pub echo_linked: u32,
+    /// …of which dropped: no system segment came within the timeout.
+    pub echo_discarded: u32,
+    /// Transcribed microphone segments the text rule marked as echoes (at insert or later).
+    pub echo_marked_by_text: u32,
+}
+
 /// What a listening session expects from its audio.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListenOptions {
@@ -132,6 +159,9 @@ pub struct PipelineHandle {
     levels_wanted: Arc<AtomicBool>,
     /// Whether the echo rule runs (see [`PipelineHandle::set_echo_dedup`]).
     echo_dedup: Arc<AtomicBool>,
+    echo_audio: Arc<AtomicU8>,
+    echo_pending_timeout_ms: Arc<AtomicU64>,
+    echo_stats: Arc<Mutex<EchoStats>>,
 }
 
 /// The audio a session reads: the plain microphone-only stream (every chunk is the
@@ -186,11 +216,19 @@ impl Pipeline {
         } = self;
         let levels_wanted = Arc::new(AtomicBool::new(true));
         let echo_dedup = Arc::new(AtomicBool::new(true));
+        let echo_mode = EchoAudioMode::from_env();
+        log::info!("audio-level echo check (OATS_ECHO_AUDIO): {echo_mode:?}");
+        let echo_audio = Arc::new(AtomicU8::new(echo_mode.to_u8()));
+        let echo_pending_timeout_ms = Arc::new(AtomicU64::new(echo_audio::ECHO_PENDING_TIMEOUT_MS));
+        let echo_stats = Arc::new(Mutex::new(EchoStats::default()));
         let out = Outbox {
             tx: event_tx,
             wake,
             levels_wanted: levels_wanted.clone(),
             echo_dedup: echo_dedup.clone(),
+            echo_audio: echo_audio.clone(),
+            echo_pending_timeout_ms: echo_pending_timeout_ms.clone(),
+            echo_stats: echo_stats.clone(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
@@ -220,6 +258,9 @@ impl Pipeline {
             cancel,
             levels_wanted,
             echo_dedup,
+            echo_audio,
+            echo_pending_timeout_ms,
+            echo_stats,
         }
     }
 }
@@ -261,6 +302,25 @@ impl PipelineHandle {
     /// ([`crate::DedupMode`]: off while the output is headphones).
     pub fn set_echo_dedup(&self, on: bool) {
         self.echo_dedup.store(on, Ordering::Relaxed);
+    }
+
+    /// The audio-level echo check's mode (default: `OATS_ECHO_AUDIO`, else auto = while the
+    /// echo rule is on). Takes effect at the next closing microphone segment.
+    pub fn set_echo_audio(&self, mode: EchoAudioMode) {
+        self.echo_audio.store(mode.to_u8(), Ordering::Relaxed);
+    }
+
+    /// How long (of audio) a suspected echo waits for its system segment before it is
+    /// discarded (default [`echo_audio::ECHO_PENDING_TIMEOUT_MS`]).
+    pub fn set_echo_pending_timeout(&self, timeout: Duration) {
+        self.echo_pending_timeout_ms
+            .store(timeout.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// The echo counters of the current session (updated as they change), or of the last one
+    /// once it ended.
+    pub fn echo_stats(&self) -> EchoStats {
+        self.echo_stats.lock().map(|s| *s).unwrap_or_default()
     }
 
     /// The echo rule's switch, for a capture thread that follows the output device.
@@ -310,6 +370,9 @@ struct Outbox {
     wake: Box<dyn Fn() + Send + Sync>,
     levels_wanted: Arc<AtomicBool>,
     echo_dedup: Arc<AtomicBool>,
+    echo_audio: Arc<AtomicU8>,
+    echo_pending_timeout_ms: Arc<AtomicU64>,
+    echo_stats: Arc<Mutex<EchoStats>>,
 }
 
 impl Outbox {
@@ -361,6 +424,12 @@ impl SampleClock {
         let rate = i64::from(SAMPLE_RATE);
         let delta = sample as i64 - self.anchor_sample as i64;
         self.anchor_ms + delta * 1000 / rate
+    }
+
+    /// The inverse of [`SampleClock::ms_at`]: the sample position heard at `ms` (may be
+    /// negative, before the lane started).
+    fn sample_at(&self, ms: i64) -> i64 {
+        self.anchor_sample as i64 + (ms - self.anchor_ms) * i64::from(SAMPLE_RATE) / 1000
     }
 
     /// A chunk arrived at (`wall_ms`, `mono`); `before` samples had arrived before it.
@@ -456,6 +525,7 @@ fn worker(
                     engine_name: &engine_name,
                     store: &store,
                     out,
+                    echo: EchoState::default(),
                 };
                 match session.run(config, &listen, cmd_rx) {
                     AfterListen::Idle => next = cmd_rx.recv().ok(),
@@ -521,12 +591,38 @@ impl Lane {
     }
 }
 
+/// A microphone segment the audio-level check took for an echo, waiting for its system
+/// segment to be stored.
+#[derive(Clone, Copy, Debug)]
+struct PendingEcho {
+    session_id: i64,
+    started_at: i64,
+    ended_at: i64,
+    speech_ms: u32,
+    peak: f32,
+    lag_ms: i32,
+}
+
+/// The audio-level echo check's per-session state.
+#[derive(Default)]
+struct EchoState {
+    /// The last 45 s of system audio, by the system lane's sample position.
+    ring: SystemRing,
+    /// The system lane's clock (a copy, updated with every system chunk).
+    sys_clock: Option<SampleClock>,
+    pending: Vec<PendingEcho>,
+    stats: EchoStats,
+    /// What [`PipelineHandle::echo_stats`] last saw.
+    published: EchoStats,
+}
+
 /// One listening session's borrowed context.
 struct Session<'a> {
     engine: &'a mut dyn SpeechEngine,
     engine_name: &'a str,
     store: &'a Store,
     out: &'a Outbox,
+    echo: EchoState,
 }
 
 impl Session<'_> {
@@ -549,6 +645,8 @@ impl Session<'_> {
                 return AfterListen::Idle;
             }
         };
+        // a new session counts from zero
+        self.publish_echo_stats();
         self.out.send(PipelineEvent::SessionStarted(session_id));
         self.out
             .send(PipelineEvent::Status(PipelineStatus::Listening));
@@ -657,6 +755,8 @@ impl Session<'_> {
                 self.finish_segment(lane.kind, session_id, &clock, &seg);
             }
         }
+        self.expire_pending(i64::MAX);
+        self.end_echo_stats(session_id);
         if let Err(e) = self.store.end_session(session_id, now_ms()) {
             self.out.send(PipelineEvent::Warning(format!(
                 "could not close the session: {e}"
@@ -689,6 +789,10 @@ impl Session<'_> {
         });
         clock.observe(lane.received, wall, mono);
         let clock = *clock;
+        if lane.kind == AudioSourceKind::System && self.echo_mode() != EchoAudioMode::Never {
+            self.echo.ring.push(lane.received, samples);
+            self.echo.sys_clock = Some(clock);
+        }
         lane.received += samples.len() as u64;
         lane.pending.extend_from_slice(samples);
         let mut offset = 0;
@@ -719,6 +823,140 @@ impl Session<'_> {
             }
         }
         lane.pending.drain(..offset);
+        if !self.echo.pending.is_empty() {
+            self.expire_pending(clock.ms_at(lane.received));
+        }
+        if self.echo.stats != self.echo.published {
+            self.publish_echo_stats();
+        }
+    }
+
+    fn publish_echo_stats(&mut self) {
+        self.echo.published = self.echo.stats;
+        if let Ok(mut shared) = self.out.echo_stats.lock() {
+            *shared = self.echo.stats;
+        }
+    }
+
+    fn echo_mode(&self) -> EchoAudioMode {
+        EchoAudioMode::from_u8(self.out.echo_audio.load(Ordering::Relaxed))
+    }
+
+    /// Compare a closed microphone segment with the system audio over its span (widened by
+    /// the lag window): `None` when there is nothing to compare or nothing can be decided.
+    fn audio_echo_check(&self, started_at: i64, seg: &Segment) -> Option<echo_audio::Verdict> {
+        let clock = self.echo.sys_clock?;
+        if self.echo.ring.is_empty() {
+            return None;
+        }
+        let widen = i64::from(echo_audio::ECHO_MAX_LAG_MS) * i64::from(SAMPLE_RATE) / 1000;
+        let from = clock.sample_at(started_at) - widen;
+        let to = from + seg.samples.len() as i64 + 2 * widen;
+        let system = self.echo.ring.slice(from, to);
+        echo_audio::analyse(&seg.samples, &system)
+    }
+
+    /// A suspected echo: linked at once to a system segment already stored over its span,
+    /// else kept until one is.
+    fn suspect_echo(&mut self, echo: PendingEcho) {
+        let near = match self.store.segments_near(
+            AudioSourceKind::System,
+            echo.started_at - echo_audio::LINK_SLACK_MS,
+            echo.ended_at + echo_audio::LINK_SLACK_MS,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                log::warn!("echo check: {e}");
+                Vec::new()
+            }
+        };
+        let overlap =
+            |r: &TranscriptRow| r.ended_at.min(echo.ended_at) - r.started_at.max(echo.started_at);
+        match near.iter().max_by_key(|r| overlap(r)) {
+            Some(system) => self.link_echo(&echo, system.id),
+            None => self.echo.pending.push(echo),
+        }
+    }
+
+    /// Store a suspected echo as the (empty) echo row of `system_id`. The UI hears nothing:
+    /// echoes are never shown.
+    fn link_echo(&mut self, echo: &PendingEcho, system_id: i64) {
+        match self.store.insert_segment_from(
+            echo.session_id,
+            echo.started_at,
+            echo.ended_at,
+            "",
+            None,
+            AudioSourceKind::Mic,
+            Some(system_id),
+        ) {
+            Ok(row) => {
+                self.echo.stats.echo_linked += 1;
+                log::debug!(
+                    "mic segment {} ({} ms of speech, envelope peak {:.2} at {} ms) stored \
+                     untranscribed as the echo of system segment {system_id}",
+                    row.id,
+                    echo.speech_ms,
+                    echo.peak,
+                    echo.lag_ms
+                );
+            }
+            Err(e) => self.out.send(PipelineEvent::Warning(format!(
+                "could not save a segment: {e}"
+            ))),
+        }
+    }
+
+    /// A system segment was stored: the suspected echoes overlapping it are its echoes.
+    fn link_pending(&mut self, system: &TranscriptRow) {
+        let slack = echo_audio::LINK_SLACK_MS;
+        let (hits, rest): (Vec<PendingEcho>, Vec<PendingEcho>) =
+            std::mem::take(&mut self.echo.pending)
+                .into_iter()
+                .partition(|p| {
+                    p.ended_at >= system.started_at - slack
+                        && p.started_at <= system.ended_at + slack
+                });
+        self.echo.pending = rest;
+        for p in hits {
+            self.link_echo(&p, system.id);
+        }
+    }
+
+    /// Drop the suspected echoes that ended more than the timeout before `now_ms` (audio
+    /// time; `i64::MAX` drops them all).
+    fn expire_pending(&mut self, now_ms: i64) {
+        let timeout = self.out.echo_pending_timeout_ms.load(Ordering::Relaxed) as i64;
+        let before = self.echo.pending.len();
+        self.echo
+            .pending
+            .retain(|p| now_ms.saturating_sub(p.ended_at) <= timeout);
+        let dropped = (before - self.echo.pending.len()) as u32;
+        if dropped > 0 {
+            self.echo.stats.echo_discarded += dropped;
+            log::debug!(
+                "{dropped} suspected mic echo(es) discarded: no system segment within {timeout} \
+                 ms ({:?})",
+                self.echo.stats
+            );
+        }
+    }
+
+    /// Log the session's echo counters and publish them for [`PipelineHandle::echo_stats`].
+    fn end_echo_stats(&mut self, session_id: i64) {
+        let s = self.echo.stats;
+        if s != EchoStats::default() {
+            log::info!(
+                "session {session_id} echoes: {} mic segments transcribed, {} skipped by the \
+                 audio check ({} linked, {} discarded), {} marked by the text rule",
+                s.mic_transcribed,
+                s.echo_skipped_by_audio,
+                s.echo_linked,
+                s.echo_discarded,
+                s.echo_marked_by_text
+            );
+        }
+        self.publish_echo_stats();
     }
 
     /// Transcribe a closed segment, store it (as an echo when it repeats system audio) and
@@ -732,6 +970,38 @@ impl Session<'_> {
     ) {
         let started_at = clock.ms_at(seg.start_sample);
         let ended_at = clock.ms_at(seg.start_sample + seg.samples.len() as u64);
+        if source == AudioSourceKind::Mic
+            && self
+                .echo_mode()
+                .active(self.out.echo_dedup.load(Ordering::Relaxed))
+            && let Some(v) = self.audio_echo_check(started_at, seg)
+        {
+            log::debug!(
+                "mic segment {} ms: envelope peak {:.2} at {} ms, {:+.1} dB vs system, {} ms \
+                 uncovered of {} ms → {}",
+                seg.duration_ms(),
+                v.peak,
+                v.lag_ms,
+                v.gain_db,
+                v.uncovered_ms,
+                v.active_ms,
+                if v.is_echo() { "echo" } else { "transcribe" }
+            );
+            if v.is_echo() {
+                self.echo.stats.echo_skipped_by_audio += 1;
+                return self.suspect_echo(PendingEcho {
+                    session_id,
+                    started_at,
+                    ended_at,
+                    speech_ms: seg.speech_ms,
+                    peak: v.peak,
+                    lag_ms: v.lag_ms,
+                });
+            }
+        }
+        if source == AudioSourceKind::Mic {
+            self.echo.stats.mic_transcribed += 1;
+        }
         let t = match self.engine.transcribe(&seg.samples) {
             Ok(t) => t,
             Err(e) => return self.out.send(PipelineEvent::Warning(e.to_string())),
@@ -769,14 +1039,20 @@ impl Session<'_> {
             }
         };
         if let Some(sys) = echo_of {
+            self.echo.stats.echo_marked_by_text += 1;
             log::info!(
                 "mic segment {} stored as the echo of system segment {sys}",
                 row.id
             );
         }
         self.out.send(PipelineEvent::Segment(row.clone()));
-        if dedup && source == AudioSourceKind::System {
-            self.claim_echoes(&row);
+        if source == AudioSourceKind::System {
+            if !self.echo.pending.is_empty() {
+                self.link_pending(&row);
+            }
+            if dedup {
+                self.claim_echoes(&row);
+            }
         }
     }
 
@@ -819,6 +1095,7 @@ impl Session<'_> {
             }
             match self.store.set_segment_echo(mic.id, Some(system.id)) {
                 Ok(()) => {
+                    self.echo.stats.echo_marked_by_text += 1;
                     log::info!(
                         "mic segment {} marked as the echo of system segment {}",
                         mic.id,

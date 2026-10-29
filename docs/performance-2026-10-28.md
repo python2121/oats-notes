@@ -333,3 +333,24 @@ per-second mean is 4.1 %. Interpretation: idle listening with the stateful VAD n
 1.2 % of one core (down from 2.1 % at baseline) even on a loaded machine, and the lane split did
 not add measurable mic-only cost; the system lane's own idle cost (a silent tap, all-zero frames
 skip VAD) is still unmeasured until the permission works.
+
+## Addendum (2026-10-29): audio-level echo check — expected saving, not yet measured
+
+In a real meeting on the built-in speakers, 55 of 69 microphone segments were echoes of the
+system lane, and two-lane listening cost ≈ 15 % of a core against ≈ 3 % single-lane: most of
+the difference was Parakeet transcribing microphone audio that the text rule
+(`oats_core::echo`) then hid. The pipeline now checks each closing microphone segment against
+the system audio it already holds (`oats_core::echo_audio`: 10 ms envelope correlation over
+± 500 ms lags, plus gain and coverage guards) and does not transcribe a suspected echo. The
+check itself is a few hundred thousand multiply-adds per segment (envelopes of ≤ 31 s of audio,
+≤ 3 000 frames × 101 lags) — negligible next to one transcription — and the system ring is a
+memcpy of every system chunk into a 45 s buffer (≈ 2.9 MB).
+
+Expected: two-lane speech on speakers should approach the single-lane cost (system lane
+transcribed, plus the user's own segments), i.e. from ≈ 15 % toward ≈ 3–5 % of a core, to the
+extent the echoes are recognised. To be confirmed by a live measurement: a call on speakers
+with `RUST_LOG=oats_core=info` (the session's last log line gives `mic segments transcribed /
+skipped by the audio check (linked, discarded) / marked by the text rule`) and
+`scripts/perf.sh`. The thresholds are calibrated on synthetic signals only; if real rooms
+correlate lower, segments are simply transcribed as before (no saving, no loss) — the
+counters show which. `OATS_ECHO_AUDIO=never` gives the old behaviour for an A/B run.

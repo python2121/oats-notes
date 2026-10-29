@@ -70,14 +70,9 @@ pub fn ncc_peak(
 
 /// The RMS envelope of `samples`: one value per `hop` samples (the last partial hop dropped).
 /// Correlating envelopes ([`ncc_peak`] on two envelopes, mean removed by [`centred`]) is
-/// robust to the room's filtering, which smears the raw waveform.
-pub fn envelope(samples: &[f32], hop: usize) -> Vec<f32> {
-    let hop = hop.max(1);
-    samples
-        .chunks_exact(hop)
-        .map(|c| (c.iter().map(|&s| s * s).sum::<f32>() / hop as f32).sqrt())
-        .collect()
-}
+/// robust to the room's filtering, which smears the raw waveform. The same function the
+/// pipeline's audio-level echo check uses.
+pub use oats_core::echo_audio::envelope;
 
 /// `v` minus its mean.
 pub fn centred(v: &[f32]) -> Vec<f32> {
