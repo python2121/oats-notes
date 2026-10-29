@@ -35,6 +35,24 @@ ROOT=$(pwd)
 DURATION=${PERF_DURATION:-120}
 STRESS_SPEED=${PERF_STRESS_SPEED:-4}
 OUT=${PERF_OUT:-$ROOT/target/perf/$(date +%Y%m%d-%H%M%S)}
+
+# Provenance, so runs archived under docs/perf/ stay comparable over time (apples to apples):
+# commit, dirty tree, build profile, machine, OS, script version. Written before anything runs.
+write_provenance() {
+    mkdir -p "$OUT"
+    {
+        echo "# Provenance"
+        echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$ROOT" diff --quiet 2>/dev/null || echo ' (dirty)')"
+        echo "perf.sh: $(git -C "$ROOT" log -1 --format=%h -- scripts/perf.sh scripts/perf_summary.py 2>/dev/null || echo unknown)"
+        echo "binary: $BIN ($(stat -f %Sm -t %Y-%m-%dT%H:%M:%S "$BIN" 2>/dev/null || echo missing))"
+        echo "profile: $( [[ "$BIN" == */release/* ]] && echo release || echo debug )"
+        echo "machine: $(sysctl -n machdep.cpu.brand_string 2>/dev/null) · $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )) GB"
+        echo "os: $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null) ($(sw_vers -buildVersion 2>/dev/null))"
+        echo "env: OATS_BRAIN=${OATS_BRAIN:-} OATS_ENGINE=${OATS_ENGINE:-}"
+        echo
+    } > "$OUT/provenance.md"
+}
 BIN=${PERF_BIN:-$ROOT/target/release/oats-notes}
 SPEECH=${PERF_SPEECH_WAV:-long.wav}
 SAMPLE=${PERF_SAMPLE:-1}
@@ -47,6 +65,7 @@ if [ ! -x "$BIN" ]; then
     cargo build --release -p oats-notes
 fi
 mkdir -p "$OUT"
+write_provenance
 # never leave the app, top or log stream behind (an error, ^C)
 trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 echo "perf: results in $OUT"
@@ -182,4 +201,4 @@ for s in "${SCENARIOS[@]}"; do
     sleep 5   # let the machine settle between runs
 done
 
-python3 -I "$ROOT/scripts/perf_summary.py" "$OUT" "${SCENARIOS[@]}" | tee "$OUT/summary.md"
+{ cat "$OUT/provenance.md"; python3 -I "$ROOT/scripts/perf_summary.py" "$OUT" "${SCENARIOS[@]}"; } | tee "$OUT/summary.md"
