@@ -7,7 +7,7 @@
 //! - The worker blocks on the audio channel; nothing spins. With no audio channel attached
 //!   (not listening) it blocks on the command channel.
 //! - VAD runs on every frame (cheap); the model runs only on closed speech segments.
-//! - Level events are rate-limited to ~10 Hz; the UI repaints only when an event arrives
+//! - Level events are rate-limited to ~4 Hz (and off while the UI says it has no use for them); the UI repaints only when an event arrives
 //!   (`wake` is called after each event is queued).
 
 use std::sync::Arc;
@@ -21,8 +21,8 @@ use crate::store::{Store, TranscriptRow};
 
 /// How long the worker waits for audio before checking commands again.
 const AUDIO_POLL: Duration = Duration::from_millis(100);
-/// Minimum spacing of `Level` events (~10 Hz).
-const LEVEL_INTERVAL: Duration = Duration::from_millis(100);
+/// Minimum spacing of `Level` events (~4 Hz).
+const LEVEL_INTERVAL: Duration = Duration::from_millis(250);
 /// How long dropping the handle waits for the worker before detaching it (a model load can
 /// take minutes and can't be interrupted; quitting must not wait for it).
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -69,6 +69,8 @@ pub struct PipelineHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     /// Set on drop: the worker gives up between engine-load steps.
     cancel: Arc<AtomicBool>,
+    /// Whether the worker sends `Level` events (the UI turns them off while hidden).
+    levels_wanted: Arc<AtomicBool>,
 }
 
 pub(crate) enum Command {
@@ -101,7 +103,12 @@ impl Pipeline {
             segmenter,
             wake,
         } = self;
-        let out = Outbox { tx: event_tx, wake };
+        let levels_wanted = Arc::new(AtomicBool::new(true));
+        let out = Outbox {
+            tx: event_tx,
+            wake,
+            levels_wanted: levels_wanted.clone(),
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let thread = std::thread::Builder::new()
@@ -128,6 +135,7 @@ impl Pipeline {
             events,
             thread,
             cancel,
+            levels_wanted,
         }
     }
 }
@@ -142,6 +150,12 @@ impl PipelineHandle {
     /// closed.
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(Command::Stop);
+    }
+
+    /// Turn `Level` events on or off (default on). Off sends none and wakes nothing for them;
+    /// all other events are unaffected.
+    pub fn set_levels_wanted(&self, wanted: bool) {
+        self.levels_wanted.store(wanted, Ordering::Relaxed);
     }
 
     /// Drain pending events (call once per UI frame).
@@ -185,6 +199,7 @@ impl Drop for PipelineHandle {
 struct Outbox {
     tx: Sender<PipelineEvent>,
     wake: Box<dyn Fn() + Send + Sync>,
+    levels_wanted: Arc<AtomicBool>,
 }
 
 impl Outbox {
@@ -422,7 +437,9 @@ impl Session<'_> {
                     }
                     pending.drain(..offset);
 
-                    if last_level.is_none_or(|t| t.elapsed() >= LEVEL_INTERVAL) {
+                    if self.out.levels_wanted.load(Ordering::Relaxed)
+                        && last_level.is_none_or(|t| t.elapsed() >= LEVEL_INTERVAL)
+                    {
                         last_level = Some(Instant::now());
                         self.out.send(PipelineEvent::Level {
                             rms_db: EnergyVad::rms_db(&chunk),

@@ -3,7 +3,7 @@
 //! the in-window egui bar, the key map, and sticky prefs through eframe storage.
 //!
 //! Idle cost: nothing here asks for a repaint. The pipeline's `wake` repaints when an event
-//! arrives (≤ ~10 Hz level updates while listening); with nothing happening the app sits at
+//! arrives (≤ ~4 Hz level updates while listening and visible); with nothing happening the app sits at
 //! ~0 % CPU.
 
 use std::any::Any;
@@ -278,6 +278,10 @@ pub struct OatsApp {
     status_item: Option<Box<dyn StatusItem>>,
     /// What the status item was last told to show.
     status_shown: Option<StatusState>,
+    /// Whether `Level` events are currently requested from the pipeline (off while hidden).
+    levels_on: bool,
+    /// The window was hidden by close-to-status-item and not yet shown again.
+    window_hidden: bool,
     /// The shared menu event stream (native menu bar + status item); macOS only.
     menu_events: Option<MenuEvents>,
     /// Quit was asked for (⌘Q, the status item's Quit): let the window close for real.
@@ -326,6 +330,8 @@ impl OatsApp {
             prefs,
             persist: options.persist,
             native_menu: cfg!(target_os = "macos") && options.native_menu,
+            levels_on: true,
+            window_hidden: false,
             status: PipelineStatus::Loading("Starting…".to_owned()),
             engine_name: String::new(),
             level: None,
@@ -439,6 +445,7 @@ impl OatsApp {
             match a {
                 StatusAction::ToggleListening => self.run(Command::ToggleListening),
                 StatusAction::ShowWindow => {
+                    self.window_hidden = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -456,7 +463,21 @@ impl OatsApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_hidden = true;
             log::info!("window hidden; still running in the status item (Quit to exit)");
+        }
+    }
+
+    /// Ask the pipeline for level events only while the window can be seen.
+    fn sync_levels(&mut self, ctx: &egui::Context) {
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        let want = !self.window_hidden && !minimized;
+        if want != self.levels_on {
+            self.levels_on = want;
+            self.pipeline.set_levels_wanted(want);
+            if !want {
+                self.level = None;
+            }
         }
     }
 
@@ -1144,6 +1165,7 @@ impl eframe::App for OatsApp {
         self.route_menu_events();
         self.sync_status_item(ctx);
         self.handle_close(ctx);
+        self.sync_levels(ctx);
         // "Today" rolls over at local midnight even when nothing else wakes the UI: one
         // repaint scheduled for then (not a continuous one)
         ctx.request_repaint_after(until_local_midnight());

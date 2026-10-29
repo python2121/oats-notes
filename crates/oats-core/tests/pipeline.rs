@@ -247,7 +247,7 @@ fn startup_reports_loading_engine_and_idle_in_order() {
 }
 
 #[test]
-fn level_events_are_rate_limited_to_about_10_hz() {
+fn level_events_are_rate_limited_to_about_4_hz() {
     let rig = null("levels");
     let mut seen = Vec::new();
     wait_idle(&rig.h, &mut seen);
@@ -273,16 +273,41 @@ fn level_events_are_rate_limited_to_about_10_hz() {
         .iter()
         .filter(|e| matches!(e, PipelineEvent::Level { .. }))
         .count();
-    assert!(levels >= 3, "{levels} level events in {elapsed} ms");
+    assert!(levels >= 2, "{levels} level events in {elapsed} ms");
     assert!(
-        levels <= elapsed / 100 + 2,
-        "{levels} level events in {elapsed} ms (≤ ~10 Hz expected)"
+        levels <= elapsed / 250 + 2,
+        "{levels} level events in {elapsed} ms (≤ ~4 Hz expected)"
     );
     for e in &seen {
         if let PipelineEvent::Level { rms_db, .. } = e {
             assert!((-100.0..=0.0).contains(rms_db), "{rms_db}");
         }
     }
+}
+
+#[test]
+fn no_level_events_while_levels_are_unwanted_but_segments_still_arrive() {
+    let rig = scripted("nolevels", Faults::default());
+    let mut seen = Vec::new();
+    wait_idle(&rig.h, &mut seen);
+    rig.h.set_levels_wanted(false);
+    let (tx, _) = start(&rig.h, &mut seen);
+    seen.clear();
+    send(&tx, SPEECH, 1_000);
+    send(&tx, 0.0, 1_500);
+    wait_for(&rig.h, &mut seen, "segment", |e| {
+        matches!(e, PipelineEvent::Segment(_))
+    });
+    rig.h.stop();
+    wait_for(&rig.h, &mut seen, "session end", |e| {
+        matches!(e, PipelineEvent::SessionEnded(_))
+    });
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, PipelineEvent::Level { .. })),
+        "{seen:?}"
+    );
 }
 
 #[test]
