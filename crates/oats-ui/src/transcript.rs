@@ -4,9 +4,10 @@
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use egui::{Align2, Rect, Sense, pos2, vec2};
-use oats_core::{AudioSourceKind, Node, TranscriptRow};
+use oats_core::{AudioSourceKind, TranscriptRow};
 
-use crate::notes::node_path;
+use crate::move_to::{MoveDraft, move_field};
+use oats_brain::MoveTarget;
 
 use crate::theme::Tokens;
 
@@ -17,6 +18,11 @@ pub enum TranscriptAction {
     Move {
         segment: i64,
         category: Option<i64>,
+    },
+    /// "Move to…" on a row: the text typed in its field.
+    MoveText {
+        segment: i64,
+        text: String,
     },
     Delete {
         segment: i64,
@@ -240,7 +246,7 @@ fn edge_marker(ui: &mut egui::Ui, t: &Tokens, text: &str) -> Rect {
 pub fn transcript_list(
     ui: &mut egui::Ui,
     pages: &mut TranscriptPages,
-    nodes: &[Node],
+    draft: &mut Option<MoveDraft>,
     focus: &mut TranscriptFocus,
 ) -> Vec<TranscriptAction> {
     let t = Tokens::get(ui.ctx());
@@ -317,7 +323,7 @@ pub fn transcript_list(
                     });
                     ui.add_space(4.0);
                 }
-                let rect = transcript_row(ui, &t, row, nodes, &mut actions);
+                let rect = transcript_row(ui, &t, row, draft, &mut actions);
                 focus_row(ui, &t, focus, row.id, rect);
                 let y = rect.top() - origin;
                 if was_armed {
@@ -391,7 +397,7 @@ fn focus_row(ui: &mut egui::Ui, t: &Tokens, focus: &mut TranscriptFocus, id: i64
 pub fn transcript_rows(
     ui: &mut egui::Ui,
     rows: &[TranscriptRow],
-    nodes: &[Node],
+    draft: &mut Option<MoveDraft>,
 ) -> Vec<TranscriptAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
@@ -413,7 +419,7 @@ pub fn transcript_rows(
             });
             ui.add_space(4.0);
         }
-        transcript_row(ui, &t, row, nodes, &mut actions);
+        transcript_row(ui, &t, row, draft, &mut actions);
     }
     actions
 }
@@ -445,7 +451,7 @@ fn transcript_row(
     ui: &mut egui::Ui,
     t: &Tokens,
     row: &TranscriptRow,
-    nodes: &[Node],
+    draft: &mut Option<MoveDraft>,
     actions: &mut Vec<TranscriptAction>,
 ) -> Rect {
     // the hover fill goes UNDER the text: reserve its slot first, fill it once the row's height
@@ -518,35 +524,20 @@ fn transcript_row(
         }
     }
     resp.context_menu(|ui| {
-        ui.menu_button("Move to", |ui| {
-            for c in nodes.iter().filter(|n| !n.archived) {
-                let here = row.node_id == Some(c.id);
-                let name = node_path(nodes, c.id);
-                let label = if here { format!("✔ {name}") } else { name };
-                if ui.add_enabled(!here, egui::Button::new(label)).clicked() {
-                    actions.push(TranscriptAction::Move {
-                        segment: row.id,
-                        category: Some(c.id),
-                    });
-                    ui.close();
-                }
-            }
-            ui.separator();
-            let none = row.node_id.is_none();
-            if ui
-                .add_enabled(
-                    !none,
-                    egui::Button::new(if none { "✔ None" } else { "None" }),
-                )
-                .clicked()
-            {
-                actions.push(TranscriptAction::Move {
-                    segment: row.id,
-                    category: None,
-                });
-                ui.close();
-            }
-        });
+        if ui.button("Move to…").clicked() {
+            *draft = Some(MoveDraft::new(MoveTarget::Segment(row.id), row.node_id));
+            ui.close();
+        }
+        if ui
+            .add_enabled(row.node_id.is_some(), egui::Button::new("Unfile"))
+            .clicked()
+        {
+            actions.push(TranscriptAction::Move {
+                segment: row.id,
+                category: None,
+            });
+            ui.close();
+        }
         if ui.button("Copy Text").clicked() {
             ui.ctx().copy_text(row.text.clone());
             ui.close();
@@ -557,6 +548,12 @@ fn transcript_row(
             ui.close();
         }
     });
+    if let Some(text) = move_field(ui, t, draft, MoveTarget::Segment(row.id)) {
+        actions.push(TranscriptAction::MoveText {
+            segment: row.id,
+            text,
+        });
+    }
     ui.add_space(2.0);
     rect
 }

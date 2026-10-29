@@ -238,6 +238,14 @@ pub enum BrainCommand {
     /// call.
     Summarise(i64),
     UndoChange(i64),
+    /// "Move to…" with text the local resolver could not settle: haiku picks an existing node
+    /// or proposes one new project, and the item is moved there. `current_node` is where the
+    /// item is filed now (the default category for a new project).
+    ResolveMove {
+        target: crate::moveto::MoveTarget,
+        text: String,
+        current_node: Option<i64>,
+    },
     Shutdown,
 }
 
@@ -536,6 +544,7 @@ struct Worker {
     pending_commands: VecDeque<PendingCommand>,
     reinterpret: VecDeque<i64>,
     summarise: VecDeque<i64>,
+    moves: VecDeque<(crate::moveto::MoveTarget, String, Option<i64>)>,
     undo: VecDeque<i64>,
     categorise_due: Option<Instant>,
     interpret_due: Option<Instant>,
@@ -636,6 +645,7 @@ impl Worker {
             pending_commands: VecDeque::new(),
             reinterpret: VecDeque::new(),
             summarise: VecDeque::new(),
+            moves: VecDeque::new(),
             undo: VecDeque::new(),
             categorise_due: None,
             interpret_due: None,
@@ -868,6 +878,12 @@ impl Worker {
                 }
                 continue;
             }
+            if up && let Some((target, text, current)) = self.moves.pop_front() {
+                self.run_move(target, &text, current);
+                let (kind, id) = target.kind_and_id();
+                self.settled(kind, Some(id));
+                continue;
+            }
             if !up {
                 // unavailable: nothing runs but the (free) re-probe; due jobs simply wait
                 if due(self.probe_due()) {
@@ -964,6 +980,15 @@ impl Worker {
             BrainCommand::Summarise(id) => {
                 self.queued("summarise", Some(id));
                 self.summarise.push_back(id);
+            }
+            BrainCommand::ResolveMove {
+                target,
+                text,
+                current_node,
+            } => {
+                let (kind, id) = target.kind_and_id();
+                self.queued(kind, Some(id));
+                self.moves.push_back((target, text, current_node));
             }
             BrainCommand::UndoChange(id) => self.undo.push_back(id),
             BrainCommand::Shutdown => return false,
@@ -1306,6 +1331,71 @@ impl Worker {
             }
         }
         self.report_backlog();
+    }
+
+    /// "Move to…": one tier-0 call picks an existing node or proposes one new project for
+    /// the typed text; the item is moved there and the result reported like a voice command
+    /// (a confirmation pop-up). A failure is a warning; nothing is retried (the user's field
+    /// reopens with the text).
+    fn run_move(&mut self, target: crate::moveto::MoveTarget, text: &str, current: Option<i64>) {
+        use crate::moveto;
+        let item = match target {
+            moveto::MoveTarget::Episode(id) => match self.store.episode(id) {
+                Ok(Some(e)) => format!("{}\n{}", e.title, e.summary),
+                _ => {
+                    return self.out.send(BrainEvent::Warning(
+                        "move: the note no longer exists".into(),
+                    ));
+                }
+            },
+            moveto::MoveTarget::Segment(id) => match self.store.segment(id) {
+                Ok(Some(r)) => r.text,
+                _ => {
+                    return self.out.send(BrainEvent::Warning(
+                        "move: the segment no longer exists".into(),
+                    ));
+                }
+            },
+        };
+        if !self.within_budget(Tier::Reactive) {
+            return self.out.send(BrainEvent::Warning(
+                "move: the brain's tier-0 limit is reached; try again later".into(),
+            ));
+        }
+        let model = self.cfg.models.reactive.clone();
+        let text = text.to_owned();
+        let _ = self.run_job(Tier::Reactive, "move", move |w, _run_id| {
+            let tree = w.store.nodes().map_err(|e| e.to_string())?;
+            let req = moveto::move_request(&tree, target, &item, current, &text, Some(model));
+            let resp = w.call(&req).map_err(JobError::from)?;
+            let fail = |msg: String| JobError {
+                cost_usd: resp.cost_usd,
+                ..JobError::from(msg)
+            };
+            let decision = resp
+                .structured
+                .as_ref()
+                .ok_or_else(|| "no structured output".to_owned())
+                .and_then(|v| moveto::parse_move(v).map_err(|e| e.to_string()))
+                .map_err(fail)?;
+            let done = moveto::execute_move(&w.store, target, &decision, now_ms()).map_err(fail)?;
+            w.out.send(BrainEvent::Command {
+                segment_id: match target {
+                    moveto::MoveTarget::Segment(id) => id,
+                    moveto::MoveTarget::Episode(_) => 0,
+                },
+                lines: vec![done.confirmation.clone()],
+                confirmations: vec![done.confirmation.clone()],
+            });
+            Ok(JobOutput {
+                summary: done.confirmation.clone(),
+                cost_usd: resp.cost_usd,
+                duration_ms: resp.duration_ms,
+                model: resp.model,
+                lines: vec![done.confirmation],
+                changed: true,
+            })
+        });
     }
 
     /// A command that kept failing: consumed (no later pass retries it, and it never joins

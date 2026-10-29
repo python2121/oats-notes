@@ -29,9 +29,11 @@ pub mod dates;
 pub mod episodes;
 pub mod hotword;
 pub mod interpret;
+pub mod moveto;
 pub mod scheduler;
 
 pub use claude_cli::{ClaudeCli, CliError, Request, Response, Version};
 pub use episodes::{Chunk, EpisodeRule};
 pub use hotword::{Executed, HotwordConfig};
+pub use moveto::{LocalMove, MoveTarget, resolve_local};
 pub use scheduler::{Brain, BrainCommand, BrainConfig, BrainEvent, BrainHandle, Tier, TierModels};

@@ -40,16 +40,11 @@ pub enum NotesAction {
     Summarise(i64),
     /// A note's decision / action item was clicked: the transcript at the segment it was said.
     ShowSegment(i64),
-    /// "Move to ▸" on a note: refile the episode under this node.
-    MoveNote {
+    /// "Move to…" on a note: the text typed in its field (resolved by the app: the tree
+    /// first, the model when that is ambiguous or new).
+    MoveText {
         episode: i64,
-        node: i64,
-    },
-    /// "New project…" on a note: create a project (the user's own) under the note's category
-    /// (else Work) and move the note there.
-    MoveToNewProject {
-        episode: i64,
-        name: String,
+        text: String,
     },
 }
 
@@ -156,6 +151,7 @@ pub fn busy_label(kind: &str) -> &'static str {
         "reorganise" => "Reorganising…",
         "reinterpret" => "Re-interpreting…",
         "summarise" => "Summarising…",
+        "move" | "move_segment" => "Moving…",
         _ => "Working…",
     }
 }
@@ -339,8 +335,8 @@ pub struct NotesState {
     /// Conversation notes heard (partly) from an app classed Media — "Mark as media" is
     /// offered on them.
     pub media_convertible: std::collections::HashSet<i64>,
-    /// "New project…" on a note: the inline name field (episode id, name, focus pending).
-    pub new_project: Option<(i64, String, bool)>,
+    /// "Move to…": the open inline field, for a note or a transcript segment.
+    pub move_draft: Option<crate::move_to::MoveDraft>,
 }
 
 /// The text fields of a note being edited. Decisions: one per line. Action items: one per
@@ -642,96 +638,35 @@ fn item_line(
     chip(ui, actions);
 }
 
-/// "Move to ▸" (every node, full paths; the note's own node checked) and "New project…" on a
-/// note's context menu.
-fn move_menu(
-    ui: &mut egui::Ui,
-    e: &Episode,
-    nodes: &[Node],
-    state: &mut NotesState,
-    actions: &mut Vec<NotesAction>,
-) {
-    ui.menu_button("Move to", |ui| {
-        let mut list: Vec<(String, i64)> = nodes
-            .iter()
-            .filter(|n| !n.archived)
-            .map(|n| (node_path(nodes, n.id), n.id))
-            .collect();
-        list.sort();
-        for (path, id) in list {
-            let here = e.node_id == Some(id);
-            let label = if here { format!("✔ {path}") } else { path };
-            if ui.add_enabled(!here, egui::Button::new(label)).clicked() {
-                actions.push(NotesAction::MoveNote {
-                    episode: e.id,
-                    node: id,
-                });
-                ui.close();
-            }
-        }
-    });
-    if ui.button("New project…").clicked() {
-        state.new_project = Some((e.id, String::new(), true));
+/// "Move to…" on a note's context menu: opens the inline field.
+fn move_menu(ui: &mut egui::Ui, e: &Episode, state: &mut NotesState) {
+    if ui.button("Move to…").clicked() {
+        state.move_draft = Some(crate::move_to::MoveDraft::new(
+            oats_brain::MoveTarget::Episode(e.id),
+            e.node_id,
+        ));
         ui.close();
     }
 }
 
-/// The inline "New project" name field under a note's title (after "New project…"): Enter or
-/// Create makes the project and moves the note there; Escape or Cancel closes it.
-fn new_project_field(
+/// The inline "Move to" field under a note's title.
+fn move_field(
     ui: &mut egui::Ui,
     t: &Tokens,
     e: &Episode,
     state: &mut NotesState,
     actions: &mut Vec<NotesAction>,
 ) {
-    let Some((id, name, focus)) = state.new_project.as_mut() else {
-        return;
-    };
-    if *id != e.id {
-        return;
-    }
-    let mut create = false;
-    let mut cancel = false;
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("New project")
-                .color(t.text_secondary)
-                .size(11.5),
-        );
-        let r = ui.add(
-            egui::TextEdit::singleline(name)
-                .desired_width(220.0)
-                .hint_text("Project name")
-                .font(t.font(12.5)),
-        );
-        if *focus {
-            r.request_focus();
-            *focus = false;
-        }
-        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            create = true;
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            cancel = true;
-        }
-        if small_button(ui, "Create", !name.trim().is_empty()) {
-            create = true;
-        }
-        if small_button(ui, "Cancel", true) {
-            cancel = true;
-        }
-    });
-    if create && let Some((episode, name, _)) = state.new_project.take() {
-        if !name.trim().is_empty() {
-            actions.push(NotesAction::MoveToNewProject {
-                episode,
-                name: name.trim().to_owned(),
-            });
-        }
-    } else if cancel {
-        state.new_project = None;
+    if let Some(text) = crate::move_to::move_field(
+        ui,
+        t,
+        &mut state.move_draft,
+        oats_brain::MoveTarget::Episode(e.id),
+    ) {
+        actions.push(NotesAction::MoveText {
+            episode: e.id,
+            text,
+        });
     }
 }
 
@@ -1039,7 +974,7 @@ pub(crate) fn episode_card(
                     });
                 }
                 resp.context_menu(|ui| {
-                    move_menu(ui, e, nodes, state, actions);
+                    move_menu(ui, e, state);
                     if e.is_media() || convertible {
                         ui.separator();
                     }
@@ -1138,7 +1073,7 @@ pub(crate) fn episode_card(
                     }
                 });
             });
-            new_project_field(ui, t, e, state, actions);
+            move_field(ui, t, e, state, actions);
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(12.0);
                 ui.label(
@@ -1591,7 +1526,7 @@ pub fn node_view(
             });
             if state.show_transcript {
                 ui.add_space(4.0);
-                out.transcript = transcript_rows(ui, rows, nodes);
+                out.transcript = transcript_rows(ui, rows, &mut state.move_draft);
             }
             ui.add_space(12.0);
         });
@@ -1917,16 +1852,16 @@ fn project_notes(
     }
     ui.add_space(2.0);
     for e in episodes {
-        // "New project…" from a closed row: its name field lives in the open card
+        // "Move to…" from a closed row: its field lives in the open card
         if state
-            .new_project
+            .move_draft
             .as_ref()
-            .is_some_and(|(id, _, _)| *id == e.id)
+            .is_some_and(|d| d.target == oats_brain::MoveTarget::Episode(e.id))
         {
             state.open_notes.insert(e.id);
         }
         let open = state.open_notes.contains(&e.id);
-        if note_row(ui, t, e, nodes, state, open, actions) {
+        if note_row(ui, t, e, state, open, actions) {
             if open {
                 state.open_notes.remove(&e.id);
             } else {
@@ -1945,14 +1880,13 @@ fn note_row(
     ui: &mut egui::Ui,
     t: &Tokens,
     e: &Episode,
-    nodes: &[Node],
     state: &mut NotesState,
     open: bool,
     actions: &mut Vec<NotesAction>,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
     resp.context_menu(|ui| {
-        move_menu(ui, e, nodes, state, actions);
+        move_menu(ui, e, state);
     });
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| {

@@ -11,6 +11,7 @@
 pub mod app;
 pub mod calendar;
 pub mod menu_events;
+pub mod move_to;
 #[cfg(target_os = "macos")]
 pub mod native_menu;
 pub mod notes;

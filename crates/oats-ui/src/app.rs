@@ -35,6 +35,7 @@ use crate::transcript::{
     PAGE_ROWS, TranscriptAction, TranscriptFocus, TranscriptPages, local_midnight_ms,
     transcript_list, until_local_midnight,
 };
+use oats_brain::MoveTarget;
 
 /// eframe storage key for [`AppPrefs`] (RON).
 pub const PREFS_KEY: &str = "oatsnotes.prefs";
@@ -494,6 +495,9 @@ pub struct OatsApp {
     brain_status: BrainStatus,
     /// The last executed voice command, for the status strip.
     last_command: Option<String>,
+    /// Confirmation pop-ups raised where no `Context` is at hand (a local "Move to…"); shown
+    /// at the next brain-event pass.
+    pending_confirms: Vec<String>,
     episodes: Vec<Episode>,
     /// A project page's items filed there from notes homed elsewhere
     /// ([`Store::items_filed_under`]); empty outside a Node view.
@@ -612,6 +616,7 @@ impl OatsApp {
             brain,
             brain_status: BrainStatus::default(),
             last_command: None,
+            pending_confirms: Vec::new(),
             episodes: Vec::new(),
             filed_items: Vec::new(),
             events: Vec::new(),
@@ -993,6 +998,10 @@ impl OatsApp {
             BrainCommand::ReorganiseNow => ("reorganise", None),
             BrainCommand::Reinterpret(id) => ("reinterpret", Some(*id)),
             BrainCommand::Summarise(id) => ("summarise", Some(*id)),
+            BrainCommand::ResolveMove { target, .. } => {
+                let (kind, id) = target.kind_and_id();
+                (kind, Some(id))
+            }
             _ => ("", None),
         };
         if !kind.is_empty() {
@@ -1660,9 +1669,13 @@ impl OatsApp {
 
     /// Drain and apply the brain's events (`ctx` for the confirmation pop-ups' clock).
     fn handle_brain_events(&mut self, ctx: &egui::Context) {
+        let local = std::mem::take(&mut self.pending_confirms);
+        if !local.is_empty() {
+            self.confirm(ctx, local);
+        }
         let events: Vec<BrainEvent> = match &self.brain {
             Some(b) => b.poll(),
-            None => return,
+            None => Vec::new(),
         };
         let mut reload = false;
         for ev in events {
@@ -1745,8 +1758,48 @@ impl OatsApp {
                 }
             }
         }
+        if self.settle_move_draft(ctx) {
+            reload = true;
+        }
         if reload {
             self.reload();
+        }
+    }
+
+    /// A "Move to…" the model was asked about has settled (or its wait ended): the field
+    /// closes when the item's home changed, else it reopens with the text and a warning pop-up.
+    /// `true` when the item moved (the caller reloads).
+    fn settle_move_draft(&mut self, ctx: &egui::Context) -> bool {
+        let Some(d) = self.notes_state.move_draft.clone() else {
+            return false;
+        };
+        let (kind, id) = d.target.kind_and_id();
+        if !d.sent || self.brain_status.busy(kind, Some(id)) {
+            return false;
+        }
+        let home = match d.target {
+            MoveTarget::Episode(i) => self.store.episode(i).ok().flatten().map(|e| e.node_id),
+            MoveTarget::Segment(i) => self.store.segment(i).ok().flatten().map(|r| r.node_id),
+        };
+        match home {
+            Some(n) if n != d.from => {
+                self.notes_state.move_draft = None;
+                if let (MoveTarget::Episode(ep), Some(node)) = (d.target, n)
+                    && self.focus_episode == Some(ep)
+                {
+                    self.set_view(View::Node(node));
+                    self.focus_episode = Some(ep);
+                }
+                true
+            }
+            _ => {
+                if let Some(d) = self.notes_state.move_draft.as_mut() {
+                    d.sent = false;
+                    d.focus = true;
+                }
+                self.brain_toast(ctx, "Couldn't move it; try another name".to_owned(), true);
+                false
+            }
         }
     }
 
@@ -2014,6 +2067,10 @@ impl OatsApp {
                     edited = true;
                     self.store.set_segment_node(segment, category)
                 }
+                TranscriptAction::MoveText { segment, text } => {
+                    self.submit_move(MoveTarget::Segment(segment), text);
+                    continue;
+                }
                 TranscriptAction::Delete { segment } => {
                     edited = true;
                     self.store.delete_segment(segment)
@@ -2077,9 +2134,8 @@ impl OatsApp {
                     self.notes_state.pending_focus = Some(id);
                 }
                 NotesAction::ShowSegment(seg) => self.jump_to_segment(Some(seg)),
-                NotesAction::MoveNote { episode, node } => self.move_note(episode, node),
-                NotesAction::MoveToNewProject { episode, name } => {
-                    self.move_note_to_new_project(episode, &name)
+                NotesAction::MoveText { episode, text } => {
+                    self.submit_move(MoveTarget::Episode(episode), text)
                 }
                 NotesAction::SaveEdit(id, content) => {
                     let now = chrono::Local::now().timestamp_millis();
@@ -2093,93 +2149,64 @@ impl OatsApp {
         }
     }
 
-    /// "Move to ▸" on a note: refiled (an `episode_move` change); a note open on its own
-    /// follows to its new place.
-    fn move_note(&mut self, episode: i64, node: i64) {
-        let now = chrono::Local::now().timestamp_millis();
-        match self.store.move_episode(episode, node, now) {
-            Ok(true) => {
-                let name = self
-                    .store
-                    .node(node)
-                    .ok()
-                    .flatten()
-                    .map(|n| n.name)
-                    .unwrap_or_default();
-                self.last_command = Some(format!("Moved the note to {name}"));
-                if self.focus_episode == Some(episode) {
-                    self.set_view(View::Node(node));
-                    self.focus_episode = Some(episode);
-                }
-                self.reload();
-            }
-            Ok(false) => {}
-            Err(e) => self.store_error(e),
+    /// "Move to…": the typed text is matched against the tree first (no model call); an
+    /// ambiguous or new target goes to the brain (`ResolveMove`), and the field stays open,
+    /// disabled with a spinner, until it settles.
+    fn submit_move(&mut self, target: MoveTarget, text: String) {
+        let from = self
+            .notes_state
+            .move_draft
+            .as_ref()
+            .filter(|d| d.target == target)
+            .and_then(|d| d.from);
+        if let oats_brain::LocalMove::One(node) = oats_brain::resolve_local(&self.nodes, &text) {
+            return self.move_local(target, node);
         }
+        if self.brain.is_none() || !self.brain_status.available() {
+            self.warning = Some(
+                "That needs claude to work out (it isn't available); use an existing name"
+                    .to_owned(),
+            );
+            return;
+        }
+        if let Some(d) = self.notes_state.move_draft.as_mut() {
+            d.sent = true;
+        }
+        self.brain_send(BrainCommand::ResolveMove {
+            target,
+            text,
+            current_node: from,
+        });
     }
 
-    /// "New project…" on a note: a project of the user's own under the note's category (else
-    /// Work, else the first category), then the note moves there.
-    fn move_note_to_new_project(&mut self, episode: i64, name: &str) {
-        let home = self
-            .store
-            .episode(episode)
-            .ok()
-            .flatten()
-            .and_then(|e| e.node_id);
-        let root = |id: i64| {
-            let mut cur = self.nodes.iter().find(|n| n.id == id)?;
-            for _ in 0..16 {
-                match cur.parent_id {
-                    None => return Some(cur.id),
-                    Some(p) => cur = self.nodes.iter().find(|n| n.id == p)?,
+    /// A move the tree settled by itself: refiled at once (an `episode_move` change for a
+    /// note), confirmed with a pop-up.
+    fn move_local(&mut self, target: MoveTarget, node: i64) {
+        let now = chrono::Local::now().timestamp_millis();
+        let moved = match target {
+            MoveTarget::Episode(id) => self.store.move_episode(id, node, now),
+            MoveTarget::Segment(id) => self.store.set_segment_node(id, Some(node)).map(|_| true),
+        };
+        match moved {
+            Ok(moved) => {
+                let path = oats_brain::moveto::node_path(&self.nodes, node);
+                self.pending_confirms.push(if moved {
+                    format!("Moved to {path}")
+                } else {
+                    format!("Already in {path}")
+                });
+                self.last_command = Some(format!("Moved to {path}"));
+                self.notes_state.move_draft = None;
+                if let MoveTarget::Episode(ep) = target
+                    && self.focus_episode == Some(ep)
+                {
+                    self.set_view(View::Node(node));
+                    self.focus_episode = Some(ep);
                 }
-            }
-            None
-        };
-        let categories = || {
-            self.nodes
-                .iter()
-                .filter(|n| n.kind == oats_core::NodeKind::Category && !n.archived)
-        };
-        let parent = home
-            .and_then(root)
-            .filter(|c| {
-                self.nodes
-                    .iter()
-                    .any(|n| n.id == *c && n.name != oats_core::store::MEDIA_CATEGORY)
-            })
-            .or_else(|| {
-                categories()
-                    .find(|n| oats_core::store::name_key(&n.name) == "work")
-                    .map(|n| n.id)
-            })
-            .or_else(|| categories().map(|n| n.id).next());
-        let Some(parent) = parent else {
-            self.warning = Some("No category to create the project in".to_owned());
-            return;
-        };
-        let created = self.store.add_node(
-            Some(parent),
-            oats_core::NodeKind::Project,
-            name,
-            "",
-            oats_core::Origin::User,
-        );
-        match created {
-            Ok(node) => {
-                let now = chrono::Local::now().timestamp_millis();
-                if let Err(e) = self.store.record_change(
-                    None,
-                    "node_create",
-                    &format!("Created project '{}'", node.name),
-                    &serde_json::json!(null),
-                    &serde_json::json!(node),
-                    now,
-                ) {
-                    self.store_error(e);
+                self.reload();
+                if matches!(target, MoveTarget::Segment(_)) {
+                    self.reload_rows();
                 }
-                self.move_note(episode, node.id);
             }
             Err(e) => self.store_error(e),
         }
@@ -3200,7 +3227,7 @@ impl eframe::App for OatsApp {
                             transcript_actions = transcript_list(
                                 &mut body_ui,
                                 &mut self.pages,
-                                &self.nodes,
+                                &mut self.notes_state.move_draft,
                                 &mut self.transcript_focus,
                             );
                         }

@@ -367,7 +367,7 @@ hotword; hotwords are unchanged.
 
 ## The brain (`crates/oats-brain`)
 
-Design and sources: `docs/research-claude-cli-and-interpretation.md`. Four modules plus the
+Design and sources: `docs/research-claude-cli-and-interpretation.md`. Five modules plus the
 scheduler, all platform-neutral, all testable without the CLI (a fake `claude` shell script):
 
 - `claude_cli`: `ClaudeCli::run(&Request) -> Response` spawns
@@ -477,6 +477,26 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   respects the per-run new-node cap (`execute_capped`). The prompt's "now" is when the
   command was SPOKEN (the segment's timestamp), so a command worked off a backlog still dates
   "tomorrow" from that day.
+- `moveto` ("Move to…" on a note card / single-note view / project-page note row, and on
+  transcript rows): right-click → "Move to…" opens an inline field (placeholder "project or
+  topic name, or describe a new one…"; Enter submits, Escape cancels; `oats-ui::move_to`).
+  The tree submenu and "New project…" are gone. The app first resolves the text locally with
+  no model call (`oats_brain::resolve_local`, pure: a full path "Work › Commerce project" /
+  "work/commerce", else an exact name, else a unique prefix, else a unique substring among
+  projects and topics; archived nodes ignored) and moves at once (`episode_move` change for a
+  note, `set_segment_node` for a segment; toast "Moved to Work › Commerce project").
+  Ambiguous or new text sends `BrainCommand::ResolveMove { target: MoveTarget::Episode(id) |
+  Segment(id), text, current_node }`: a tier-0 (haiku) job with `prompts/move.{system,user}.md`
+  and schema `{action: existing|create, node_id, new_project{name,parent_id,description},
+  reason}` (the prompt gets the tree, the item's title/summary or text, its current path). The
+  scheduler executes it in one savepoint (`moveto::execute_move`): an unknown node / parent,
+  a Media parent or an empty name is a warning and nothing changes; a new project is
+  `created_by = user` with a `node_create` change; the result is a `BrainEvent::Command`
+  confirmation ("Moved to …" / "Created Admin › X and moved the note") so the usual toast and
+  ding show. Kinds in `Queued` / `Settled`: `move` (episode id) and `move_segment`. Tier-0
+  caps apply. While it runs the field is disabled with a spinner; on failure (or when the wait
+  ends) it reopens with the text and a warning toast. Needs claude: without it only names in
+  the tree work.
 - `scheduler`: one worker thread (`Brain::spawn() -> BrainHandle`, same shape as the
   pipeline), one job at a time, blocks on `recv_timeout` until the next due job. Tiers:
   0 reactive (haiku): hotword commands at once; categorisation 3 min after the first new

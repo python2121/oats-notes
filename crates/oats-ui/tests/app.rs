@@ -1321,33 +1321,84 @@ fn an_item_filed_elsewhere_shows_inline_and_its_click_chain_reaches_the_transcri
     assert!(rig.shows("the checkout needs a progress spinner"));
 }
 
-#[test]
-fn move_to_a_new_project_creates_it_and_moves_the_note() {
-    let dir = TempDir::new("move-new-project");
-    let (commerce, pricing, _launch) = seed_project_notes(&dir.db());
-    let mut rig = build(&dir.db(), None, None);
-    rig.app().selftest_view_node(commerce);
-    rig.harness.run_steps(3);
-    rig.harness
-        .get_by_label("Note: Pricing sync")
-        .click_secondary();
+/// A fake `claude` that logs every prompt and answers any "move" request with a new project
+/// under the Admin category (`admin`).
+fn fake_cli_move(dir: &Path, admin: i64) -> ClaudeCli {
+    let script = dir.join("claude");
+    let body = format!(
+        r#"#!/bin/sh
+case " $* " in *" --version "*) echo "2.1.312 (Claude Code)"; exit 0;; esac
+cat >> '{prompts}'
+echo '{{"type":"result","is_error":false,"result":"","total_cost_usd":0.001,"duration_ms":10,"structured_output":{{"action":"create","node_id":null,"new_project":{{"name":"Apartment lease renewal","parent_id":{admin},"description":"Renewing the lease"}},"reason":"new"}}}}'
+"#,
+        prompts = dir.join("prompts").display()
+    );
+    std::fs::write(&script, body).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    ClaudeCli {
+        binary: script,
+        model: None,
+        timeout: Duration::from_secs(10),
+        max_budget_usd: None,
+        work_dir: Some(dir.join("work")),
+        isolate: true,
+    }
+}
+
+fn open_move_field(rig: &mut Rig, note: &str, text: &str) {
+    rig.harness.get_by_label(note).click_secondary();
     rig.harness.run_steps(2);
-    rig.harness.get_by_label("New project…").click();
+    rig.harness.get_by_label("Move to…").click();
     rig.harness.run_steps(3);
     rig.harness
         .get_by_role(egui::accesskit::Role::TextInput)
-        .type_text("Pricing committee");
+        .type_text(text);
     rig.harness.run_steps(2);
-    rig.harness.get_by_label("Create").click();
+    rig.harness.key_press(egui::Key::Enter);
+}
+
+#[test]
+fn move_to_an_existing_name_moves_the_note_without_a_brain_call() {
+    let dir = TempDir::new("move-local");
+    let (_commerce, pricing, _launch) = seed_project_notes(&dir.db());
+    let lease = Store::open(&dir.db())
+        .unwrap()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "Apartment lease")
+        .unwrap()
+        .id;
+    let commerce = Store::open(&dir.db())
+        .unwrap()
+        .episode(pricing)
+        .unwrap()
+        .unwrap()
+        .node_id
+        .unwrap();
+    let brain = Brain {
+        config: BrainConfig {
+            cli: fake_cli_logging(&dir.0),
+            ..BrainConfig::default()
+        },
+        store_path: dir.db(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    let mut rig = build(&dir.db(), None, Some(brain));
+    rig.app().selftest_view_node(commerce);
+    rig.until("the brain to report in", |app| {
+        interpret_enabled(app) == Some(true)
+    });
+    rig.harness.run_steps(3);
+    // a unique substring of "Apartment lease"
+    open_move_field(&mut rig, "Note: Pricing sync", "apartment");
     rig.harness.run_steps(3);
     let s = Store::open(&dir.db()).unwrap();
-    let work = s.categories().unwrap()[0].id;
-    let p = s
-        .find_node(Some(work), "Pricing committee")
-        .unwrap()
-        .unwrap();
-    assert_eq!(p.created_by, oats_core::Origin::User);
-    assert_eq!(s.episode(pricing).unwrap().unwrap().node_id, Some(p.id));
+    assert_eq!(s.episode(pricing).unwrap().unwrap().node_id, Some(lease));
     assert!(
         s.changes(10)
             .unwrap()
@@ -1355,6 +1406,63 @@ fn move_to_a_new_project_creates_it_and_moves_the_note() {
             .any(|c| c.kind == "episode_move")
     );
     assert!(!rig.shows("Note: Pricing sync"), "moved off this page");
+    assert!(rig.shows("Moved to Work › Apartment lease"), "the toast");
+    assert!(
+        !dir.0.join("prompts").exists(),
+        "no model call for a name in the tree"
+    );
+}
+
+#[test]
+fn move_to_something_new_asks_the_model_and_creates_the_project() {
+    let dir = TempDir::new("move-new-project");
+    let (commerce, pricing, _launch) = seed_project_notes(&dir.db());
+    let admin = Store::open(&dir.db())
+        .unwrap()
+        .categories()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == "Admin")
+        .unwrap()
+        .id;
+    let brain = Brain {
+        config: BrainConfig {
+            cli: fake_cli_move(&dir.0, admin),
+            ..BrainConfig::default()
+        },
+        store_path: dir.db(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    let mut rig = build(&dir.db(), None, Some(brain));
+    rig.app().selftest_view_node(commerce);
+    rig.until("the brain to report in", |app| {
+        interpret_enabled(app) == Some(true)
+    });
+    rig.harness.run_steps(3);
+    open_move_field(
+        &mut rig,
+        "Note: Pricing sync",
+        "new project for the lease renewal under admin",
+    );
+    rig.until("the note to move", |app| {
+        app.listed_episodes().iter().all(|e| e.id != pricing)
+    });
+    let s = Store::open(&dir.db()).unwrap();
+    let p = s
+        .find_node(Some(admin), "Apartment lease renewal")
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.created_by, oats_core::Origin::User);
+    assert_eq!(s.episode(pricing).unwrap().unwrap().node_id, Some(p.id));
+    let prompts = std::fs::read_to_string(dir.0.join("prompts")).unwrap();
+    assert!(prompts.contains("lease renewal under admin"));
+    assert!(
+        s.changes(10)
+            .unwrap()
+            .iter()
+            .any(|c| c.kind == "node_create")
+    );
 }
 
 #[test]
