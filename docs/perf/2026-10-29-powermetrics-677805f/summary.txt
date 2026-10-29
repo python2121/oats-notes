@@ -1,0 +1,20 @@
+~/pm-baseline.txt: 29 samples (first skipped)
+  metric                               mean       peak
+  E-cluster active residency %         66.8      100.0
+  P-cluster active residency %         52.9       72.5
+  CPU power mW                        386.7     3730.0
+  GPU power mW                         12.5       17.0
+  ANE power mW                          0.0        0.0
+  Combined power mW                   399.0     3743.0
+  GPU active frequency MHz            460.9      650.0
+  GPU active residency %                4.7        6.1
+~/pm-app.txt: 29 samples (first skipped)
+  metric                               mean       peak
+  E-cluster active residency %         75.7       99.8
+  P-cluster active residency %         52.9       62.8
+  CPU power mW                        533.9     2706.0
+  GPU power mW                         35.3       47.0
+  ANE power mW                         38.7     1121.0
+  Combined power mW                   607.8     3292.0
+  GPU active frequency MHz            479.3      666.0
+  GPU active residency %                8.4       10.7
