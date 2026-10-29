@@ -20,6 +20,7 @@ pub mod selftest;
 pub mod sidebar;
 pub mod system_font;
 pub mod theme;
+pub mod timefmt;
 pub mod toast;
 pub mod todos;
 pub mod topic;

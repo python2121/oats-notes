@@ -1954,3 +1954,36 @@ fn interpret_now_greys_out_with_a_spinner_label_until_the_brain_settles() {
             .is_none()
     );
 }
+
+#[test]
+fn toggling_24_hour_time_in_preferences_rerenders_transcript_times() {
+    let dir = TempDir::new("clock24");
+    seed(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.harness.step();
+    let t = now_ms() - 60_000;
+    let local = chrono::Local.timestamp_millis_opt(t).single().unwrap();
+    use chrono::Timelike;
+    let h12 = if local.hour().is_multiple_of(12) {
+        12
+    } else {
+        local.hour() % 12
+    };
+    let ap = if local.hour() < 12 { "am" } else { "pm" };
+    let twelve = format!("{h12}:{:02} {ap}", local.minute());
+    let twenty_four = format!("{:02}:{:02}", local.hour(), local.minute());
+    rig.until_label("rows", "loose words");
+    assert!(rig.shows(&twelve), "12-hour by default: {twelve}");
+    rig.app().run(Command::Preferences);
+    rig.harness.step();
+    rig.harness.step();
+    rig.harness.get_by_label("Use 24-hour time").click();
+    rig.harness.step();
+    rig.harness.step();
+    assert!(rig.app().prefs().clock_24h);
+    assert!(
+        rig.shows(&twenty_four),
+        "24-hour after the toggle: {twenty_four}"
+    );
+    assert!(!rig.shows(&twelve) || twelve.starts_with(&twenty_four));
+}

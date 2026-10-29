@@ -468,11 +468,7 @@ fn media_section(
     for p in plays {
         ui.horizontal(|ui| {
             ui.add_space(MARGIN);
-            let when = format!(
-                "{}–{}",
-                clock(p.started_at, &Local),
-                clock(p.ended_at, &Local)
-            );
+            let when = crate::timefmt::range(p.started_at, p.ended_at, &Local);
             let text = RichText::new(play_label(p)).size(12.5);
             let resp = match &p.url {
                 Some(url) => {

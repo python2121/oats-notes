@@ -279,13 +279,13 @@ fn transcript_hit(ui: &mut egui::Ui, t: &Tokens, row: &TranscriptRow, hl: &str) 
         ui.add_space(8.0);
         let tag = source_label(row);
         let (time_rect, _) = ui.allocate_exact_size(
-            vec2(44.0, if tag.is_some() { 32.0 } else { 18.0 }),
+            vec2(60.0, if tag.is_some() { 32.0 } else { 18.0 }),
             Sense::hover(),
         );
         ui.painter().text(
             pos2(time_rect.left() + 4.0, time_rect.top() + 3.0),
             Align2::LEFT_TOP,
-            clock(row.started_at, &Local),
+            crate::timefmt::clock_col(row.started_at, &Local),
             t.mono(10.5),
             t.text_tertiary,
         );

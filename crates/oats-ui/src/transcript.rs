@@ -186,14 +186,9 @@ pub fn day_heading(day: NaiveDate, this_year: i32) -> String {
     }
 }
 
-/// "14:05".
-pub fn clock<Tz: TimeZone>(ms: i64, tz: &Tz) -> String
-where
-    Tz::Offset: std::fmt::Display,
-{
-    at(ms, tz)
-        .map(|d| d.format("%H:%M").to_string())
-        .unwrap_or_else(|| "--:--".to_owned())
+/// "14:05" or "2:05 pm" (the clock preference; see `timefmt`).
+pub fn clock<Tz: TimeZone>(ms: i64, tz: &Tz) -> String {
+    crate::timefmt::clock(ms, tz)
 }
 
 /// Indices into `rows` where a new day starts (always includes 0 for a non-empty list), with
@@ -424,7 +419,7 @@ pub fn transcript_rows(
 }
 
 /// Width of the time column.
-const TIME_W: f32 = 44.0;
+const TIME_W: f32 = 60.0;
 
 /// The small lane tag ("them") of a system-audio row, top-left at `at`.
 pub(crate) fn source_tag(ui: &egui::Ui, t: &Tokens, at: egui::Pos2, label: &str) {
@@ -467,12 +462,19 @@ fn transcript_row(
             // the time; "me" rows (the microphone) look as they always did
             let (time_rect, time_resp) = ui
                 .allocate_exact_size(vec2(TIME_W, if them { 32.0 } else { 18.0 }), Sense::hover());
-            ui.painter().text(
-                pos2(time_rect.left() + 4.0, time_rect.top() + 3.0),
-                Align2::LEFT_TOP,
-                clock(row.started_at, &Local),
-                t.mono(10.5),
-                t.text_tertiary,
+            // a real (non-selectable) label so the time is also in the accessibility tree
+            ui.put(
+                Rect::from_min_size(
+                    pos2(time_rect.left() + 4.0, time_rect.top() + 3.0),
+                    vec2(TIME_W - 4.0, 14.0),
+                ),
+                egui::Label::new(
+                    egui::RichText::new(crate::timefmt::clock_col(row.started_at, &Local))
+                        .font(t.mono(10.5))
+                        .color(t.text_tertiary),
+                )
+                .selectable(false)
+                .wrap_mode(egui::TextWrapMode::Extend),
             );
             if let Some(tag) = tag {
                 source_tag(
@@ -620,7 +622,7 @@ mod tests {
         let ms = 1_793_106_300_000;
         let day = day_of(ms, &tz);
         assert_eq!(day, NaiveDate::from_ymd_opt(2026, 10, 27));
-        assert_eq!(clock(ms, &tz), "14:05");
+        assert_eq!(crate::timefmt::clock_with(ms, &tz, true), "14:05");
         let d = NaiveDate::from_ymd_opt(2026, 10, 27);
         assert_eq!(
             d.map(|d| day_heading(d, 2026)).as_deref(),

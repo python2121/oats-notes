@@ -62,6 +62,8 @@ pub struct AppPrefs {
     /// The Transcripts view lists media rows (YouTube, music, media apps); off by default —
     /// search results always include them, tagged "media".
     pub show_media: bool,
+    /// Show clock times as 14:05 instead of 2:05 pm.
+    pub clock_24h: bool,
 }
 
 impl Default for AppPrefs {
@@ -75,6 +77,7 @@ impl Default for AppPrefs {
             command_sound: true,
             sidebar_episodes_open: Vec::new(),
             show_media: false,
+            clock_24h: false,
         }
     }
 }
@@ -576,6 +579,7 @@ impl OatsApp {
             (status.is_some() || options.native_menu).then(|| MenuEvents::install(&cc.egui_ctx));
         #[cfg(not(target_os = "macos"))]
         let menu_events = None;
+        crate::timefmt::set_24h(prefs.clock_24h);
         let sidebar_open = prefs.sidebar_episodes_open.iter().copied().collect();
         let mut app = OatsApp {
             pipeline,
@@ -2309,6 +2313,7 @@ impl OatsApp {
         let mut save = false;
         let mut close = false;
         let mut sound = self.prefs.command_sound;
+        let mut clock_24h = self.prefs.clock_24h;
         // the YouTube & music policy: OATS_MEDIA_POLICY fixes it, else `meta.media_policy`
         let fixed_policy = oats_core::MediaPolicy::env_override();
         let stored_policy = self
@@ -2353,6 +2358,7 @@ impl OatsApp {
                 );
                 ui.add_space(8.0);
                 ui.checkbox(&mut sound, "Play a sound for voice commands");
+                ui.checkbox(&mut clock_24h, "Use 24-hour time");
                 ui.add_space(10.0);
                 ui.label(
                     egui::RichText::new("Media (YouTube, music, media apps)")
@@ -2402,6 +2408,8 @@ impl OatsApp {
             }
         }
         self.prefs.command_sound = sound;
+        self.prefs.clock_24h = clock_24h;
+        crate::timefmt::set_24h(clock_24h);
         if close {
             self.prefs_window = None;
         }
@@ -2756,6 +2764,7 @@ impl eframe::App for OatsApp {
     // Runs every frame, and also while the window is hidden (eframe then runs no ui pass), so
     // everything the status item drives lives here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::timefmt::set_24h(self.prefs.clock_24h);
         self.poll_quit_flag(ctx);
         self.handle_events();
         self.brain_status.now = ctx.input(|i| i.time);
@@ -3148,6 +3157,7 @@ mod tests {
             command_sound: false,
             sidebar_episodes_open: vec![3, 9],
             show_media: true,
+            clock_24h: true,
         };
         prefs.store(&mut s);
         assert_eq!(AppPrefs::load(&s), prefs);

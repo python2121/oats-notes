@@ -124,8 +124,10 @@ where
 {
     let tz = now.timezone();
     match tz.timestamp_millis_opt(ms).single() {
-        Some(d) if d.year() == now.year() => d.format("%a %-d %b, %H:%M").to_string(),
-        Some(d) => d.format("%a %-d %b %Y, %H:%M").to_string(),
+        Some(d) if d.year() == now.year() => {
+            format!("{}, {}", d.format("%a %-d %b"), crate::timefmt::hm(&d))
+        }
+        Some(d) => format!("{}, {}", d.format("%a %-d %b %Y"), crate::timefmt::hm(&d)),
         None => "?".to_owned(),
     }
 }
@@ -148,9 +150,9 @@ where
     let label = if due - now_ms < HOUR {
         format!("in {} min", ((due - now_ms) + MINUTE - 1) / MINUTE)
     } else if days == 0 {
-        d.format("today, %H:%M").to_string()
+        format!("today, {}", crate::timefmt::hm(&d))
     } else if days == 1 {
-        d.format("tomorrow, %H:%M").to_string()
+        format!("tomorrow, {}", crate::timefmt::hm(&d))
     } else if days < 7 {
         format!("in {days} days")
     } else {
@@ -167,7 +169,7 @@ where
     let until = t.snoozed_until.filter(|u| *u > now.timestamp_millis())?;
     let d = now.timezone().timestamp_millis_opt(until).single()?;
     Some(if d.date_naive() == now.date_naive() {
-        d.format("snoozed until %H:%M").to_string()
+        format!("snoozed until {}", crate::timefmt::hm(&d))
     } else {
         format!("snoozed until {}", absolute(until, now))
     })
@@ -586,21 +588,27 @@ mod tests {
         let at = n.timestamp_millis();
         assert_eq!(due_label(at + 20 * MINUTE, &n), ("in 20 min".into(), false));
         assert_eq!(due_label(at + 61, &n), ("in 1 min".into(), false));
-        assert_eq!(due_label(at + 3 * HOUR, &n), ("today, 17:00".into(), false));
+        assert_eq!(
+            due_label(at + 3 * HOUR, &n),
+            ("today, 5:00 pm".into(), false)
+        );
         assert_eq!(
             due_label(at + 19 * HOUR, &n),
-            ("tomorrow, 09:00".into(), false)
+            ("tomorrow, 9:00 am".into(), false)
         );
         assert_eq!(due_label(at + 2 * DAY, &n), ("in 2 days".into(), false));
         assert_eq!(
             due_label(at + 44 * DAY - 5 * HOUR, &n),
-            ("Sat 12 Dec, 09:00".into(), false)
+            ("Sat 12 Dec, 9:00 am".into(), false)
         );
         assert_eq!(
             due_label(at + 400 * DAY, &n),
-            ("Fri 3 Dec 2027, 14:00".into(), false)
+            ("Fri 3 Dec 2027, 2:00 pm".into(), false)
         );
-        assert_eq!(due_label(at - HOUR, &n), ("Thu 29 Oct, 13:00".into(), true));
+        assert_eq!(
+            due_label(at - HOUR, &n),
+            ("Thu 29 Oct, 1:00 pm".into(), true)
+        );
         assert!(due_label(at, &n).1, "due now is due");
     }
 
@@ -657,11 +665,14 @@ mod tests {
             dedupe_key: None,
             created_at: 0,
         };
-        assert_eq!(snooze_label(&t, &n).as_deref(), Some("snoozed until 14:30"));
+        assert_eq!(
+            snooze_label(&t, &n).as_deref(),
+            Some("snoozed until 2:30 pm")
+        );
         t.snoozed_until = Some(n.timestamp_millis() + DAY);
         assert_eq!(
             snooze_label(&t, &n).as_deref(),
-            Some("snoozed until Fri 30 Oct, 14:00")
+            Some("snoozed until Fri 30 Oct, 2:00 pm")
         );
         t.snoozed_until = Some(n.timestamp_millis() - 1);
         assert_eq!(snooze_label(&t, &n), None);

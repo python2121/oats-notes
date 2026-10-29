@@ -910,13 +910,9 @@ pub(crate) fn episode_card(
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(12.0);
                 ui.label(
-                    RichText::new(format!(
-                        "{}–{}",
-                        clock(e.started_at, &Local),
-                        clock(e.ended_at, &Local)
-                    ))
-                    .font(t.mono(10.5))
-                    .color(t.text_tertiary),
+                    RichText::new(crate::timefmt::range(e.started_at, e.ended_at, &Local))
+                        .font(t.mono(10.5))
+                        .color(t.text_tertiary),
                 );
                 if let Some(n) = e.node_id {
                     chip(ui, t, &node_path(nodes, n), true);
@@ -926,7 +922,7 @@ pub(crate) fn episode_card(
                 }
                 if let Some(at) = e.user_edited_at {
                     let when = crate::transcript::at(at, &Local)
-                        .map(|d| d.format("%b %-d, %H:%M").to_string())
+                        .map(|d| format!("{}, {}", d.format("%b %-d"), crate::timefmt::hm(&d)))
                         .unwrap_or_default();
                     chip(ui, t, "edited", false).on_hover_text(format!(
                         "Edited by you, {when}. The brain leaves its text alone."
@@ -1393,7 +1389,7 @@ fn children_section(
                 let last = c
                     .last_activity
                     .and_then(|ms| crate::transcript::at(ms, &Local))
-                    .map(|d| format!(" · last {}", d.format("%b %-d, %H:%M")))
+                    .map(|d| format!(" · last {}, {}", d.format("%b %-d"), crate::timefmt::hm(&d)))
                     .unwrap_or_default();
                 ui.label(
                     RichText::new(format!(
@@ -1712,11 +1708,7 @@ fn note_row(
         t.text_tertiary,
     );
     x += 46.0_f32.max(w + 6.0);
-    let range = format!(
-        "{}–{}",
-        clock(e.started_at, &Local),
-        clock(e.ended_at, &Local)
-    );
+    let range = crate::timefmt::range(e.started_at, e.ended_at, &Local);
     let range = p.layout_no_wrap(range, t.mono(10.5), t.text_tertiary);
     let w = range.size().x;
     p.galley(
