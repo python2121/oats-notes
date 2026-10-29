@@ -1529,16 +1529,18 @@ impl OatsApp {
                     self.jump_to_segment(seg);
                     continue;
                 }
-                TodoAction::Add(text) => self
+                TodoAction::Add { text, due } => self
                     .store
                     .add_todo(
                         &NewTodo {
                             text,
+                            due,
                             ..Default::default()
                         },
                         now,
                     )
                     .map(|_| ()),
+                TodoAction::SetDue(id, due) => self.store.set_todo_due(id, due),
                 TodoAction::SetDone(id, true) => self.store.complete_todo(id, now),
                 TodoAction::SetDone(id, false) => self.store.reopen_todo(id),
                 TodoAction::Snooze { id, until } => self.store.snooze_todo(id, until),

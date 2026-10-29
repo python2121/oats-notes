@@ -26,6 +26,7 @@ pub mod paths;
 pub mod pipeline;
 pub mod segmenter;
 pub mod store;
+pub mod when;
 
 pub use echo::DedupMode;
 pub use echo_audio::EchoAudioMode;

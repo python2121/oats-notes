@@ -30,7 +30,7 @@ one engine crate and one status crate against those contracts, and nothing else 
 never changes.
 
 ```
-crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, echo rules (text + audio), paths  (no platform code)
+crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, echo rules (text + audio), `when` date parser, paths  (no platform code)
 crates/oats-brain              the brain: `claude` CLI wrapper, episode cutting, prompts (prompts/*.md), hotword commands, tiered scheduler  (no platform code)
 crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mic/system + own FIR resampler: microphone (InputPolicy, MicMode plain | voice processing) and system audio (SystemCapture); the voice-command ding (chime)
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
@@ -279,9 +279,20 @@ hotword; hotwords are unchanged.
   first) at the BOTTOM, crossed through (`RichText::strikethrough`, text_tertiary, "done
   <date>"). Open rows: checkbox, text, due ("in 20 min" / "today, 15:00" / "tomorrow, 09:00" /
   "in 3 days" / "Thu 12 Dec, 09:00"; overdue in `t.danger`; `todos::due_label`), "snoozed
-  until …", node chip, source chip. "+ Add todo" field (Enter adds an undated todo, source
-  user). Right-click: Mark Done/Not Done, Edit Text, Snooze ▸ 1 hour / 1 day / 1 week, Clear
-  Snooze, Show in Transcript, Delete. Reloads on `BrainEvent::Changed` / `Command` and after
+  until …", node chip, source chip. "+ Add todo" text field plus a "due" field (Enter in
+  either adds, source user; `todos::parse_add`): the due text goes through
+  `oats_core::when::parse` (lenient and pure, generic over the zone: `2026-11-04 [09:00]`,
+  `11/4[/2026]`, `4 nov` / `nov 4`, `today`, `tomorrow`, weekday names / `next friday` (next
+  occurrence), `in 2 hours` / `in 3 days` / `in 1 week`, each optionally `at 9`, `at 9:30`,
+  `9am`, `14:00`, `noon`; date-only = 09:00 local; a DST gap resolves forward; unreadable =
+  `None`, never a guess). The text field also takes a trailing ` @ <date>` ("call landlord @
+  tomorrow 9am"; the due field wins if both). An unreadable date is shown in `t.danger` and
+  nothing is added. Right-click: Mark Done/Not Done, Edit Text, Set due… (inline field,
+  pre-filled `YYYY-MM-DD HH:MM`; Enter saves via `Store::set_todo_due`, empty clears, Escape
+  cancels; the calendar's day panel menu has no inline editor, so only Clear due there), Clear
+  due, Snooze ▸ 1 hour / 1 day / 1 week, Clear Snooze, Show in Transcript, Delete. The due
+  label on a row is clickable and opens the same editor. Dated todos show in the calendar grid
+  and day panel (one shared `todos` list, reloaded after every edit). Reloads on `BrainEvent::Changed` / `Command` and after
   local edits.
 - **Reminder pop-ups** (`toast::toasts`, an `egui::Area` anchored RIGHT_TOP, 12 pt below the
   control bar, cards 340 pt, corner radius 10, `t.chrome` + 1 px `t.button_border`, the popup
@@ -365,7 +376,7 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   and never creates nodes. Anti-sprawl:
   existing nodes are preferred, names are matched case/whitespace-insensitively
   (`store::name_key`), at most `max_new_nodes_per_run` new nodes per run. Events are upserted
-  by `dedupe_key = ep:<episode>:<date>:<name_key(title)>`, so a revision updates in place and
+  by `dedupe_key = ev:<date>:<name_key(title)>` (no episode id), so a revision updates in place and
   drops what it no longer proposes. `apply_interpretation` runs in one transaction
   (`Store::with_savepoint`): a failure half-way leaves nothing. The user's own data is out of
   the automatic tiers' reach: the review's `drop_event` only removes events with
@@ -548,7 +559,7 @@ specific node, `episode_id`, `interpreted_at`, `categorised`, `source` mic | sys
 views, counts, `uninterpreted_*` / `uncategorised_*`, `segments_between`, `segments_of_episode`;
 ordering by `started_at, id` interleaves the lanes); `episodes` (title, markdown
 summary, node, decisions / action items / topics JSON, `low_signal`, model, cost, `revision`,
-`last_revised_at`); `events` (`dedupe_key` UNIQUE, `source`, `source_segment_id`,
+`last_revised_at`); `events` (`dedupe_key` UNIQUE: interpretation events are `ev:<local date>:<name_key(title)>` — NO episode id, so a re-interpretation, a revision or a second meeting mentioning the same event that day upserts one row (latest details, `source_episode_id` = latest episode that mentioned it); hotword events are `hotword:<segment>:…`, never colliding; `name_key` = whitespace-collapsed, lower-cased. `reset_episode` leaves the episode's interpretation events pointing at the dead id; `apply_interpretation` then re-points those whose `source_segment_id` is in the new chunk (`Store::adopt_orphan_events`) and drops the ones the new pass didn't propose (hotword/user events never touched). The v6 migration rewrites `ep:<id>:…` keys, collapses twins (lowest id survives with the latest twin's details, todos repointed) and deletes interpretation events whose episode no longer exists, logged at info; `source`, `source_segment_id`,
 `source_episode_id`, `confidence`); `reminders` = THE TODOS (name kept; `event_id`, `text`,
 `due` NULL = undated, `completed_at` NULL = open — `done` is kept in sync for the record, a
 v3 done row got `completed_at = created_at` —, `snoozed_until`, `source` default hotword,

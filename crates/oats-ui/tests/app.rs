@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use chrono::TimeZone;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use oats_brain::{Brain, BrainConfig, BrainHandle, ClaudeCli};
@@ -815,7 +816,11 @@ fn the_todos_view_lists_open_then_completed_and_adds_by_hand() {
     assert!(rig.shows("Already done"));
     // typed by hand: Enter adds an undated todo
     use egui::accesskit::Role;
-    rig.harness.get_by_role(Role::TextInput).click();
+    rig.harness
+        .get_all_by_role(Role::TextInput)
+        .next()
+        .unwrap()
+        .click();
     rig.harness.run_steps(1);
     rig.harness
         .event(egui::Event::Text("Buy oat milk".to_owned()));
@@ -845,6 +850,106 @@ fn the_todos_view_lists_open_then_completed_and_adds_by_hand() {
             .is_some_and(|t| t.done())
     );
     assert!(rig.app().todos()[0].id != first);
+}
+
+#[test]
+fn a_dated_todo_lands_on_the_calendar_and_set_due_dates_an_undated_one() {
+    use chrono::{Duration, Local, Timelike};
+    use egui::accesskit::Role;
+    let dir = TempDir::new("todo-due");
+    let plain = add_todo(&dir.db(), "Water the plants", None);
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    // "text @ date" in the text field
+    rig.harness
+        .get_all_by_role(Role::TextInput)
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(1);
+    rig.harness
+        .event(egui::Event::Text("call landlord @ tomorrow 9am".to_owned()));
+    rig.harness.key_press(egui::Key::Enter);
+    rig.harness.run_steps(2);
+    let tomorrow = Local::now().date_naive() + Duration::days(1);
+    let added = rig
+        .app()
+        .todos()
+        .iter()
+        .find(|t| t.text == "call landlord")
+        .cloned()
+        .expect("added without the suffix");
+    let due = Local
+        .timestamp_millis_opt(added.due.expect("dated"))
+        .unwrap();
+    assert_eq!(
+        (due.date_naive(), due.hour(), due.minute()),
+        (tomorrow, 9, 0)
+    );
+    let todos = rig.app().todos().to_vec();
+    let by_day = oats_ui::calendar::items_by_day(&[], &todos, &Local, false);
+    assert!(
+        by_day[&tomorrow]
+            .iter()
+            .any(|i| matches!(i, oats_ui::calendar::DayItem::Todo(t) if t.id == added.id))
+    );
+    rig.app().run(Command::ShowCalendar);
+    rig.harness.run_steps(2);
+    // (the grid paints its chips as plain shapes; the offscreen selftest shows them)
+    // an unreadable due in the due field adds nothing
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    let fields: Vec<_> = rig.harness.get_all_by_role(Role::TextInput).collect();
+    fields[0].click();
+    rig.harness.run_steps(1);
+    rig.harness.event(egui::Event::Text("Bad one".to_owned()));
+    rig.harness.run_steps(1);
+    rig.harness
+        .get_all_by_role(Role::TextInput)
+        .nth(1)
+        .unwrap()
+        .click();
+    rig.harness.run_steps(1);
+    rig.harness.event(egui::Event::Text("someday".to_owned()));
+    rig.harness.key_press(egui::Key::Enter);
+    rig.harness.run_steps(2);
+    assert!(rig.app().todos().iter().all(|t| t.text != "Bad one"));
+    // "Set due…" on an undated todo dates it
+    rig.harness
+        .get_by_label("Water the plants")
+        .click_secondary();
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Set due…").click();
+    rig.harness.run_steps(3);
+    rig.harness
+        .event(egui::Event::Text("2030-05-06 15:30".to_owned()));
+    rig.harness.key_press(egui::Key::Enter);
+    rig.harness.run_steps(3);
+    let due = rig
+        .app()
+        .todos()
+        .iter()
+        .find(|t| t.id == plain)
+        .and_then(|t| t.due)
+        .expect("now dated");
+    let d = Local.timestamp_millis_opt(due).unwrap();
+    assert_eq!(d.format("%Y-%m-%d %H:%M").to_string(), "2030-05-06 15:30");
+    // and "Clear due" undates it again
+    rig.harness
+        .get_by_label("Water the plants")
+        .click_secondary();
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Clear due").click();
+    rig.harness.run_steps(3);
+    assert_eq!(
+        rig.app()
+            .todos()
+            .iter()
+            .find(|t| t.id == plain)
+            .and_then(|t| t.due),
+        None
+    );
 }
 
 #[test]
