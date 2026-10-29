@@ -35,6 +35,8 @@ pub struct SelftestOptions {
     pub no_sidebar: bool,
     /// Open the search bar with this query over the seeded data.
     pub search: Option<String>,
+    /// Open the Topic view for this topic over the seeded data.
+    pub topic: Option<String>,
 }
 
 /// [`run_with`] with the default options (Today view, not listening).
@@ -111,6 +113,9 @@ pub fn run_with(
     }
     if let Some(q) = &options.search {
         harness.state_mut().selftest_search(q);
+    }
+    if let Some(q) = &options.topic {
+        harness.state_mut().selftest_topic(q);
     }
     // settle: fonts, layout, the scroll area's stick-to-bottom
     harness.run_steps(4);

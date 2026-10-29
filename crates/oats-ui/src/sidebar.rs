@@ -349,6 +349,10 @@ pub(crate) enum HeaderIcon {
     ShowSidebar,
     /// An ×, for closing a bar (search).
     Close,
+    /// A magnifying glass (the control bar's Find button).
+    Search,
+    /// The same, in the accent colour (the search bar is open).
+    SearchOn,
 }
 
 /// A 24 pt frameless icon button: hover/press backdrop, the icon stroked in the secondary text
@@ -365,7 +369,9 @@ pub(crate) fn header_icon(ui: &mut egui::Ui, icon: HeaderIcon) -> egui::Response
     } else if resp.hovered() {
         p.rect_filled(rect, 4.0, t.hover);
     }
-    let col = if resp.hovered() {
+    let col = if matches!(icon, HeaderIcon::SearchOn) {
+        t.accent
+    } else if resp.hovered() {
         t.text
     } else {
         t.text_secondary
@@ -379,6 +385,10 @@ pub(crate) fn header_icon(ui: &mut egui::Ui, icon: HeaderIcon) -> egui::Response
         HeaderIcon::Plus => {
             p.line_segment([at(12.0, 6.0), at(12.0, 18.0)], stroke);
             p.line_segment([at(6.0, 12.0), at(18.0, 12.0)], stroke);
+        }
+        HeaderIcon::Search | HeaderIcon::SearchOn => {
+            p.circle_stroke(at(10.5, 10.5), 5.5 * s, stroke);
+            p.line_segment([at(14.6, 14.6), at(20.0, 20.0)], stroke);
         }
         HeaderIcon::Close => {
             p.line_segment([at(7.0, 7.0), at(17.0, 17.0)], stroke);

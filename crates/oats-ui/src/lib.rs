@@ -19,6 +19,7 @@ pub mod selftest;
 pub mod sidebar;
 pub mod system_font;
 pub mod theme;
+pub mod topic;
 pub mod transcript;
 
 pub use app::{

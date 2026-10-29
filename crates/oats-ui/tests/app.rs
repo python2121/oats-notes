@@ -629,3 +629,77 @@ fn search_opens_finds_segments_and_episodes_and_escape_restores_the_view() {
     assert_eq!(rig.app().prefs().view, View::All);
     assert!(rig.shows("loose words"));
 }
+
+#[test]
+fn the_search_icon_opens_the_bar() {
+    let dir = TempDir::new("search-icon");
+    let mut rig = build(&dir.db(), None, None);
+    rig.harness.run_steps(2);
+    assert!(!rig.app().search_open());
+    // far right of the 34 pt control bar (under the menu bar), 12 pt margin, 24 pt icon
+    let menu = rig.harness.get_by_label("File").rect();
+    let width = rig.harness.ctx.content_rect().right();
+    rig.click_at(egui::pos2(width - 24.0, menu.bottom() + 12.0));
+    assert!(rig.app().search_open(), "the icon opens the search bar");
+}
+
+#[test]
+fn a_topic_chip_lists_its_notes_and_a_row_jumps_to_the_card() {
+    use oats_core::EpisodeContent;
+    let dir = TempDir::new("topic");
+    let (_work, commerce, _lease) = seed_projects(&dir.db());
+    {
+        let s = Store::open(&dir.db()).unwrap();
+        let t = now_ms() - 3_600_000;
+        s.insert_episode(
+            t,
+            t + 60_000,
+            &EpisodeContent {
+                title: "Pricing sync".into(),
+                summary: "- numbers".into(),
+                node_id: Some(commerce),
+                topics: vec!["Q4 roadmap".into()],
+                model: "m".into(),
+                ..Default::default()
+            },
+            t + 120_000,
+        )
+        .unwrap();
+    }
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowNotes);
+    rig.harness.run_steps(3);
+    assert!(!rig.app().topic_open());
+    rig.harness.get_by_label("Q4 roadmap").click();
+    rig.harness.run_steps(3);
+    assert!(rig.app().topic_open());
+    assert!(rig.shows("Tagged “Q4 roadmap”"));
+    assert!(rig.shows("1 note"));
+    assert!(rig.shows("Pricing sync"));
+    assert!(!rig.shows("- numbers"), "no summaries in the list");
+    assert_eq!(
+        rig.app().prefs().view,
+        View::Notes,
+        "the saved view is untouched"
+    );
+    // a row jumps to the note in its node's view; the card consumes the focus
+    rig.harness.get_by_label("Pricing sync").click();
+    rig.harness.run_steps(3);
+    assert!(!rig.app().topic_open());
+    assert_eq!(rig.app().prefs().view, View::Node(commerce));
+    assert_eq!(
+        rig.app().pending_focus(),
+        None,
+        "the card consumed the focus"
+    );
+    assert!(rig.shows("Pricing sync"));
+    // Escape closes the topic view back to the previous view
+    rig.app().run(Command::ShowNotes);
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Q4 roadmap").click();
+    rig.harness.run_steps(2);
+    assert!(rig.app().topic_open());
+    rig.harness.key_press(egui::Key::Escape);
+    rig.harness.run_steps(2);
+    assert!(!rig.app().topic_open());
+}

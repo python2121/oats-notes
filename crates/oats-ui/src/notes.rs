@@ -22,6 +22,8 @@ pub enum NotesAction {
     Undo(i64),
     /// Drill into a node (a project chip in a category's view).
     SelectNode(i64),
+    /// A topic chip was clicked: show everything tagged with it.
+    OpenTopic(String),
 }
 
 /// What the strip shows about the brain.
@@ -100,7 +102,14 @@ pub struct NotesState {
     pub expanded: Vec<i64>,
     /// A node view's raw transcript section is open (collapsed by default).
     pub show_transcript: bool,
+    /// Scroll to this episode's card and flash it when a list lays it out (consumed there).
+    pub pending_focus: Option<i64>,
+    /// The card flashing right now and the egui time the flash started.
+    pub flash: Option<(i64, f64)>,
 }
+
+/// How long a jumped-to card flashes.
+const FLASH_SECS: f64 = 1.5;
 
 /// "Work › Export rewrite › CSV" for a node.
 pub fn node_path(nodes: &[Node], id: i64) -> String {
@@ -236,6 +245,28 @@ pub fn chip(ui: &mut egui::Ui, t: &Tokens, text: &str, accent: bool) {
             if accent { t.accent } else { t.text_secondary },
         );
     }
+}
+
+/// A topic chip you can click (hover fill, pointer cursor).
+fn topic_chip(ui: &mut egui::Ui, t: &Tokens, text: &str) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), t.font(10.5), t.text_secondary);
+    let size = vec2(galley.size().x + 12.0, 16.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if resp.hovered() { t.pressed } else { t.hover };
+        ui.painter().rect_filled(rect, 8.0, fill);
+        let col = if resp.hovered() {
+            t.text
+        } else {
+            t.text_secondary
+        };
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, col);
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn small_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
@@ -441,7 +472,12 @@ pub(crate) fn episode_card(
                     chip(ui, t, &format!("rev {}", e.revision), false);
                 }
                 for topic in e.topics.iter().take(5) {
-                    chip(ui, t, topic, false);
+                    if topic_chip(ui, t, topic)
+                        .on_hover_text(format!("Show everything tagged “{topic}”"))
+                        .clicked()
+                    {
+                        actions.push(NotesAction::OpenTopic(topic.clone()));
+                    }
                 }
             });
             if !collapsed {
@@ -506,8 +542,35 @@ pub(crate) fn episode_card(
             t.inset.gamma_multiply(if e.low_signal { 0.5 } else { 1.0 }),
         ),
     );
+    focus_card(ui, t, state, e.id, rect);
     ui.add_space(6.0);
     rect
+}
+
+/// The jump-to-note mechanism, run for every laid-out card: scroll to it when it is the
+/// pending focus, then flash an accent fill that fades over [`FLASH_SECS`] (repaints are
+/// requested only while it fades).
+fn focus_card(ui: &mut egui::Ui, t: &Tokens, state: &mut NotesState, id: i64, rect: egui::Rect) {
+    if state.pending_focus == Some(id) {
+        state.pending_focus = None;
+        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+        state.flash = Some((id, ui.input(|i| i.time)));
+    }
+    let Some((fid, start)) = state.flash else {
+        return;
+    };
+    if fid != id {
+        return;
+    }
+    let left = 1.0 - (ui.input(|i| i.time) - start) / FLASH_SECS;
+    if left <= 0.0 {
+        state.flash = None;
+        return;
+    }
+    ui.painter()
+        .rect_filled(rect, 6.0, t.accent_alpha(0.28 * left as f32));
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
 }
 
 /// The view. `episodes` newest first.

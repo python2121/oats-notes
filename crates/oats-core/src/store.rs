@@ -2114,6 +2114,23 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Episodes whose topics include `topic` (case-insensitive, whole topic), newest first.
+    pub fn episodes_with_topic(&self, topic: &str) -> Result<Vec<Episode>, StoreError> {
+        let sql = format!(
+            "SELECT {EPISODE_COLUMNS} FROM episodes
+             WHERE EXISTS (SELECT 1 FROM json_each(episodes.topics_json)
+                           WHERE lower(value) = lower(?1))
+             ORDER BY started_at DESC, id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([topic], row_to_episode)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2972,6 +2989,33 @@ mod tests {
         assert_eq!(s.run_count_of_tier_since(0, 150)?, 1);
         assert_eq!(s.run_count_of_tier_since(1, 0)?, 1);
         assert_eq!(s.run_count_since(0)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn episodes_with_topic_matches_case_insensitively() -> R {
+        let s = Store::open_in_memory()?;
+        let mk = |title: &str, topics: &[&str]| EpisodeContent {
+            title: title.into(),
+            summary: String::new(),
+            node_id: None,
+            decisions: vec![],
+            action_items: vec![],
+            topics: topics.iter().map(|t| t.to_string()).collect(),
+            low_signal: false,
+            model: "m".into(),
+            cost_usd: None,
+        };
+        s.insert_episode(10, 20, &mk("old", &["Q4 roadmap", "x"]), 1)?;
+        s.insert_episode(30, 40, &mk("new", &["q4 ROADMAP"]), 2)?;
+        s.insert_episode(50, 60, &mk("other", &["Q4 roadmap extra", "50%_"]), 3)?;
+        let hits = s.episodes_with_topic("Q4 Roadmap")?;
+        assert_eq!(
+            hits.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
+            vec!["new", "old"]
+        );
+        assert!(s.episodes_with_topic("nothing")?.is_empty());
+        assert!(s.episodes_with_topic("Q4")?.is_empty(), "whole topic only");
         Ok(())
     }
 }

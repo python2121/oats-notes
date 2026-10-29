@@ -30,7 +30,7 @@ one engine crate and one status crate against those contracts, and nothing else 
 never changes.
 
 ```
-crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, paths  (no platform code)
+crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, echo rules (text + audio), paths  (no platform code)
 crates/oats-brain              the brain: `claude` CLI wrapper, episode cutting, prompts (prompts/*.md), hotword commands, tiered scheduler  (no platform code)
 crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mic/system + own FIR resampler: microphone (InputPolicy, MicMode plain | voice processing) and system audio (SystemCapture)
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
@@ -159,6 +159,33 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   rule only while the default output is speakers (`OutputInfo::speakers`), i.e. skips it on
   headphones/AirPods. The binary sets `PipelineHandle::set_echo_dedup` from the system
   capture's `on_output`; with `--system-audio-file` (no device) auto counts as speakers.
+- **Audio-level echo check** (`oats_core::echo_audio`, pure, tested; runs BEFORE the model —
+  echoes were most of the two-lane CPU): the session keeps the last 45 s of system audio
+  (`SystemRing`, indexed by the system lane's sample clock; filled unless the knob is never).
+  A closing MIC segment is compared with the system audio over its span ± 500 ms: 10 ms RMS
+  envelopes (linear), the mic's cut to its active frames (> peak − 20 dB and > its 10th
+  percentile + 9 dB, so shared on/off edges don't count), Pearson correlation per lag in
+  ± 500 ms. Echo = all of: peak ≥ `ECHO_ENV_THRESHOLD` 0.6 for ≥ 3 s of active audio, rising
+  linearly to 0.9 at 1 s (`required_peak`: short envelopes correlate by chance — unrelated
+  synthetic voices reach 0.84 at 1 s, 0.53 at 3 s); mic at most +6 dB louder than the
+  aligned system audio; at most 250 ms of active mic audio where the system played nothing
+  (200 ms reverb allowance — a segment that runs on into the user's reply is not an echo).
+  Undecidable (< 1 s active, a flat envelope such as a steady tone, silent system audio)
+  = transcribe. A suspected echo is NOT transcribed: linked at once to a system segment
+  already stored within ± 2 s (an empty mic row, `echo_of` set, `confidence` NULL, no
+  `PipelineEvent`), else pending until one is stored, discarded after 45 s of audio
+  (`PipelineHandle::set_echo_pending_timeout`; at session end the rest). The text rule stays
+  the backstop for everything transcribed. Knob: `OATS_ECHO_AUDIO=auto|always|never`
+  (`EchoAudioMode`, read at `Pipeline::spawn`, `PipelineHandle::set_echo_audio`; auto = while
+  the text rule is on, i.e. on speakers; never = old behaviour). Counters
+  (`pipeline::EchoStats`: `mic_transcribed`, `echo_skipped_by_audio` = `echo_linked` +
+  `echo_discarded` + still pending, `echo_marked_by_text`) are logged at info when the session
+  ends and readable via `PipelineHandle::echo_stats()` (no UI event). Calibrated on synthetic
+  signals only (`docs/performance-2026-10-28.md` addendum: live check pending). Known gap: a
+  system tap rebuild (< 2 s without chunks) shifts the system lane's sample clock behind the
+  wall clock by the gap (the clock only resyncs after a sleep), and the shift accumulates per
+  rebuild; once past the ± 500 ms lag window the check finds no correlation and segments are
+  transcribed as before (lost saving, not lost speech) until listening restarts.
 - **Echo cancellation spike** (built 2026-10-29, NOT run on hardware yet): does Apple's
   voice-processing microphone (`kAudioUnitSubType_VoiceProcessingIO`: AEC, noise suppression,
   AGC) remove what OTHER apps play through the speakers? `oats_audio::MicMode { Plain,
@@ -362,6 +389,7 @@ cargo run -p oats-notes -- --listen --audio-file speech.wav [--audio-speed 4] [-
 cargo run -p oats-notes -- --listen --audio-file mic.wav --system-audio-file them.wav           # two lanes from two WAVs (the echo rule end to end)
 OATS_INPUT_DEVICE="Scarlett 2i2" …         # microphone by name (default: the built-in microphone, never silently a Bluetooth headset)
 OATS_SYSTEM_DEDUP=auto|always|never …      # the mic-echo rule (auto: only while the output is speakers)
+OATS_ECHO_AUDIO=auto|always|never …        # the audio-level echo pre-check (auto: while the echo rule is on; never = transcribe every mic segment)
 scripts/perf.sh [rest|idle|speech|stress]    # CPU/memory/energy profile per scenario (release build); see docs/performance-2026-10-28.md
 cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events — how the shell is verified without a window
 cargo run -p oats-notes -- --listen      # start listening as soon as the engine is ready (doesn't change the remembered pref)
@@ -387,6 +415,20 @@ fails with "no LC_RPATH's found"). Microphone access: run from a terminal, macOS
 the terminal's mic permission; a bundled .app will need `NSMicrophoneUsageDescription`.
 System audio: "System Audio Recording Only", granted to the terminal app when run from one;
 a bundled .app needs `NSAudioCaptureUsageDescription` (see "Audio sources and lanes").
+
+## Topic view and jump-to-note (`crates/oats-ui/src/topic.rs`, `notes.rs`)
+
+Find icon: a 24 pt magnifying glass (`HeaderIcon::Search`, accent while the search bar is open) at the far right of the control bar, tooltip "Find (⌘F)", fires `Command::Search`.
+Topic chips on episode cards are clickable (`NotesAction::OpenTopic`): `OatsApp::open_topic` loads
+`Store::episodes_with_topic` (case-insensitive whole-topic match via `json_each` on `topics_json`) into
+a `TopicState` shown over the current view like the search results (header "Tagged “…”" + count + ×;
+Escape closes; never touches the saved `prefs.view`). One concise row per episode (date, time range,
+title, node path); clicking a row calls `jump_to_episode`: it sets `NotesState::pending_focus`
+(`OatsApp::pending_focus()`) and switches to the episode's node view (Notes without a node). The card
+that matches (`notes::focus_card`, run for every laid-out `episode_card`) consumes it with
+`ui.scroll_to_rect` and flashes an accent fill for 1.5 s (`NotesState::flash`, repaints only while it
+fades). Search-result clicks on a note use the same path.
+Selftest: `--selftest out.png --topic "Q4 roadmap"`.
 
 ## Database (`crates/oats-core/src/store.rs`)
 

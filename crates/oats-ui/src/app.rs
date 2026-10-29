@@ -24,6 +24,7 @@ use crate::notes::{BrainStatus, NotesAction, NotesState, node_view, notes_view};
 use crate::search::{BAR_H, SEARCH_LIMIT, SearchAction, SearchState, search_bar, search_results};
 use crate::sidebar::{HeaderIcon, SidebarAction, SidebarState, header_icon, sidebar_panel};
 use crate::theme::Tokens;
+use crate::topic::{BAR_H as TOPIC_BAR_H, TopicAction, TopicState, topic_header, topic_list};
 use crate::transcript::{
     TranscriptAction, local_midnight_ms, transcript_list, until_local_midnight,
 };
@@ -348,6 +349,9 @@ pub struct OatsApp {
     /// The search bar and its results, while open (the view underneath is untouched, so
     /// closing restores it).
     search: Option<SearchState>,
+    /// The Topic view (episodes tagged with a clicked topic chip), while open; sits over the
+    /// current view like the search results and is never persisted.
+    topic: Option<TopicState>,
     /// The status-bar item (menu bar extra), if the platform has one. While it exists, closing
     /// the window only hides it; Quit quits.
     status_item: Option<Box<dyn StatusItem>>,
@@ -429,6 +433,7 @@ impl OatsApp {
             sidebar: SidebarState::default(),
             prefs_window: None,
             search: None,
+            topic: None,
             status_item: status,
             status_shown: None,
             menu_events,
@@ -697,10 +702,7 @@ impl OatsApp {
                         .and_then(|s| s.results.episodes.iter().find(|e| e.id == id))
                         .and_then(|e| e.node_id);
                     self.close_search();
-                    match node {
-                        Some(n) => self.set_view(View::Node(n)),
-                        None => self.set_view(View::Notes),
-                    }
+                    self.jump_to_episode(id, node);
                 }
                 SearchAction::OpenSegment(at) => {
                     self.close_search();
@@ -713,6 +715,60 @@ impl OatsApp {
                 SearchAction::OpenEvent(_) => {
                     self.close_search();
                     self.set_view(View::Calendar);
+                }
+            }
+        }
+    }
+
+    /// Whether the Topic view is open.
+    pub fn topic_open(&self) -> bool {
+        self.topic.is_some()
+    }
+
+    /// The episode the notes list will scroll to and flash when it lays its card out.
+    pub fn pending_focus(&self) -> Option<i64> {
+        self.notes_state.pending_focus
+    }
+
+    /// Open the Topic view for `topic` (the search bar closes; the view underneath stays).
+    fn open_topic(&mut self, topic: String) {
+        let episodes = match self.store.episodes_with_topic(&topic) {
+            Ok(e) => e,
+            Err(e) => {
+                self.store_error(e);
+                Vec::new()
+            }
+        };
+        self.close_search();
+        self.topic = Some(TopicState { topic, episodes });
+    }
+
+    fn close_topic(&mut self) {
+        self.topic = None;
+    }
+
+    /// Show an episode's note: its node's view (Notes when it has none), scrolled to its card,
+    /// which flashes. The card consumes `pending_focus` when it is laid out.
+    fn jump_to_episode(&mut self, id: i64, node: Option<i64>) {
+        self.topic = None;
+        self.notes_state.pending_focus = Some(id);
+        match node.filter(|n| self.nodes.iter().any(|x| x.id == *n)) {
+            Some(n) => self.set_view(View::Node(n)),
+            None => self.set_view(View::Notes),
+        }
+    }
+
+    fn apply_topic(&mut self, actions: Vec<TopicAction>) {
+        for a in actions {
+            match a {
+                TopicAction::Close => self.close_topic(),
+                TopicAction::Open(id) => {
+                    let node = self
+                        .topic
+                        .as_ref()
+                        .and_then(|t| t.episodes.iter().find(|e| e.id == id))
+                        .and_then(|e| e.node_id);
+                    self.jump_to_episode(id, node);
                 }
             }
         }
@@ -1162,6 +1218,7 @@ impl OatsApp {
                 NotesAction::Reinterpret(id) => self.brain_send(BrainCommand::Reinterpret(id)),
                 NotesAction::Undo(id) => self.brain_send(BrainCommand::UndoChange(id)),
                 NotesAction::SelectNode(id) => self.set_view(View::Node(id)),
+                NotesAction::OpenTopic(topic) => self.open_topic(topic),
             }
         }
     }
@@ -1256,6 +1313,21 @@ impl OatsApp {
             }
             _ => {}
         }
+        // Find, at the far right
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(12.0);
+            let icon = if self.search.is_some() {
+                HeaderIcon::SearchOn
+            } else {
+                HeaderIcon::Search
+            };
+            if header_icon(ui, icon)
+                .on_hover_text(with_shortcut(ui.ctx(), "Find", Command::Search))
+                .clicked()
+            {
+                cmds.push(Command::Search);
+            }
+        });
         cmds
     }
 
@@ -1470,6 +1542,11 @@ impl OatsApp {
         self.run_search();
     }
 
+    /// Selftest only: open the Topic view for this topic.
+    pub(crate) fn selftest_topic(&mut self, topic: &str) {
+        self.open_topic(topic.to_owned());
+    }
+
     /// Selftest only: show the Listening state with a fixed input level, no audio opened.
     pub(crate) fn selftest_fake_listening(&mut self, rms_db: f32, in_speech: bool) {
         self.capture = Some(Box::new(()));
@@ -1504,6 +1581,12 @@ impl eframe::App for OatsApp {
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
         {
             self.close_search();
+        } else if self.topic.is_some()
+            && self.search.is_none()
+            && self.prefs_window.is_none()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.close_topic();
         }
 
         if !self.has_native_menu() {
@@ -1548,6 +1631,7 @@ impl eframe::App for OatsApp {
         let mut notes_actions = Vec::new();
         let mut calendar_actions = Vec::new();
         let mut search_actions = Vec::new();
+        let mut topic_actions = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.chrome))
             .show(ui, |ui| {
@@ -1622,6 +1706,32 @@ impl eframe::App for OatsApp {
                             &self.nodes,
                         ));
                     }
+                } else if let Some(topic) = &self.topic {
+                    let bar =
+                        Rect::from_min_size(list_rect.min, vec2(list_rect.width(), TOPIC_BAR_H));
+                    list_ui.painter().rect_filled(bar, 0.0, t.chrome);
+                    list_ui.painter().hline(
+                        bar.x_range(),
+                        bar.bottom() - 0.5,
+                        egui::Stroke::new(1.0, t.divider),
+                    );
+                    let mut head_ui = list_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(bar)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    if topic_header(&mut head_ui, topic) {
+                        topic_actions.push(TopicAction::Close);
+                    }
+                    let body =
+                        Rect::from_min_max(pos2(list_rect.left(), bar.bottom()), list_rect.max);
+                    let mut body_ui = list_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(body)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    body_ui.set_clip_rect(body);
+                    topic_actions.extend(topic_list(&mut body_ui, topic, &self.nodes));
                 } else {
                     match self.prefs.view {
                         View::Notes => {
@@ -1680,6 +1790,7 @@ impl eframe::App for OatsApp {
         self.apply_notes(notes_actions);
         self.apply_calendar(calendar_actions);
         self.apply_search(search_actions);
+        self.apply_topic(topic_actions);
         for c in cmds {
             self.run(c);
         }
