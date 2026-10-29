@@ -29,8 +29,13 @@ pub struct SelftestOptions {
     pub notes: bool,
     /// Show the Work category's view (its projects, their notes, the transcript toggle).
     pub work: bool,
-    /// Show the Calendar view (seeded events and a reminder).
+    /// Show the Calendar view (the month grid with seeded events and todos, today selected).
     pub calendar: bool,
+    /// Show the Todos view (open, snoozed, undated and completed todos).
+    pub todos: bool,
+    /// Seed a todo that is due now and a voice command's confirmation, so the pop-ups show
+    /// (over the Todos view unless another view is asked for).
+    pub toast: bool,
     /// Start with the sidebar hidden (the control bar then shows the restore button).
     pub no_sidebar: bool,
     /// Open the search bar with this query over the seeded data.
@@ -57,7 +62,7 @@ pub fn run_with(
     audio: AudioStarter,
     options: SelftestOptions,
 ) -> Result<[u32; 2], String> {
-    seed(&store).map_err(|e| format!("seeding the store: {e}"))?;
+    seed(&store, options.toast).map_err(|e| format!("seeding the store: {e}"))?;
     let mut harness = Harness::builder()
         .with_size(egui::vec2(SIZE[0], SIZE[1]))
         .with_pixels_per_point(PIXELS_PER_POINT)
@@ -110,6 +115,15 @@ pub fn run_with(
         }
     } else if options.calendar {
         harness.state_mut().run(Command::ShowCalendar);
+    } else if options.todos || options.toast {
+        harness.state_mut().run(Command::ShowTodos);
+    }
+    if options.toast {
+        let ctx = harness.ctx.clone();
+        harness.state_mut().selftest_command(
+            &ctx,
+            vec!["Reminder set: Call the landlord — Sat 31 Oct, 14:05".to_owned()],
+        );
     }
     if let Some(q) = &options.search {
         harness.state_mut().selftest_search(q);
@@ -132,7 +146,7 @@ pub fn run_with(
 
 /// A session and eight segments: four yesterday afternoon, four this morning (two of them
 /// system audio from a call, plus a hidden microphone echo); two filed under Work.
-fn seed(store: &Store) -> Result<(), oats_core::StoreError> {
+fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
     const H: i64 = 3_600_000;
     const M: i64 = 60_000;
     let today = midnight_ms(&Local::now());
@@ -225,7 +239,7 @@ fn seed(store: &Store) -> Result<(), oats_core::StoreError> {
         }
         // what the brain would have made of yesterday's meeting: a project under Work, the
         // episode filed under it, an event it found, a reminder from a voice command
-        use oats_core::{ActionItem, EpisodeContent, NewEvent, NewReminder, NodeKind, Origin};
+        use oats_core::{ActionItem, EpisodeContent, NewEvent, NewTodo, NodeKind, Origin};
         let project = store.add_node(
             Some(work.id),
             NodeKind::Project,
@@ -317,17 +331,122 @@ fn seed(store: &Store) -> Result<(), oats_core::StoreError> {
             },
             now,
         )?;
-        store.upsert_reminder(
-            &NewReminder {
-                event_id: Some(taxes.id),
-                due: today + 38 * 24 * H,
-                text: "Property taxes due in one week".into(),
-                source: Some(Origin::Hotword),
-                source_segment_id: ids.get(7).copied(),
-                dedupe_key: Some("selftest:taxes-reminder".into()),
+        // todos: the taxes day itself and a week before (a voice command), a reminder in two
+        // days, undated ones, a snoozed one, completed ones
+        let todo = |text: &str, due: Option<i64>, source: Origin, event: Option<i64>| NewTodo {
+            text: text.into(),
+            due,
+            event_id: event,
+            source: Some(source),
+            source_segment_id: (source == Origin::Hotword)
+                .then(|| ids.get(7).copied())
+                .flatten(),
+            node_id: None,
+            dedupe_key: None,
+        };
+        store.add_todo(
+            &todo(
+                "Property taxes due",
+                Some(today + 45 * 24 * H + 9 * H),
+                Origin::Hotword,
+                Some(taxes.id),
+            ),
+            now,
+        )?;
+        store.add_todo(
+            &todo(
+                "Property taxes due in one week",
+                Some(today + 38 * 24 * H + 9 * H),
+                Origin::Hotword,
+                Some(taxes.id),
+            ),
+            now,
+        )?;
+        store.add_todo(
+            &todo(
+                "Call the landlord",
+                Some(today + 2 * 24 * H + 14 * H + 5 * M),
+                Origin::Hotword,
+                None,
+            ),
+            now,
+        )?;
+        store.add_todo(
+            &NewTodo {
+                node_id: Some(project.id),
+                ..todo(
+                    "Send Priya the export test files",
+                    Some(today + 24 * H + 9 * H),
+                    Origin::User,
+                    None,
+                )
             },
             now,
         )?;
+        store.add_todo(
+            &todo("Buy oat milk and coffee beans", None, Origin::Hotword, None),
+            now,
+        )?;
+        store.add_todo(
+            &todo("Renew the parking permit", None, Origin::User, None),
+            now,
+        )?;
+        let snoozed = store.add_todo(
+            &todo(
+                "Book the design review room",
+                Some(today + 8 * H),
+                Origin::User,
+                None,
+            ),
+            now,
+        )?;
+        store.snooze_todo(snoozed.id, Local::now().timestamp_millis() + 3 * H)?;
+        for (text, days_ago) in [("Send the Q4 estimate", 1), ("Water the plants", 3)] {
+            let done = store.add_todo(
+                &todo(
+                    text,
+                    Some(today - days_ago * 24 * H + 10 * H),
+                    Origin::User,
+                    None,
+                ),
+                now,
+            )?;
+            store.complete_todo(done.id, today - days_ago * 24 * H + 11 * H)?;
+        }
+        // earlier this month, so the grid has something in it
+        for (title, days_ago, hour) in [
+            ("Dentist", 20i64, Some(15)),
+            ("Quarterly planning", 13, Some(10)),
+            ("Mum's birthday", 6, None),
+        ] {
+            let start = today - days_ago * 24 * H + hour.unwrap_or(0) * H;
+            store.upsert_event(
+                &NewEvent {
+                    when_start: start,
+                    all_day: hour.is_none(),
+                    title: title.into(),
+                    source: Some(Origin::Hotword),
+                    source_segment_id: ids.get(3).copied(),
+                    confidence: Some(1.0),
+                    dedupe_key: Some(format!("selftest:{title}")),
+                    ..Default::default()
+                },
+                now,
+            )?;
+        }
+        if due_now {
+            // came due a few minutes ago: the reminder pop-up shows
+            let at = Local::now().timestamp_millis() - 5 * M;
+            store.add_todo(
+                &todo(
+                    "Pay the property taxes",
+                    Some(at),
+                    Origin::Hotword,
+                    Some(taxes.id),
+                ),
+                now,
+            )?;
+        }
         let run = store.begin_run(1, "interpret", "sonnet", now - 4_000)?;
         store.finish_run(
             run,

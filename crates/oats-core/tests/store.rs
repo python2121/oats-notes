@@ -1,6 +1,6 @@
 //! Integration tests for the SQLite store through its public API (and, where the API has no
 //! window onto it, a raw `rusqlite` connection to the same file): the v1 → v2 migration of a
-//! realistic database, subtree views, event/reminder upsert semantics, the node helpers and
+//! realistic database, subtree views, event/todo upsert semantics, the node helpers and
 //! their effect on everything filed under a node, the change log, and several connections on
 //! one file (the pipeline, the brain and the UI each open their own).
 
@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 
 use oats_core::store::name_key;
-use oats_core::{EpisodeContent, NewEvent, NewReminder, NodeKind, Origin, Store, StoreError, View};
+use oats_core::{
+    EpisodeContent, NewEvent, NewTodo, NodeKind, Origin, Store, StoreError, TodoFilter, View,
+};
 
 type R = Result<(), StoreError>;
 
@@ -136,7 +138,7 @@ fn migrates_a_realistic_v1_file_keeping_every_row_and_id() -> R {
     let v1 = write_v1(&path);
 
     let s = Store::open(&path)?;
-    assert_eq!(s.meta("schema_version")?.as_deref(), Some("3"));
+    assert_eq!(s.meta("schema_version")?.as_deref(), Some("4"));
 
     // categories became root nodes with the same ids, in position order; nothing re-seeded
     let cats = s.categories()?;
@@ -331,12 +333,12 @@ fn a_newer_schema_file_is_refused_and_left_alone() -> R {
         let conn = raw(&path);
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES ('schema_version', '4');",
+             INSERT INTO meta VALUES ('schema_version', '5');",
         )?;
     }
     assert!(matches!(
         Store::open(&path),
-        Err(StoreError::SchemaTooNew(4))
+        Err(StoreError::SchemaTooNew(5))
     ));
     let conn = raw(&path);
     assert!(
@@ -348,7 +350,7 @@ fn a_newer_schema_file_is_refused_and_left_alone() -> R {
         [],
         |r| r.get(0),
     )?;
-    assert_eq!(v, "4");
+    assert_eq!(v, "5");
     Ok(())
 }
 
@@ -428,7 +430,7 @@ fn node_views_cover_exactly_the_subtree() -> R {
     Ok(())
 }
 
-// ---- events and reminders --------------------------------------------------------------------
+// ---- events and todos -----------------------------------------------------------------------
 
 #[test]
 fn event_upsert_updates_in_place_and_keeps_provenance() -> R {
@@ -541,7 +543,7 @@ fn event_upsert_updates_in_place_and_keeps_provenance() -> R {
 }
 
 #[test]
-fn reminder_upsert_keeps_done_and_event_link() -> R {
+fn todo_upsert_keeps_completion_and_event_link() -> R {
     let s = Store::open_in_memory()?;
     let ev = s.upsert_event(
         &NewEvent {
@@ -552,56 +554,59 @@ fn reminder_upsert_keeps_done_and_event_link() -> R {
         1,
     )?;
     let key = Some("hotword:3:reminder:2026-12-05:taxes".to_owned());
-    let r = s.upsert_reminder(
-        &NewReminder {
+    let r = s.add_todo(
+        &NewTodo {
             event_id: Some(ev.id),
-            due: 5_000,
+            due: Some(5_000),
             text: "Taxes in a week".into(),
             source: Some(Origin::Hotword),
             source_segment_id: Some(3),
             dedupe_key: key.clone(),
+            ..Default::default()
         },
         1,
     )?;
-    s.set_reminder_done(r.id, true)?;
-    let again = s.upsert_reminder(
-        &NewReminder {
-            event_id: None,
-            due: 6_000,
+    s.complete_todo(r.id, 7)?;
+    let again = s.add_todo(
+        &NewTodo {
+            due: Some(6_000),
             text: "Taxes soon".into(),
             source: Some(Origin::Interpretation),
-            source_segment_id: None,
             dedupe_key: key,
+            ..Default::default()
         },
         2,
     )?;
     assert_eq!(again.id, r.id);
-    assert_eq!((again.due, again.text.as_str()), (6_000, "Taxes soon"));
+    assert_eq!(
+        (again.due, again.text.as_str()),
+        (Some(6_000), "Taxes soon")
+    );
     assert_eq!(
         again.event_id,
         Some(ev.id),
         "a missing event keeps the link"
     );
-    assert!(again.done, "re-dictating doesn't reopen a done reminder");
+    assert!(again.done(), "re-dictating doesn't reopen a completed todo");
     assert_eq!(again.source, Origin::Hotword);
     assert_eq!(again.source_segment_id, Some(3));
     assert_eq!(again.created_at, 1);
 
     // ordering and the open filter
-    let later = s.upsert_reminder(
-        &NewReminder {
-            due: 1_000,
+    let earliest = s.add_todo(
+        &NewTodo {
+            due: Some(1_000),
             text: "earliest".into(),
             ..Default::default()
         },
         3,
     )?;
-    let all: Vec<i64> = s.reminders(false, 10)?.iter().map(|r| r.id).collect();
-    assert_eq!(all, vec![later.id, r.id]);
-    let open: Vec<i64> = s.reminders(true, 10)?.iter().map(|r| r.id).collect();
-    assert_eq!(open, vec![later.id]);
-    s.set_reminder_done(r.id, false)?;
-    assert_eq!(s.reminders(true, 10)?.len(), 2);
+    let all: Vec<i64> = s.todos(TodoFilter::All)?.iter().map(|r| r.id).collect();
+    assert_eq!(all, vec![earliest.id, r.id], "open first, completed last");
+    let open: Vec<i64> = s.todos(TodoFilter::Open)?.iter().map(|r| r.id).collect();
+    assert_eq!(open, vec![earliest.id]);
+    s.reopen_todo(r.id)?;
+    assert_eq!(s.todos(TodoFilter::Open)?.len(), 2);
     Ok(())
 }
 

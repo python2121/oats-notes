@@ -1,5 +1,6 @@
 //! OatsNotes' egui front end (eframe): the sidebar (views + the category/project/topic tree),
-//! the transcript list, the Notes view (the brain's episodes), the Calendar view,
+//! the transcript list, the Notes view (the brain's episodes), the month Calendar, the Todos
+//! view and the reminder / confirmation pop-ups,
 //! the listen controls and status line, the theme (the SwiftInvert shell's dark charcoal tokens
 //! and the OS UI font) and, on macOS, the native menu bar.
 //!
@@ -19,10 +20,12 @@ pub mod selftest;
 pub mod sidebar;
 pub mod system_font;
 pub mod theme;
+pub mod toast;
+pub mod todos;
 pub mod topic;
 pub mod transcript;
 
 pub use app::{
-    AppOptions, AppPrefs, AudioRequest, AudioStarter, Command, MenuEntry, MenuSection, MenuState,
-    OatsApp, SHORTCUTS, StartedAudio, build_menu_model,
+    AppOptions, AppPrefs, AudioRequest, AudioStarter, Chime, Command, MenuEntry, MenuSection,
+    MenuState, OatsApp, SHORTCUTS, StartedAudio, build_menu_model,
 };

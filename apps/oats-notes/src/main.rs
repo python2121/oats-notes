@@ -32,7 +32,7 @@
 //! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
 //! `oats_brain::BrainConfig::from_env`).
 //!
-//! `--selftest <out.png> [--listening|--notes|--work|--calendar] [--no-sidebar] [--search <text>] [--topic <text>]` renders the whole window offscreen to a PNG (seeded
+//! `--selftest <out.png> [--listening|--notes|--work|--calendar|--todos|--toast] [--no-sidebar] [--search <text>] [--topic <text>]` renders the whole window offscreen to a PNG (seeded
 //! demo content, the null engine, a throwaway database) — the shell verified without a window.
 
 use std::any::Any;
@@ -182,7 +182,7 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--work|--calendar] [--no-sidebar] [--search <text>] [--topic <text>]\n\n\
+        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--work|--calendar|--todos|--toast] [--no-sidebar] [--search <text>] [--topic <text>]\n\n\
          --listen       start listening as soon as the speech engine is ready\n\
          --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
          \x20              paced in real time; listening stops when the file ends\n\
@@ -193,7 +193,9 @@ fn usage() -> ExitCode {
          --listening    with --selftest: show the Listening state with a fake input level\n\
          --notes        with --selftest: the Notes view (a seeded interpreted episode)\n\
          --work         with --selftest: the Work category view (projects and their notes)\n\
-         --calendar     with --selftest: the Calendar view (seeded events and a reminder)\n\
+         --calendar     with --selftest: the month Calendar (seeded events and todos)\n\
+         --todos        with --selftest: the Todos view (open, snoozed, undated, completed)\n\
+         --toast        with --selftest: a due reminder and a voice-command confirmation pop-up\n\
          --search TEXT  with --selftest: open the search bar (⌘F) with this query\n\
          --topic TEXT   with --selftest: open the Topic view for this topic"
     );
@@ -324,7 +326,7 @@ fn main() -> ExitCode {
             // every other platform keeps the in-window egui menu bar.
             let native_menu =
                 cfg!(target_os = "macos") && std::env::var_os("OATS_NO_NATIVE_MENU").is_none();
-            let app = oats_ui::OatsApp::new(
+            let mut app = oats_ui::OatsApp::new(
                 cc,
                 oats_ui::AppOptions {
                     native_menu,
@@ -340,6 +342,8 @@ fn main() -> ExitCode {
                 status_item(&cc.egui_ctx),
                 Some(brain),
             );
+            // the voice-command ding (the Preferences window turns it off)
+            app.set_chime(Box::new(oats_audio::chime::play));
             #[cfg(target_os = "macos")]
             if native_menu {
                 return Ok(match oats_ui::native_menu::NativeMenuApp::new(app) {
@@ -379,6 +383,8 @@ fn selftest_cli(args: &[String]) -> ExitCode {
             "--listening" => options.listening = true,
             "--notes" => options.notes = true,
             "--calendar" => options.calendar = true,
+            "--todos" => options.todos = true,
+            "--toast" => options.toast = true,
             "--work" => options.work = true,
             "--no-sidebar" => options.no_sidebar = true,
             f if !f.starts_with("--") && out.is_none() => out = Some(f.into()),

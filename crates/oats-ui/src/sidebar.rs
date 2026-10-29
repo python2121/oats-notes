@@ -1,4 +1,4 @@
-//! The left sidebar: the "Views" group (Today, All transcripts, Notes, Calendar) and the tree
+//! The left sidebar: the "Views" group (Today, All transcripts, Notes, Calendar, Todos) and the tree
 //! group — the store's categories as 22 pt hover rows, with the projects the brain created
 //! under them and topics under those, collapsible per node (a disclosure triangle on rows with
 //! children, indented SwiftInvert-style); a "+" header icon that reveals an inline field to add
@@ -99,6 +99,7 @@ pub fn sidebar_panel(
         ("All transcripts", View::All),
         ("Notes", View::Notes),
         ("Calendar", View::Calendar),
+        ("Todos", View::Todos),
     ] {
         if hover_row(ui, &t, label, view == v, 0, None).clicked() {
             actions.push(SidebarAction::Select(v));

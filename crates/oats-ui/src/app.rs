@@ -13,8 +13,8 @@ use egui::{Key, KeyboardShortcut, Modifiers, Rect, Sense, pos2, vec2};
 use oats_brain::{BrainCommand, BrainEvent, BrainHandle};
 use oats_core::pipeline::ListenOptions;
 use oats_core::{
-    AudioChunk, Change, Episode, Event, Node, PipelineEvent, PipelineHandle, PipelineStatus,
-    Reminder, Store, TranscriptRow, View,
+    AudioChunk, Change, Episode, Event, NewTodo, Node, PipelineEvent, PipelineHandle,
+    PipelineStatus, Store, Todo, TodoFilter, TranscriptRow, View,
 };
 use oats_status::{StatusAction, StatusItem, StatusState};
 
@@ -24,9 +24,11 @@ use crate::notes::{BrainStatus, NotesAction, NotesState, node_view, notes_view};
 use crate::search::{BAR_H, SEARCH_LIMIT, SearchAction, SearchState, search_bar, search_results};
 use crate::sidebar::{HeaderIcon, SidebarAction, SidebarState, header_icon, sidebar_panel};
 use crate::theme::Tokens;
+use crate::toast::{Confirmation, ToastAction, ToastState, toasts};
+use crate::todos::{TodoAction, TodosState, todos_view};
 use crate::topic::{BAR_H as TOPIC_BAR_H, TopicAction, TopicState, topic_header, topic_list};
 use crate::transcript::{
-    TranscriptAction, local_midnight_ms, transcript_list, until_local_midnight,
+    TranscriptAction, TranscriptFocus, local_midnight_ms, transcript_list, until_local_midnight,
 };
 
 /// eframe storage key for [`AppPrefs`] (RON).
@@ -46,6 +48,8 @@ pub struct AppPrefs {
     /// Capture system audio (what the computer plays: the other side of a call) next to the
     /// microphone.
     pub capture_system: bool,
+    /// Play a short ding when a voice command created something.
+    pub command_sound: bool,
 }
 
 impl Default for AppPrefs {
@@ -56,6 +60,7 @@ impl Default for AppPrefs {
             view: View::Today,
             listening: false,
             capture_system: true,
+            command_sound: true,
         }
     }
 }
@@ -130,6 +135,10 @@ impl StartedAudio {
 pub type AudioStarter =
     Box<dyn Fn(mpsc::Sender<AudioChunk>, AudioRequest) -> Result<StartedAudio, String>>;
 
+/// The voice-command confirmation sound (the binary wires `oats_audio::chime::play`; it must
+/// return at once). Boxed so `oats-ui` doesn't depend on the audio crate.
+pub type Chime = Box<dyn Fn() + Send + Sync>;
+
 /// Everything a menu item or shortcut can do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -146,6 +155,7 @@ pub enum Command {
     ShowAll,
     ShowNotes,
     ShowCalendar,
+    ShowTodos,
     /// Run the brain's interpretation over whatever is new, now.
     InterpretNow,
     /// Run the coherence review of today's episodes, now.
@@ -175,6 +185,7 @@ pub const SHORTCUTS: &[(KeyboardShortcut, Command)] = &[
     (sc(Modifiers::COMMAND, Key::Num2), Command::ShowAll),
     (sc(Modifiers::COMMAND, Key::Num3), Command::ShowNotes),
     (sc(Modifiers::COMMAND, Key::Num4), Command::ShowCalendar),
+    (sc(Modifiers::COMMAND, Key::Num5), Command::ShowTodos),
     (sc(Modifiers::COMMAND, Key::F), Command::Search),
     (sc(Modifiers::COMMAND, Key::I), Command::InterpretNow),
     (sc(Modifiers::COMMAND, Key::Comma), Command::Preferences),
@@ -284,6 +295,7 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                 check("All Transcripts", Command::ShowAll, s.view == View::All),
                 check("Notes", Command::ShowNotes, s.view == View::Notes),
                 check("Calendar", Command::ShowCalendar, s.view == View::Calendar),
+                check("Todos", Command::ShowTodos, s.view == View::Todos),
             ],
         },
         MenuSection {
@@ -335,10 +347,22 @@ pub struct OatsApp {
     last_command: Option<String>,
     episodes: Vec<Episode>,
     events: Vec<Event>,
-    reminders: Vec<Reminder>,
+    /// Every todo, in display order (open, then completed).
+    todos: Vec<Todo>,
+    /// The todos whose pop-up is showing (due, or the snooze is over).
+    due_now: Vec<Todo>,
+    /// When the next todo comes due (a repaint is scheduled for then).
+    next_due: Option<i64>,
     changes: Vec<Change>,
     notes_state: NotesState,
     calendar_state: CalendarState,
+    todos_state: TodosState,
+    /// The confirmation pop-ups of voice commands.
+    toasts: ToastState,
+    /// A transcript row to scroll to and flash (a calendar item / todo → where it was said).
+    transcript_focus: TranscriptFocus,
+    /// The voice-command ding.
+    chime: Chime,
     /// The last non-fatal problem (pipeline warning, store or microphone error).
     warning: Option<String>,
     /// Start listening as soon as the engine reports Idle (prefs said we were listening).
@@ -425,10 +449,16 @@ impl OatsApp {
             last_command: None,
             episodes: Vec::new(),
             events: Vec::new(),
-            reminders: Vec::new(),
+            todos: Vec::new(),
+            due_now: Vec::new(),
+            next_due: None,
             changes: Vec::new(),
             notes_state: NotesState::default(),
             calendar_state: CalendarState::default(),
+            todos_state: TodosState::default(),
+            toasts: ToastState::default(),
+            transcript_focus: TranscriptFocus::default(),
+            chime: Box::new(|| {}),
             warning: None,
             sidebar: SidebarState::default(),
             prefs_window: None,
@@ -441,6 +471,41 @@ impl OatsApp {
         };
         app.reload();
         app
+    }
+
+    /// The sound played when a voice command created something (default: none).
+    pub fn set_chime(&mut self, chime: Chime) {
+        self.chime = chime;
+    }
+
+    /// Every todo, in display order.
+    pub fn todos(&self) -> &[Todo] {
+        &self.todos
+    }
+
+    /// The todos whose reminder pop-up is showing.
+    pub fn due_todos(&self) -> &[Todo] {
+        &self.due_now
+    }
+
+    /// When the next todo comes due (the one scheduled repaint).
+    pub fn next_due(&self) -> Option<i64> {
+        self.next_due
+    }
+
+    /// The voice-command confirmations on screen.
+    pub fn confirmations(&self) -> &[Confirmation] {
+        &self.toasts.confirmations
+    }
+
+    /// The transcript row the list will scroll to and flash when it lays it out.
+    pub fn pending_segment_focus(&self) -> Option<i64> {
+        self.transcript_focus.pending
+    }
+
+    /// The status strip's warning, if any.
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
     }
 
     /// Whether the menus live in the macOS menu bar (and not in the window).
@@ -530,6 +595,8 @@ impl OatsApp {
                 StatusAction::ToggleListening => self.run(Command::ToggleListening),
                 StatusAction::ShowWindow => {
                     self.window_hidden = false;
+                    // whatever came due while hidden pops up now
+                    self.refresh_due();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -658,6 +725,7 @@ impl OatsApp {
             Command::ShowAll => self.set_view(View::All),
             Command::ShowNotes => self.set_view(View::Notes),
             Command::ShowCalendar => self.set_view(View::Calendar),
+            Command::ShowTodos => self.set_view(View::Todos),
             Command::InterpretNow => self.brain_send(BrainCommand::InterpretNow),
             Command::ReviewNow => self.brain_send(BrainCommand::ReviewNow),
             Command::Reorganise => self.brain_send(BrainCommand::ReorganiseNow),
@@ -889,18 +957,11 @@ impl OatsApp {
             Ok(e) => self.events = e,
             Err(e) => self.store_error(e),
         }
-        // every open reminder first (oldest-due-first with done ones mixed in would, past the
-        // limit, hide the newest open ones), then done ones for "show done"
-        let reminders = self.store.reminders(true, 300).and_then(|mut open| {
-            let done = self.store.reminders(false, 300)?;
-            open.extend(done.into_iter().filter(|r| r.done));
-            open.sort_by_key(|r| (r.due, r.id));
-            Ok(open)
-        });
-        match reminders {
-            Ok(r) => self.reminders = r,
+        match self.store.todos(TodoFilter::All) {
+            Ok(t) => self.todos = t,
             Err(e) => self.store_error(e),
         }
+        self.refresh_due();
         match self.store.changes(50) {
             Ok(c) => self.changes = c,
             Err(e) => self.store_error(e),
@@ -912,6 +973,73 @@ impl OatsApp {
             self.brain_status.spend_today_usd = spent;
         }
         self.run_search();
+    }
+
+    /// Re-read which todos are due now and when the next one comes due.
+    fn refresh_due(&mut self) {
+        let now = chrono::Local::now().timestamp_millis();
+        match self.store.due_todos(now) {
+            Ok(d) => self.due_now = d,
+            Err(e) => self.store_error(e),
+        }
+        match self.store.next_due_at(now) {
+            Ok(n) => self.next_due = n,
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    /// Show a transcript line: the view that holds its day (Today, else All transcripts),
+    /// scrolled to the row, which flashes. A missing or hidden (echo) segment says so in the
+    /// status strip.
+    fn jump_to_segment(&mut self, id: Option<i64>) {
+        let row = match id.map(|id| self.store.segment(id)) {
+            Some(Ok(r)) => r.filter(|r| r.echo_of.is_none()),
+            Some(Err(e)) => {
+                self.store_error(e);
+                None
+            }
+            None => None,
+        };
+        let Some(row) = row else {
+            self.warning = Some("No transcript for this item".to_owned());
+            return;
+        };
+        self.close_search();
+        self.topic = None;
+        self.today_start = local_midnight_ms();
+        if row.started_at >= self.today_start {
+            self.set_view(View::Today);
+        } else {
+            self.set_view(View::All);
+        }
+        self.transcript_focus.pending = Some(row.id);
+    }
+
+    /// Where an event was said: its hotword segment, else the first segment of the episode it
+    /// was interpreted from.
+    fn event_source(&mut self, id: i64) -> Option<i64> {
+        let event = self.events.iter().find(|e| e.id == id).cloned()?;
+        if let Some(seg) = event.source_segment_id {
+            return Some(seg);
+        }
+        let episode = event.source_episode_id?;
+        match self.store.segments_of_episode(episode) {
+            Ok(rows) => rows
+                .iter()
+                .min_by_key(|r| (r.started_at, r.id))
+                .map(|r| r.id),
+            Err(e) => {
+                self.store_error(e);
+                None
+            }
+        }
+    }
+
+    /// Where a todo was said: its own segment, else its event's source.
+    fn todo_source(&mut self, id: i64) -> Option<i64> {
+        let todo = self.todos.iter().find(|t| t.id == id).cloned()?;
+        todo.source_segment_id
+            .or_else(|| todo.event_id.and_then(|e| self.event_source(e)))
     }
 
     /// Whether `node` is `root` or below it.
@@ -944,12 +1072,12 @@ impl OatsApp {
             View::Today => row.started_at >= self.today_start,
             View::All => true,
             View::Node(id) => row.node_id.is_some_and(|n| self.in_subtree(n, id)),
-            View::Notes | View::Calendar => false,
+            View::Notes | View::Calendar | View::Todos => false,
         }
     }
 
-    /// Drain and apply the brain's events.
-    fn handle_brain_events(&mut self) {
+    /// Drain and apply the brain's events (`ctx` for the confirmation pop-ups' clock).
+    fn handle_brain_events(&mut self, ctx: &egui::Context) {
         let events: Vec<BrainEvent> = match &self.brain {
             Some(b) => b.poll(),
             None => return,
@@ -976,8 +1104,13 @@ impl OatsApp {
                     self.brain_status.running = None;
                     self.brain_status.last_run = Some(run);
                 }
-                BrainEvent::Command { lines, .. } => {
+                BrainEvent::Command {
+                    lines,
+                    confirmations,
+                    ..
+                } => {
                     self.last_command = Some(lines.join(" · "));
+                    self.confirm(ctx, confirmations);
                     reload = true;
                 }
                 BrainEvent::Changed(_) => reload = true,
@@ -992,6 +1125,25 @@ impl OatsApp {
         }
         if reload {
             self.reload();
+        }
+    }
+
+    /// Show a voice command's confirmation pop-ups (they close by themselves after 4 s: one
+    /// repaint scheduled for then) and play the ding once, when anything was created.
+    fn confirm(&mut self, ctx: &egui::Context, confirmations: Vec<String>) {
+        if confirmations.is_empty() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        for c in confirmations.into_iter().rev() {
+            self.toasts.confirm(c, now);
+        }
+        ctx.request_repaint();
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+            crate::toast::CONFIRM_SECS,
+        ));
+        if self.prefs.command_sound {
+            (self.chime)();
         }
     }
 
@@ -1224,22 +1376,90 @@ impl OatsApp {
     }
 
     fn apply_calendar(&mut self, actions: Vec<CalendarAction>) {
+        let mut todo_actions = Vec::new();
+        let mut changed = false;
+        for a in actions {
+            match a {
+                CalendarAction::DeleteEvent(id) => {
+                    match self.store.delete_event(id) {
+                        // the user's own delete: leave no copy in the WAL
+                        Ok(()) => self.store.checkpoint(),
+                        Err(e) => self.store_error(e),
+                    }
+                    changed = true;
+                }
+                CalendarAction::ShowEvent(id) => {
+                    let seg = self.event_source(id);
+                    self.jump_to_segment(seg);
+                }
+                CalendarAction::Todo(t) => todo_actions.push(t),
+            }
+        }
+        self.apply_todos(todo_actions);
+        if changed {
+            self.reload_brain_data();
+        }
+    }
+
+    /// Todo edits from the Todos view, the calendar's day panel and the pop-ups.
+    fn apply_todos(&mut self, actions: Vec<TodoAction>) {
         if actions.is_empty() {
             return;
         }
+        let now = chrono::Local::now().timestamp_millis();
+        let mut changed = false;
         for a in actions {
             let r = match a {
-                CalendarAction::SetReminderDone(id, done) => self.store.set_reminder_done(id, done),
-                CalendarAction::DeleteEvent(id) => self.store.delete_event(id).map(|()| {
+                TodoAction::Show(id) => {
+                    let seg = self.todo_source(id);
+                    self.jump_to_segment(seg);
+                    continue;
+                }
+                TodoAction::Add(text) => self
+                    .store
+                    .add_todo(
+                        &NewTodo {
+                            text,
+                            ..Default::default()
+                        },
+                        now,
+                    )
+                    .map(|_| ()),
+                TodoAction::SetDone(id, true) => self.store.complete_todo(id, now),
+                TodoAction::SetDone(id, false) => self.store.reopen_todo(id),
+                TodoAction::Snooze { id, until } => self.store.snooze_todo(id, until),
+                TodoAction::ClearSnooze(id) => self.store.clear_todo_snooze(id),
+                TodoAction::SetText(id, text) => self.store.set_todo_text(id, &text),
+                TodoAction::Delete(id) => self.store.delete_todo(id).map(|()| {
                     // the user's own delete: leave no copy in the WAL
                     self.store.checkpoint();
                 }),
             };
+            changed = true;
             if let Err(e) = r {
                 self.store_error(e);
             }
         }
-        self.reload_brain_data();
+        if changed {
+            self.reload_brain_data();
+        }
+    }
+
+    fn apply_toasts(&mut self, actions: Vec<ToastAction>) {
+        let todo_actions = actions
+            .into_iter()
+            .filter_map(|a| match a {
+                ToastAction::Done(id) => Some(TodoAction::SetDone(id, true)),
+                ToastAction::Snooze { id, until } => Some(TodoAction::Snooze { id, until }),
+                ToastAction::ShowTodos => {
+                    self.close_search();
+                    self.topic = None;
+                    self.set_view(View::Todos);
+                    None
+                }
+            })
+            .collect();
+        self.apply_todos(todo_actions);
     }
 
     /// "listening · mic + system", "listening · mic", "idle", …
@@ -1339,6 +1559,7 @@ impl OatsApp {
         let mut open = true;
         let mut save = false;
         let mut close = false;
+        let mut sound = self.prefs.command_sound;
         egui::Window::new("Preferences")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
@@ -1371,6 +1592,8 @@ impl OatsApp {
                     .color(t.text_tertiary)
                     .size(11.0),
                 );
+                ui.add_space(8.0);
+                ui.checkbox(&mut sound, "Play a sound for voice commands");
             });
         if !open || ctx.input(|i| i.key_pressed(Key::Escape)) {
             save = true;
@@ -1382,6 +1605,7 @@ impl OatsApp {
                 self.warning = Some(format!("Could not save your name: {e}"));
             }
         }
+        self.prefs.command_sound = sound;
         if close {
             self.prefs_window = None;
         }
@@ -1547,6 +1771,14 @@ impl OatsApp {
         self.open_topic(topic.to_owned());
     }
 
+    /// Selftest only: a voice command's result as the brain reports it (`BrainEvent::Command`
+    /// without a brain): the status line, the confirmation pop-ups, the ding.
+    pub fn selftest_command(&mut self, ctx: &egui::Context, confirmations: Vec<String>) {
+        self.last_command = confirmations.first().cloned();
+        self.confirm(ctx, confirmations);
+        self.reload();
+    }
+
     /// Selftest only: show the Listening state with a fixed input level, no audio opened.
     pub(crate) fn selftest_fake_listening(&mut self, rms_db: f32, in_speech: bool) {
         self.capture = Some(Box::new(()));
@@ -1561,7 +1793,19 @@ impl eframe::App for OatsApp {
     // everything the status item drives lives here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events();
-        self.handle_brain_events();
+        self.handle_brain_events(ctx);
+        // a todo came due (or a snooze ended): show its pop-up; then ONE repaint is scheduled
+        // for the next due time — no polling
+        let now = chrono::Local::now().timestamp_millis();
+        if self.next_due.is_some_and(|at| at <= now) {
+            self.refresh_due();
+            ctx.request_repaint();
+        }
+        if let Some(at) = self.next_due {
+            ctx.request_repaint_after(std::time::Duration::from_millis(
+                (at - now).max(0) as u64 + 50,
+            ));
+        }
         self.route_menu_events();
         self.sync_status_item(ctx);
         self.handle_close(ctx);
@@ -1630,6 +1874,8 @@ impl eframe::App for OatsApp {
         let mut transcript_actions = Vec::new();
         let mut notes_actions = Vec::new();
         let mut calendar_actions = Vec::new();
+        let mut todo_actions = Vec::new();
+        let mut list_top = 0.0;
         let mut search_actions = Vec::new();
         let mut topic_actions = Vec::new();
         egui::CentralPanel::default()
@@ -1644,6 +1890,7 @@ impl eframe::App for OatsApp {
                     pos2(full.left(), bar_rect.bottom() + 1.0),
                     pos2(full.right(), status_rect.top()),
                 );
+                list_top = list_rect.top();
 
                 let mut bar_ui = ui.new_child(
                     egui::UiBuilder::new()
@@ -1749,7 +1996,15 @@ impl eframe::App for OatsApp {
                                 &mut list_ui,
                                 &mut self.calendar_state,
                                 &self.events,
-                                &self.reminders,
+                                &self.todos,
+                                &self.nodes,
+                            );
+                        }
+                        View::Todos => {
+                            todo_actions = todos_view(
+                                &mut list_ui,
+                                &mut self.todos_state,
+                                &self.todos,
                                 &self.nodes,
                             );
                         }
@@ -1768,8 +2023,12 @@ impl eframe::App for OatsApp {
                             }
                         }
                         _ => {
-                            transcript_actions =
-                                transcript_list(&mut list_ui, &self.rows, &self.nodes);
+                            transcript_actions = transcript_list(
+                                &mut list_ui,
+                                &self.rows,
+                                &self.nodes,
+                                &mut self.transcript_focus,
+                            );
                         }
                     }
                 }
@@ -1784,11 +2043,15 @@ impl eframe::App for OatsApp {
                 ui.advance_cursor_after_rect(full);
             });
 
+        // the pop-ups: over every view, in the content area's upper right
+        let toast_actions = toasts(&ctx, list_top, &self.due_now, &mut self.toasts);
         self.preferences_window(&ctx, &t);
         self.apply_sidebar(sidebar_actions, &mut cmds);
         self.apply_transcript(transcript_actions);
         self.apply_notes(notes_actions);
         self.apply_calendar(calendar_actions);
+        self.apply_todos(todo_actions);
+        self.apply_toasts(toast_actions);
         self.apply_search(search_actions);
         self.apply_topic(topic_actions);
         for c in cmds {
@@ -1839,6 +2102,7 @@ mod tests {
             view: View::Node(7),
             listening: true,
             capture_system: false,
+            command_sound: false,
         };
         prefs.store(&mut s);
         assert_eq!(AppPrefs::load(&s), prefs);
@@ -1864,6 +2128,7 @@ mod tests {
             Command::ShowAll,
             Command::ShowNotes,
             Command::ShowCalendar,
+            Command::ShowTodos,
             Command::InterpretNow,
         ] {
             assert!(menu_shortcut(cmd).is_some(), "{cmd:?}");

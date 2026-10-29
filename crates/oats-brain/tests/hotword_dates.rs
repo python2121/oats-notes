@@ -262,19 +262,19 @@ fn several_actions_with_relative_reminders_across_the_year_end() {
     assert!(party.all_day);
     assert!(!dentist.all_day, "a time makes it a timed event");
     let r = |i: usize| match &done[i] {
-        Executed::Reminder(r) => r.clone(),
+        Executed::Todo(r) => r.clone(),
         other => panic!("{other:?}"),
     };
     // each relative reminder hangs off the event spoken just before it
     assert_eq!(r(1).event_id, Some(party.id));
     assert_eq!(r(1).text, "New year's eve party tomorrow");
     assert_eq!(
-        local(r(1).due, &tz).date_naive(),
+        local(r(1).due.unwrap(), &tz).date_naive(),
         NaiveDate::from_ymd_opt(2026, 12, 30).unwrap()
     );
     assert_eq!(r(3).event_id, Some(dentist.id));
     assert_eq!(r(3).text, "Dentist in 2 days");
-    let due = local(r(3).due, &tz);
+    let due = local(r(3).due.unwrap(), &tz);
     assert_eq!(
         (due.date_naive(), due.hour(), due.minute()),
         (NaiveDate::from_ymd_opt(2026, 12, 30).unwrap(), 9, 15),
@@ -282,12 +282,12 @@ fn several_actions_with_relative_reminders_across_the_year_end() {
     );
     assert_eq!(r(4).event_id, Some(dentist.id));
     assert_eq!(
-        local(r(4).due, &tz).date_naive(),
+        local(r(4).due.unwrap(), &tz).date_naive(),
         NaiveDate::from_ymd_opt(2026, 12, 25).unwrap()
     );
     assert_eq!(r(5).text, "Pay the dentist");
     assert_eq!(
-        local(r(5).due, &tz).date_naive(),
+        local(r(5).due.unwrap(), &tz).date_naive(),
         NaiveDate::from_ymd_opt(2027, 1, 4).unwrap()
     );
     assert_eq!(
@@ -295,7 +295,8 @@ fn several_actions_with_relative_reminders_across_the_year_end() {
         "Event: Dentist at Fri 1 Jan 2027 09:15"
     );
     assert_eq!(s.events_from(i64::MIN, 10).unwrap().len(), 2);
-    assert_eq!(s.reminders(false, 10).unwrap().len(), 4);
+    // the four reminders and each event's own todo for its day
+    assert_eq!(s.todos(oats_core::TodoFilter::All).unwrap().len(), 6);
 }
 
 #[test]
@@ -320,10 +321,10 @@ fn relative_reminders_across_month_ends_and_leap_years() {
             ],
             &tz,
         );
-        let Executed::Reminder(r) = &done[1] else {
+        let Executed::Todo(r) = &done[1] else {
             panic!("{date}: {done:?}")
         };
-        let due = local(r.due, &tz);
+        let due = local(r.due.unwrap(), &tz);
         assert_eq!(
             (due.year(), due.month(), due.day()),
             (y, m, d),
@@ -374,20 +375,22 @@ fn relative_reminders_keep_the_clock_time_across_dst() {
         ],
         &z,
     );
-    let (Executed::Event(ev), Executed::Reminder(r)) = (&done[0], &done[1]) else {
+    let (Executed::Event(ev), Executed::Todo(r)) = (&done[0], &done[1]) else {
         panic!("{done:?}")
     };
+    let r_due = r.due.unwrap();
     assert_eq!(ev.when_start, utc(2026, 3, 12, 13, 0) * 1000, "09:00 EDT");
-    assert_eq!(r.due, utc(2026, 3, 5, 14, 0) * 1000, "09:00 EST");
+    assert_eq!(r_due, utc(2026, 3, 5, 14, 0) * 1000, "09:00 EST");
     assert_eq!(
-        ev.when_start - r.due,
+        ev.when_start - r_due,
         (7 * 24 - 1) * 3_600_000,
         "a 23-hour day in between"
     );
-    let due = local(r.due, &z);
+    let due = local(r_due, &z);
     assert_eq!((due.day(), due.hour(), due.minute()), (5, 9, 0));
 
-    // autumn: an all-day event after the change, reminder before it; local midnight both times
+    // autumn: an all-day event after the change, reminder before it: the event at local
+    // midnight, its reminder at 09:00 (a date-only due time) in the other offset
     let (_, done) = run(
         vec![
             action(
@@ -401,15 +404,14 @@ fn relative_reminders_keep_the_clock_time_across_dst() {
         ],
         &z,
     );
-    let (Executed::Event(ev), Executed::Reminder(r)) = (&done[0], &done[1]) else {
+    let (Executed::Event(ev), Executed::Todo(r)) = (&done[0], &done[1]) else {
         panic!("{done:?}")
     };
     assert_eq!(ev.when_start, utc(2026, 11, 5, 5, 0) * 1000, "midnight EST");
-    assert_eq!(r.due, utc(2026, 10, 29, 4, 0) * 1000, "midnight EDT");
-    assert_eq!(local(r.due, &z).hour(), 0);
+    assert_eq!(r.due, Some(utc(2026, 10, 29, 13, 0) * 1000), "09:00 EDT");
     assert_eq!(
         done[1].describe(&z),
-        "Reminder: Taxes in one week on Thu 29 Oct 2026"
+        "Todo: Taxes in one week · due Thu 29 Oct 2026 09:00"
     );
 
     // the repeated hour: the earlier of the two instants
@@ -490,5 +492,5 @@ fn a_relative_reminder_landing_in_the_dst_gap_still_gets_a_date() {
         ],
         &z,
     );
-    assert!(matches!(&done[1], Executed::Reminder(_)), "{done:?}");
+    assert!(matches!(&done[1], Executed::Todo(_)), "{done:?}");
 }

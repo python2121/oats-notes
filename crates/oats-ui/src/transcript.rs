@@ -23,6 +23,18 @@ pub enum TranscriptAction {
     },
 }
 
+/// The jump-to-a-line mechanism (a calendar item or todo → where it was said): the row to
+/// scroll to and flash when the list lays it out (consumed there), and the flash in progress.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranscriptFocus {
+    pub pending: Option<i64>,
+    /// The row flashing right now and the egui time the flash started.
+    pub flash: Option<(i64, f64)>,
+}
+
+/// How long a jumped-to row flashes.
+const FLASH_SECS: f64 = 1.5;
+
 /// Unix ms → a time in `tz` (`None` for an out-of-range value).
 pub fn at<Tz: TimeZone>(ms: i64, tz: &Tz) -> Option<DateTime<Tz>> {
     tz.timestamp_millis_opt(ms).single()
@@ -119,6 +131,7 @@ pub fn transcript_list(
     ui: &mut egui::Ui,
     rows: &[TranscriptRow],
     nodes: &[Node],
+    focus: &mut TranscriptFocus,
 ) -> Vec<TranscriptAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
@@ -138,7 +151,8 @@ pub fn transcript_list(
     egui::ScrollArea::vertical()
         .id_salt("transcript-scroll")
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
+        // a jump scrolls to its row instead of the end
+        .stick_to_bottom(focus.pending.is_none() && focus.flash.is_none())
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add_space(6.0);
@@ -161,11 +175,37 @@ pub fn transcript_list(
                     });
                     ui.add_space(4.0);
                 }
-                transcript_row(ui, &t, row, nodes, &mut actions);
+                let rect = transcript_row(ui, &t, row, nodes, &mut actions);
+                focus_row(ui, &t, focus, row.id, rect);
             }
             ui.add_space(8.0);
         });
     actions
+}
+
+/// Scroll to the row when it is the pending focus, then flash an accent fill that fades over
+/// [`FLASH_SECS`] (repaints are requested only while it fades).
+fn focus_row(ui: &mut egui::Ui, t: &Tokens, focus: &mut TranscriptFocus, id: i64, rect: Rect) {
+    if focus.pending == Some(id) {
+        focus.pending = None;
+        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+        focus.flash = Some((id, ui.input(|i| i.time)));
+    }
+    let Some((fid, start)) = focus.flash else {
+        return;
+    };
+    if fid != id {
+        return;
+    }
+    let left = 1.0 - (ui.input(|i| i.time) - start) / FLASH_SECS;
+    if left <= 0.0 {
+        focus.flash = None;
+        return;
+    }
+    ui.painter()
+        .rect_filled(rect, 4.0, t.accent_alpha(0.28 * left as f32));
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
 }
 
 /// The rows with day headings, laid out in the caller's scroll area (a node view's collapsible
@@ -221,13 +261,14 @@ pub fn source_label(row: &TranscriptRow) -> Option<&'static str> {
     }
 }
 
+/// One row; returns its rect (the hover / flash area).
 fn transcript_row(
     ui: &mut egui::Ui,
     t: &Tokens,
     row: &TranscriptRow,
     nodes: &[Node],
     actions: &mut Vec<TranscriptAction>,
-) {
+) -> Rect {
     // the hover fill goes UNDER the text: reserve its slot first, fill it once the row's height
     // is known
     let fill = ui.painter().add(egui::Shape::Noop);
@@ -331,6 +372,7 @@ fn transcript_row(
         }
     });
     ui.add_space(2.0);
+    rect
 }
 
 #[cfg(test)]

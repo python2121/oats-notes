@@ -5,12 +5,16 @@
 //! schema; the actions that come back (an event AND a reminder for the example above) are
 //! executed against the store with `source = hotword` and the source segment id, so the user
 //! can audit what a spoken command did.
+//!
+//! Todos and reminders are one thing (a reminder is a todo with a due time): `add_todo` and
+//! its alias `add_reminder` both make a todo; every spoken `add_event` also gets a todo due
+//! when the event starts (an all-day event: 09:00 that day), so a dictated due date pops up
+//! that morning. Interpretation-extracted events get no todo (too noisy).
 
 use chrono::{DateTime, TimeZone};
 use oats_core::store::name_key;
 use oats_core::{
-    Event, NewEvent, NewReminder, Node, NodeKind, Note, Origin, Reminder, Store, StoreError,
-    TranscriptRow,
+    Event, NewEvent, NewTodo, Node, NodeKind, Note, Origin, Store, StoreError, Todo, TranscriptRow,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -148,6 +152,9 @@ pub struct CommandAction {
     pub relative_to_event: Option<bool>,
     #[serde(default)]
     pub offset_days: Option<i64>,
+    /// "in 2 hours / 2 days / 3 weeks": minutes from the moment the command was spoken.
+    #[serde(default)]
+    pub in_minutes: Option<i64>,
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
@@ -176,7 +183,7 @@ pub fn command_schema() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "intent": { "type": "string", "enum": ["add_event", "add_reminder", "add_note", "create_project", "unknown"] },
+                        "intent": { "type": "string", "enum": ["add_event", "add_todo", "add_reminder", "add_note", "create_project", "unknown"] },
                         "title": short,
                         "date": { "type": ["string", "null"], "description": "YYYY-MM-DD", "maxLength": 32 },
                         "time": { "type": ["string", "null"], "description": "HH:MM", "maxLength": 32 },
@@ -187,12 +194,17 @@ pub fn command_schema() -> Value {
                             "minimum": -dates::MAX_OFFSET_DAYS,
                             "maximum": dates::MAX_OFFSET_DAYS
                         },
+                        "in_minutes": {
+                            "type": ["integer", "null"],
+                            "minimum": 0,
+                            "maximum": dates::MAX_IN_MINUTES
+                        },
                         "text": long,
                         "details": long,
                         "node_name": short,
                         "category_name": short
                     },
-                    "required": ["intent", "title", "date", "time", "all_day", "relative_to_event", "offset_days", "text", "details", "node_name", "category_name"],
+                    "required": ["intent", "title", "date", "time", "all_day", "relative_to_event", "offset_days", "in_minutes", "text", "details", "node_name", "category_name"],
                     "additionalProperties": false
                 }
             }
@@ -256,6 +268,7 @@ pub fn parse_command(v: &Value) -> Result<CommandResult, serde_json::Error> {
         a.offset_days = a
             .offset_days
             .map(|d| d.clamp(-dates::MAX_OFFSET_DAYS, dates::MAX_OFFSET_DAYS));
+        a.in_minutes = a.in_minutes.map(|m| m.clamp(0, dates::MAX_IN_MINUTES));
     }
     Ok(r)
 }
@@ -264,7 +277,8 @@ pub fn parse_command(v: &Value) -> Result<CommandResult, serde_json::Error> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Executed {
     Event(Event),
-    Reminder(Reminder),
+    /// A todo (`add_todo`, or a reminder: a todo with a due time).
+    Todo(Todo),
     Note(Note),
     Project(Node),
     /// Not understood, or missing what it needed (the text says what).
@@ -294,12 +308,120 @@ impl Executed {
                 format!("Event: {} on {}", e.title, day(e.when_start))
             }
             Executed::Event(e) => format!("Event: {} at {}", e.title, at(e.when_start)),
-            Executed::Reminder(r) => format!("Reminder: {} on {}", r.text, day(r.due)),
+            Executed::Todo(r) => match r.due {
+                Some(due) => format!("Todo: {} · due {}", r.text, at(due)),
+                None => format!("Todo: {}", r.text),
+            },
             Executed::Note(n) => format!("Note: {}", n.text),
             Executed::Project(p) => format!("Project: {}", p.name),
             Executed::Unknown(t) => format!("Not understood: {t}"),
         }
     }
+
+    /// The confirmation pop-up's text for something the command created ("Todo added: …",
+    /// "Reminder set: … — Thu 12 Dec, 09:00", "Event added: …", "Note filed: …",
+    /// "Project created: …"); `None` for what wasn't understood.
+    pub fn confirmation<Tz: TimeZone>(&self, tz: &Tz) -> Option<String>
+    where
+        Tz::Offset: std::fmt::Display,
+    {
+        let fmt = |ms: i64, f: &str| {
+            tz.timestamp_millis_opt(ms)
+                .single()
+                .map(|d| d.format(f).to_string())
+                .unwrap_or_default()
+        };
+        Some(match self {
+            Executed::Todo(t) => match t.due {
+                Some(due) => format!(
+                    "Reminder set: {} — {}",
+                    t.text,
+                    fmt(due, "%a %-d %b, %H:%M")
+                ),
+                None => format!("Todo added: {}", t.text),
+            },
+            Executed::Event(e) if e.all_day => {
+                format!(
+                    "Event added: {} — {}",
+                    e.title,
+                    fmt(e.when_start, "%a %-d %b %Y")
+                )
+            }
+            Executed::Event(e) => format!(
+                "Event added: {} — {}",
+                e.title,
+                fmt(e.when_start, "%a %-d %b %Y, %H:%M")
+            ),
+            Executed::Note(n) => {
+                let mut text: String = n.text.chars().take(60).collect();
+                if n.text.chars().count() > 60 {
+                    text.push('…');
+                }
+                format!("Note filed: {text}")
+            }
+            Executed::Project(p) => format!("Project created: {}", p.name),
+            Executed::Unknown(_) => return None,
+        })
+    }
+}
+
+/// When an event's todo is due: its start; an all-day event's at
+/// [`dates::default_due_time`] that day.
+fn event_due<Tz: TimeZone>(ev: &Event, tz: &Tz) -> Option<i64> {
+    if !ev.all_day {
+        return Some(ev.when_start);
+    }
+    let day = tz
+        .timestamp_millis_opt(ev.when_start)
+        .single()?
+        .date_naive();
+    dates::due_ms(day, None, tz)
+}
+
+/// Store a voice command's todo, deduplicated per segment (a retried command doesn't add it
+/// twice): `hotword:<segment>:reminder:<due day>:<text>`, or `…:todo:<text>` undated. A newly
+/// created one is recorded in the change log.
+fn add_todo<Tz: TimeZone>(
+    store: &Store,
+    t: &NewTodo,
+    now_ms: i64,
+    tz: &Tz,
+) -> Result<Todo, StoreError>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let seg = t.source_segment_id.unwrap_or(0);
+    let key = match t.due.and_then(|d| tz.timestamp_millis_opt(d).single()) {
+        Some(d) => format!(
+            "hotword:{seg}:reminder:{}:{}",
+            d.format("%Y-%m-%d"),
+            name_key(&t.text)
+        ),
+        None => format!("hotword:{seg}:todo:{}", name_key(&t.text)),
+    };
+    let todo = store.add_todo(
+        &NewTodo {
+            dedupe_key: Some(key),
+            ..t.clone()
+        },
+        now_ms,
+    )?;
+    if todo.created_at == now_ms {
+        let due = todo
+            .due
+            .and_then(|d| tz.timestamp_millis_opt(d).single())
+            .map(|d| format!(" (due {})", d.format("%a %-d %b %Y %H:%M")))
+            .unwrap_or_default();
+        store.record_change(
+            None,
+            "todo_create",
+            &format!("Todo by voice command: {}{due}", todo.text),
+            &json!(null),
+            &json!(todo),
+            now_ms,
+        )?;
+    }
+    Ok(todo)
 }
 
 fn find_by_name(tree: &[Node], name: &str) -> Option<Node> {
@@ -406,17 +528,41 @@ where
                     },
                     now_ms,
                 )?;
+                // the event's own todo, due when it starts (all day: that morning), so a
+                // dictated due date pops up on the day
+                if let Some(due) = event_due(&ev, tz) {
+                    add_todo(
+                        store,
+                        &NewTodo {
+                            text: ev.title.clone(),
+                            due: Some(due),
+                            event_id: Some(ev.id),
+                            source: Some(Origin::Hotword),
+                            source_segment_id: Some(seg),
+                            node_id: ev.node_id,
+                            dedupe_key: None,
+                        },
+                        now_ms,
+                        tz,
+                    )?;
+                }
                 last_event = Some(ev.clone());
                 out.push(Executed::Event(ev));
             }
-            "add_reminder" => {
+            // a reminder is a todo with a due time
+            "add_todo" | "add_reminder" => {
+                let reminder = a.intent == "add_reminder";
                 let relative = a.relative_to_event.unwrap_or(false)
-                    || (a.date.is_none() && offset_days.is_some());
+                    || (a.date.is_none() && a.in_minutes.is_none() && offset_days.is_some());
+                let spoken = tz.timestamp_millis_opt(segment.started_at).single();
+                let in_minutes = a
+                    .in_minutes
+                    .or_else(|| a.date.as_deref().and_then(dates::parse_in_phrase));
                 let (due, default_text) = if relative {
                     match &last_event {
                         Some(ev) => {
-                            let start = tz.timestamp_millis_opt(ev.when_start).single();
-                            let due = start
+                            let due = event_due(ev, tz)
+                                .and_then(|ms| tz.timestamp_millis_opt(ms).single())
                                 .and_then(|s| dates::shift_days(&s, offset_days.unwrap_or(0)))
                                 .map(|d| d.timestamp_millis());
                             let days = -offset_days.unwrap_or(0);
@@ -430,51 +576,54 @@ where
                         }
                         None => (None, String::new()),
                     }
+                } else if let Some(m) = in_minutes {
+                    (
+                        spoken.and_then(|s| dates::after_minutes(&s, m)),
+                        String::new(),
+                    )
                 } else {
                     let due = a.date.as_deref().and_then(dates::parse_date).and_then(|d| {
-                        dates::to_ms(d, a.time.as_deref().and_then(dates::parse_time), tz)
+                        dates::due_ms(d, a.time.as_deref().and_then(dates::parse_time), tz)
                     });
                     (due, String::new())
                 };
-                let Some(due) = due else {
+                // a reminder needs a time; a todo may be undated — unless it asked for a date
+                // that couldn't be read
+                let unreadable = a.date.as_deref().is_some_and(|d| !d.trim().is_empty());
+                if due.is_none() && (reminder || relative || unreadable) {
                     out.push(Executed::Unknown(format!(
                         "reminder without a date: {}",
                         text_of(a)
                     )));
                     continue;
-                };
+                }
                 let text = {
                     let t = text_of(a);
                     if t.is_empty() { default_text } else { t }
                 };
                 if text.is_empty() {
-                    out.push(Executed::Unknown("reminder without text".into()));
+                    out.push(Executed::Unknown("todo without text".into()));
                     continue;
                 }
-                let due_day = tz
-                    .timestamp_millis_opt(due)
-                    .single()
-                    .map(|d| d.format("%Y-%m-%d").to_string())
-                    .unwrap_or_default();
-                let r = store.upsert_reminder(
-                    &NewReminder {
+                let t = add_todo(
+                    store,
+                    &NewTodo {
+                        text,
+                        due,
                         event_id: if relative {
                             last_event.as_ref().map(|e| e.id)
                         } else {
                             None
                         },
-                        due,
-                        text: text.clone(),
                         source: Some(Origin::Hotword),
                         source_segment_id: Some(seg),
-                        dedupe_key: Some(format!(
-                            "hotword:{seg}:reminder:{due_day}:{}",
-                            name_key(&text)
-                        )),
+                        node_id: node.as_ref().map(|n| n.id),
+                        dedupe_key: None,
                     },
                     now_ms,
+                    tz,
                 )?;
-                out.push(Executed::Reminder(r));
+                out.push(Executed::Todo(t));
             }
             "add_note" => {
                 let text = text_of(a);
@@ -570,7 +719,7 @@ mod tests {
         };
         assert!(!can_command(&echo));
     }
-    use chrono::{FixedOffset, NaiveDate};
+    use chrono::{Datelike, FixedOffset, NaiveDate, Timelike};
 
     const SENTENCE: &str =
         "Hey, computer, property taxes are due on 12/12/2026, also set a reminder one week ahead.";
@@ -657,16 +806,33 @@ mod tests {
             day.date_naive(),
             NaiveDate::from_ymd_opt(2026, 12, 12).unwrap()
         );
-        let Executed::Reminder(r) = &done[1] else {
+        let Executed::Todo(r) = &done[1] else {
             unreachable!()
         };
         assert_eq!(r.text, "Property taxes due in one week");
         assert_eq!(r.event_id, Some(ev.id));
         assert_eq!(r.source, Origin::Hotword);
-        let due = tz.timestamp_millis_opt(r.due).single().unwrap();
+        let due = tz.timestamp_millis_opt(r.due.unwrap()).single().unwrap();
         assert_eq!(
-            due.date_naive(),
-            NaiveDate::from_ymd_opt(2026, 12, 5).unwrap()
+            (due.date_naive(), due.hour()),
+            (NaiveDate::from_ymd_opt(2026, 12, 5).unwrap(), 9),
+            "a week before the all-day event, in the morning"
+        );
+        // the event's own todo: due that morning, so it pops up on the day
+        let todos = s.todos(oats_core::TodoFilter::Open).unwrap();
+        assert_eq!(todos.len(), 2, "{todos:?}");
+        let own = todos
+            .iter()
+            .find(|t| t.text == "Property taxes due")
+            .unwrap();
+        let own_due = tz.timestamp_millis_opt(own.due.unwrap()).single().unwrap();
+        assert_eq!(
+            (own_due.date_naive(), own_due.hour(), own_due.minute()),
+            (NaiveDate::from_ymd_opt(2026, 12, 12).unwrap(), 9, 0)
+        );
+        assert_eq!(
+            (own.event_id, own.source_segment_id, own.node_id),
+            (Some(ev.id), Some(seg.id), ev.node_id)
         );
         assert_eq!(
             done[0].describe(&tz),
@@ -674,12 +840,22 @@ mod tests {
         );
         assert_eq!(
             done[1].describe(&tz),
-            "Reminder: Property taxes due in one week on Sat 5 Dec 2026"
+            "Todo: Property taxes due in one week · due Sat 5 Dec 2026 09:00"
         );
+        // both todos are in the change log
+        let logged: Vec<String> = s
+            .changes(10)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.kind == "todo_create")
+            .map(|c| c.description)
+            .collect();
+        assert_eq!(logged.len(), 2, "{logged:?}");
         // running the same command twice (a retried run) doesn't duplicate anything
         execute(&s, &tree, &seg, &result, 100, &tz).unwrap();
         assert_eq!(s.events_from(0, 10).unwrap().len(), 1);
-        assert_eq!(s.reminders(true, 10).unwrap().len(), 1);
+        assert_eq!(s.todos(oats_core::TodoFilter::Open).unwrap().len(), 2);
+        assert_eq!(s.changes(10).unwrap().len(), 2, "nothing logged twice");
     }
 
     #[test]
@@ -718,14 +894,17 @@ mod tests {
             unreachable!()
         };
         assert_eq!(p2.id, p.id, "deduped by name");
-        let Executed::Reminder(r) = &done[3] else {
+        let Executed::Todo(r) = &done[3] else {
             unreachable!()
         };
         assert_eq!(r.event_id, None);
+        let due = tz.timestamp_millis_opt(r.due.unwrap()).single().unwrap();
+        assert_eq!(due.hour(), 18, "a spoken time is kept");
         assert!(matches!(&done[4], Executed::Unknown(t) if t.contains("without a date")));
         assert!(matches!(&done[5], Executed::Unknown(_)));
         assert!(matches!(&done[6], Executed::Unknown(t) if t == "mumble"));
-        assert_eq!(s.changes(10).unwrap().len(), 1);
+        let kinds: Vec<String> = s.changes(10).unwrap().into_iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, ["todo_create", "node_create"]);
     }
 
     #[test]
@@ -806,10 +985,10 @@ mod tests {
             ],
         };
         let done = execute(&s, &tree, &seg, &result, 1, &tz).unwrap();
-        let Executed::Reminder(r) = &done[1] else {
+        let Executed::Todo(r) = &done[1] else {
             unreachable!("{done:?}")
         };
-        let due = tz.timestamp_millis_opt(r.due).single().unwrap();
+        let due = tz.timestamp_millis_opt(r.due.unwrap()).single().unwrap();
         assert_eq!(
             due.date_naive(),
             NaiveDate::from_ymd_opt(2025, 12, 11).unwrap()
@@ -860,6 +1039,122 @@ mod tests {
             req.user_prompt.contains("2026-10-20"),
             "{}",
             req.user_prompt
+        );
+    }
+
+    fn todo_action(extra: Value) -> CommandAction {
+        let mut a = json!({"intent": "add_todo", "title": null, "date": null, "time": null,
+            "all_day": false, "relative_to_event": false, "offset_days": null,
+            "in_minutes": null, "text": null, "details": null, "node_name": null,
+            "category_name": null});
+        for (k, v) in extra.as_object().unwrap() {
+            a[k] = v.clone();
+        }
+        parse_command(&json!({ "actions": [a] }))
+            .unwrap()
+            .actions
+            .remove(0)
+    }
+
+    /// The user's examples: "remind me in 2 days to call the landlord" counts from when it
+    /// was SPOKEN (not when the command ran); "todo: buy oat milk" is undated; "tomorrow at 9"
+    /// and a weekday are dates the model resolved; a bare date is due at 09:00.
+    #[test]
+    fn todos_relative_to_the_spoken_time_and_undated() {
+        let s = Store::open_in_memory().unwrap();
+        let sid = s.begin_session(0, "e").unwrap();
+        let tz = FixedOffset::east_opt(3600).unwrap();
+        let spoken = tz
+            .with_ymd_and_hms(2026, 10, 29, 14, 5, 0)
+            .single()
+            .unwrap();
+        let seg = s
+            .insert_segment(
+                sid,
+                spoken.timestamp_millis(),
+                spoken.timestamp_millis() + 4_000,
+                "hey computer remind me in 2 days to call the landlord",
+                None,
+            )
+            .unwrap();
+        let tree = s.nodes().unwrap();
+        let result = CommandResult {
+            actions: vec![
+                todo_action(json!({"text": "Call the landlord", "in_minutes": 2880})),
+                todo_action(json!({"text": "Buy oat milk", "node_name": "personal"})),
+                todo_action(
+                    json!({"text": "Send the invoice", "date": "2026-10-30", "time": "09:00"}),
+                ),
+                todo_action(json!({"text": "Water the plants", "date": "2026-11-06"})),
+                todo_action(json!({"text": "Stretch", "in_minutes": 90})),
+                todo_action(json!({"text": "Check the oven", "date": "in an hour"})),
+                todo_action(json!({"text": "Unreadable", "date": "next blursday"})),
+                todo_action(json!({"text": "   "})),
+            ],
+        };
+        // executed a day later (a backlog after an outage): still from the spoken time
+        let later = spoken.timestamp_millis() + 86_400_000;
+        let done = execute(&s, &tree, &seg, &result, later, &tz).unwrap();
+        let todo = |i: usize| match &done[i] {
+            Executed::Todo(t) => t.clone(),
+            other => unreachable!("{other:?}"),
+        };
+        let local = |ms: Option<i64>| tz.timestamp_millis_opt(ms.unwrap()).single().unwrap();
+        let landlord = todo(0);
+        assert_eq!(landlord.text, "Call the landlord");
+        let d = local(landlord.due);
+        assert_eq!(
+            (d.date_naive(), d.hour(), d.minute()),
+            (NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(), 14, 5)
+        );
+        assert_eq!(landlord.source, Origin::Hotword);
+        assert_eq!(landlord.source_segment_id, Some(seg.id));
+        let milk = todo(1);
+        assert_eq!(milk.due, None, "no moment said: undated");
+        assert_eq!(
+            milk.node_id,
+            Some(tree.iter().find(|n| n.name == "Personal").unwrap().id)
+        );
+        assert_eq!(
+            done[1].describe(&tz),
+            "Todo: Buy oat milk",
+            "an undated todo says so"
+        );
+        let d = local(todo(2).due);
+        assert_eq!((d.day(), d.hour()), (30, 9));
+        let d = local(todo(3).due);
+        assert_eq!(
+            (d.day(), d.hour(), d.minute()),
+            (6, 9, 0),
+            "a bare date: 09:00"
+        );
+        assert_eq!(todo(4).due, Some(spoken.timestamp_millis() + 90 * 60_000));
+        assert_eq!(
+            todo(5).due,
+            Some(spoken.timestamp_millis() + 60 * 60_000),
+            "an 'in …' phrase in the date field still works"
+        );
+        assert!(matches!(&done[6], Executed::Unknown(t) if t.contains("without a date")));
+        assert!(matches!(&done[7], Executed::Unknown(t) if t.contains("without text")));
+        assert_eq!(
+            done[0].describe(&tz),
+            "Todo: Call the landlord · due Sat 31 Oct 2026 14:05"
+        );
+        assert_eq!(s.todos(oats_core::TodoFilter::Open).unwrap().len(), 6);
+        // the schema offers the intent and the field
+        let schema = command_schema();
+        let item = &schema["properties"]["actions"]["items"];
+        assert!(
+            item["properties"]["intent"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("add_todo"))
+        );
+        assert!(
+            item["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("in_minutes"))
         );
     }
 }

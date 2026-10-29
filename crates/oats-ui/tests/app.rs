@@ -703,3 +703,238 @@ fn a_topic_chip_lists_its_notes_and_a_row_jumps_to_the_card() {
     rig.harness.run_steps(2);
     assert!(!rig.app().topic_open());
 }
+
+// ---- todos, reminder pop-ups, the calendar's jump to the transcript ----------------------------
+
+fn add_todo(db: &Path, text: &str, due: Option<i64>) -> i64 {
+    let s = Store::open(db).unwrap();
+    s.add_todo(
+        &oats_core::NewTodo {
+            text: text.into(),
+            due,
+            ..Default::default()
+        },
+        now_ms(),
+    )
+    .unwrap()
+    .id
+}
+
+#[test]
+fn a_due_todo_pops_up_and_done_completes_it() {
+    let dir = TempDir::new("toast-done");
+    let id = add_todo(&dir.db(), "Pay the property taxes", Some(now_ms() - 60_000));
+    add_todo(&dir.db(), "Later thing", Some(now_ms() + 3_600_000));
+    let mut rig = build(&dir.db(), None, None);
+    rig.harness.run_steps(2);
+    assert_eq!(
+        rig.app()
+            .due_todos()
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        [id]
+    );
+    assert!(rig.shows("Pay the property taxes"));
+    assert!(rig.app().next_due().is_some(), "the later one is scheduled");
+    rig.harness.get_by_label("Done").click();
+    rig.harness.run_steps(2);
+    assert!(rig.app().due_todos().is_empty(), "the pop-up closed");
+    let t = rig
+        .app()
+        .todos()
+        .iter()
+        .find(|t| t.id == id)
+        .cloned()
+        .unwrap();
+    assert!(t.done(), "Done completes it");
+    assert_eq!(
+        rig.app().todos().last().map(|t| t.id),
+        Some(id),
+        "completed todos go to the end"
+    );
+}
+
+#[test]
+fn the_close_button_of_a_reminder_completes_it_too() {
+    let dir = TempDir::new("toast-x");
+    let id = add_todo(&dir.db(), "Call the landlord", Some(now_ms() - 1_000));
+    let mut rig = build(&dir.db(), None, None);
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("×").click();
+    rig.harness.run_steps(2);
+    assert!(rig.app().due_todos().is_empty());
+    assert!(
+        Store::open(&dir.db())
+            .unwrap()
+            .todo(id)
+            .unwrap()
+            .unwrap()
+            .done()
+    );
+}
+
+#[test]
+fn snoozing_a_reminder_hides_it_for_an_hour() {
+    let dir = TempDir::new("toast-snooze");
+    let id = add_todo(&dir.db(), "Water the plants", Some(now_ms() - 1_000));
+    let mut rig = build(&dir.db(), None, None);
+    rig.harness.run_steps(2);
+    let before = now_ms();
+    rig.harness.get_by_label("1h").click();
+    rig.harness.run_steps(2);
+    assert!(rig.app().due_todos().is_empty(), "snoozed: hidden");
+    let t = Store::open(&dir.db()).unwrap().todo(id).unwrap().unwrap();
+    assert!(!t.done());
+    let until = t.snoozed_until.unwrap();
+    assert!((before + 3_600_000..=now_ms() + 3_600_000).contains(&until));
+    assert_eq!(rig.app().next_due(), Some(until), "it wakes the UI then");
+}
+
+#[test]
+fn the_todos_view_lists_open_then_completed_and_adds_by_hand() {
+    let dir = TempDir::new("todos-view");
+    let done = add_todo(&dir.db(), "Already done", None);
+    Store::open(&dir.db())
+        .unwrap()
+        .complete_todo(done, now_ms())
+        .unwrap();
+    add_todo(&dir.db(), "Undated thing", None);
+    add_todo(&dir.db(), "Dated thing", Some(now_ms() + 2 * 86_400_000));
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    assert_eq!(rig.app().prefs().view, View::Todos);
+    let texts: Vec<String> = rig.app().todos().iter().map(|t| t.text.clone()).collect();
+    assert_eq!(texts, ["Dated thing", "Undated thing", "Already done"]);
+    assert!(rig.shows("Completed (1)"));
+    assert!(rig.shows("in 2 days"));
+    assert!(rig.shows("Already done"));
+    // typed by hand: Enter adds an undated todo
+    use egui::accesskit::Role;
+    rig.harness.get_by_role(Role::TextInput).click();
+    rig.harness.run_steps(1);
+    rig.harness
+        .event(egui::Event::Text("Buy oat milk".to_owned()));
+    rig.harness.key_press(egui::Key::Enter);
+    rig.harness.run_steps(2);
+    let added = rig
+        .app()
+        .todos()
+        .iter()
+        .find(|t| t.text == "Buy oat milk")
+        .cloned();
+    assert!(added.is_some_and(|t| t.due.is_none() && !t.done()));
+    // the first checkbox completes the first open todo; it moves under "Completed"
+    let first = rig.app().todos()[0].id;
+    rig.harness
+        .get_all_by_role(Role::CheckBox)
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(2);
+    assert!(rig.shows("Completed (2)"));
+    assert!(
+        rig.app()
+            .todos()
+            .iter()
+            .find(|t| t.id == first)
+            .is_some_and(|t| t.done())
+    );
+    assert!(rig.app().todos()[0].id != first);
+}
+
+#[test]
+fn a_voice_command_confirmation_shows_and_closes_after_four_seconds() {
+    let dir = TempDir::new("confirm");
+    let mut rig = build(&dir.db(), None, None);
+    let dinged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let d = dinged.clone();
+    rig.app().set_chime(Box::new(move || {
+        d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let ctx = rig.harness.ctx.clone();
+    rig.app().selftest_command(
+        &ctx,
+        vec![
+            "Todo added: Buy oat milk".to_owned(),
+            "Note filed: the landlord's number".to_owned(),
+        ],
+    );
+    rig.harness.run_steps(1);
+    assert!(rig.shows("Todo added: Buy oat milk"));
+    assert!(rig.shows("Note filed: the landlord's number"));
+    assert_eq!(rig.app().confirmations().len(), 2);
+    assert_eq!(
+        dinged.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one ding per command"
+    );
+    // the harness advances egui's clock by 0.25 s a step: 4 s later they are gone
+    rig.harness.run_steps(17);
+    assert!(rig.app().confirmations().is_empty());
+    assert!(!rig.shows("Todo added: Buy oat milk"));
+}
+
+#[test]
+fn a_calendar_item_jumps_to_where_it_was_said() {
+    let dir = TempDir::new("cal-jump");
+    seed(&dir.db());
+    let seg = {
+        let s = Store::open(&dir.db()).unwrap();
+        let sid = s.begin_session(now_ms() - 30_000, "e").unwrap();
+        let t = now_ms() - 20_000;
+        let seg = s
+            .insert_segment(
+                sid,
+                t,
+                t + 3_000,
+                "hey computer dentist today at five",
+                None,
+            )
+            .unwrap();
+        s.upsert_event(
+            &oats_core::NewEvent {
+                when_start: now_ms(),
+                title: "Dentist appointment".into(),
+                source: Some(oats_core::Origin::Hotword),
+                source_segment_id: Some(seg.id),
+                ..Default::default()
+            },
+            now_ms(),
+        )
+        .unwrap();
+        s.upsert_event(
+            &oats_core::NewEvent {
+                when_start: now_ms(),
+                title: "Orphan event".into(),
+                source: Some(oats_core::Origin::User),
+                ..Default::default()
+            },
+            now_ms(),
+        )
+        .unwrap();
+        seg
+    };
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowCalendar);
+    rig.harness.run_steps(2);
+    // the day panel (today is selected) lists it; clicking it shows the transcript
+    rig.harness.get_by_label("Dentist appointment").click();
+    rig.harness.step();
+    assert_eq!(rig.app().prefs().view, View::Today, "said today");
+    rig.harness.run_steps(3);
+    assert_eq!(
+        rig.app().pending_segment_focus(),
+        None,
+        "the row consumed the focus"
+    );
+    assert!(rig.shows(&seg.text));
+    // an item with no source says so
+    rig.app().run(Command::ShowCalendar);
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Orphan event").click();
+    rig.harness.run_steps(2);
+    assert_eq!(rig.app().prefs().view, View::Calendar);
+    assert_eq!(rig.app().warning(), Some("No transcript for this item"));
+}

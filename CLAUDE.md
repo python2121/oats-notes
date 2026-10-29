@@ -32,11 +32,11 @@ never changes.
 ```
 crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, echo rules (text + audio), paths  (no platform code)
 crates/oats-brain              the brain: `claude` CLI wrapper, episode cutting, prompts (prompts/*.md), hotword commands, tiered scheduler  (no platform code)
-crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mic/system + own FIR resampler: microphone (InputPolicy, MicMode plain | voice processing) and system audio (SystemCapture)
+crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mic/system + own FIR resampler: microphone (InputPolicy, MicMode plain | voice processing) and system audio (SystemCapture); the voice-command ding (chime)
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
-crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Notes / Calendar views, node view (notes + projects)
+crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Notes / Calendar (month grid) / Todos views, node view (notes + projects), reminder + confirmation pop-ups
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
 vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
 vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream and a voice-processing input stream (macOS); NOT a workspace member
@@ -225,7 +225,8 @@ view while open: Notes (episode cards, matches marked), Calendar (events), Trans
 from `Store::search(query, 200)` (case-insensitive substring, echoes excluded, re-run only when
 the text or the data changes). Esc (also from the field) or × closes it and the previous view is
 back; ⌘F again re-selects the field. Clicking a note opens its node view (Notes if unfiled), an
-event opens Calendar, a line opens Today / All — no scroll-to-row yet.
+event opens Calendar, a line opens Today / All — no scroll-to-row yet from search (the
+calendar and todos do scroll to the row, see below).
 `--selftest out.png --search TEXT` renders it.
 
 Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui::Window` anchored
@@ -239,6 +240,50 @@ categorise, review and command through the `{{user_name_note}}` placeholder, whi
 `prompts/user_name.md` (with `{{user_name}}`: "The person using this app is …; `me:` is …;
 action items for them are owner \"me\"") or, with no name, a neutral sentence. It is NOT a
 hotword; hotwords are unchanged.
+
+## Todos, reminder pop-ups and the calendar (`oats-ui`: `todos`, `toast`, `calendar`)
+
+- **Todos view** (⌘5, View ▸ Todos, sidebar "Todos"; `View::Todos`): `Store::todos(All)`
+  order — open dated (soonest first), open undated (manual `position`), completed (most recent
+  first) at the BOTTOM, crossed through (`RichText::strikethrough`, text_tertiary, "done
+  <date>"). Open rows: checkbox, text, due ("in 20 min" / "today, 15:00" / "tomorrow, 09:00" /
+  "in 3 days" / "Thu 12 Dec, 09:00"; overdue in `t.danger`; `todos::due_label`), "snoozed
+  until …", node chip, source chip. "+ Add todo" field (Enter adds an undated todo, source
+  user). Right-click: Mark Done/Not Done, Edit Text, Snooze ▸ 1 hour / 1 day / 1 week, Clear
+  Snooze, Show in Transcript, Delete. Reloads on `BrainEvent::Changed` / `Command` and after
+  local edits.
+- **Reminder pop-ups** (`toast::toasts`, an `egui::Area` anchored RIGHT_TOP, 12 pt below the
+  control bar, cards 340 pt, corner radius 10, `t.chrome` + 1 px `t.button_border`, the popup
+  shadow): every open todo with `COALESCE(snoozed_until, due) <= now` (`Store::due_todos`),
+  newest due on top, max 3 + "and N more due" (→ Todos). Card: painted bell, text, "Due …",
+  Snooze 1h · 1d · 1w, **Done** (accent). The × in the corner is ALSO Done (tooltip "Done —
+  mark complete"): the user's rule is "dismiss = mark complete", so there is no
+  dismiss-without-completing. Scheduling: `refresh_due` (after every todo change, on load, on
+  "Show OatsNotes" from the status item) reads `due_todos` + `next_due_at`; `logic()`
+  schedules ONE `request_repaint_after` for the next due time and refreshes when it passes —
+  no polling, no continuous repaint. Pop-ups live in the window only (a hidden window shows
+  them when re-shown).
+- **Confirmations**: each `BrainEvent::Command` confirmation becomes a lighter card in the
+  same stack (check glyph, text, ×), max 3, closed after 4 s by one scheduled repaint
+  (hovering holds it open), and the ding plays once per command when the
+  `AppPrefs::command_sound` pref is on (Preferences ▸ "Play a sound for voice commands",
+  default on). The ding: `oats_audio::chime::play` (880 Hz then 1320 Hz, 80 ms each, 10 ms
+  fades, −18 dBFS, default OUTPUT device, own short-lived thread, failures logged), handed to
+  the UI as `oats_ui::Chime` via `OatsApp::set_chime` (the UI doesn't depend on oats-audio;
+  the selftest and tests have none). The system-audio lane hears it through the tap: 160 ms is
+  under the segmenter's 400 ms minimum speech, so it never becomes a segment.
+- **Calendar** (⌘4): month grid, ‹ month year › + Today, weeks Monday–Sunday (a pref later),
+  outside days dimmed, today outlined in accent, selected day tinted; per cell up to 3
+  one-line chips (events `t.accent_alpha`, dated todos `t.button` — `t.field` is invisible on
+  the canvas — completed todos struck through) and "+N"; a hotword event's own same-titled
+  todo is folded into the event in the grid (`calendar::items_by_day`). The day panel below
+  lists the selected day's events and todos in full with their right-click actions.
+- **Jump to the transcript**: clicking a calendar chip / day-panel row / a dictated todo's text
+  resolves its source (`source_segment_id`; an interpreted event: the first segment of its
+  `source_episode_id`; a todo without one: its event's source), switches to Today (said
+  today) or All transcripts, scrolls to the row and flashes it 1.5 s
+  (`transcript::TranscriptFocus`, consumed when the row is laid out; stick-to-bottom is off
+  while it runs). No source / deleted: "No transcript for this item" in the status strip.
 
 ## The brain (`crates/oats-brain`)
 
@@ -301,9 +346,23 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   punctuation-insensitive, and only on the user's own microphone (`hotword::can_command`: a
   `them:` segment or a mic echo never commands this computer); the command text goes to
   `command.*` (haiku) → actions
-  `add_event` / `add_reminder` (relative offsets: "one week ahead" = `offset_days: -7` from the
-  event in the same command) / `add_note` / `create_project` / `unknown`, executed with
-  `source = hotword` and the source segment id. The segment is marked consumed (never part of
+  `add_event` / `add_todo` / `add_reminder` (relative offsets: "one week ahead" =
+  `offset_days: -7` from the event in the same command) / `add_note` / `create_project` /
+  `unknown`, executed with `source = hotword` and the source segment id. TODOS: a reminder is
+  a todo with a due time — `add_todo` and its alias `add_reminder` both write a todo
+  (`Executed::Todo`, "Todo: … · due …"). Due times: `in_minutes` ("in 2 hours / 2 days / 3
+  weeks", counted from when the command was SPOKEN; whole days keep the clock time across
+  DST, `dates::after_minutes`; an "in N …" phrase the model put in `date` is parsed as a
+  fallback, `dates::parse_in_phrase`), else `date` (+ `time`; a date alone is due at 09:00
+  local, `dates::default_due_time`), else undated (`add_reminder` needs a time: "reminder
+  without a date"). Every spoken `add_event` also gets its own todo due at its start (all-day:
+  09:00 that day) so "property taxes are due 12/12/2026" pops up that morning; a relative
+  reminder off an all-day event is due at 09:00 too. Interpretation-extracted events get NO
+  todo. Todos are deduped per segment (`hotword:<seg>:reminder:<day>:<text>` /
+  `…:todo:<text>`) and a new one is logged in `changes` as `todo_create` (not undoable).
+  `BrainEvent::Command` carries `confirmations` (`Executed::confirmation`: "Todo added: …",
+  "Reminder set: … — Thu 12 Dec, 09:00", "Event added: …", "Note filed: …" (60 chars),
+  "Project created: …"). The segment is marked consumed (never part of
   an episode). The EARLIEST hotword in a segment starts the command (a later one stays in the
   text; the model returns actions for both). Bounds, enforced at parse time and again in
   `execute`, and declared in the schema: at most 8 actions, title/name strings 200 chars,
@@ -391,7 +450,7 @@ OATS_INPUT_DEVICE="Scarlett 2i2" …         # microphone by name (default: the 
 OATS_SYSTEM_DEDUP=auto|always|never …      # the mic-echo rule (auto: only while the output is speakers)
 OATS_ECHO_AUDIO=auto|always|never …        # the audio-level echo pre-check (auto: while the echo rule is on; never = transcribe every mic segment)
 scripts/perf.sh [rest|idle|speech|stress]    # CPU/memory/energy profile per scenario (release build); see docs/performance-2026-10-28.md
-cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events — how the shell is verified without a window
+cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar|--todos|--toast]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events / todos (--toast: a due reminder + a confirmation) — how the shell is verified without a window
 cargo run -p oats-notes -- --listen      # start listening as soon as the engine is ready (doesn't change the remembered pref)
 OATS_NO_NATIVE_MENU=1 …                   # in-window egui menu bar instead of the macOS menu bar
 OATS_NO_STATUS_ITEM=1 …                   # no menu bar extra (closing the window then quits)
@@ -445,9 +504,11 @@ nested transaction (`Store::with_savepoint`; outermost `BEGIN IMMEDIATE`, inner 
 `SAVEPOINT`, rolled back on error or panic). `episodes.id` is `AUTOINCREMENT` (an older table
 is rebuilt in place on open, same schema version), so a reset or merged episode's id is never
 handed to a later episode that would adopt its events.
-Schema version 3 (`meta.schema_version`; a v1 file is migrated on open — `categories` become
-the root `nodes` with the same ids, `segments` is rebuilt — and a v2 file gets two columns
-in place, `segments.source TEXT NOT NULL DEFAULT 'mic'` and `segments.echo_of INTEGER NULL`):
+Schema version 4 (`meta.schema_version`; a v1 file is migrated on open — `categories` become
+the root `nodes` with the same ids, `segments` is rebuilt — a v2 file gets two columns
+in place, `segments.source TEXT NOT NULL DEFAULT 'mic'` and `segments.echo_of INTEGER NULL`,
+and a v3 file's `reminders` table is rebuilt as the todos, same ids, by
+`Store::ensure_todos_table`):
 `sessions`; `nodes` (ONE tree:
 `kind` category | project | topic, `parent_id`, `description`, `created_by` user | auto |
 hotword, `archived`; categories seeded Work/Admin/Personal); `segments` (`node_id` = most
@@ -457,7 +518,14 @@ views, counts, `uninterpreted_*` / `uncategorised_*`, `segments_between`, `segme
 ordering by `started_at, id` interleaves the lanes); `episodes` (title, markdown
 summary, node, decisions / action items / topics JSON, `low_signal`, model, cost, `revision`,
 `last_revised_at`); `events` (`dedupe_key` UNIQUE, `source`, `source_segment_id`,
-`source_episode_id`, `confidence`); `reminders` (`event_id`, `due`, `done`); `notes`;
+`source_episode_id`, `confidence`); `reminders` = THE TODOS (name kept; `event_id`, `text`,
+`due` NULL = undated, `completed_at` NULL = open — `done` is kept in sync for the record, a
+v3 done row got `completed_at = created_at` —, `snoozed_until`, `source` default hotword,
+`source_segment_id`, `node_id` (unfiled on node delete, moved on merge), `position` manual
+order, `dedupe_key` UNIQUE; API `add_todo(NewTodo)` (upsert on `dedupe_key`; a moved due time
+drops the snooze; a completed todo stays completed), `todos(TodoFilter)`, `complete_todo`,
+`reopen_todo`, `snooze_todo`, `clear_todo_snooze`, `due_todos(now)`, `next_due_at(now)`,
+`set_todo_text`, `delete_todo`); `notes`;
 `brain_runs` (tier, kind, model, cost, duration, ok/error, summary); `changes` (kind,
 description, before/after JSON, `undone`). `View::Node(id)` means the subtree (recursive CTE).
 
@@ -510,8 +578,10 @@ VENDORED.md's list of our modifications current. Attribution: `THIRD_PARTY.md`.
 Stateful VAD (drop the context re-feed): done 2026-10-28, see `vendor/fluidaudio-rs/VENDORED.md`.
 Performance notes: `docs/performance-2026-10-28.md`.
 
-Brain: a month-grid calendar view, undo for node merges (recorded, not reversible yet),
-reminders that notify (they are only listed), prompt editing without a rebuild, per-tier
+Brain: undo for node merges (recorded, not reversible yet), reminders that notify outside
+the window (macOS notifications; today they pop up in the window only), a week-start pref
+for the calendar, drag to reorder undated todos (`position` exists), prompt editing without
+a rebuild, per-tier
 budgets in the UI. Elsewhere: diarization (FluidAudio has it); system audio phase 5
 (`docs/research-system-audio.md`: per-app taps and "which app is on the call" from the Core
 Audio process list, starting the lane only during calls, VPIO/AEC if text dedup is not

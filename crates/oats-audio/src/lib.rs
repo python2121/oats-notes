@@ -28,6 +28,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod chime;
 pub mod file_source;
 pub mod measure;
 pub mod resample;

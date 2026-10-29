@@ -253,10 +253,12 @@ pub enum BrainEvent {
         kind: String,
     },
     RunFinished(BrainRun),
-    /// A hotword command was executed; one line per action.
+    /// A hotword command was executed; one line per action, and one confirmation pop-up
+    /// text per thing it created (see `Executed::confirmation`).
     Command {
         segment_id: i64,
         lines: Vec<String>,
+        confirmations: Vec<String>,
     },
     /// Episodes, nodes, events or changes were written: the UI should reload.
     Changed(Vec<String>),
@@ -1205,6 +1207,7 @@ impl Worker {
             w.out.send(BrainEvent::Command {
                 segment_id: seg.id,
                 lines: lines.clone(),
+                confirmations: done.iter().filter_map(|d| d.confirmation(&Local)).collect(),
             });
             Ok(JobOutput {
                 summary: lines.join("; "),
@@ -1852,7 +1855,11 @@ esac
         assert!((run.cost_usd.unwrap_or(0.0) - 0.011).abs() < 1e-9);
         // a second arrival of the same segment must not run it twice
         h.segment_arrived(seg_hot.clone());
-        let Some(BrainEvent::Command { segment_id, lines }) = seen
+        let Some(BrainEvent::Command {
+            segment_id,
+            lines,
+            confirmations,
+        }) = seen
             .iter()
             .find(|e| matches!(e, BrainEvent::Command { .. }))
             .cloned()
@@ -1862,7 +1869,18 @@ esac
         assert_eq!(segment_id, seg_hot.id);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].starts_with("Event: Property taxes due on"));
-        assert!(lines[1].starts_with("Reminder: Property taxes due in one week on"));
+        assert!(
+            lines[1].starts_with("Todo: Property taxes due in one week · due"),
+            "{lines:?}"
+        );
+        assert!(
+            confirmations[0].starts_with("Event added: Property taxes due — "),
+            "{confirmations:?}"
+        );
+        assert!(
+            confirmations[1].starts_with("Reminder set: Property taxes due in one week — "),
+            "{confirmations:?}"
+        );
         wait_for(
             &h,
             "spend",
@@ -1879,7 +1897,8 @@ esac
         );
         assert!(s.nodes().unwrap().iter().any(|n| n.name == "Exporter"));
         assert_eq!(s.events_from(0, 10).unwrap().len(), 1);
-        assert_eq!(s.reminders(true, 10).unwrap().len(), 1);
+        // the "one week ahead" reminder and the event's own todo for the day
+        assert_eq!(s.todos(oats_core::TodoFilter::Open).unwrap().len(), 2);
         assert_eq!(
             s.segments(View::All, 0)
                 .unwrap()

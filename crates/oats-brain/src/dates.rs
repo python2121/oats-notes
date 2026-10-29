@@ -58,6 +58,68 @@ pub fn shift_days<Tz: TimeZone>(at: &DateTime<Tz>, days: i64) -> Option<DateTime
     tz.timestamp_millis_opt(ms).single()
 }
 
+/// The clock time a todo / reminder given only a date is due at (local): the morning of that
+/// day, so "property taxes are due 12/12" pops up when the day starts, not at midnight.
+pub fn default_due_time() -> NaiveTime {
+    NaiveTime::from_hms_opt(9, 0, 0).unwrap_or(NaiveTime::MIN)
+}
+
+/// A due time from a date and an optional clock time: without a time, [`default_due_time`].
+pub fn due_ms<Tz: TimeZone>(date: NaiveDate, time: Option<NaiveTime>, tz: &Tz) -> Option<i64> {
+    to_ms(date, Some(time.unwrap_or_else(default_due_time)), tz)
+}
+
+/// The largest "in N …" a command may ask for, in minutes (a year).
+pub const MAX_IN_MINUTES: i64 = MAX_OFFSET_DAYS * 24 * 60;
+
+/// `minutes` after `at` ("remind me in 2 hours / 2 days / 3 weeks", resolved against the time
+/// the command was SPOKEN). Whole days keep the clock time across a DST change (2 days from
+/// 14:05 is 14:05); anything else is plain elapsed time. Clamped to [0, [`MAX_IN_MINUTES`]].
+pub fn after_minutes<Tz: TimeZone>(at: &DateTime<Tz>, minutes: i64) -> Option<i64> {
+    let minutes = minutes.clamp(0, MAX_IN_MINUTES);
+    if minutes > 0 && minutes % (24 * 60) == 0 {
+        return shift_days(at, minutes / (24 * 60)).map(|d| d.timestamp_millis());
+    }
+    Some(at.timestamp_millis() + minutes * 60_000)
+}
+
+/// "in 2 days", "in an hour", "in three weeks", "in 90 minutes" → minutes; `None` for
+/// anything else. The model normally fills `in_minutes` itself; this is the fallback when it
+/// put the phrase in the date field instead.
+pub fn parse_in_phrase(s: &str) -> Option<i64> {
+    let lower = s.trim().to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '.')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let rest = match words.as_slice() {
+        ["in", rest @ ..] => rest,
+        rest => rest,
+    };
+    let [n, unit] = rest else { return None };
+    let n: i64 = match *n {
+        "a" | "an" | "one" => 1,
+        "two" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        n => n.parse().ok().filter(|n: &i64| (0..=100_000).contains(n))?,
+    };
+    let per = match unit.trim_end_matches('s') {
+        "minute" | "min" => 1,
+        "hour" | "hr" => 60,
+        "day" => 24 * 60,
+        "week" | "wk" => 7 * 24 * 60,
+        _ => return None,
+    };
+    Some((n * per).min(MAX_IN_MINUTES))
+}
+
 /// "2026-10-28 (Wednesday) 14:05, Europe/Oslo"-style context line for the prompts.
 pub fn describe_now(now: &DateTime<Local>) -> String {
     format!(
@@ -196,5 +258,44 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()
         );
         assert_eq!((back.hour(), back.minute()), (1, 0), "the end of the gap");
+    }
+
+    #[test]
+    fn dates_without_a_time_are_due_in_the_morning() {
+        let tz = FixedOffset::east_opt(3600).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 12, 12).unwrap();
+        let due = due_ms(d, None, &tz).unwrap();
+        let at = tz.timestamp_millis_opt(due).single().unwrap();
+        assert_eq!((at.date_naive(), at.hour(), at.minute()), (d, 9, 0));
+        let timed = due_ms(d, NaiveTime::from_hms_opt(18, 30, 0), &tz).unwrap();
+        assert_eq!(tz.timestamp_millis_opt(timed).single().unwrap().hour(), 18);
+    }
+
+    #[test]
+    fn in_phrases_and_minutes_from_the_spoken_time() {
+        assert_eq!(parse_in_phrase("in 2 days"), Some(2 * 1440));
+        assert_eq!(parse_in_phrase("In an hour"), Some(60));
+        assert_eq!(parse_in_phrase("in three weeks"), Some(3 * 7 * 1440));
+        assert_eq!(parse_in_phrase("90 minutes"), Some(90));
+        assert_eq!(parse_in_phrase("in 1 hr."), Some(60));
+        assert_eq!(parse_in_phrase("next tuesday"), None);
+        assert_eq!(parse_in_phrase("in 2 fortnights"), None);
+        assert_eq!(parse_in_phrase("in 99999 weeks"), Some(MAX_IN_MINUTES));
+        let tz = FixedOffset::east_opt(0).unwrap();
+        let at = tz
+            .with_ymd_and_hms(2026, 10, 29, 14, 5, 0)
+            .single()
+            .unwrap();
+        let two_days = after_minutes(&at, 2 * 1440).unwrap();
+        let d = tz.timestamp_millis_opt(two_days).single().unwrap();
+        assert_eq!(
+            (d.date_naive(), d.hour(), d.minute()),
+            (NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(), 14, 5)
+        );
+        assert_eq!(
+            after_minutes(&at, 90),
+            Some(at.timestamp_millis() + 90 * 60_000)
+        );
+        assert_eq!(after_minutes(&at, -5), Some(at.timestamp_millis()));
     }
 }

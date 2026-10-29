@@ -2,7 +2,7 @@
 //! pipeline writes segments, the brain writes interpretations, the UI reads). Times are Unix
 //! milliseconds (UTC); the UI formats them in local time.
 //!
-//! Schema version 3 (`meta.schema_version`; v1 and v2 databases are migrated on open):
+//! Schema version 4 (`meta.schema_version`; v1, v2 and v3 databases are migrated on open):
 //! - `sessions(id, started_at, ended_at NULL, engine)` — one per listen start/stop.
 //! - `nodes(id, parent_id NULL, kind, name, description, created_by, position, archived,
 //!   created_at)` — ONE tree: the user's top-level categories (`kind = category`, seeded
@@ -20,8 +20,13 @@
 //!   title, markdown summary, node, decisions / action items / topics as JSON, `low_signal`
 //!   for TV / music / self-talk, the model and cost, and a `revision` counter bumped by every
 //!   re-interpretation of the rolling window.
-//! - `events(…)` / `reminders(…)` — the calendar: significant dates the brain extracted or the
-//!   user dictated with a hotword; `dedupe_key` keeps re-interpretation from duplicating them.
+//! - `events(…)` — the calendar: significant dates the brain extracted or the user dictated
+//!   with a hotword; `dedupe_key` keeps re-interpretation from duplicating them.
+//! - `reminders(id, event_id NULL, due NULL, text, done, completed_at NULL, snoozed_until NULL,
+//!   source, source_segment_id NULL, node_id NULL, position, dedupe_key, created_at)` — the
+//!   TODOS (the table keeps its v3 name): a reminder is a todo with a `due` time, which pops
+//!   up in the window when it comes (or when its snooze ends). Open = `completed_at IS NULL`;
+//!   `done` is kept in sync for the record (v4 rebuilt the v3 table: `due` became nullable).
 //! - `notes(…)` — free-text notes filed under a node by a hotword command.
 //! - `brain_runs(…)` — every brain job with tier, model, cost, duration and outcome (the daily
 //!   budget is summed from here); `changes(…)` — structural changes a run made (node
@@ -233,27 +238,71 @@ pub struct NewEvent {
     pub dedupe_key: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Reminder {
+/// A todo. Todos and reminders are one thing: a reminder is a todo with a `due` time, and it
+/// pops up in the window when that time comes (see [`Store::due_todos`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Todo {
     pub id: i64,
+    /// The event it belongs to (a hotword event's own todo, or "one week ahead" of it).
     pub event_id: Option<i64>,
-    pub due: i64,
     pub text: String,
-    pub done: bool,
+    /// When it comes due (Unix ms); `None` = an undated todo (never pops up).
+    pub due: Option<i64>,
+    /// When it was completed; `None` = open.
+    pub completed_at: Option<i64>,
+    /// Snoozed: don't pop up before this time (Unix ms), whatever `due` says.
+    pub snoozed_until: Option<i64>,
     pub source: Origin,
     pub source_segment_id: Option<i64>,
+    /// The node it is filed under, if any.
+    pub node_id: Option<i64>,
+    /// Manual order among the undated todos (new ones go last).
+    pub position: i64,
     pub dedupe_key: Option<String>,
     pub created_at: i64,
 }
 
+impl Todo {
+    pub fn done(&self) -> bool {
+        self.completed_at.is_some()
+    }
+
+    /// When it next pops up: the end of its snooze, else its due time; `None` when it is
+    /// completed, or undated and not snoozed.
+    pub fn alert_at(&self) -> Option<i64> {
+        if self.done() {
+            None
+        } else {
+            self.snoozed_until.or(self.due)
+        }
+    }
+
+    /// Whether it should be showing as a pop-up at `now`.
+    pub fn is_due(&self, now: i64) -> bool {
+        self.alert_at().is_some_and(|at| at <= now)
+    }
+}
+
+/// A todo to insert (or update, matched on `dedupe_key` when set). `source` defaults to the
+/// user.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct NewReminder {
-    pub event_id: Option<i64>,
-    pub due: i64,
+pub struct NewTodo {
     pub text: String,
+    pub due: Option<i64>,
+    pub event_id: Option<i64>,
     pub source: Option<Origin>,
     pub source_segment_id: Option<i64>,
+    pub node_id: Option<i64>,
     pub dedupe_key: Option<String>,
+}
+
+/// Which todos [`Store::todos`] lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TodoFilter {
+    Open,
+    Completed,
+    #[default]
+    All,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,8 +368,10 @@ pub enum View {
     Node(i64),
     /// The interpreted episodes (the Notes view).
     Notes,
-    /// Events and reminders.
+    /// The month calendar: events and dated todos.
     Calendar,
+    /// The todo list (reminders are todos with a due time).
+    Todos,
 }
 
 /// The default categories, in sidebar order.
@@ -330,7 +381,7 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// The v2 schema, first half (meta, sessions, nodes, episodes); every statement is idempotent so
 /// it doubles as the "make sure everything exists" step.
@@ -414,17 +465,6 @@ CREATE TABLE IF NOT EXISTS events (
     updated_at        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_when ON events(when_start);
-CREATE TABLE IF NOT EXISTS reminders (
-    id                INTEGER PRIMARY KEY,
-    event_id          INTEGER REFERENCES events(id),
-    due               INTEGER NOT NULL,
-    text              TEXT NOT NULL,
-    done              INTEGER NOT NULL DEFAULT 0,
-    source            TEXT NOT NULL,
-    source_segment_id INTEGER,
-    dedupe_key        TEXT UNIQUE,
-    created_at        INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS notes (
     id                INTEGER PRIMARY KEY,
     node_id           INTEGER REFERENCES nodes(id),
@@ -585,20 +625,42 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     })
 }
 
-const REMINDER_COLUMNS: &str =
-    "id, event_id, due, text, done, source, source_segment_id, dedupe_key, created_at";
+/// The `reminders` table (the todos) as of schema v4: `due` nullable, `completed_at`
+/// replacing the meaning of `done` (kept, in sync, for the record), the snooze, the node, a
+/// manual order. Created by [`Store::ensure_todos_table`], which also rebuilds a v3 table.
+const TODOS_TABLE: &str = "(
+    id                INTEGER PRIMARY KEY,
+    event_id          INTEGER REFERENCES events(id),
+    due               INTEGER,
+    text              TEXT NOT NULL,
+    done              INTEGER NOT NULL DEFAULT 0,
+    completed_at      INTEGER,
+    snoozed_until     INTEGER,
+    source            TEXT NOT NULL DEFAULT 'hotword',
+    source_segment_id INTEGER,
+    node_id           INTEGER REFERENCES nodes(id),
+    position          INTEGER NOT NULL DEFAULT 0,
+    dedupe_key        TEXT UNIQUE,
+    created_at        INTEGER NOT NULL
+)";
 
-fn row_to_reminder(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reminder> {
-    Ok(Reminder {
+const TODO_COLUMNS: &str = "id, event_id, text, due, completed_at, snoozed_until, source, \
+     source_segment_id, node_id, position, dedupe_key, created_at";
+
+fn row_to_todo(row: &rusqlite::Row<'_>) -> rusqlite::Result<Todo> {
+    Ok(Todo {
         id: row.get(0)?,
         event_id: row.get(1)?,
-        due: row.get(2)?,
-        text: row.get(3)?,
-        done: row.get::<_, i64>(4)? != 0,
-        source: Origin::parse(&row.get::<_, String>(5)?),
-        source_segment_id: row.get(6)?,
-        dedupe_key: row.get(7)?,
-        created_at: row.get(8)?,
+        text: row.get(2)?,
+        due: row.get(3)?,
+        completed_at: row.get(4)?,
+        snoozed_until: row.get(5)?,
+        source: Origin::parse(&row.get::<_, String>(6)?),
+        source_segment_id: row.get(7)?,
+        node_id: row.get(8)?,
+        position: row.get(9)?,
+        dedupe_key: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 
@@ -802,16 +864,22 @@ impl Store {
                 conn.execute_batch(SCHEMA_REST)?;
             }
             Some(1) => {
-                log::info!("migrating the database from schema 1 to 3");
+                log::info!("migrating the database from schema 1 to {SCHEMA_VERSION}");
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(MIGRATE_V1_TO_V2)?;
                 conn.execute_batch(MIGRATE_V2_TO_V3)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
             Some(2) => {
-                log::info!("migrating the database from schema 2 to 3");
+                log::info!("migrating the database from schema 2 to {SCHEMA_VERSION}");
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(MIGRATE_V2_TO_V3)?;
+                conn.execute_batch(SCHEMA_REST)?;
+            }
+            Some(3) => {
+                // v3 → v4 is the todos table, rebuilt by `ensure_todos_table` below
+                log::info!("migrating the database from schema 3 to {SCHEMA_VERSION}");
+                conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
             Some(v) if v == SCHEMA_VERSION => {
@@ -821,6 +889,7 @@ impl Store {
             Some(v) => return Err(StoreError::SchemaTooNew(v)),
         }
         Self::episode_ids_never_reused(conn)?;
+        Self::ensure_todos_table(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -871,6 +940,39 @@ impl Store {
                  SELECT COALESCE(MAX(id), 0) AS m FROM episodes
                  UNION ALL SELECT COALESCE(MAX(source_episode_id), 0) FROM events
                  UNION ALL SELECT COALESCE(MAX(episode_id), 0) FROM segments)));",
+        )?;
+        Ok(())
+    }
+
+    /// The todos (`reminders`) table in its v4 form: created when missing; a v3 table (`due`
+    /// NOT NULL, a `done` flag) rebuilt in place — same ids, `completed_at` = `created_at`
+    /// for the done ones (the moment they were ticked was never recorded), `position` = id.
+    /// Runs inside `init`'s transaction with foreign keys off; idempotent.
+    fn ensure_todos_table(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('reminders')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        if columns.is_empty() {
+            conn.execute_batch(&format!("CREATE TABLE reminders {TODOS_TABLE};"))?;
+        } else if !columns.iter().any(|c| c == "completed_at") {
+            log::info!("upgrading the reminders table to todos");
+            conn.execute_batch(&format!(
+                "CREATE TABLE reminders_v4 {TODOS_TABLE};
+                 INSERT INTO reminders_v4(id, event_id, due, text, done, completed_at,
+                     snoozed_until, source, source_segment_id, node_id, position, dedupe_key,
+                     created_at)
+                 SELECT id, event_id, due, text, done,
+                     CASE WHEN done != 0 THEN created_at END, NULL, source, source_segment_id,
+                     NULL, id, dedupe_key, created_at
+                 FROM reminders;
+                 DROP TABLE reminders;
+                 ALTER TABLE reminders_v4 RENAME TO reminders;"
+            ))?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS reminders_due ON reminders(due);
+             CREATE INDEX IF NOT EXISTS reminders_open ON reminders(completed_at);",
         )?;
         Ok(())
     }
@@ -1103,7 +1205,7 @@ impl Store {
                 ),
                 &[id],
             ),
-            View::Notes | View::Calendar => Ok(Vec::new()),
+            View::Notes | View::Calendar | View::Todos => Ok(Vec::new()),
         }
     }
 
@@ -1441,7 +1543,7 @@ impl Store {
             return Ok(());
         }
         let tx = Savepoint::begin(&self.conn)?;
-        for table in ["segments", "episodes", "events", "notes"] {
+        for table in ["segments", "episodes", "events", "notes", "reminders"] {
             tx.execute(
                 &format!("UPDATE {table} SET node_id = ?2 WHERE node_id = ?1"),
                 [from, into],
@@ -1461,7 +1563,7 @@ impl Store {
         let ids = self.subtree_ids(id)?;
         let tx = Savepoint::begin(&self.conn)?;
         for nid in ids.iter().rev() {
-            for table in ["segments", "episodes", "events", "notes"] {
+            for table in ["segments", "episodes", "events", "notes", "reminders"] {
                 tx.execute(
                     &format!("UPDATE {table} SET node_id = NULL WHERE node_id = ?1"),
                     [nid],
@@ -1733,7 +1835,7 @@ impl Store {
         Ok(())
     }
 
-    // ---- events, reminders, notes -----------------------------------------------------
+    // ---- events and notes -----------------------------------------------------
 
     /// Insert an event, or update the one with the same `dedupe_key`. Returns the row.
     pub fn upsert_event(&self, e: &NewEvent, now: i64) -> Result<Event, StoreError> {
@@ -1852,11 +1954,16 @@ impl Store {
         Ok(())
     }
 
-    /// Insert a reminder, or update the one with the same `dedupe_key`.
-    pub fn upsert_reminder(&self, r: &NewReminder, now: i64) -> Result<Reminder, StoreError> {
+    // ---- todos (reminders are todos with a due time) ----------------------------------
+
+    /// Insert a todo (last in the manual order), or update the one with the same
+    /// `dedupe_key`: text, due time, event and node; a changed due time clears the snooze.
+    /// A completed todo stays completed (re-dictating it doesn't reopen it).
+    pub fn add_todo(&self, t: &NewTodo, now: i64) -> Result<Todo, StoreError> {
         use rusqlite::OptionalExtension;
-        let source = r.source.unwrap_or(Origin::Interpretation).as_str();
-        let existing: Option<i64> = match &r.dedupe_key {
+        let source = t.source.unwrap_or(Origin::User).as_str();
+        let text = t.text.trim();
+        let existing: Option<i64> = match &t.dedupe_key {
             Some(k) => self
                 .conn
                 .query_row("SELECT id FROM reminders WHERE dedupe_key = ?1", [k], |r| {
@@ -1868,54 +1975,153 @@ impl Store {
         let id = match existing {
             Some(id) => {
                 self.conn.execute(
-                    "UPDATE reminders SET due = ?2, text = ?3, event_id = COALESCE(?4, event_id)
+                    "UPDATE reminders SET text = ?2,
+                         snoozed_until = CASE WHEN due IS ?3 THEN snoozed_until END,
+                         due = ?3, event_id = COALESCE(?4, event_id),
+                         node_id = COALESCE(?5, node_id)
                      WHERE id = ?1",
-                    rusqlite::params![id, r.due, r.text, r.event_id],
+                    rusqlite::params![id, text, t.due, t.event_id, t.node_id],
                 )?;
                 id
             }
             None => {
                 self.conn.execute(
                     "INSERT INTO reminders(event_id, due, text, source, source_segment_id,
-                         dedupe_key, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                         node_id, position, dedupe_key, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                         (SELECT COALESCE(MAX(position), 0) + 1 FROM reminders), ?7, ?8)",
                     rusqlite::params![
-                        r.event_id,
-                        r.due,
-                        r.text,
+                        t.event_id,
+                        t.due,
+                        text,
                         source,
-                        r.source_segment_id,
-                        r.dedupe_key,
+                        t.source_segment_id,
+                        t.node_id,
+                        t.dedupe_key,
                         now
                     ],
                 )?;
                 self.conn.last_insert_rowid()
             }
         };
-        Ok(self.conn.query_row(
-            &format!("SELECT {REMINDER_COLUMNS} FROM reminders WHERE id = ?1"),
-            [id],
-            row_to_reminder,
-        )?)
+        self.todo(id)?
+            .ok_or_else(|| StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
-    /// Reminders, soonest first; `open_only` hides the done ones.
-    pub fn reminders(&self, open_only: bool, limit: i64) -> Result<Vec<Reminder>, StoreError> {
-        let filter = if open_only { "WHERE done = 0" } else { "" };
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {REMINDER_COLUMNS} FROM reminders {filter} ORDER BY due, id LIMIT ?1"
-        ))?;
+    pub fn todo(&self, id: i64) -> Result<Option<Todo>, StoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {TODO_COLUMNS} FROM reminders WHERE id = ?1"),
+                [id],
+                row_to_todo,
+            )
+            .optional()?)
+    }
+
+    fn query_todos(&self, sql: &str, args: &[i64]) -> Result<Vec<Todo>, StoreError> {
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt
-            .query_map([limit], row_to_reminder)?
+            .query_map(rusqlite::params_from_iter(args.iter()), row_to_todo)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    pub fn set_reminder_done(&self, id: i64, done: bool) -> Result<(), StoreError> {
+    /// The todo list in display order: open ones with a due time (soonest first), then the
+    /// undated open ones (manual order), then the completed ones (most recently completed
+    /// first).
+    pub fn todos(&self, filter: TodoFilter) -> Result<Vec<Todo>, StoreError> {
+        let filter = match filter {
+            TodoFilter::Open => "WHERE completed_at IS NULL",
+            TodoFilter::Completed => "WHERE completed_at IS NOT NULL",
+            TodoFilter::All => "",
+        };
+        self.query_todos(
+            &format!(
+                "SELECT {TODO_COLUMNS} FROM reminders {filter}
+                 ORDER BY completed_at IS NOT NULL,
+                     CASE WHEN completed_at IS NULL THEN due IS NULL END,
+                     CASE WHEN completed_at IS NULL THEN due END,
+                     CASE WHEN completed_at IS NULL THEN position END,
+                     completed_at DESC, id"
+            ),
+            &[],
+        )
+    }
+
+    /// Open todos whose pop-up is due at `now`: the snooze is over, or (not snoozed) the due
+    /// time has come. Soonest first.
+    pub fn due_todos(&self, now: i64) -> Result<Vec<Todo>, StoreError> {
+        self.query_todos(
+            &format!(
+                "SELECT {TODO_COLUMNS} FROM reminders
+                 WHERE completed_at IS NULL AND COALESCE(snoozed_until, due) <= ?1
+                 ORDER BY COALESCE(snoozed_until, due), id"
+            ),
+            &[now],
+        )
+    }
+
+    /// The next moment after `now` an open todo comes due (or its snooze ends) — when the UI
+    /// should wake to show it.
+    pub fn next_due_at(&self, now: i64) -> Result<Option<i64>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT MIN(COALESCE(snoozed_until, due)) FROM reminders
+             WHERE completed_at IS NULL AND COALESCE(snoozed_until, due) > ?1",
+            [now],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Mark done at `at` (the snooze goes with it).
+    pub fn complete_todo(&self, id: i64, at: i64) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE reminders SET done = ?2 WHERE id = ?1",
-            rusqlite::params![id, i64::from(done)],
+            "UPDATE reminders SET completed_at = ?2, done = 1, snoozed_until = NULL
+             WHERE id = ?1 AND completed_at IS NULL",
+            rusqlite::params![id, at],
         )?;
+        Ok(())
+    }
+
+    /// Open again (a past due time pops up again at once).
+    pub fn reopen_todo(&self, id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE reminders SET completed_at = NULL, done = 0, snoozed_until = NULL
+             WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Don't pop up before `until` (an undated todo then pops up at `until`).
+    pub fn snooze_todo(&self, id: i64, until: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE reminders SET snoozed_until = ?2 WHERE id = ?1",
+            rusqlite::params![id, until],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_todo_snooze(&self, id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE reminders SET snoozed_until = NULL WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_todo_text(&self, id: i64, text: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE reminders SET text = ?2 WHERE id = ?1",
+            rusqlite::params![id, text.trim()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_todo(&self, id: i64) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM reminders WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -2290,7 +2496,7 @@ mod tests {
         let s = Store::open_in_memory()?;
         let names: Vec<String> = s.categories()?.into_iter().map(|c| c.name).collect();
         assert_eq!(names, DEFAULT_CATEGORIES);
-        assert_eq!(version(&s)?, "3");
+        assert_eq!(version(&s)?, "4");
         assert!(s.categories()?.iter().all(|c| c.kind == NodeKind::Category));
         Ok(())
     }
@@ -2319,7 +2525,7 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory()?;
         conn.execute_batch(V1)?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "3");
+        assert_eq!(version(&s)?, "4");
         let cats = s.categories()?;
         assert_eq!(
             cats.iter()
@@ -2376,7 +2582,7 @@ mod tests {
              INSERT INTO segments VALUES (2, 1, 4000, 5000, 'loose', NULL, NULL, NULL, NULL, 0);",
         )?;
         let s = Store::init(conn)?;
-        assert_eq!(version(&s)?, "3");
+        assert_eq!(version(&s)?, "4");
         let rows = s.segments(View::All, 0)?;
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -2726,10 +2932,10 @@ mod tests {
         assert!(s.events_from(101, 10)?.is_empty());
         assert_eq!(s.events_before(101, 10)?.len(), 1);
 
-        let r = s.upsert_reminder(
-            &NewReminder {
+        let r = s.add_todo(
+            &NewTodo {
                 event_id: Some(first.id),
-                due: 50,
+                due: Some(50),
                 text: "Property taxes in a week".into(),
                 source: Some(Origin::Hotword),
                 dedupe_key: Some("k".into()),
@@ -2737,9 +2943,9 @@ mod tests {
             },
             1,
         )?;
-        let r2 = s.upsert_reminder(
-            &NewReminder {
-                due: 60,
+        let r2 = s.add_todo(
+            &NewTodo {
+                due: Some(60),
                 text: "x".into(),
                 dedupe_key: Some("k".into()),
                 ..Default::default()
@@ -2747,17 +2953,204 @@ mod tests {
             2,
         )?;
         assert_eq!(r.id, r2.id);
-        assert_eq!(r2.due, 60);
-        assert_eq!(s.reminders(true, 10)?.len(), 1);
-        s.set_reminder_done(r.id, true)?;
-        assert!(s.reminders(true, 10)?.is_empty());
-        assert_eq!(s.reminders(false, 10)?.len(), 1);
+        assert_eq!(r2.due, Some(60));
+        assert_eq!(r2.source, Origin::Hotword, "the first source stays");
+        assert_eq!(s.todos(TodoFilter::Open)?.len(), 1);
+        s.complete_todo(r.id, 70)?;
+        assert!(s.todos(TodoFilter::Open)?.is_empty());
+        assert_eq!(s.todos(TodoFilter::All)?.len(), 1);
         s.delete_event(first.id)?;
-        assert_eq!(s.reminders(false, 10)?[0].event_id, None);
+        assert_eq!(s.todos(TodoFilter::All)?[0].event_id, None);
 
         let n = s.insert_note(None, " remember milk ", Origin::Hotword, Some(3), 5)?;
         assert_eq!(n.text, "remember milk");
         assert_eq!(s.notes(10)?[0].id, n.id);
+        Ok(())
+    }
+
+    /// The v3 `reminders` table (due NOT NULL, a done flag) is rebuilt as the todos: ids,
+    /// texts, due times and event links survive, done rows become completed, the new columns
+    /// work, and reopening doesn't migrate again.
+    #[test]
+    fn migrates_v3_to_v4_reminders_become_todos() -> R {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(SCHEMA_REST)?;
+        conn.execute_batch(
+            "CREATE TABLE reminders (
+                id                INTEGER PRIMARY KEY,
+                event_id          INTEGER REFERENCES events(id),
+                due               INTEGER NOT NULL,
+                text              TEXT NOT NULL,
+                done              INTEGER NOT NULL DEFAULT 0,
+                source            TEXT NOT NULL,
+                source_segment_id INTEGER,
+                dedupe_key        TEXT UNIQUE,
+                created_at        INTEGER NOT NULL
+            );
+            INSERT INTO meta VALUES ('schema_version', '3');
+            INSERT INTO events(id, when_start, title, source, created_at, updated_at)
+                VALUES (4, 1000, 'Taxes', 'hotword', 1, 1);
+            INSERT INTO reminders VALUES (7, 4, 500, 'taxes in a week', 0, 'hotword', 9, 'k7', 10);
+            INSERT INTO reminders VALUES (8, NULL, 600, 'old one', 1, 'hotword', NULL, NULL, 20);",
+        )?;
+        let s = Store::init(conn)?;
+        assert_eq!(version(&s)?, "4");
+        let all = s.todos(TodoFilter::All)?;
+        assert_eq!(all.len(), 2);
+        let open = &all[0];
+        assert_eq!(
+            (open.id, open.event_id, open.due, open.text.as_str()),
+            (7, Some(4), Some(500), "taxes in a week")
+        );
+        assert_eq!(open.source, Origin::Hotword);
+        assert_eq!(open.source_segment_id, Some(9));
+        assert_eq!(open.dedupe_key.as_deref(), Some("k7"));
+        assert!(!open.done());
+        assert_eq!(all[1].id, 8);
+        assert_eq!(
+            all[1].completed_at,
+            Some(20),
+            "done → completed at creation"
+        );
+        // undated todos work on the rebuilt table, ids continue
+        let t = s.add_todo(
+            &NewTodo {
+                text: "undated".into(),
+                ..Default::default()
+            },
+            30,
+        )?;
+        assert!(t.id > 8 && t.due.is_none());
+        assert_eq!(t.source, Origin::User);
+        s.init_locked()?;
+        assert_eq!(s.todos(TodoFilter::All)?.len(), 3);
+        Ok(())
+    }
+
+    /// Display order, completion, reopening, snoozes and the pop-up queries.
+    #[test]
+    fn todos_order_complete_snooze_and_come_due() -> R {
+        let s = Store::open_in_memory()?;
+        let add = |text: &str, due: Option<i64>| {
+            s.add_todo(
+                &NewTodo {
+                    text: format!(" {text} "),
+                    due,
+                    ..Default::default()
+                },
+                1,
+            )
+        };
+        let milk = add("buy oat milk", None)?;
+        let late = add("later", Some(5_000))?;
+        let soon = add("soon", Some(1_000))?;
+        let bread = add("bread", None)?;
+        let done = add("done one", Some(500))?;
+        assert_eq!(milk.text, "buy oat milk", "trimmed");
+        assert!(bread.position > milk.position, "new ones go last");
+        s.complete_todo(done.id, 900)?;
+        let ids = |f| -> Result<Vec<i64>, StoreError> {
+            Ok(s.todos(f)?.into_iter().map(|t| t.id).collect())
+        };
+        // dated open soonest first, then undated by position, then completed
+        assert_eq!(
+            ids(TodoFilter::All)?,
+            vec![soon.id, late.id, milk.id, bread.id, done.id]
+        );
+        assert_eq!(ids(TodoFilter::Completed)?, vec![done.id]);
+        assert_eq!(ids(TodoFilter::Open)?.len(), 4);
+        // completing twice keeps the first time; most recently completed first
+        s.complete_todo(done.id, 999)?;
+        assert_eq!(s.todo(done.id)?.and_then(|t| t.completed_at), Some(900));
+        s.complete_todo(milk.id, 950)?;
+        assert_eq!(ids(TodoFilter::Completed)?, vec![milk.id, done.id]);
+        s.reopen_todo(milk.id)?;
+        assert_eq!(ids(TodoFilter::Completed)?, vec![done.id]);
+
+        // pop-ups: nothing before 1000; at 1000 `soon`; the next wake is `late`
+        assert!(s.due_todos(999)?.is_empty());
+        assert_eq!(s.next_due_at(999)?, Some(1_000));
+        assert_eq!(
+            s.due_todos(1_000)?.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![soon.id]
+        );
+        assert_eq!(s.next_due_at(1_000)?, Some(5_000));
+        // snoozed: hidden until the snooze ends, which is the next wake
+        s.snooze_todo(soon.id, 3_000)?;
+        assert!(s.due_todos(2_000)?.is_empty());
+        assert_eq!(s.next_due_at(2_000)?, Some(3_000));
+        assert_eq!(s.due_todos(3_000)?.len(), 1);
+        s.clear_todo_snooze(soon.id)?;
+        assert_eq!(s.due_todos(2_000)?.len(), 1);
+        // a snoozed undated todo pops up when the snooze ends
+        s.snooze_todo(bread.id, 4_000)?;
+        assert_eq!(s.next_due_at(3_500)?, Some(4_000));
+        // completing clears the snooze and the pop-up
+        s.complete_todo(soon.id, 2_500)?;
+        assert!(s.due_todos(2_600)?.is_empty());
+        assert_eq!(s.todo(soon.id)?.and_then(|t| t.snoozed_until), None);
+        // a dedupe-key update moving the due time drops the snooze
+        let k = s.add_todo(
+            &NewTodo {
+                text: "keyed".into(),
+                due: Some(10_000),
+                dedupe_key: Some("key".into()),
+                ..Default::default()
+            },
+            1,
+        )?;
+        s.snooze_todo(k.id, 20_000)?;
+        let same = s.add_todo(
+            &NewTodo {
+                text: "keyed".into(),
+                due: Some(10_000),
+                dedupe_key: Some("key".into()),
+                ..Default::default()
+            },
+            2,
+        )?;
+        assert_eq!(same.snoozed_until, Some(20_000), "same due: snooze kept");
+        let moved = s.add_todo(
+            &NewTodo {
+                text: "keyed".into(),
+                due: Some(15_000),
+                dedupe_key: Some("key".into()),
+                ..Default::default()
+            },
+            3,
+        )?;
+        assert_eq!((moved.id, moved.snoozed_until), (k.id, None));
+        // edit and delete
+        s.set_todo_text(bread.id, "  rye bread ")?;
+        assert_eq!(
+            s.todo(bread.id)?.map(|t| t.text).as_deref(),
+            Some("rye bread")
+        );
+        s.delete_todo(bread.id)?;
+        assert!(s.todo(bread.id)?.is_none());
+        Ok(())
+    }
+
+    /// A todo filed under a node: deleting the node unfiles it, merging moves it.
+    #[test]
+    fn todos_follow_node_deletes_and_merges() -> R {
+        let s = Store::open_in_memory()?;
+        let work = s.categories()?[0].id;
+        let p = s.add_node(Some(work), NodeKind::Project, "P", "", Origin::Auto)?;
+        let q = s.add_node(Some(work), NodeKind::Project, "Q", "", Origin::Auto)?;
+        let t = s.add_todo(
+            &NewTodo {
+                text: "filed".into(),
+                node_id: Some(p.id),
+                ..Default::default()
+            },
+            1,
+        )?;
+        s.merge_nodes(p.id, q.id)?;
+        assert_eq!(s.todo(t.id)?.and_then(|t| t.node_id), Some(q.id));
+        s.delete_node(q.id)?;
+        assert_eq!(s.todo(t.id)?.and_then(|t| t.node_id), None);
         Ok(())
     }
 
@@ -2965,7 +3358,7 @@ mod tests {
             ))?;
         }
         let s = Store::open(&path)?;
-        assert_eq!(version(&s)?, "3");
+        assert_eq!(version(&s)?, "4");
         assert_eq!(s.episodes(10)?.len(), 1, "rows survive the rebuild");
         let c = s.insert_episode(40, 50, &content, 2)?;
         let events = s.events_from(i64::MIN, 10)?;
