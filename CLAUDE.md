@@ -88,12 +88,7 @@ meeting detection from the Core Audio process list, VPIO/AEC — not). Two lanes
 **mic** ("me") and **system** ("them": what the computer plays — the other side of a call, a
 video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
 
-**NOT yet verified on hardware (2026-10-28, commit bad1dd5):** `levels --system` on the MacBook Air
-opened the mic ("MacBook Air Microphone") but the system lane delivered 0 chunks in ~12 s while
-`say` played through "MacBook Air Speakers" (the tap open never returned: the permission was not
-effective for the ClaudeShip-launched terminal — ungranted, prompt unanswered, or ClaudeShip not
-restarted since the grant). The live `--listen` mic + system run, the echo marking and the AirPods
-check (none connected) were not done. See `docs/verification-2026-10-28.md`.
+**Verified on hardware 2026-10-29 (commit bad1dd5+, MacBook Air, output = built-in speakers, "System Audio Recording Only" granted to ClaudeShip):** `levels --system` delivered 99 system chunks (94 with signal); a live `--listen` run stored system segments from a video playing on the Mac and marked the microphone's copies as `echo_of` those rows (log: `mic segment 1 marked as the echo of system segment 3`); the input was "MacBook Air Microphone" and the tap "MacBook Air Speakers" (echo rule on, Auto). Not yet checked: AirPods as the output (none connected). Details: `docs/verification-2026-10-28.md`.
 
 - **Microphone device policy** (`oats_audio::InputPolicy`, default `BuiltIn`; a user decision):
   never capture from a Bluetooth headset unless named — its microphone switches AirPods to the

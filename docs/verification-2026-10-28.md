@@ -61,3 +61,36 @@ Per the task, Part 1 stopped here: steps 2 (live `--listen` mic + system, echo m
    two `say -a "MacBook Air Speakers"` sentences 8 s apart; expect `audio input (BuiltIn):
    "MacBook Air Microphone"`, `listening started (mic + system)`, system rows and mic rows with
    `echo_of` set; then the same on AirPods with no echo rows and no AirPods input opened.
+
+## 2026-10-29 — system audio verified on hardware
+
+Permission "System Audio Recording Only" granted to ClaudeShip (the app that launched the terminal), ClaudeShip restarted.
+
+`./target/release/examples/levels --system` (12 s, a video playing through "MacBook Air Speakers"):
+mic −37…−54 dBFS, system −13…−31 dBFS while sound played, then both fell to −60; `system lane: 99 chunks, 94 with signal`.
+
+`./target/release/oats-notes --listen` (release, `OATS_BRAIN=off`, scratch data dir), log:
+
+```
+audio input (BuiltIn): "MacBook Air Microphone" at 48000 Hz, 1 channel(s), F32 → 16000 Hz mono
+listening started (mic + system)
+system audio: "MacBook Air Speakers" at 48000 Hz, 2 channel(s), F32 → 16000 Hz mono (speakers)
+echo rule on (output "MacBook Air Speakers", Auto)
+system audio: first signal
+FluidAudio VAD stream for the system lane
+mic segment 1 marked as the echo of system segment 3
+mic segment 2 marked as the echo of system segment 3
+mic segment 5 stored as the echo of system segment 4
+```
+
+Segments (id, lane, echo_of, start, seconds, text):
+
+```
+3  system  -  08:57:14  18.9  But oh yeah, this is a beautiful revelation. Now we can start our speedrun. As soon as we click on a million, …
+1  mic     3  08:57:14  11.5  But uh yeah, this is a beautiful revelation. Now we can start a speedrun. As soon as we click on a million, we…
+2  mic     3  08:57:29   3.3  With that, the next thing we're gonna upgrade is
+4  system  -  09:01:29   5.6  Also remember that the apartment lease renewal paperwork is due at the start of February.
+5  mic     4  09:01:29   6.1  Also remember that the apartment lease renewal paperwork is due at the start of February.
+```
+
+Rows 3 and 4 came from the system lane (a video the user played, and a `say` sentence); the microphone's copies 1, 2 and 5 are stored as echoes and hidden from the views. Both the reverse-order path (1 and 2 marked after 3 arrived) and the forward path (5 stored as an echo at insert) were exercised. Harness note: the first `say` sentence never played and the second ran ~4 min late while the user's audio was playing — a `say` quirk, not the app. Still unchecked: AirPods as the output device (none connected).
