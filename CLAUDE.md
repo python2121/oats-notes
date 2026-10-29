@@ -273,9 +273,10 @@ the `fluidaudio-rs` bridge resets the model's recurrent state per call (3 infere
 bridge does not expose. The real fix: patch the Swift bridge (`FluidAudioBridge.swift` +
 `src/ffi/bridge.rs` in fluidaudio-rs; vendor or fork it pinned) to expose a stateful
 `vad_process_chunk` that keeps state across calls, then make `FluidAudioEngine::vad` one
-inference per chunk with no re-feed and no batching delay. Stop-gap options, not yet applied:
-batch 1 s per call (halves the cost, adds ≤ 750 ms segment latency) and a conservative
-loudness gate (≈ −55 dBFS with hangover) that skips Silero in a quiet room.
+inference per chunk with no re-feed and no batching delay. Stop-gaps APPLIED in `oats-core::pipeline` (2026-10-28): 1 s VAD batches (`VAD_BATCH_FRAMES`,
+halves the cost, ≤ 750 ms decision delay) and a quiet-room gate (`QUIET_FLOOR_DB` −55 dBFS,
+`QUIET_HANGOVER_BATCHES` 3) that skips Silero when no segment is open and the room has been
+quiet for 3 s. Remove both when the stateful VAD lands.
 See `docs/performance-2026-10-28.md`.
 
 Brain: a month-grid calendar view, undo for node merges (recorded, not reversible yet),
