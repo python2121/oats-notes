@@ -219,6 +219,66 @@ fn seed(db: &Path) -> i64 {
     work
 }
 
+/// Two projects under Work, one episode in each, plus the seeded segments.
+fn seed_projects(db: &Path) -> (i64, i64, i64) {
+    use oats_core::{EpisodeContent, NodeKind, Origin};
+    let work = seed(db);
+    let s = Store::open(db).unwrap();
+    let t = now_ms() - 600_000;
+    let mut ids = Vec::new();
+    for (name, title) in [
+        ("Commerce project", "Checkout flow decisions"),
+        ("Apartment lease", "Lease renewal terms"),
+    ] {
+        let p = s
+            .add_node(Some(work), NodeKind::Project, name, "", Origin::Auto)
+            .unwrap();
+        s.insert_episode(
+            t,
+            t + 60_000,
+            &EpisodeContent {
+                title: title.into(),
+                summary: "- something concrete".into(),
+                node_id: Some(p.id),
+                model: "m".into(),
+                ..Default::default()
+            },
+            t + 120_000,
+        )
+        .unwrap();
+        ids.push(p.id);
+    }
+    (work, ids[0], ids[1])
+}
+
+#[test]
+fn a_category_shows_its_projects_and_notes_and_the_transcript_behind_a_toggle() {
+    let dir = TempDir::new("category-notes");
+    let (work, commerce, _lease) = seed_projects(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    assert_eq!(rig.select_first_category(), View::Node(work));
+    rig.harness.run_steps(3);
+    // projects and notes, not transcript rows
+    assert!(rig.shows("Commerce project"));
+    assert!(rig.shows("Apartment lease"));
+    assert!(rig.shows("Checkout flow decisions"));
+    assert!(rig.shows("Lease renewal terms"));
+    assert!(!rig.shows("filed under work"));
+    assert!(rig.shows("Show transcript (1 segment)"));
+    // the toggle reveals the raw segments filed under the subtree
+    rig.harness.get_by_label_contains("Show transcript").click();
+    rig.harness.run_steps(3);
+    assert!(rig.shows("filed under work"));
+    assert!(!rig.shows("loose words"));
+    // a project shows only its own episode
+    rig.harness.get_by_label("Commerce project").click();
+    rig.harness.run_steps(3);
+    assert_eq!(rig.harness.state().prefs().view, View::Node(commerce));
+    assert!(rig.shows("Checkout flow decisions"));
+    assert!(!rig.shows("Lease renewal terms"));
+    assert!(rig.shows("Show transcript (0 segments)"));
+}
+
 #[test]
 fn selecting_a_node_view_reloads_the_rows() {
     let dir = TempDir::new("node-view");
@@ -229,6 +289,10 @@ fn selecting_a_node_view_reloads_the_rows() {
     assert!(rig.shows("loose words"));
 
     assert_eq!(rig.select_first_category(), View::Node(work));
+    rig.harness.run_steps(2);
+    assert!(rig.shows("No projects yet"));
+    assert!(rig.shows("Show transcript (1 segment)"));
+    rig.harness.get_by_label_contains("Show transcript").click();
     rig.harness.run_steps(2);
     assert!(rig.shows("filed under work"));
     assert!(!rig.shows("loose words"), "only the Work subtree is listed");
@@ -266,7 +330,7 @@ fn a_segment_for_another_view_bumps_the_count_without_appending() {
         !rig.shows("no engine]"),
         "appended to a view it doesn't belong to"
     );
-    assert!(rig.shows("filed under work"));
+    assert!(rig.shows("Show transcript (1 segment)"));
     // …but the status item heard about the new count
     assert!(
         shown

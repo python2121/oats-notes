@@ -5,7 +5,7 @@ The episode below was spoken on {{episode_date}} from {{episode_start}} to {{epi
 
 # The user's tree (categories → projects → topics)
 
-Reference nodes by their numeric id. `node_id` must be one of these ids or null.
+Reference nodes by their numeric id. `node_id` must be one of these ids or null. File the episode under a project (an existing one, or a `new_project` under the right category); categories are folders.
 
 {{tree}}
 

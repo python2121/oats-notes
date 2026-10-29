@@ -20,7 +20,7 @@ use oats_status::{StatusAction, StatusItem, StatusState};
 
 use crate::calendar::{CalendarAction, CalendarState, calendar_view};
 use crate::menu_events::MenuEvents;
-use crate::notes::{BrainStatus, NotesAction, NotesState, notes_view};
+use crate::notes::{BrainStatus, NotesAction, NotesState, node_view, notes_view};
 use crate::sidebar::{SidebarAction, SidebarState, sidebar_panel};
 use crate::theme::Tokens;
 use crate::transcript::{
@@ -626,7 +626,9 @@ impl OatsApp {
     fn set_view(&mut self, view: View) {
         if self.prefs.view != view {
             self.prefs.view = view;
+            self.notes_state.show_transcript = false;
             self.reload_rows();
+            self.reload_brain_data();
         }
     }
 
@@ -1052,6 +1054,7 @@ impl OatsApp {
                 NotesAction::Reorganise => self.run(Command::Reorganise),
                 NotesAction::Reinterpret(id) => self.brain_send(BrainCommand::Reinterpret(id)),
                 NotesAction::Undo(id) => self.brain_send(BrainCommand::UndoChange(id)),
+                NotesAction::SelectNode(id) => self.set_view(View::Node(id)),
             }
         }
     }
@@ -1289,6 +1292,15 @@ impl OatsApp {
         self.data_dir = label;
     }
 
+    /// Selftest only: select the node with this name; `false` when there is none.
+    pub(crate) fn selftest_show_node(&mut self, name: &str) -> bool {
+        let Some(id) = self.nodes.iter().find(|n| n.name == name).map(|n| n.id) else {
+            return false;
+        };
+        self.set_view(View::Node(id));
+        true
+    }
+
     /// Selftest only: show the Listening state with a fixed input level, no audio opened.
     pub(crate) fn selftest_fake_listening(&mut self, rms_db: f32, in_speech: bool) {
         self.capture = Some(Box::new(()));
@@ -1410,6 +1422,20 @@ impl eframe::App for OatsApp {
                             &self.reminders,
                             &self.nodes,
                         );
+                    }
+                    View::Node(id) if self.nodes.iter().any(|n| n.id == id) => {
+                        if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
+                            let out = node_view(
+                                &mut list_ui,
+                                &mut self.notes_state,
+                                node,
+                                &self.episodes,
+                                &self.rows,
+                                &self.nodes,
+                            );
+                            notes_actions = out.notes;
+                            transcript_actions = out.transcript;
+                        }
                     }
                     _ => {
                         transcript_actions = transcript_list(&mut list_ui, &self.rows, &self.nodes);

@@ -32,7 +32,7 @@
 //! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
 //! `oats_brain::BrainConfig::from_env`).
 //!
-//! `--selftest <out.png> [--listening|--notes|--calendar]` renders the whole window offscreen to a PNG (seeded
+//! `--selftest <out.png> [--listening|--notes|--work|--calendar]` renders the whole window offscreen to a PNG (seeded
 //! demo content, the null engine, a throwaway database) — the shell verified without a window.
 
 use std::any::Any;
@@ -182,7 +182,7 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--calendar]\n\n\
+        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes|--work|--calendar]\n\n\
          --listen       start listening as soon as the speech engine is ready\n\
          --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
          \x20              paced in real time; listening stops when the file ends\n\
@@ -192,6 +192,7 @@ fn usage() -> ExitCode {
          --selftest     render the window offscreen to a PNG (demo content, no microphone)\n\
          --listening    with --selftest: show the Listening state with a fake input level\n\
          --notes        with --selftest: the Notes view (a seeded interpreted episode)\n\
+         --work         with --selftest: the Work category view (projects and their notes)\n\
          --calendar     with --selftest: the Calendar view (seeded events and a reminder)"
     );
     ExitCode::from(2)
@@ -367,6 +368,7 @@ fn selftest_cli(args: &[String]) -> ExitCode {
             "--listening" => options.listening = true,
             "--notes" => options.notes = true,
             "--calendar" => options.calendar = true,
+            "--work" => options.work = true,
             f if !f.starts_with("--") && out.is_none() => out = Some(f.into()),
             _ => return usage(),
         }

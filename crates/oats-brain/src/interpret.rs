@@ -1411,6 +1411,19 @@ mod tests {
     }
 
     #[test]
+    fn the_interpret_prompt_says_to_file_under_a_project() {
+        let (_, tree, chunk) = seeded();
+        let req = interpret_request(&tree, &chunk, None, &Local::now(), None);
+        assert!(
+            req.system_prompt
+                .contains("File every real episode under a PROJECT")
+        );
+        assert!(req.system_prompt.contains("`new_project`"));
+        assert!(req.system_prompt.contains("FOLDERS"));
+        assert!(req.user_prompt.contains("File the episode under a project"));
+    }
+
+    #[test]
     fn interpret_request_carries_transcript_tree_and_prior() {
         let (_, tree, chunk) = seeded();
         let now = Local::now();

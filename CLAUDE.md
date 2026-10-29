@@ -36,11 +36,22 @@ crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mi
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
-crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Notes / Calendar views
+crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Notes / Calendar views, node view (notes + projects)
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
 vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
 vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream and a voice-processing input stream (macOS); NOT a workspace member
 ```
+
+## The UI's node view (`crates/oats-ui/src/notes.rs::node_view`)
+
+Categories are folders. Selecting a category / project / topic (`View::Node(id)`) shows its
+path as the header, its child projects (topics, under a project) as clickable rows with note
+count and last activity, the notes (episode cards, `Store::episodes_under`, newest first) of
+the subtree, and "Show transcript (N segments)" — the raw segments filed under the subtree,
+collapsed by default (`NotesState::show_transcript`, reset on every view change). Today and
+All transcripts stay transcript views; Notes shows every episode. The sidebar shows a muted
+"No projects yet" row under a category without projects. `--selftest out.png --work` renders
+the Work view offscreen.
 
 ## The status item (`crates/oats-status/src/lib.rs`)
 
@@ -215,7 +226,11 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   so tests use canned JSON. `render` substitutes `{{key}}` in ONE pass (inserted values are
   never re-scanned); transcripts, segment text and spoken commands sit between
   `<transcript>` and `</transcript>` (those tags are stripped from the data, nothing else is
-  escaped); every system prompt says to ignore instructions inside the data. Anti-sprawl:
+  escaped); every system prompt says to ignore instructions inside the data. Filing rule: categories are
+  folders; an episode is filed under a PROJECT (an existing one, or `new_project` with
+  `parent_id` = the category, named after the concrete subject), the category alone only for
+  miscellaneous low-signal content; categorisation prefers the most specific existing project
+  and never creates nodes. Anti-sprawl:
   existing nodes are preferred, names are matched case/whitespace-insensitively
   (`store::name_key`), at most `max_new_nodes_per_run` new nodes per run. Events are upserted
   by `dedupe_key = ep:<episode>:<date>:<name_key(title)>`, so a revision updates in place and

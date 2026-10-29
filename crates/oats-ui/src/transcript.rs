@@ -168,6 +168,38 @@ pub fn transcript_list(
     actions
 }
 
+/// The rows with day headings, laid out in the caller's scroll area (a node view's collapsible
+/// transcript section).
+pub fn transcript_rows(
+    ui: &mut egui::Ui,
+    rows: &[TranscriptRow],
+    nodes: &[Node],
+) -> Vec<TranscriptAction> {
+    let t = Tokens::get(ui.ctx());
+    let mut actions = Vec::new();
+    let breaks = day_breaks(rows, &Local);
+    let this_year = Local::now().year();
+    let mut next_break = breaks.iter().peekable();
+    for (i, row) in rows.iter().enumerate() {
+        if let Some((_, day)) = next_break.next_if(|(at, _)| *at == i) {
+            let heading = day
+                .map(|d| day_heading(d, this_year))
+                .unwrap_or_else(|| "Unknown date".to_owned());
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.label(
+                    egui::RichText::new(heading)
+                        .font(crate::theme::font_medium(ui.ctx(), 12.5))
+                        .color(t.text_secondary),
+                );
+            });
+            ui.add_space(4.0);
+        }
+        transcript_row(ui, &t, row, nodes, &mut actions);
+    }
+    actions
+}
+
 /// Width of the time column.
 const TIME_W: f32 = 44.0;
 

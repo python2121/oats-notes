@@ -3,7 +3,7 @@
 //! under them and topics under those, collapsible per node (a disclosure triangle on rows with
 //! children, indented SwiftInvert-style); a "+" header icon that reveals an inline field to add
 //! a category; right-click → Rename / Delete with an inline rename. Selecting a node shows
-//! everything filed under it or below it.
+//! its notes (see `notes::node_view`).
 
 use std::collections::HashSet;
 
@@ -195,6 +195,9 @@ pub fn sidebar_panel(
                         ui.close();
                     }
                 });
+                if n.parent_id.is_none() && !has_children(nodes, n.id) {
+                    empty_row(ui, &t, "No projects yet");
+                }
             }
             if let Some(id) = toggle
                 && !state.collapsed.remove(&id)
@@ -216,6 +219,20 @@ pub fn sidebar_panel(
             }
         });
     actions
+}
+
+/// A muted, non-interactive placeholder row one level under a category.
+fn empty_row(ui: &mut egui::Ui, t: &Tokens, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().text(
+            pos2(rect.left() + 12.0 + 14.0 + 12.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            t.font(11.5),
+            t.text_tertiary,
+        );
+    }
 }
 
 fn group_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {

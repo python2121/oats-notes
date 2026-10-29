@@ -27,6 +27,8 @@ pub struct SelftestOptions {
     /// Show the Notes view (a seeded interpreted episode with a project, action items and a
     /// change-log line) instead of the transcript.
     pub notes: bool,
+    /// Show the Work category's view (its projects, their notes, the transcript toggle).
+    pub work: bool,
     /// Show the Calendar view (seeded events and a reminder).
     pub calendar: bool,
 }
@@ -95,6 +97,11 @@ pub fn run_with(
     }
     if options.notes {
         harness.state_mut().run(Command::ShowNotes);
+    } else if options.work {
+        let app = harness.state_mut();
+        if !app.selftest_show_node("Work") {
+            return Err("no Work category in the seeded store".to_owned());
+        }
     } else if options.calendar {
         harness.state_mut().run(Command::ShowCalendar);
     }
@@ -244,6 +251,28 @@ fn seed(store: &Store) -> Result<(), oats_core::StoreError> {
                 low_signal: true,
                 model: "claude-sonnet-4-5".into(),
                 cost_usd: Some(0.004),
+                ..Default::default()
+            },
+            now,
+        )?;
+        let vendor = store.add_node(
+            Some(work.id),
+            NodeKind::Project,
+            "Vendor contract",
+            "legal review of the data retention clause",
+            Origin::Auto,
+        )?;
+        store.insert_episode(
+            today + 9 * H + 15 * M,
+            today + 9 * H + 22 * M,
+            &EpisodeContent {
+                title: "Stand-up: sync fix shipped, vendor contract slips".into(),
+                summary: "- The Friday sync bug is fixed and deployed; crash reports are near zero.\n- Legal wants another pass on the **data retention clause**, so signing slips to next week.".into(),
+                node_id: Some(vendor.id),
+                decisions: vec!["Hold the signature until legal clears the retention clause".into()],
+                topics: vec!["data retention".into()],
+                model: "claude-sonnet-4-5".into(),
+                cost_usd: Some(0.012),
                 ..Default::default()
             },
             now,

@@ -7,10 +7,10 @@
 
 use chrono::Local;
 use egui::{Align2, RichText, Sense, vec2};
-use oats_core::{BrainRun, Change, Episode, Node};
+use oats_core::{BrainRun, Change, Episode, Node, TranscriptRow};
 
 use crate::theme::Tokens;
-use crate::transcript::{clock, day_heading, day_of};
+use crate::transcript::{TranscriptAction, clock, day_heading, day_of, transcript_rows};
 
 /// What the user did in the Notes view this frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -20,6 +20,8 @@ pub enum NotesAction {
     Reorganise,
     Reinterpret(i64),
     Undo(i64),
+    /// Drill into a node (a project chip in a category's view).
+    SelectNode(i64),
 }
 
 /// What the strip shows about the brain.
@@ -96,6 +98,8 @@ pub struct NotesState {
     pub show_changes: bool,
     /// Low-signal episodes expanded by the user.
     pub expanded: Vec<i64>,
+    /// A node view's raw transcript section is open (collapsed by default).
+    pub show_transcript: bool,
 }
 
 /// "Work › Export rewrite › CSV" for a node.
@@ -539,6 +543,230 @@ pub fn notes_view(
             ui.add_space(8.0);
         });
     actions
+}
+
+/// One child of the viewed node, with what lives under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildSummary {
+    pub id: i64,
+    pub name: String,
+    pub episodes: usize,
+    /// End of the newest episode under it.
+    pub last_activity: Option<i64>,
+}
+
+/// Whether `node` is `root` or below it.
+pub fn node_in_subtree(nodes: &[Node], node: i64, root: i64) -> bool {
+    let mut cur = Some(node);
+    for _ in 0..16 {
+        match cur {
+            Some(id) if id == root => return true,
+            Some(id) => cur = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent_id),
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The non-archived children of `root` (projects of a category, topics of a project), in tree
+/// order, each with its episode count and latest activity over `episodes` (the subtree's).
+pub fn child_summaries(nodes: &[Node], root: i64, episodes: &[Episode]) -> Vec<ChildSummary> {
+    let mut kids: Vec<&Node> = nodes
+        .iter()
+        .filter(|n| n.parent_id == Some(root) && !n.archived)
+        .collect();
+    kids.sort_by_key(|n| (n.position, n.id));
+    kids.into_iter()
+        .map(|k| {
+            let under: Vec<&Episode> = episodes
+                .iter()
+                .filter(|e| e.node_id.is_some_and(|n| node_in_subtree(nodes, n, k.id)))
+                .collect();
+            ChildSummary {
+                id: k.id,
+                name: k.name.clone(),
+                episodes: under.len(),
+                last_activity: under.iter().map(|e| e.ended_at).max(),
+            }
+        })
+        .collect()
+}
+
+/// What the user did in a node view this frame.
+#[derive(Default)]
+pub struct NodeViewOut {
+    pub notes: Vec<NotesAction>,
+    pub transcript: Vec<TranscriptAction>,
+}
+
+/// A category, project or topic selected in the sidebar: its path as the header, the child
+/// projects (or topics) as clickable rows, the notes (episodes) of the subtree newest first,
+/// and the raw transcript segments filed there behind a toggle (collapsed by default).
+pub fn node_view(
+    ui: &mut egui::Ui,
+    state: &mut NotesState,
+    node: &Node,
+    episodes: &[Episode],
+    rows: &[TranscriptRow],
+    nodes: &[Node],
+) -> NodeViewOut {
+    let t = Tokens::get(ui.ctx());
+    let mut out = NodeViewOut::default();
+    let children = child_summaries(nodes, node.id, episodes);
+    let this_year = chrono::Datelike::year(&Local::now());
+    egui::ScrollArea::vertical()
+        .id_salt("node-scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(node_path(nodes, node.id))
+                            .font(crate::theme::font_medium(ui.ctx(), 16.0))
+                            .color(t.text),
+                    )
+                    .truncate(),
+                );
+            });
+            if !node.description.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&node.description)
+                                .color(t.text_secondary)
+                                .size(11.5),
+                        )
+                        .truncate(),
+                    );
+                });
+            }
+            ui.add_space(8.0);
+            let heading = if node.kind == oats_core::NodeKind::Topic {
+                None
+            } else if node.kind == oats_core::NodeKind::Category {
+                Some((
+                    "Projects",
+                    "No projects yet. The brain creates one when it files notes.",
+                ))
+            } else {
+                Some(("Topics", ""))
+            };
+            if let Some((title, empty)) = heading
+                && (!children.is_empty() || !empty.is_empty())
+            {
+                section_label(ui, &t, title);
+                if children.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(RichText::new(empty).color(t.text_tertiary).size(12.0));
+                    });
+                }
+                for c in &children {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        let resp = ui.add(
+                            egui::Label::new(
+                                RichText::new(&c.name)
+                                    .font(crate::theme::font_medium(ui.ctx(), 13.0))
+                                    .color(t.accent),
+                            )
+                            .sense(Sense::click()),
+                        );
+                        if resp.clicked() {
+                            out.notes.push(NotesAction::SelectNode(c.id));
+                        }
+                        let last = c
+                            .last_activity
+                            .and_then(|ms| crate::transcript::at(ms, &Local))
+                            .map(|d| format!(" · last {}", d.format("%b %-d, %H:%M")))
+                            .unwrap_or_default();
+                        ui.label(
+                            RichText::new(format!(
+                                "{} note{}{last}",
+                                c.episodes,
+                                if c.episodes == 1 { "" } else { "s" }
+                            ))
+                            .color(t.text_tertiary)
+                            .size(11.0),
+                        );
+                    });
+                    ui.add_space(2.0);
+                }
+                ui.add_space(8.0);
+            }
+            section_label(ui, &t, "Notes");
+            if episodes.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(
+                        RichText::new("No notes here yet.")
+                            .color(t.text_tertiary)
+                            .size(12.0),
+                    );
+                });
+            }
+            ui.add_space(4.0);
+            let mut last_day = None;
+            for e in episodes {
+                let day = day_of(e.started_at, &Local);
+                if last_day != Some(day) {
+                    last_day = Some(day);
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(
+                            RichText::new(
+                                day.map(|d| day_heading(d, this_year))
+                                    .unwrap_or_else(|| "Unknown date".to_owned()),
+                            )
+                            .font(crate::theme::font_medium(ui.ctx(), 12.5))
+                            .color(t.text_secondary),
+                        );
+                    });
+                    ui.add_space(4.0);
+                }
+                episode_card(ui, &t, state, e, nodes, &mut out.notes);
+            }
+            ui.add_space(8.0);
+            let label = format!(
+                "{} Show transcript ({} segment{})",
+                if state.show_transcript { "▾" } else { "▸" },
+                rows.len(),
+                if rows.len() == 1 { "" } else { "s" }
+            );
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                if ui
+                    .add(
+                        egui::Label::new(RichText::new(label).color(t.text_secondary).size(12.0))
+                            .sense(Sense::click()),
+                    )
+                    .clicked()
+                {
+                    state.show_transcript = !state.show_transcript;
+                }
+            });
+            if state.show_transcript {
+                ui.add_space(4.0);
+                out.transcript = transcript_rows(ui, rows, nodes);
+            }
+            ui.add_space(12.0);
+        });
+    out
+}
+
+fn section_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        ui.label(
+            RichText::new(text)
+                .font(crate::theme::font_medium(ui.ctx(), 11.0))
+                .color(t.text_tertiary),
+        );
+    });
 }
 
 #[cfg(test)]
