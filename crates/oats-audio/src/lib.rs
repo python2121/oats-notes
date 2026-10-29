@@ -107,7 +107,7 @@ pub enum InputChoice {
 /// Whether an input device name is the computer's own microphone (macOS naming).
 pub fn is_builtin_input(name: &str) -> bool {
     let n = name.to_lowercase();
-    n.contains("macbook") || n.contains("built-in") || n.contains("builtin")
+    n.contains("macbook") || n.contains("imac") || n.contains("built-in") || n.contains("builtin")
 }
 
 /// Pick an input device by `policy` from the input devices' `names` (pure; tested).
@@ -515,6 +515,15 @@ mod tests {
                 true
             ),
             InputChoice::BuiltIn(0)
+        );
+        // an iMac names its microphone after itself
+        assert_eq!(
+            choose_input(
+                &InputPolicy::BuiltIn,
+                &names(&["Alex’s AirPods", "iMac Microphone"]),
+                true
+            ),
+            InputChoice::BuiltIn(1)
         );
         // no built-in microphone (a Mac mini): the default, with a warning
         assert!(matches!(

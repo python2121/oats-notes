@@ -488,6 +488,10 @@ ALTER TABLE segments ADD COLUMN echo_of INTEGER;
 
 const SEGMENT_COLUMNS: &str = "id, session_id, started_at, ended_at, text, confidence, node_id, episode_id, interpreted_at, categorised, source, echo_of";
 
+/// Longer than any stored segment (the segmenter caps them at 30 s): how far before a
+/// window [`Store::segments_near`] looks for segments reaching into it.
+const NEAR_MAX_SEGMENT_MS: i64 = 10 * 60_000;
+
 /// Echoes (see [`crate::echo`]) are never part of a listing.
 const NOT_ECHO: &str = "echo_of IS NULL";
 
@@ -997,13 +1001,25 @@ impl Store {
         from: i64,
         to: i64,
     ) -> Result<Vec<TranscriptRow>, StoreError> {
+        // the lower bound on `started_at` keeps this an index range (segments are ≤ 30 s
+        // long; without it `started_at <= to` matches the whole history: a full scan per
+        // transcribed segment, all day)
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {SEGMENT_COLUMNS} FROM segments
-             WHERE source = ?1 AND {NOT_ECHO} AND ended_at >= ?2 AND started_at <= ?3
+             WHERE started_at >= ?4 AND started_at <= ?3
+               AND source = ?1 AND {NOT_ECHO} AND ended_at >= ?2
              ORDER BY started_at, id"
         ))?;
         let rows = stmt
-            .query_map(rusqlite::params![source.as_str(), from, to], row_to_segment)?
+            .query_map(
+                rusqlite::params![
+                    source.as_str(),
+                    from,
+                    to,
+                    from.saturating_sub(NEAR_MAX_SEGMENT_MS)
+                ],
+                row_to_segment,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }

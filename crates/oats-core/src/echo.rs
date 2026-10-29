@@ -25,6 +25,9 @@ pub const ECHO_WINDOW_MS: i64 = 45_000;
 pub const ECHO_THRESHOLD: f32 = 0.8;
 /// Below this many words on either side, only an exact match counts.
 pub const MIN_FUZZY_WORDS: usize = 4;
+/// The joined comparison (split system segments) uses only the system rows overlapping the
+/// microphone segment's span widened by this much (the lanes' clocks are anchored apart).
+pub const JOIN_SLACK_MS: i64 = 2_000;
 
 /// Whether the echo rule runs (`OATS_SYSTEM_DEDUP`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -126,9 +129,9 @@ pub fn within_window(a0: i64, a1: i64, b0: i64, b1: i64) -> bool {
 /// The system segment a microphone segment (`[started_at, ended_at]`, `text`) echoes, if any:
 /// among `system` rows within the window (rows of other sources and rows that are themselves
 /// echoes are ignored), the most similar one that passes [`is_echo`]. When no single row
-/// passes, the window's rows joined in time order are tried too (the microphone's segmenter
-/// can merge two system segments into one); the match then points at the row sharing the
-/// most words.
+/// passes, the rows overlapping the microphone segment's span (± [`JOIN_SLACK_MS`]) joined in
+/// time order are tried too (the microphone's segmenter can merge two system segments into
+/// one); the match then points at the row sharing the most words.
 pub fn find_echo_of(
     started_at: i64,
     ended_at: i64,
@@ -152,15 +155,23 @@ pub fn find_echo_of(
     if let Some((_, id)) = best {
         return Some(id);
     }
-    if near.len() > 1 {
-        let joined = near
+    // only the rows the microphone segment actually spans: joining the whole ±45 s window
+    // makes a long text that contains every word of a short reply ("yeah I think so too")
+    let spanned: Vec<&&TranscriptRow> = near
+        .iter()
+        .filter(|r| {
+            r.ended_at >= started_at - JOIN_SLACK_MS && r.started_at <= ended_at + JOIN_SLACK_MS
+        })
+        .collect();
+    if spanned.len() > 1 {
+        let joined = spanned
             .iter()
             .map(|r| r.text.as_str())
             .collect::<Vec<_>>()
             .join(" ");
         if is_echo(text, &joined) {
             let mic: HashSet<String> = words(text).into_iter().collect();
-            return near
+            return spanned
                 .iter()
                 .max_by_key(|r| words(&r.text).iter().filter(|w| mic.contains(*w)).count())
                 .map(|r| r.id);
@@ -302,6 +313,60 @@ mod tests {
         let merged = "Welcome everyone to the planning meeting. Today we decide the launch \
                       date for the new app.";
         assert!(find_echo_of(0, 7_200, merged, &rows).is_some());
+    }
+
+    /// Regression: the joined comparison once took every system row of the ±45 s window, so
+    /// the user's own short reply between the other side's sentences ("yeah I think so too")
+    /// was contained in the joined text and hidden as an echo.
+    #[test]
+    fn a_short_reply_between_system_rows_is_not_an_echo_of_the_joined_window() {
+        let rows = [
+            sys(
+                1,
+                0,
+                8_000,
+                "So I think the plan is that we move the launch to next week if that works for everyone",
+            ),
+            sys(
+                2,
+                20_000,
+                28_000,
+                "Yeah and I would also like to hear what the design team thinks about it too",
+            ),
+            sys(
+                3,
+                40_000,
+                46_000,
+                "Does that make sense so far or should I go over it again",
+            ),
+        ];
+        assert_eq!(
+            find_echo_of(30_000, 31_500, "yeah I think so too", &rows),
+            None
+        );
+        assert_eq!(
+            find_echo_of(30_000, 31_500, "I think that makes sense", &rows),
+            None
+        );
+        // the mic heard the end of one system row and the start of the next as one segment
+        // (neither row alone passes): the rows it spans, joined, still match
+        let split = [
+            sys(
+                1,
+                0,
+                3_000,
+                "alright so the first item on the agenda is hiring",
+            ),
+            sys(
+                2,
+                3_400,
+                7_000,
+                "we have two candidates for the backend role",
+            ),
+        ];
+        let heard = "first item on the agenda is hiring we have two candidates";
+        assert!(split.iter().all(|r| !is_echo(heard, &r.text)));
+        assert_eq!(find_echo_of(1_500, 5_500, heard, &split), Some(1));
     }
 
     #[test]

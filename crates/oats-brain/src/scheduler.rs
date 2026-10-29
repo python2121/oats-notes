@@ -1117,6 +1117,13 @@ impl Worker {
         {
             return;
         }
+        // stored since as the echo of a system segment (the speakers said it; the system
+        // segment closed after the microphone's): not the user's command
+        if let Ok(Some(stored)) = self.store.segment(seg.id)
+            && !hotword::can_command(&stored)
+        {
+            return;
+        }
         if !self.within_budget(Tier::Reactive) {
             cmd.not_before = Some(Instant::now() + TIER0_WAIT);
             self.pending_commands.push_back(cmd);
@@ -1142,6 +1149,23 @@ impl Worker {
                     cost_usd: resp.cost_usd,
                     ..JobError::from(msg)
                 })?;
+            // the system segment this echoes can land while the CLI runs (the lanes close
+            // their segments a moment apart): check again before anything is written
+            if w.store
+                .segment(seg.id)
+                .ok()
+                .flatten()
+                .is_some_and(|r| !hotword::can_command(&r))
+            {
+                return Ok(JobOutput {
+                    summary: "not run: an echo of system audio".to_owned(),
+                    cost_usd: resp.cost_usd,
+                    duration_ms: resp.duration_ms,
+                    model: resp.model,
+                    lines: Vec::new(),
+                    changed: false,
+                });
+            }
             let done = w
                 .store
                 .with_savepoint(|s| {
@@ -2360,6 +2384,44 @@ esac
             }))
             .is_ok()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a microphone command segment marked as the echo of system audio after it
+    /// was queued (the system segment closed second) must not run.
+    #[test]
+    fn a_command_that_became_an_echo_does_not_run() {
+        let dir = temp_dir("cmdecho");
+        let ran = dir.join("ran");
+        let mut w = bare_worker(script_cli(
+            &dir,
+            &format!("touch '{}'\necho 'not json'", ran.display()),
+        ));
+        let sid = w.store.begin_session(0, "e").unwrap();
+        let t = now_ms() - 60_000;
+        let mic = w
+            .store
+            .insert_segment(sid, t, t + 1_000, "hey computer note the milk", None)
+            .unwrap();
+        let them = w
+            .store
+            .insert_segment_from(
+                sid,
+                t,
+                t + 1_000,
+                "hey computer note the milk",
+                None,
+                oats_core::AudioSourceKind::System,
+                None,
+            )
+            .unwrap();
+        w.on_segment(mic.clone());
+        assert_eq!(w.pending_commands.len(), 1);
+        w.store.set_segment_echo(mic.id, Some(them.id)).unwrap();
+        let cmd = w.pending_commands.pop_front().unwrap();
+        w.run_command(cmd);
+        assert!(!ran.exists(), "claude was called for an echo");
+        assert!(w.pending_commands.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

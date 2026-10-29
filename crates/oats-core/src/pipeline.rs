@@ -39,6 +39,12 @@ const AUDIO_POLL: Duration = Duration::from_millis(100);
 const LEVEL_INTERVAL: Duration = Duration::from_millis(250);
 /// A lane that delivered nothing for this long reads as silent in `Level` events.
 const LEVEL_STALE: Duration = Duration::from_secs(1);
+/// Both captures deliver a 100 ms chunk every 100 ms, silence included, into one channel:
+/// this many system chunks in a row (3 s) without a microphone chunk means the microphone's
+/// capture died (the system capture keeps the channel open, so the session goes on and nobody
+/// would notice). Counted in chunks, not time, so a processing stall (chunks queued) can't
+/// fake it.
+const MIC_LOST_AFTER_CHUNKS: u32 = 30;
 /// How long dropping the handle waits for the worker before detaching it (a model load can
 /// take minutes and can't be interrupted; quitting must not wait for it).
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -557,10 +563,16 @@ impl Session<'_> {
         let mut last_level: Option<Instant> = None;
         let mut vad_warned = false;
         let mut no_signal_reported = false;
+        let mut mic_lost_reported = false;
+        let mut system_since_mic: u32 = 0;
 
         let after = loop {
             match listen.audio.recv_timeout(AUDIO_POLL) {
                 Ok(chunk) => {
+                    system_since_mic = match chunk.source {
+                        AudioSourceKind::Mic => 0,
+                        AudioSourceKind::System => system_since_mic.saturating_add(1),
+                    };
                     let lane = &mut lanes[chunk.source.index()];
                     let silent = chunk.samples.iter().all(|s| *s == 0.0);
                     if lane.kind == AudioSourceKind::System && !silent && !lane.signal {
@@ -605,6 +617,16 @@ impl Session<'_> {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break AfterListen::Idle,
+            }
+            // the microphone went quiet while system audio flows: its device is gone
+            if !mic_lost_reported && system_since_mic >= MIC_LOST_AFTER_CHUNKS {
+                mic_lost_reported = true;
+                log::warn!("the microphone stopped delivering audio; system audio continues");
+                self.out.send(PipelineEvent::Warning(
+                    "Microphone: no audio from the input device (lost?) — only system audio \
+                     is being transcribed; stop and start listening to reopen it"
+                        .to_owned(),
+                ));
             }
             if listen.options.system
                 && !no_signal_reported

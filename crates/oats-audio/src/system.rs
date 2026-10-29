@@ -181,6 +181,11 @@ fn monitor(
             on_output(&output_info(&device));
             Some(r)
         }
+        Err(e @ CaptureError::LoopbackUnsupported) => {
+            // permanent (the audio host can't record its output): no retries all day
+            log::warn!("system audio: {e}; the lane stays closed");
+            return;
+        }
         Err(e) => {
             log::warn!("system audio: could not open: {e}");
             failed = Some((
@@ -323,7 +328,9 @@ fn build_loopback(
 }
 
 /// Elsewhere: an input stream on the output device — the sink's monitor on cpal's PipeWire
-/// host; other hosts refuse it.
+/// host (WASAPI's loopback on Windows). Refused on ALSA and JACK: there the default output
+/// device IS the default input ("default" PCM), so an input stream on it would record the
+/// microphone into the system lane.
 #[cfg(not(target_os = "macos"))]
 fn build_loopback(
     device: &cpal::Device,
@@ -331,6 +338,9 @@ fn build_loopback(
     format: SampleFormat,
     sink: Sink,
 ) -> Result<Stream, CaptureError> {
+    if matches!(cpal::default_host().id().name(), "ALSA" | "JACK") {
+        return Err(CaptureError::LoopbackUnsupported);
+    }
     match format {
         SampleFormat::F32 => crate::build::<f32>(device, config, sink),
         SampleFormat::I16 => crate::build::<i16>(device, config, sink),

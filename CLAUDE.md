@@ -70,7 +70,9 @@ the `claude` CLI on its own thread and reports `BrainEvent`s back (the UI reload
 Failure edges: a lost microphone arrives on cpal's error callback; a terminal error
 (device / host gone, permission revoked, stream invalidated) drops that capture's sender. A
 lane error closes only that lane: the session runs on while the other capture's sender lives
-(the system capture rebuilds itself, see below); when every sender is gone the pipeline sees
+(the system capture rebuilds itself, see below; a microphone that stops delivering while
+system audio flows — 30 system chunks in a row — is reported once as a "Microphone: …"
+warning); when every sender is gone the pipeline sees
 `Disconnected` and ends the session, and the UI stops listening with "audio input closed" in
 the status strip (following a newly chosen default input device is not done — the user
 starts listening again). A session row the store refuses becomes
@@ -90,7 +92,7 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   never capture from a Bluetooth headset unless named — its microphone switches AirPods to the
   call profile and playback degrades. Order: `OATS_INPUT_DEVICE` (a device name: exact,
   case-insensitive, else substring) → the built-in microphone (macOS: name contains
-  "MacBook" / "Built-in"; Linux: the default input) → the system default with a `warn!`
+  "MacBook" / "iMac" / "Built-in"; Linux: the default input) → the system default with a `warn!`
   ("may be a Bluetooth headset or another unknown device"). The choice is logged at info
   (`audio input (BuiltIn): "MacBook Air Microphone" …`). `InputPolicy::SystemDefault` /
   `Named` exist for a later UI. Pure picker: `choose_input` (tested).
@@ -100,7 +102,8 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   `build_loopback_stream_raw` (stock cpal opens a headset's microphone when the output device
   also has an input — see `vendor/cpal/VENDORED.md`). Linux: an input stream on the PipeWire
   host's default sink records its monitor (needs cpal's `pipewire` feature, not enabled yet;
-  under ALSA the lane fails to open and the mic carries on). The stream is opened on the
+  under ALSA / JACK the lane is refused — there the default output device is the default
+  input, so it would record the microphone — and the mic carries on). The stream is opened on the
   capture's OWN thread: on macOS the first open blocks inside Core Audio while the
   permission prompt is up (observed), and that must not freeze the UI; dropping the guard
   waits ≤ 0.5 s, then detaches. The thread polls the default output every 2 s (one property
@@ -133,11 +136,11 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   speakers the microphone hears the call. Before inserting a MIC segment, the system
   segments reaching into ±45 s of it (`Store::segments_near`) are compared: word-Jaccard OR
   containment ≥ 0.8 over normalised words (lower case, punctuation/apostrophes dropped),
-  exact match only when either side has < 4 words; the window's system rows joined are tried
-  too. A match is STORED with `segments.echo_of = <system id>` (nothing is dropped; the rule is
-  auditable: `Store::echoes_of`). The reverse order (system segment stored second) marks the
+  exact match only when either side has < 4 words; the system rows overlapping the mic
+  segment's own span (± 2 s, not the whole window) joined are tried too. A match is STORED
+  with `segments.echo_of = <system id>` (nothing is dropped; the rule is auditable: `Store::echoes_of`). The reverse order (system segment stored second) marks the
   stored mic row and sends `PipelineEvent::EchoMarked { segment, echo_of }` (the UI drops the
-  row). Echoes are excluded from every listing: the views, counts, the brain's queues and
+  row; a queued voice command that became an echo is not run). Echoes are excluded from every listing: the views, counts, the brain's queues and
   transcript rendering; deleting a system segment deletes its echoes. Switch:
   `OATS_SYSTEM_DEDUP=auto|always|never` (default auto; `oats_core::DedupMode`): auto runs the
   rule only while the default output is speakers (`OutputInfo::speakers`), i.e. skips it on

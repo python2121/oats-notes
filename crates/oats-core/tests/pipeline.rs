@@ -955,3 +955,32 @@ fn a_silent_system_lane_is_reported_and_a_closed_one_leaves_the_mic_running() {
         *e == PipelineEvent::SessionEnded(sid)
     });
 }
+
+/// Regression: the system capture keeps the shared channel open, so a microphone that dies
+/// mid-session never ends it ("audio input closed"); it must at least be reported.
+#[test]
+fn a_microphone_that_stops_while_system_audio_flows_is_reported() {
+    let rig = scripted("miclost", Faults::default());
+    let mut seen = Vec::new();
+    wait_idle(&rig.h, &mut seen);
+    let (tx, sid) = start_lanes(&rig.h, &mut seen, ListenOptions::default());
+    send_both(&tx, 0.0, 0.0, 300);
+    // a backlog (the worker busy) is not a lost microphone: chunks stay interleaved
+    send_both(&tx, 0.0, 0.0, 5_000);
+    // only system chunks from now on
+    send_lane(&tx, AudioSourceKind::System, 0.0, 4_000);
+    wait_for(
+        &rig.h,
+        &mut seen,
+        "mic lost warning",
+        |e| matches!(e, PipelineEvent::Warning(w) if w.starts_with("Microphone")),
+    );
+    stop_and_wait(&rig, &mut seen, sid);
+    assert_eq!(
+        seen.iter()
+            .filter(|e| matches!(e, PipelineEvent::Warning(w) if w.starts_with("Microphone")))
+            .count(),
+        1,
+        "reported once"
+    );
+}
