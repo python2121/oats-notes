@@ -310,3 +310,26 @@ batching stop-gap (`VAD_BATCH_FRAMES`) and the quiet-room gate (`QUIET_FLOOR_DB`
   idle-null), which inflates both absolute numbers. Compare the delta, not the totals. Two
   more idle-only runs under the same load gave 2.0 % and 2.7 %. Re-measure on a quiet machine
   before quoting a new headline.
+
+## Before/after (late 2026-10-28, after the system-audio lane, bad1dd5)
+
+Archive: `docs/perf/2026-10-28-stateful-vad-lanes-bad1dd5/`. Shortened protocol (on request):
+idle = 90 s steady window; speech = the first 90 s of `long.wav` at real time (3 segments, so
+segment counts are not comparable with the 327 s runs). `--audio-file` only, so the **system
+lane was absent** (log: `listening started (mic)`); the System Audio Recording grant was not
+effective on this machine anyway (`docs/verification-2026-10-28.md`). **The machine was busy**
+(mediaanalysisd ~200 % CPU, 1-min load 5.5–12.9 after a 5 min wait), so treat these as indicative.
+
+| run | idle CPU mean / p95 % | speech CPU mean / p95 % | RSS steady MB (idle / speech) | energy mean (idle / speech) | segments stored (speech) |
+|---|---:|---:|---:|---:|---:|
+| baseline e678c2c | 2.1 / 2.7 | 4.6 / 6.6 | 29 / 63 | 2.1 / 5.0 | 11 (327 s file) |
+| stop-gaps c2c1b31 | 1.7 / – | – (partial run) | – | – | – |
+| stateful VAD 8045a3c (busy) | 2.1 / 3.6 | – | 48 / – | 2.1 / – | – |
+| **lanes bad1dd5 (busy, shortened)** | **1.2 / 1.8** | **2.8 / 2.0** | **41 / 45** | **1.1 / 4.1** | **3 (90 s cut)** |
+
+Speech mean > p95 because ps's `%cpu` shows three transcription bursts (20.8, 21.5, 67.4 %)
+in the 83 s window — one per ~30 s segment (transcribe ≈ 750 ms each, RTF 0.025); `top`'s
+per-second mean is 4.1 %. Interpretation: idle listening with the stateful VAD now costs about
+1.2 % of one core (down from 2.1 % at baseline) even on a loaded machine, and the lane split did
+not add measurable mic-only cost; the system lane's own idle cost (a silent tap, all-zero frames
+skip VAD) is still unmeasured until the permission works.
