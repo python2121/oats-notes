@@ -252,10 +252,19 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   room difference is ≥ 20 dB below plain's and the correlation peaks collapse; then it can
   replace (or back) the text-level echo rule on speakers. VoiceProcessing is NOT the
   default until the spike passes. Pure helpers: `oats_audio::measure` (tested).
-- **UI**: "Capture System Audio" (Listen menu, checked) and a "System audio" pill in the
-  control bar toggle the `AppPrefs::capture_system` pref (persisted, default on; toggling while
-  listening reopens the captures). The status strip reads "listening · mic + system" /
-  "listening · mic", plus "system audio: no signal" after the 30 s check; a system capture that
+- **UI**: the control bar has two independent lane pills, "Mic" and "System audio" (the
+  Listen menu's checked "Microphone" / "System Audio" items are the same toggles). Listening is
+  on whenever at least one lane is; turning the last one off stops it. A change while listening
+  restarts the captures AND the pipeline session (stop, then a new session once the pipeline
+  reports Idle via `auto_listen`; lanes are not changed inside a session) with
+  `AudioRequest { mic, system }` / `ListenOptions { mic, system }`; system-only listening never
+  opens the microphone, and the "microphone stopped" warning is off when `mic` is false.
+  `AppPrefs::lanes` (`Lanes { mic, system }`, default both) remembers the last lane set; the
+  master switch (⌘L / "Start Listening", the status item's toggle, `--listen`, listening
+  resumed at launch) opens that set, "Stop Listening" turns every lane off (the set is kept).
+  The old `capture_system` pref is read once into `lanes.system` on load and no longer
+  written. A starter that opens nothing (system-only and the tap fails) returns `Err`. The status strip reads "listening · mic + system" /
+  "listening · mic" / "listening · system", plus "system audio: no signal" after the 30 s check; a system capture that
   fails to open shows "System audio: …" as the warning while the mic runs. Transcript rows from
   system audio carry a small "them" tag under the time; echoes never appear.
   `oats_ui::AudioStarter` = `Fn(Sender<AudioChunk>, AudioRequest { system }) ->

@@ -141,8 +141,14 @@ fn audio_starter(
         // --audio-file: the WAV instead of the microphone, from the start each time; a
         // --system-audio-file plays alongside as the system lane (no device: auto dedups)
         Some(samples) => Box::new(move |tx, request| {
-            let mic = oats_audio::FileSource::start(samples.clone(), file_options, tx.clone())
-                .map_err(|e| e.to_string())?;
+            let mic = if request.mic {
+                Some(
+                    oats_audio::FileSource::start(samples.clone(), file_options, tx.clone())
+                        .map_err(|e| e.to_string())?,
+                )
+            } else {
+                None
+            };
             let system = match (&system_file, request.system) {
                 (Some(sys), true) => {
                     echo_dedup.store(dedup_mode.active(true), Ordering::Relaxed);
@@ -167,13 +173,20 @@ fn audio_starter(
             let policy = oats_audio::InputPolicy::default().with_env();
             let mic_mode = oats_audio::MicMode::from_env();
             Box::new(move |tx, request| {
-                let mic = oats_audio::Capture::start_mic_with(
-                    tx.clone(),
-                    &policy,
-                    mic_mode,
-                    oats_audio::VoiceProcessingOptions::default(),
-                )
-                .map_err(|e| e.to_string())?;
+                // system-audio-only listening never opens the microphone
+                let mic = if request.mic {
+                    Some(
+                        oats_audio::Capture::start_mic_with(
+                            tx.clone(),
+                            &policy,
+                            mic_mode,
+                            oats_audio::VoiceProcessingOptions::default(),
+                        )
+                        .map_err(|e| e.to_string())?,
+                    )
+                } else {
+                    None
+                };
                 let mut system_error = None;
                 let system = if request.system {
                     // until the output is known: on unless the mode says never
@@ -198,6 +211,13 @@ fn audio_starter(
                 } else {
                     None
                 };
+                if mic.is_none()
+                    && system.is_none()
+                    && let Some(e) = system_error
+                {
+                    // nothing is listening: the whole request failed
+                    return Err(e);
+                }
                 // what plays is only looked at while system audio is captured
                 let media = system.as_ref().and(media.as_ref()).map(MediaActive::new);
                 Ok(oats_ui::StartedAudio {

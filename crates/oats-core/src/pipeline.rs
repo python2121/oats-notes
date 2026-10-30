@@ -146,6 +146,9 @@ pub struct EchoStats {
 /// What a listening session expects from its audio.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListenOptions {
+    /// The microphone lane is open (off for system-audio-only listening: the "microphone
+    /// stopped delivering" warning must not fire then).
+    pub mic: bool,
     /// System audio was asked for (the "no signal" report only runs then).
     pub system: bool,
     /// Report [`PipelineEvent::SystemAudio`] `{ signal: false }` after this long without a
@@ -156,6 +159,7 @@ pub struct ListenOptions {
 impl Default for ListenOptions {
     fn default() -> Self {
         Self {
+            mic: true,
             system: false,
             no_signal_after: Duration::from_secs(30),
         }
@@ -851,7 +855,8 @@ impl Session<'_> {
                 Err(RecvTimeoutError::Disconnected) => break AfterListen::Idle,
             }
             // the microphone went quiet while system audio flows: its device is gone
-            if !mic_lost_reported && system_since_mic >= MIC_LOST_AFTER_CHUNKS {
+            if listen.options.mic && !mic_lost_reported && system_since_mic >= MIC_LOST_AFTER_CHUNKS
+            {
                 mic_lost_reported = true;
                 log::warn!("the microphone stopped delivering audio; system audio continues");
                 self.out.send(PipelineEvent::Warning(

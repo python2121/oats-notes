@@ -31,6 +31,6 @@ pub mod topic;
 pub mod transcript;
 
 pub use app::{
-    AppOptions, AppPrefs, AudioRequest, AudioStarter, Chime, Command, MenuEntry, MenuSection,
-    MenuState, OatsApp, SHORTCUTS, StartedAudio, build_menu_model,
+    AppOptions, AppPrefs, AudioRequest, AudioStarter, Chime, Command, Lanes, MenuEntry,
+    MenuSection, MenuState, OatsApp, SHORTCUTS, StartedAudio, build_menu_model,
 };

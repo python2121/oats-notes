@@ -15,7 +15,7 @@ use egui_kittest::kittest::Queryable;
 use oats_brain::{Brain, BrainConfig, BrainHandle, ClaudeCli};
 use oats_core::{AudioChunk, NullEngine, Pipeline, PipelineStatus, SpeechEngine, Store, View};
 use oats_status::{StatusAction, StatusItem, StatusState};
-use oats_ui::{AppOptions, AudioStarter, Command, MenuEntry, OatsApp, StartedAudio};
+use oats_ui::{AppOptions, AudioRequest, AudioStarter, Command, MenuEntry, OatsApp, StartedAudio};
 
 struct TempDir(PathBuf);
 
@@ -71,6 +71,8 @@ type Mic = Rc<RefCell<Option<Sender<AudioChunk>>>>;
 struct Rig {
     harness: Harness<'static, OatsApp>,
     mic: Mic,
+    /// Every request the fake starter received.
+    requests: Rc<RefCell<Vec<AudioRequest>>>,
 }
 
 fn build(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>) -> Rig {
@@ -89,10 +91,13 @@ fn build_with(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>, sys
     .spawn();
     let mic: Mic = Rc::default();
     let m = mic.clone();
-    let audio: AudioStarter = Box::new(move |tx, _request| {
+    let requests: Rc<RefCell<Vec<AudioRequest>>> = Rc::default();
+    let r = requests.clone();
+    let audio: AudioStarter = Box::new(move |tx, request| {
         *m.borrow_mut() = Some(tx);
+        r.borrow_mut().push(request);
         Ok(StartedAudio {
-            system,
+            system: system && request.system,
             ..StartedAudio::mic(Box::new(()))
         })
     });
@@ -114,7 +119,11 @@ fn build_with(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>, sys
                 brain,
             )
         });
-    let mut rig = Rig { harness, mic };
+    let mut rig = Rig {
+        harness,
+        mic,
+        requests,
+    };
     rig.until("the engine is ready", |app| {
         *app.status() == PipelineStatus::Idle
     });
@@ -2691,4 +2700,108 @@ fn search_shows_tags_first_and_a_tag_opens_its_topic_view() {
         rig.shows("Weekly sync"),
         "case-insensitive: the lower-case tag too"
     );
+}
+
+fn last_request(rig: &Rig) -> AudioRequest {
+    *rig.requests.borrow().last().expect("a request")
+}
+
+#[test]
+fn the_mic_and_system_pills_are_independent_lanes() {
+    let dir = TempDir::new("lanes");
+    let mut rig = build_with(&dir.db(), None, None, true);
+    // Mic alone
+    rig.harness.get_by_label("Mic").click();
+    rig.harness.run_steps(2);
+    assert!(rig.app().is_listening());
+    assert_eq!(
+        last_request(&rig),
+        AudioRequest {
+            mic: true,
+            system: false
+        }
+    );
+    rig.until("listening", |app| {
+        *app.status() == PipelineStatus::Listening
+    });
+    assert_eq!(rig.app().state_label(), "listening · mic");
+    assert_eq!(
+        rig.app().status_item_state().tooltip,
+        "OatsNotes — Listening · mic · 0 segments today"
+    );
+    // add System: restart with both
+    rig.harness.get_by_label("System audio").click();
+    rig.until("both lanes", |app| {
+        app.is_listening() && app.system_audio_on() && *app.status() == PipelineStatus::Listening
+    });
+    assert_eq!(
+        last_request(&rig),
+        AudioRequest {
+            mic: true,
+            system: true
+        }
+    );
+    assert_eq!(rig.app().state_label(), "listening · mic + system");
+    // drop Mic: system only, and the starter is told not to open the microphone
+    rig.harness.get_by_label("Mic").click();
+    rig.until("system only", |app| {
+        app.is_listening() && app.state_label() == "listening · system"
+    });
+    assert_eq!(
+        last_request(&rig),
+        AudioRequest {
+            mic: false,
+            system: true
+        }
+    );
+    // the last lane off stops listening
+    rig.harness.get_by_label("System audio").click();
+    rig.harness.run_steps(2);
+    assert!(!rig.app().is_listening());
+    assert!(!rig.app().prefs().listening);
+    rig.until("idle", |app| *app.status() == PipelineStatus::Idle);
+    assert_eq!(rig.app().state_label(), "idle");
+    // System alone from idle
+    rig.harness.get_by_label("System audio").click();
+    rig.harness.run_steps(2);
+    assert_eq!(
+        last_request(&rig),
+        AudioRequest {
+            mic: false,
+            system: true
+        }
+    );
+    assert!(rig.app().prefs().lanes.system && !rig.app().prefs().lanes.mic);
+    // the master switch stops, then restores the remembered set; a fresh default is both
+    rig.app().run(Command::ToggleListening);
+    assert!(!rig.app().is_listening());
+    rig.until("idle", |app| *app.status() == PipelineStatus::Idle);
+    rig.app().run(Command::ToggleListening);
+    assert_eq!(
+        last_request(&rig),
+        AudioRequest {
+            mic: false,
+            system: true
+        }
+    );
+}
+
+#[test]
+fn the_master_switch_turns_both_lanes_on() {
+    let dir = TempDir::new("lanes-master");
+    let mut rig = build_with(&dir.db(), None, None, true);
+    rig.app().run(Command::ToggleListening);
+    assert_eq!(
+        last_request(&rig),
+        AudioRequest {
+            mic: true,
+            system: true
+        }
+    );
+    rig.until("listening", |app| {
+        *app.status() == PipelineStatus::Listening
+    });
+    assert_eq!(rig.app().state_label(), "listening · mic + system");
+    rig.app().run(Command::ToggleListening);
+    assert!(!rig.app().is_listening());
 }

@@ -926,6 +926,7 @@ fn a_silent_system_lane_is_reported_and_a_closed_one_leaves_the_mic_running() {
         &rig.h,
         &mut seen,
         ListenOptions {
+            mic: true,
             system: true,
             no_signal_after: Duration::from_millis(300),
         },

@@ -38,6 +38,7 @@ use crate::transcript::{
     transcript_list, until_local_midnight,
 };
 use oats_brain::MoveTarget;
+use serde::Deserialize as _;
 
 /// eframe storage key for [`AppPrefs`] (RON).
 pub const PREFS_KEY: &str = "oatsnotes.prefs";
@@ -45,6 +46,49 @@ pub const PREFS_KEY: &str = "oatsnotes.prefs";
 const TRANSCRIPTS_BAR_H: f32 = 30.0;
 /// Sidebar splitter range.
 pub const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 180.0..=360.0;
+
+/// Which audio lanes listening opens: the microphone ("me") and / or system audio ("them").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Lanes {
+    pub mic: bool,
+    pub system: bool,
+}
+
+impl Default for Lanes {
+    fn default() -> Self {
+        Self {
+            mic: true,
+            system: true,
+        }
+    }
+}
+
+impl Lanes {
+    /// Neither lane: not listening.
+    pub const NONE: Lanes = Lanes {
+        mic: false,
+        system: false,
+    };
+
+    pub fn any(self) -> bool {
+        self.mic || self.system
+    }
+}
+
+/// Reads the old plain `bool` (and an `Option<bool>`) of a pref that has been replaced.
+fn legacy_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Plain(bool),
+        Opt(Option<bool>),
+    }
+    Ok(match Either::deserialize(d)? {
+        Either::Plain(b) => Some(b),
+        Either::Opt(o) => o,
+    })
+}
 
 /// Persisted preferences.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -55,9 +99,13 @@ pub struct AppPrefs {
     pub view: View,
     /// Listening was on at quit: start again once the engine is ready ("listen all day").
     pub listening: bool,
-    /// Capture system audio (what the computer plays: the other side of a call) next to the
-    /// microphone.
-    pub capture_system: bool,
+    /// The lane set "Start Listening" (⌘L, the status item, `--listen`) opens: the last one the
+    /// user chose with the Mic / System audio pills. Default: both.
+    pub lanes: Lanes,
+    /// Pre-lanes pref (system audio next to the microphone); read once by [`AppPrefs::load`]
+    /// into `lanes.system`, never written.
+    #[serde(skip_serializing, deserialize_with = "legacy_bool")]
+    pub capture_system: Option<bool>,
     /// Play a short ding when a voice command created something.
     pub command_sound: bool,
     /// Projects whose sidebar layer (recent notes) is open; closed by default.
@@ -79,7 +127,8 @@ impl Default for AppPrefs {
             sidebar_width: 220.0,
             view: View::Transcripts,
             listening: false,
-            capture_system: true,
+            lanes: Lanes::default(),
+            capture_system: None,
             command_sound: true,
             sidebar_episodes_open: Vec::new(),
             show_media: false,
@@ -91,7 +140,16 @@ impl Default for AppPrefs {
 
 impl AppPrefs {
     pub fn load(storage: &dyn eframe::Storage) -> AppPrefs {
-        eframe::get_value(storage, PREFS_KEY).unwrap_or_default()
+        let mut prefs: AppPrefs = eframe::get_value(storage, PREFS_KEY).unwrap_or_default();
+        prefs.migrate();
+        prefs
+    }
+
+    /// Fold the old `capture_system` pref into `lanes.system`.
+    fn migrate(&mut self) {
+        if let Some(system) = self.capture_system.take() {
+            self.lanes.system = system;
+        }
     }
 
     pub fn store(&self, storage: &mut dyn eframe::Storage) {
@@ -127,7 +185,9 @@ impl Default for AppOptions {
 /// What [`AudioStarter`] is asked to open.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AudioRequest {
-    /// System audio too (the "Capture System Audio" pref), not only the microphone.
+    /// Open the microphone. Off for system-audio-only listening: it must not be opened at all.
+    pub mic: bool,
+    /// Open system audio.
     pub system: bool,
 }
 
@@ -167,7 +227,9 @@ pub type Chime = Box<dyn Fn() + Send + Sync>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     ToggleListening,
-    /// Capture system audio next to the microphone (a pref; restarts listening when on).
+    /// The Mic lane on / off (listening is on while any lane is; restarts the captures).
+    ToggleMic,
+    /// The System audio lane on / off (same).
     ToggleSystemAudio,
     /// "On a call" (⇧⌘C): every system-audio app is a meeting until switched off, 10 min of
     /// silence on system audio, or listening stops. Session-only.
@@ -263,8 +325,8 @@ pub enum MenuEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MenuState {
     pub listening: bool,
-    /// The "Capture System Audio" pref.
-    pub capture_system: bool,
+    /// The microphone lane is running in this listening session.
+    pub mic_on: bool,
     /// "On a call" is on.
     pub on_call: bool,
     /// System audio is captured in this listening session ("On a call" needs it).
@@ -318,11 +380,8 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                     listen_enabled,
                 ),
                 Separator,
-                check(
-                    "Capture System Audio",
-                    Command::ToggleSystemAudio,
-                    s.capture_system,
-                ),
+                check("Microphone", Command::ToggleMic, s.mic_on),
+                check("System Audio", Command::ToggleSystemAudio, s.system_on),
                 MenuEntry::Item {
                     label: "On a Call".to_owned(),
                     cmd: Command::ToggleOnCall,
@@ -480,6 +539,8 @@ pub struct OatsApp {
     engine_name: String,
     /// Latest input level: RMS dBFS and whether a segment is open — the louder lane.
     level: Option<(f32, bool)>,
+    /// The microphone lane is running in this listening session.
+    mic_on: bool,
     /// The system-audio lane is running in this listening session.
     system_on: bool,
     /// "On a call" (session-only; mirrored in the pipeline).
@@ -620,6 +681,7 @@ impl OatsApp {
             status: PipelineStatus::Loading("Starting…".to_owned()),
             engine_name: String::new(),
             level: None,
+            mic_on: false,
             system_on: false,
             on_call: false,
             system_no_signal: false,
@@ -854,12 +916,54 @@ impl OatsApp {
         self.capture.is_some()
     }
 
-    /// "mic + system" / "mic": what this listening session hears.
+    /// "mic + system" / "mic" / "system": what this listening session hears.
     pub fn sources_label(&self) -> &'static str {
-        if self.system_on {
-            "mic + system"
+        match (self.mic_on, self.system_on) {
+            (true, true) => "mic + system",
+            (false, true) => "system",
+            _ => "mic",
+        }
+    }
+
+    /// The lanes the pills show: the running ones, or (while a lane change restarts the
+    /// captures) the set being opened.
+    fn lanes_shown(&self) -> Lanes {
+        if self.auto_listen && !self.is_listening() && self.prefs.listening {
+            self.prefs.lanes
         } else {
-            "mic"
+            self.session_lanes()
+        }
+    }
+
+    /// The lanes running now (none while idle).
+    fn session_lanes(&self) -> Lanes {
+        if self.is_listening() {
+            Lanes {
+                mic: self.mic_on,
+                system: self.system_on,
+            }
+        } else {
+            Lanes::NONE
+        }
+    }
+
+    /// Listening with exactly these lanes: none stops it; otherwise remember the set and
+    /// (re)open the captures. The session is not kept across a lane change: the pipeline
+    /// session is ended and a new one starts once it reports Idle (the `auto_listen` path).
+    fn set_lanes(&mut self, lanes: Lanes) {
+        self.auto_listen = false;
+        if !lanes.any() {
+            self.stop_listening();
+            self.prefs.listening = false;
+            return;
+        }
+        self.prefs.lanes = lanes;
+        self.prefs.listening = true;
+        if self.is_listening() {
+            self.stop_listening();
+            self.auto_listen = true;
+        } else if !self.start_listening() {
+            self.prefs.listening = false;
         }
     }
 
@@ -992,7 +1096,7 @@ impl OatsApp {
     pub fn menu_model(&self) -> Vec<MenuSection> {
         build_menu_model(&MenuState {
             listening: self.is_listening(),
-            capture_system: self.prefs.capture_system,
+            mic_on: self.mic_on,
             on_call: self.on_call,
             system_on: self.system_on,
             show_media: self.prefs.show_media,
@@ -1042,23 +1146,23 @@ impl OatsApp {
     pub fn run(&mut self, cmd: Command) {
         match cmd {
             Command::ToggleListening => {
+                // the master switch: all off, or the remembered lane set
                 if self.is_listening() {
-                    self.stop_listening();
-                    self.prefs.listening = false;
-                } else if self.start_listening() {
-                    self.prefs.listening = true;
+                    self.set_lanes(Lanes::NONE);
+                } else {
+                    let lanes = self.prefs.lanes;
+                    self.set_lanes(if lanes.any() { lanes } else { Lanes::default() });
                 }
-                self.auto_listen = false;
+            }
+            Command::ToggleMic => {
+                let mut l = self.lanes_shown();
+                l.mic = !l.mic;
+                self.set_lanes(l);
             }
             Command::ToggleSystemAudio => {
-                self.prefs.capture_system = !self.prefs.capture_system;
-                // apply at once: reopen the captures with the new choice
-                if self.is_listening() {
-                    self.stop_listening();
-                    if !self.start_listening() {
-                        self.prefs.listening = false;
-                    }
-                }
+                let mut l = self.lanes_shown();
+                l.system = !l.system;
+                self.set_lanes(l);
             }
             Command::ToggleOnCall => {
                 if self.on_call {
@@ -1261,12 +1365,18 @@ impl OatsApp {
             return false;
         }
         let (tx, rx) = mpsc::channel();
+        let lanes = self.prefs.lanes;
+        if !lanes.any() {
+            return false;
+        }
         let request = AudioRequest {
-            system: self.prefs.capture_system,
+            mic: lanes.mic,
+            system: lanes.system,
         };
         match (self.audio)(tx, request) {
             Ok(started) => {
                 self.capture = Some(started.guard);
+                self.mic_on = request.mic;
                 self.system_on = started.system;
                 self.system_no_signal = false;
                 if let Some(e) = started.system_error {
@@ -1276,6 +1386,7 @@ impl OatsApp {
                 self.pipeline.start_lanes(
                     rx,
                     ListenOptions {
+                        mic: request.mic,
                         system: started.system,
                         ..ListenOptions::default()
                     },
@@ -1284,8 +1395,13 @@ impl OatsApp {
                 true
             }
             Err(e) => {
-                log::warn!("microphone: {e}");
-                self.warning = Some(format!("Microphone: {e}"));
+                let what = if request.mic {
+                    "Microphone"
+                } else {
+                    "System audio"
+                };
+                log::warn!("{what}: {e}");
+                self.warning = Some(format!("{what}: {e}"));
                 false
             }
         }
@@ -1307,6 +1423,7 @@ impl OatsApp {
             self.pipeline.stop();
             self.capture = None;
             self.level = None;
+            self.mic_on = false;
             self.system_on = false;
             self.system_no_signal = false;
             log::info!("listening stopped");
@@ -2047,6 +2164,8 @@ impl OatsApp {
                         // error callback closed the channel)
                         self.capture = None;
                         self.level = None;
+                        self.mic_on = false;
+                        self.system_on = false;
                         log::warn!("listening stopped: the audio input closed");
                         self.warning = Some(
                             "Listening stopped: the audio input closed (microphone disconnected?)"
@@ -2116,6 +2235,8 @@ impl OatsApp {
                     // nothing pretends to listen
                     self.capture = None;
                     self.level = None;
+                    self.mic_on = false;
+                    self.system_on = false;
                     self.prefs.listening = false;
                     self.warning = Some(format!("Listening did not start: {why}"));
                 }
@@ -2716,25 +2837,25 @@ impl OatsApp {
         }
         let listening = self.is_listening();
         let enabled = listening || self.status == PipelineStatus::Idle;
-        let (label, tip) = if listening {
-            ("● Listening", "Stop listening")
+        let lanes = self.lanes_shown();
+        let tip = if lanes.mic {
+            "Listening to the microphone (you) — click to turn off"
         } else {
-            ("Start listening", "Start listening")
+            "Listen to the microphone (you)"
         };
-        if pill(ui, t, label, listening, enabled)
-            .on_hover_text(with_shortcut(ui.ctx(), tip, Command::ToggleListening))
+        if pill(ui, t, "Mic", lanes.mic, enabled)
+            .on_hover_text(tip)
             .clicked()
         {
-            cmds.push(Command::ToggleListening);
+            cmds.push(Command::ToggleMic);
         }
         ui.add_space(6.0);
-        let system = self.prefs.capture_system;
-        let tip = if system {
+        let tip = if lanes.system {
             "Capturing system audio (what the computer plays: the other side of a call) — click to turn off"
         } else {
-            "Capture system audio (what the computer plays: the other side of a call) next to the microphone"
+            "Capture system audio (what the computer plays: the other side of a call)"
         };
-        if pill(ui, t, "System audio", system, true)
+        if pill(ui, t, "System audio", lanes.system, enabled)
             .on_hover_text(tip)
             .clicked()
         {
@@ -3254,7 +3375,8 @@ impl OatsApp {
     /// Selftest only: show the Listening state with a fixed input level, no audio opened.
     pub(crate) fn selftest_fake_listening(&mut self, rms_db: f32, in_speech: bool) {
         self.capture = Some(Box::new(()));
-        self.system_on = self.prefs.capture_system;
+        self.mic_on = self.prefs.lanes.mic;
+        self.system_on = self.prefs.lanes.system;
         self.status = PipelineStatus::Listening;
         self.level = Some((rms_db, in_speech));
     }
@@ -3667,6 +3789,31 @@ mod tests {
     }
 
     #[test]
+    fn the_old_capture_system_pref_migrates_into_the_lanes() {
+        for old in [false, true] {
+            let mut s = MemStorage::default();
+            s.set_string(
+                PREFS_KEY,
+                format!("(listening: true, capture_system: {old})"),
+            );
+            let prefs = AppPrefs::load(&s);
+            assert_eq!(
+                prefs.lanes,
+                Lanes {
+                    mic: true,
+                    system: old
+                }
+            );
+            assert_eq!(prefs.capture_system, None);
+            assert!(prefs.listening);
+            // saved again, the old key is gone and the lanes stay
+            prefs.store(&mut s);
+            assert!(!s.get_string(PREFS_KEY).unwrap().contains("capture_system"));
+            assert_eq!(AppPrefs::load(&s).lanes, prefs.lanes);
+        }
+    }
+
+    #[test]
     fn prefs_round_trip() {
         let mut s = MemStorage::default();
         let prefs = AppPrefs {
@@ -3674,7 +3821,11 @@ mod tests {
             sidebar_width: 250.0,
             view: View::Node(7),
             listening: true,
-            capture_system: false,
+            lanes: Lanes {
+                mic: true,
+                system: false,
+            },
+            capture_system: None,
             command_sound: false,
             sidebar_episodes_open: vec![3, 9],
             show_media: true,
@@ -3757,7 +3908,7 @@ mod tests {
     fn menu_model_has_the_listen_item() {
         let mut s = MenuState {
             listening: false,
-            capture_system: true,
+            mic_on: false,
             on_call: false,
             system_on: false,
             show_media: false,
@@ -3790,31 +3941,41 @@ mod tests {
         );
         let titles: Vec<_> = build_menu_model(&s).iter().map(|m| m.title).collect();
         assert_eq!(titles, ["File", "Listen", "View", "Brain"]);
-        // the system-audio toggle is a checked item in the Listen menu, following the pref
-        let system = |model: &[MenuSection]| {
+        // the lane toggles are checked items in the Listen menu, following the session
+        let lane = |model: &[MenuSection], c: Command| {
             model
                 .iter()
                 .flat_map(|s| s.entries.iter())
                 .find_map(|e| match e {
                     MenuEntry::Item {
-                        cmd: Command::ToggleSystemAudio,
+                        cmd,
                         label,
                         checked,
                         ..
-                    } => Some((label.clone(), *checked)),
+                    } if *cmd == c => Some((label.clone(), *checked)),
                     _ => None,
                 })
         };
         assert_eq!(
-            system(&build_menu_model(&s)),
-            Some(("Capture System Audio".to_owned(), Some(true)))
+            lane(&build_menu_model(&s), Command::ToggleSystemAudio),
+            Some(("System Audio".to_owned(), Some(false)))
         );
-        s.capture_system = false;
+        s.system_on = true;
+        s.mic_on = true;
         assert_eq!(
-            system(&build_menu_model(&s)).and_then(|(_, c)| c),
-            Some(false)
+            lane(&build_menu_model(&s), Command::ToggleSystemAudio).and_then(|(_, c)| c),
+            Some(true)
         );
-        assert!(AppPrefs::default().capture_system, "on by default");
+        assert_eq!(
+            lane(&build_menu_model(&s), Command::ToggleMic),
+            Some(("Microphone".to_owned(), Some(true)))
+        );
+        assert_eq!(
+            AppPrefs::default().lanes,
+            Lanes::default(),
+            "both on by default"
+        );
+        assert!(AppPrefs::default().lanes.mic && AppPrefs::default().lanes.system);
         // the Brain menu follows the brain's readiness
         let interpret = |model: &[MenuSection]| {
             model
