@@ -20,6 +20,7 @@ use oats_core::{
 use oats_status::{StatusAction, StatusItem, StatusState};
 
 use crate::calendar::{CalendarAction, CalendarState, calendar_view};
+use crate::media::{MEDIA_PAGE, MediaAction, MediaPages, media_view};
 use crate::menu_events::MenuEvents;
 use crate::notes::{BrainStatus, NotesAction, NotesState, episode_view, node_view, notes_view};
 use crate::search::{BAR_H, SEARCH_LIMIT, SearchAction, SearchState, search_bar, search_results};
@@ -28,6 +29,7 @@ use crate::sidebar::{
     sidebar_panel,
 };
 use crate::theme::Tokens;
+use crate::thumbs::Thumbs;
 use crate::toast::{Confirmation, ToastAction, ToastState, toasts};
 use crate::todos::{TodoAction, TodosState, todos_view};
 use crate::topic::{BAR_H as TOPIC_BAR_H, TopicAction, TopicState, topic_header, topic_list};
@@ -65,6 +67,9 @@ pub struct AppPrefs {
     pub show_media: bool,
     /// Show clock times as 14:05 instead of 2:05 pm.
     pub clock_24h: bool,
+    /// The Media view shows YouTube thumbnails, fetched from YouTube's image server (the one
+    /// network call the app makes itself). Off by default: nothing is fetched while off.
+    pub fetch_thumbnails: bool,
 }
 
 impl Default for AppPrefs {
@@ -79,6 +84,7 @@ impl Default for AppPrefs {
             sidebar_episodes_open: Vec::new(),
             show_media: false,
             clock_24h: false,
+            fetch_thumbnails: false,
         }
     }
 }
@@ -179,6 +185,8 @@ pub enum Command {
     ShowNotes,
     ShowCalendar,
     ShowTodos,
+    /// The Media view: the watch history (⌘6).
+    ShowMediaView,
     /// Run the brain's interpretation over whatever is new, now.
     InterpretNow,
     /// Run the coherence review of today's episodes, now.
@@ -210,6 +218,7 @@ pub const SHORTCUTS: &[(KeyboardShortcut, Command)] = &[
     (sc(Modifiers::COMMAND, Key::Num3), Command::ShowNotes),
     (sc(Modifiers::COMMAND, Key::Num4), Command::ShowCalendar),
     (sc(Modifiers::COMMAND, Key::Num5), Command::ShowTodos),
+    (sc(Modifiers::COMMAND, Key::Num6), Command::ShowMediaView),
     (sc(Modifiers::COMMAND, Key::F), Command::Search),
     (sc(Modifiers::COMMAND, Key::I), Command::InterpretNow),
     (sc(Modifiers::COMMAND, Key::Comma), Command::Preferences),
@@ -337,6 +346,7 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                 check("Conversations", Command::ShowNotes, s.view == View::Notes),
                 check("Calendar", Command::ShowCalendar, s.view == View::Calendar),
                 check("Todos", Command::ShowTodos, s.view == View::Todos),
+                check("Media", Command::ShowMediaView, s.view == View::Media),
                 Separator,
                 check(
                     "Show Media in Transcripts",
@@ -480,6 +490,14 @@ pub struct OatsApp {
     /// reload at the next frame).
     media_plays: Vec<oats_core::MediaPlay>,
     media_plays_day: Option<chrono::NaiveDate>,
+    /// The Media view: the loaded part of the watch history.
+    media_pages: MediaPages,
+    /// The Media view row to scroll to and flash (a search hit), by play id.
+    media_focus: TranscriptFocus,
+    /// The Media view's thumbnails (opt-in: `AppPrefs::fetch_thumbnails`).
+    thumbs: Thumbs,
+    /// The last URL the Media view opened in the browser.
+    opened_url: Option<String>,
     /// The segments of a Node view (the Transcripts view uses `pages`).
     rows: Vec<TranscriptRow>,
     /// The Transcripts view: the loaded range of rows.
@@ -607,6 +625,10 @@ impl OatsApp {
             system_no_signal: false,
             media_plays: Vec::new(),
             media_plays_day: None,
+            media_pages: MediaPages::default(),
+            media_focus: TranscriptFocus::default(),
+            thumbs: Thumbs::default(),
+            opened_url: None,
             rows: Vec::new(),
             pages: TranscriptPages::default(),
             page_rows: PAGE_ROWS,
@@ -1081,6 +1103,7 @@ impl OatsApp {
             Command::ShowNotes => self.set_view(View::Notes),
             Command::ShowCalendar => self.set_view(View::Calendar),
             Command::ShowTodos => self.set_view(View::Todos),
+            Command::ShowMediaView => self.set_view(View::Media),
             Command::InterpretNow | Command::ReviewNow | Command::Reorganise => {
                 // unavailable: the buttons and menu items are greyed out; the shortcut does nothing
                 if self.brain.is_some() && !self.brain_status.available() {
@@ -1140,6 +1163,8 @@ impl OatsApp {
                     self.close_search();
                     self.set_view(View::Calendar);
                 }
+                SearchAction::OpenTag(name) => self.open_topic(name),
+                SearchAction::OpenMedia(id) => self.show_media_play(id),
             }
         }
     }
@@ -1363,6 +1388,10 @@ impl OatsApp {
                 Err(e) => self.store_error(e),
             },
             View::Notes | View::Calendar | View::Todos => self.rows.clear(),
+            View::Media => {
+                self.rows.clear();
+                self.reload_media();
+            }
         }
         match self.store.segment_count_since(self.today_start) {
             Ok(n) => self.today_count = n,
@@ -1474,6 +1503,158 @@ impl OatsApp {
             let (rows, more) = self.fetch_before(Some(first), self.page_rows);
             self.pages.prepend(rows, more);
         }
+    }
+
+    /// The Media view's newest `limit` plays strictly before `before`, and whether older ones
+    /// remain.
+    fn fetch_media(
+        &mut self,
+        before: Option<(i64, i64)>,
+        limit: usize,
+    ) -> (Vec<oats_core::MediaPlay>, bool) {
+        match self.store.media_history_page(before, limit as i64 + 1) {
+            Ok(mut plays) => {
+                let more = plays.len() > limit;
+                plays.truncate(limit);
+                (plays, more)
+            }
+            Err(e) => {
+                self.store_error(e);
+                (Vec::new(), false)
+            }
+        }
+    }
+
+    /// Re-read the Media view from the newest play, as many plays as were loaded (at least a
+    /// page).
+    fn reload_media(&mut self) {
+        let n = self.media_pages.plays.max(MEDIA_PAGE);
+        let (plays, more) = self.fetch_media(None, n);
+        self.media_pages.clear();
+        self.media_pages.append(plays, more);
+    }
+
+    /// The Media view's next (older) page.
+    fn load_older_media(&mut self) {
+        if !self.media_pages.has_more {
+            return;
+        }
+        let before = self.media_pages.oldest;
+        let (plays, more) = self.fetch_media(before, MEDIA_PAGE);
+        self.media_pages.append(plays, more);
+    }
+
+    /// A search hit on a play: the Media view, paged back until its row is loaded, scrolled
+    /// to and flashed.
+    fn show_media_play(&mut self, id: i64) {
+        self.close_search();
+        self.topic = None;
+        self.focus_episode = None;
+        if self.prefs.view == View::Media {
+            self.reload_media();
+        } else {
+            self.set_view(View::Media);
+        }
+        while self.media_pages.row_of(id).is_none() && self.media_pages.has_more {
+            self.load_older_media();
+        }
+        if self.media_pages.row_of(id).is_some() {
+            self.media_focus.pending = Some(id);
+        } else {
+            self.warning = Some("That play is gone".to_owned());
+        }
+    }
+
+    /// The Media view's rows: `(title, play ids)`, newest first (tests).
+    pub fn media_rows(&self) -> Vec<(String, Vec<i64>)> {
+        self.media_pages
+            .entries
+            .iter()
+            .map(|e| (crate::media::entry_title(&e.play), e.ids.clone()))
+            .collect()
+    }
+
+    /// The last URL the Media view opened in the browser (tests).
+    pub fn last_opened_url(&self) -> Option<&str> {
+        self.opened_url.as_deref()
+    }
+
+    /// The Media view row a jump will scroll to (tests).
+    pub fn pending_media_focus(&self) -> Option<i64> {
+        self.media_focus.pending
+    }
+
+    /// Use another thumbnail cache (tests point it at a temp directory and a fake fetcher).
+    #[doc(hidden)]
+    pub fn set_thumbs(&mut self, thumbs: Thumbs) {
+        self.thumbs = thumbs;
+    }
+
+    fn apply_media(&mut self, ctx: &egui::Context, actions: Vec<MediaAction>) {
+        let mut changed = false;
+        for a in actions {
+            match a {
+                MediaAction::OpenUrl(url) => {
+                    ctx.open_url(egui::OpenUrl::new_tab(&url));
+                    self.opened_url = Some(url);
+                }
+                MediaAction::CopyLink(url) => {
+                    ctx.copy_text(url);
+                    self.last_command = Some("Link copied".to_owned());
+                }
+                MediaAction::MarkAsCall(ids) => {
+                    for id in ids {
+                        self.mark_play_as_call(id);
+                    }
+                    changed = true;
+                }
+                MediaAction::ShowTranscript(ids) => match self.store.first_segment_of_plays(&ids) {
+                    Ok(seg) => self.jump_to_segment(seg),
+                    Err(e) => self.store_error(e),
+                },
+                MediaAction::Delete(ids) => {
+                    self.delete_plays(&ids);
+                    changed = true;
+                }
+                MediaAction::LoadOlder => {
+                    self.load_older_media();
+                    ctx.request_repaint();
+                }
+            }
+        }
+        if changed {
+            self.reload_media();
+        }
+    }
+
+    /// Delete plays (a Media view row); a YouTube thumbnail cached for them goes too unless
+    /// another play still shows that video.
+    fn delete_plays(&mut self, ids: &[i64]) {
+        let videos: Vec<String> = ids
+            .iter()
+            .filter_map(|id| self.store.media_play(*id).ok().flatten())
+            .filter_map(|p| p.url.as_deref().and_then(oats_media::youtube_video_id))
+            .collect();
+        if let Err(e) = self.store.delete_media_plays(ids) {
+            return self.store_error(e);
+        }
+        // the user's own delete: leave no copy in the WAL
+        self.store.checkpoint();
+        for v in videos {
+            let still_used = match self.store.media_play_urls_containing(&v) {
+                Ok(urls) => urls
+                    .iter()
+                    .any(|u| oats_media::youtube_video_id(u).as_deref() == Some(v.as_str())),
+                Err(e) => {
+                    self.store_error(e);
+                    true
+                }
+            };
+            if !still_used {
+                self.thumbs.forget(&v);
+            }
+        }
+        self.media_plays_day = None;
     }
 
     /// Rows loaded in the Transcripts view, and the ids of the first and last (tests).
@@ -1683,7 +1864,7 @@ impl OatsApp {
             // the Transcripts pages take live rows in `handle_events`
             View::Transcripts => false,
             View::Node(id) => row.node_id.is_some_and(|n| self.in_subtree(n, id)),
-            View::Notes | View::Calendar | View::Todos => false,
+            View::Notes | View::Calendar | View::Todos | View::Media => false,
         }
     }
 
@@ -2623,6 +2804,7 @@ impl OatsApp {
         let mut close = false;
         let mut sound = self.prefs.command_sound;
         let mut clock_24h = self.prefs.clock_24h;
+        let mut thumbnails = self.prefs.fetch_thumbnails;
         // the YouTube & music policy: OATS_MEDIA_POLICY fixes it, else `meta.media_policy`
         let fixed_policy = oats_core::MediaPolicy::env_override();
         let stored_policy = self
@@ -2668,6 +2850,14 @@ impl OatsApp {
                 ui.add_space(8.0);
                 ui.checkbox(&mut sound, "Play a sound for voice commands");
                 ui.checkbox(&mut clock_24h, "Use 24-hour time");
+                ui.checkbox(
+                    &mut thumbnails,
+                    "Fetch video thumbnails (contacts YouTube's image servers)",
+                )
+                .on_hover_text(
+                    "The Media view shows a YouTube video's thumbnail, fetched once from \
+                     i.ytimg.com and kept in the data folder. Off: nothing is fetched.",
+                );
                 ui.add_space(10.0);
                 ui.label(
                     egui::RichText::new("Media (YouTube, music, media apps)")
@@ -2718,6 +2908,7 @@ impl OatsApp {
         }
         self.prefs.command_sound = sound;
         self.prefs.clock_24h = clock_24h;
+        self.prefs.fetch_thumbnails = thumbnails;
         crate::timefmt::set_24h(clock_24h);
         if close {
             self.prefs_window = None;
@@ -3178,6 +3369,7 @@ impl eframe::App for OatsApp {
         let mut notes_actions = Vec::new();
         let mut calendar_actions = Vec::new();
         let mut todo_actions = Vec::new();
+        let mut media_actions = Vec::new();
         let mut list_top = 0.0;
         let mut search_actions = Vec::new();
         let mut topic_actions = Vec::new();
@@ -3315,6 +3507,15 @@ impl eframe::App for OatsApp {
                                 ui.ctx().request_repaint();
                             }
                         }
+                        View::Media => {
+                            media_actions = media_view(
+                                &mut list_ui,
+                                &self.media_pages,
+                                &mut self.media_focus,
+                                &mut self.thumbs,
+                                self.prefs.fetch_thumbnails,
+                            );
+                        }
                         View::Todos => {
                             todo_actions = todos_view(
                                 &mut list_ui,
@@ -3423,6 +3624,7 @@ impl eframe::App for OatsApp {
         self.apply_notes(notes_actions);
         self.apply_calendar(calendar_actions);
         self.apply_todos(todo_actions);
+        self.apply_media(&ctx, media_actions);
         self.apply_toasts(toast_actions);
         self.apply_search(search_actions);
         self.apply_topic(topic_actions);
@@ -3477,6 +3679,7 @@ mod tests {
             sidebar_episodes_open: vec![3, 9],
             show_media: true,
             clock_24h: true,
+            fetch_thumbnails: true,
         };
         prefs.store(&mut s);
         assert_eq!(AppPrefs::load(&s), prefs);
@@ -3520,6 +3723,7 @@ mod tests {
             Command::ShowNotes,
             Command::ShowCalendar,
             Command::ShowTodos,
+            Command::ShowMediaView,
             Command::InterpretNow,
         ] {
             assert!(menu_shortcut(cmd).is_some(), "{cmd:?}");

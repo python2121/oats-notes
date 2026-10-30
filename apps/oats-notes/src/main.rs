@@ -38,7 +38,7 @@
 //! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
 //! `oats_brain::BrainConfig::from_env`).
 //!
-//! `--selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>]` renders the whole window offscreen to a PNG (seeded
+//! `--selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast|--media] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>]` renders the whole window offscreen to a PNG (seeded
 //! demo content, the null engine, a throwaway database) — the shell verified without a window.
 
 use std::any::Any;
@@ -230,7 +230,7 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>]\n\n\
+        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast|--media] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>]\n\n\
          --listen       start listening as soon as the speech engine is ready\n\
          --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
          \x20              paced in real time; listening stops when the file ends\n\
@@ -246,6 +246,7 @@ fn usage() -> ExitCode {
          --todos        with --selftest: the Todos view (open, snoozed, undated, completed)\n\
          --toast        with --selftest: a due reminder and a voice-command confirmation pop-up\n\
          --prefs        with --selftest: Preferences open over seeded apps (the Apps table)\n\
+         --media        with --selftest: the Media view (four seeded plays over two days, thumbnails off)\n\
          --search TEXT  with --selftest: open the search bar (⌘F) with this query\n\
          --topic TEXT   with --selftest: open the Topic view for this topic"
     );
@@ -491,6 +492,7 @@ fn selftest_cli(args: &[String]) -> ExitCode {
             "--expanded" => options.expanded = true,
             "--no-sidebar" => options.no_sidebar = true,
             "--prefs" => options.prefs = true,
+            "--media" => options.media = true,
             f if !f.starts_with("--") && out.is_none() => out = Some(f.into()),
             _ => return usage(),
         }

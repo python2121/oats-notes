@@ -68,6 +68,66 @@ impl Relabel {
     }
 }
 
+/// Consecutive plays of the same URL at most this far apart are one row of the Media view.
+pub const MEDIA_COLLAPSE_MS: i64 = 10 * 60_000;
+
+/// One row of the Media view (the watch history): a play, or consecutive plays of the same URL
+/// at most [`MEDIA_COLLAPSE_MS`] apart folded together (a pause, a reload, a tab switch away
+/// and back).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaEntry {
+    /// The newest play of the run: its title, URL, kind and app are what the row shows.
+    pub play: MediaPlay,
+    /// Every play folded in, newest first.
+    pub ids: Vec<i64>,
+    /// The earliest start and the latest end.
+    pub started_at: i64,
+    pub ended_at: i64,
+    /// The plays' own durations summed (the gaps between them are not counted).
+    pub duration_ms: i64,
+    /// Transcribed segments over all its plays.
+    pub segments_count: i64,
+}
+
+impl MediaEntry {
+    fn of(play: MediaPlay) -> Self {
+        MediaEntry {
+            ids: vec![play.id],
+            started_at: play.started_at,
+            ended_at: play.ended_at,
+            duration_ms: (play.ended_at - play.started_at).max(0),
+            segments_count: play.segments_count,
+            play,
+        }
+    }
+
+    /// `older` (a play that started before this row) continues it: the same URL, at most
+    /// [`MEDIA_COLLAPSE_MS`] before it.
+    fn continues(&self, older: &MediaPlay) -> bool {
+        older.url.is_some()
+            && older.url == self.play.url
+            && self.started_at - older.ended_at <= MEDIA_COLLAPSE_MS
+    }
+}
+
+/// Append `plays` (newest first, all older than the rows already in `entries`) to `entries`,
+/// folding each into the last row when it continues it ([`MediaEntry`]). Paging calls it once
+/// per page, so a run split by a page boundary still becomes one row.
+pub fn collapse_plays(entries: &mut Vec<MediaEntry>, plays: impl IntoIterator<Item = MediaPlay>) {
+    for p in plays {
+        match entries.last_mut() {
+            Some(last) if last.continues(&p) => {
+                last.ids.push(p.id);
+                last.started_at = last.started_at.min(p.started_at);
+                last.ended_at = last.ended_at.max(p.ended_at);
+                last.duration_ms += (p.ended_at - p.started_at).max(0);
+                last.segments_count += p.segments_count;
+            }
+            _ => entries.push(MediaEntry::of(p)),
+        }
+    }
+}
+
 /// A media episode's summary without the `**Media:** …` header line the media filing wrote.
 fn without_media_header(summary: &str) -> String {
     summary
@@ -485,6 +545,100 @@ impl Store {
         Ok(rows)
     }
 
+    /// One page of the watch history: the newest `limit` plays strictly before `before`
+    /// (`(started_at, id)`; `None` = from the newest), NEWEST first. Calls are left out (they
+    /// were never media).
+    pub fn media_history_page(
+        &self,
+        before: Option<(i64, i64)>,
+        limit: i64,
+    ) -> Result<Vec<MediaPlay>, StoreError> {
+        let (t, id) = before.unwrap_or((i64::MAX, i64::MAX));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PLAY_COLUMNS} FROM media_plays
+             WHERE kind != 'call' AND (started_at < ?1 OR (started_at = ?1 AND id < ?2))
+             ORDER BY started_at DESC, id DESC LIMIT ?3"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![t, id, limit], row_to_play)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Search: the plays (calls left out) whose title or URL matches the LIKE pattern `pat`
+    /// (backslash-escaped), newest first.
+    pub(super) fn search_media_plays(
+        &self,
+        pat: &str,
+        limit: i64,
+    ) -> Result<Vec<MediaPlay>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PLAY_COLUMNS} FROM media_plays
+             WHERE kind != 'call' AND (title LIKE ?1 ESCAPE '\\' OR url LIKE ?1 ESCAPE '\\')
+             ORDER BY started_at DESC, id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![pat, limit], row_to_play)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The first transcribed (non-echo) system segment of any of these plays — the same
+    /// segments "Mark as a call" re-stamps: stamped as media with the play's URL, starting
+    /// within the play (up to 30 s after its end, a segment's maximum length).
+    pub fn first_segment_of_plays(&self, ids: &[i64]) -> Result<Option<i64>, StoreError> {
+        use rusqlite::OptionalExtension;
+        let mut best: Option<(i64, i64)> = None;
+        for id in ids {
+            let Some(play) = self.media_play(*id)? else {
+                continue;
+            };
+            let found: Option<(i64, i64)> = self
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT started_at, id FROM segments
+                         WHERE source = 'system' AND echo_of IS NULL
+                           AND started_at >= ?1 AND started_at <= ?2
+                           AND media_kind IN {MEDIA_KINDS_SQL}
+                           AND (media_ref = ?3 OR (media_ref IS NULL AND ?3 IS NULL))
+                         ORDER BY started_at, id LIMIT 1"
+                    ),
+                    rusqlite::params![play.started_at - 1_000, play.ended_at + 30_000, play.url],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some(f) = found
+                && best.is_none_or(|b| f < b)
+            {
+                best = Some(f);
+            }
+        }
+        Ok(best.map(|(_, id)| id))
+    }
+
+    /// Delete several plays at once (a folded Media view row).
+    pub fn delete_media_plays(&self, ids: &[i64]) -> Result<(), StoreError> {
+        self.with_savepoint(|s| {
+            for id in ids {
+                s.delete_media_play(*id)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The distinct play URLs containing `fragment` (case-sensitive; e.g. a video id, to know
+    /// whether a cached thumbnail is still used).
+    pub fn media_play_urls_containing(&self, fragment: &str) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT url FROM media_plays WHERE url IS NOT NULL AND instr(url, ?1) > 0",
+        )?;
+        let rows = stmt
+            .query_map([fragment], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(rows)
+    }
+
     /// Episodes that started before `before` and contain a system segment of the call
     /// `meeting_ref` (the meeting page's URL, `segments.media_ref` of a `meeting`-stamped
     /// segment), newest first, at most `limit`. A link that recurs on earlier days is a
@@ -888,6 +1042,172 @@ mod tests {
         assert_eq!(s.media_plays_between(35_000, 45_000)?.len(), 1);
         s.delete_media_play(a)?;
         assert_eq!(s.media_play(a)?, None);
+        Ok(())
+    }
+
+    const MIN: i64 = 60_000;
+
+    fn play(
+        s: &Store,
+        at: i64,
+        end: i64,
+        url: Option<&str>,
+        kind: MediaClass,
+    ) -> Result<i64, StoreError> {
+        let id = s.begin_media_play(
+            at,
+            &MediaStamp::new(kind, url.map(str::to_owned), "T", "Firefox"),
+        )?;
+        s.update_media_play(id, end, 0)?;
+        Ok(id)
+    }
+
+    #[test]
+    fn the_history_pages_newest_first_and_leaves_calls_out() -> R {
+        let s = Store::open_in_memory()?;
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let url = format!("https://youtu.be/v{i}");
+            ids.push(play(
+                &s,
+                i * 60 * MIN,
+                i * 60 * MIN + 5 * MIN,
+                Some(&url),
+                MediaClass::YouTube,
+            )?);
+        }
+        let call = play(&s, 10 * 60 * MIN, 11 * 60 * MIN, None, MediaClass::Call)?;
+        let page = s.media_history_page(None, 2)?;
+        assert_eq!(
+            page.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [ids[4], ids[3]]
+        );
+        let last = page.last().map(|p| (p.started_at, p.id));
+        let next = s.media_history_page(last, 2)?;
+        assert_eq!(
+            next.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [ids[2], ids[1]]
+        );
+        let rest = s.media_history_page(next.last().map(|p| (p.started_at, p.id)), 2)?;
+        assert_eq!(rest.iter().map(|p| p.id).collect::<Vec<_>>(), [ids[0]]);
+        let all = s.media_history_page(None, 100)?;
+        assert!(all.iter().all(|p| p.id != call), "calls are not media");
+        // same start: the id breaks the tie, nothing is skipped or repeated
+        let twin = play(
+            &s,
+            4 * 60 * MIN,
+            4 * 60 * MIN + MIN,
+            Some("https://youtu.be/x"),
+            MediaClass::Music,
+        )?;
+        let first = s.media_history_page(None, 1)?;
+        assert_eq!(first[0].id, twin);
+        let second = s.media_history_page(Some((first[0].started_at, first[0].id)), 1)?;
+        assert_eq!(second[0].id, ids[4]);
+        Ok(())
+    }
+
+    #[test]
+    fn consecutive_plays_of_one_url_within_ten_minutes_collapse() -> R {
+        let s = Store::open_in_memory()?;
+        let a = Some("https://youtu.be/a");
+        // oldest first: a 0–10, a 15–20 (5 min gap: folds), b 21–25, a 26–30 (b between: no),
+        // a 45–50 (15 min gap: no)
+        let p1 = play(&s, 0, 10 * MIN, a, MediaClass::YouTube)?;
+        let p2 = play(&s, 15 * MIN, 20 * MIN, a, MediaClass::YouTube)?;
+        let p3 = play(
+            &s,
+            21 * MIN,
+            25 * MIN,
+            Some("https://youtu.be/b"),
+            MediaClass::YouTube,
+        )?;
+        let p4 = play(&s, 26 * MIN, 30 * MIN, a, MediaClass::YouTube)?;
+        let p5 = play(&s, 45 * MIN, 50 * MIN, a, MediaClass::YouTube)?;
+        // no URL: never folded
+        let n1 = play(&s, 60 * MIN, 61 * MIN, None, MediaClass::Music)?;
+        let n2 = play(&s, 62 * MIN, 63 * MIN, None, MediaClass::Music)?;
+        let mut rows = Vec::new();
+        collapse_plays(&mut rows, s.media_history_page(None, 100)?);
+        let ids: Vec<Vec<i64>> = rows.iter().map(|r| r.ids.clone()).collect();
+        assert_eq!(
+            ids,
+            [
+                vec![n2],
+                vec![n1],
+                vec![p5],
+                vec![p4],
+                vec![p3],
+                vec![p2, p1]
+            ]
+        );
+        let folded = &rows[5];
+        assert_eq!((folded.started_at, folded.ended_at), (0, 20 * MIN));
+        assert_eq!(folded.duration_ms, 15 * MIN, "the gap is not counted");
+        assert_eq!(folded.play.id, p2, "the newest play is shown");
+
+        // paged one play at a time, the run still folds across the page boundary
+        let mut paged = Vec::new();
+        let mut before = None;
+        loop {
+            let page = s.media_history_page(before, 1)?;
+            let Some(last) = page.last() else { break };
+            before = Some((last.started_at, last.id));
+            collapse_plays(&mut paged, page);
+        }
+        assert_eq!(paged, rows);
+        Ok(())
+    }
+
+    #[test]
+    fn a_plays_first_segment_and_deleting_a_folded_row() -> R {
+        let s = Store::open_in_memory()?;
+        let session = s.begin_session(0, "t")?;
+        let url = "https://youtu.be/a";
+        let p1 = play(&s, 0, 10 * MIN, Some(url), MediaClass::YouTube)?;
+        let p2 = play(&s, 12 * MIN, 20 * MIN, Some(url), MediaClass::YouTube)?;
+        assert_eq!(s.first_segment_of_plays(&[p1, p2])?, None);
+        let seg = |at: i64| -> Result<i64, StoreError> {
+            let row = s.insert_segment_from(
+                session,
+                at,
+                at + 5_000,
+                "video words",
+                None,
+                AudioSourceKind::System,
+                None,
+            )?;
+            s.stamp_segment_media(row.id, &stamp(url, "A"))?;
+            Ok(row.id)
+        };
+        let late = seg(14 * MIN)?;
+        let early = seg(2 * MIN)?;
+        assert_eq!(s.first_segment_of_plays(&[p2])?, Some(late));
+        assert_eq!(s.first_segment_of_plays(&[p2, p1])?, Some(early));
+        assert_eq!(
+            s.media_play_urls_containing("youtu.be/a")?,
+            vec![url.to_string()]
+        );
+        s.delete_media_plays(&[p1, p2])?;
+        assert!(s.media_history_page(None, 10)?.is_empty());
+        assert!(s.media_play_urls_containing("youtu.be/a")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn search_finds_plays_by_title_or_url() -> R {
+        let s = Store::open_in_memory()?;
+        let a = s.begin_media_play(0, &stamp("https://youtu.be/rust1", "Rust in 100 seconds"))?;
+        let b = s.begin_media_play(MIN, &stamp("https://youtu.be/zzz", "Cooking pasta"))?;
+        let mut call = MediaStamp::new(MediaClass::Call, None, "Rust standup", "Zoom");
+        call.url = Some("https://zoom.us/j/1".into());
+        s.begin_media_play(2 * MIN, &call)?;
+        let ids = |q: &str| -> Result<Vec<i64>, StoreError> {
+            Ok(s.search(q, 50)?.media.iter().map(|p| p.id).collect())
+        };
+        assert_eq!(ids("rust")?, [a], "calls are left out");
+        assert_eq!(ids("ZZZ")?, [b], "the URL matches too");
+        assert!(ids("nothing like it")?.is_empty());
         Ok(())
     }
 

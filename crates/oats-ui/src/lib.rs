@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod calendar;
+pub mod media;
 pub mod menu_events;
 pub mod merge;
 pub mod move_to;
@@ -22,6 +23,7 @@ pub mod selftest;
 pub mod sidebar;
 pub mod system_font;
 pub mod theme;
+pub mod thumbs;
 pub mod timefmt;
 pub mod toast;
 pub mod todos;

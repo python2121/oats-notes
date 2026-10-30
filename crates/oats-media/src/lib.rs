@@ -358,6 +358,22 @@ pub fn classify_url(url: &str) -> MediaKind {
     }
 }
 
+/// The YouTube video id of a watch / shorts / live / embed / youtu.be URL (`None` for anything
+/// else, music.youtube.com included). Only `[A-Za-z0-9_-]`, at most 64 characters, so it is
+/// safe as a file name and in a URL path.
+pub fn youtube_video_id(url: &str) -> Option<String> {
+    match classify_url(url) {
+        MediaKind::YouTube { video_id, .. } => Some(video_id),
+        _ => None,
+    }
+}
+
+/// The 320×180 thumbnail of a YouTube video on YouTube's image server (fetched only when the
+/// user opted in to thumbnails; see the Media view).
+pub fn youtube_thumbnail_url(video_id: &str) -> String {
+    format!("https://i.ytimg.com/vi/{video_id}/mqdefault.jpg")
+}
+
 /// The desktop app a web page stands for (its per-app class applies to the page): any
 /// `app.slack.com` / `discord.com` page.
 pub fn web_app_bundle(url: &str) -> Option<&'static str> {
@@ -691,6 +707,35 @@ fn firefox_context(ctx: &mut MediaContext, tabs: &[WindowTab]) -> Option<&'stati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn youtube_video_ids_and_thumbnail_urls() {
+        for url in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s",
+            "https://youtu.be/dQw4w9WgXcQ?si=x",
+            "https://m.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/dQw4w9WgXcQ",
+        ] {
+            assert_eq!(
+                youtube_video_id(url).as_deref(),
+                Some("dQw4w9WgXcQ"),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            youtube_video_id("https://music.youtube.com/watch?v=abc"),
+            None
+        );
+        assert_eq!(youtube_video_id("https://open.spotify.com/track/1"), None);
+        assert_eq!(
+            youtube_video_id("https://www.youtube.com/watch?v=../../x"),
+            None
+        );
+        assert_eq!(
+            youtube_thumbnail_url("dQw4w9WgXcQ"),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
+        );
+    }
 
     fn none() -> ProducerOverrides {
         ProducerOverrides::default()

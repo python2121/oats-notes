@@ -56,6 +56,8 @@ pub struct SelftestOptions {
     pub search: Option<String>,
     /// Open the Topic view for this topic over the seeded data.
     pub topic: Option<String>,
+    /// Show the Media view over four seeded plays across two days (thumbnails off).
+    pub media: bool,
 }
 
 /// Apps seen playing sound, a couple of classes set, the policy at Log only.
@@ -82,6 +84,101 @@ fn seed_apps(store: &Store) -> Result<(), oats_core::StoreError> {
     Ok(())
 }
 
+/// Four plays over yesterday and today: two YouTube videos in Firefox (one watched in two
+/// sittings five minutes apart, which the view folds into one row), Spotify, a Discord stream.
+fn seed_media(store: &Store) -> Result<(), oats_core::StoreError> {
+    use oats_core::{MediaClass, MediaStamp};
+    const H: i64 = 3_600_000;
+    const M: i64 = 60_000;
+    let today = midnight_ms(&Local::now());
+    let yesterday = today - 24 * H;
+    let plays: [(i64, i64, MediaClass, Option<&str>, &str, &str, i64); 5] = [
+        (
+            yesterday + 20 * H + 5 * M,
+            yesterday + 20 * H + 41 * M,
+            MediaClass::YouTube,
+            Some("https://www.youtube.com/watch?v=8Xg7E9shq0Y"),
+            "How SQLite stores data on disk",
+            "Firefox",
+            6,
+        ),
+        (
+            yesterday + 22 * H,
+            yesterday + 22 * H + 48 * M,
+            MediaClass::Music,
+            None,
+            "Deep focus",
+            "Spotify",
+            0,
+        ),
+        (
+            today + 8 * H + 30 * M,
+            today + 8 * H + 52 * M,
+            MediaClass::YouTube,
+            Some("https://www.youtube.com/watch?v=rQ3xV2b7Lk0"),
+            "Rust 2026: what's new in the compiler",
+            "Firefox",
+            4,
+        ),
+        (
+            today + 8 * H + 57 * M,
+            today + 9 * H + 10 * M,
+            MediaClass::YouTube,
+            Some("https://www.youtube.com/watch?v=rQ3xV2b7Lk0"),
+            "Rust 2026: what's new in the compiler",
+            "Firefox",
+            2,
+        ),
+        (
+            today + 10 * H + 15 * M,
+            today + 10 * H + 40 * M,
+            MediaClass::App,
+            Some("https://discord.com/channels/1/2"),
+            "Game night stream",
+            "Discord",
+            0,
+        ),
+    ];
+    for (from, to, kind, url, title, producer, segments) in plays {
+        let id = store.begin_media_play(
+            from,
+            &MediaStamp::new(kind, url.map(str::to_owned), title, producer),
+        )?;
+        store.update_media_play(id, to, segments)?;
+    }
+    Ok(())
+}
+
+/// Notes tagged around a commerce project, so a multi-word search ("commerce cod delay")
+/// shows the Tags section ranking.
+fn seed_tags(store: &Store) -> Result<(), oats_core::StoreError> {
+    use oats_core::EpisodeContent;
+    const H: i64 = 3_600_000;
+    let today = midnight_ms(&Local::now());
+    let now = Local::now().timestamp_millis();
+    let notes: [(&str, &[&str]); 4] = [
+        ("Checkout review", &["Commerce", "COD delay", "payments"]),
+        ("Courier escalation", &["COD delay", "couriers"]),
+        ("Commerce weekly", &["Commerce", "Q4 roadmap"]),
+        ("Storefront launch prep", &["E-commerce launch", "Commerce"]),
+    ];
+    for (i, (title, topics)) in notes.into_iter().enumerate() {
+        let at = today - (i as i64 + 2) * 24 * H + 11 * H;
+        store.insert_episode(
+            at,
+            at + H / 2,
+            &EpisodeContent {
+                title: title.into(),
+                summary: "- Seeded for the tag search.".into(),
+                topics: topics.iter().map(|t| (*t).to_owned()).collect(),
+                ..Default::default()
+            },
+            now,
+        )?;
+    }
+    Ok(())
+}
+
 /// [`run_with`] with the default options (Transcripts view, not listening).
 pub fn run(
     out: &Path,
@@ -103,6 +200,12 @@ pub fn run_with(
     seed(&store, options.toast).map_err(|e| format!("seeding the store: {e}"))?;
     if options.prefs {
         seed_apps(&store).map_err(|e| format!("seeding the apps: {e}"))?;
+    }
+    if options.media {
+        seed_media(&store).map_err(|e| format!("seeding the plays: {e}"))?;
+    }
+    if options.search.is_some() {
+        seed_tags(&store).map_err(|e| format!("seeding the tags: {e}"))?;
     }
     let mut harness = Harness::builder()
         .with_size(egui::vec2(SIZE[0], SIZE[1]))
@@ -172,6 +275,8 @@ pub fn run_with(
         }
     } else if options.calendar {
         harness.state_mut().run(Command::ShowCalendar);
+    } else if options.media {
+        harness.state_mut().run(Command::ShowMediaView);
     } else if options.todos || options.toast {
         harness.state_mut().run(Command::ShowTodos);
     }

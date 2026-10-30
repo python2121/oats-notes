@@ -369,7 +369,13 @@ pub fn transcript_list(
 
 /// Scroll to the row when it is the pending focus, then flash an accent fill that fades over
 /// [`FLASH_SECS`] (repaints are requested only while it fades).
-fn focus_row(ui: &mut egui::Ui, t: &Tokens, focus: &mut TranscriptFocus, id: i64, rect: Rect) {
+pub(crate) fn focus_row(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    focus: &mut TranscriptFocus,
+    id: i64,
+    rect: Rect,
+) {
     if focus.pending == Some(id) {
         focus.pending = None;
         ui.scroll_to_rect(rect, Some(egui::Align::Center));

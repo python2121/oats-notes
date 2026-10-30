@@ -1,4 +1,4 @@
-//! The left sidebar: the "Views" group (Transcripts, Conversations, Calendar, Todos) and the tree
+//! The left sidebar: the "Views" group (Transcripts, Conversations, Calendar, Todos, Media) and the tree
 //! group — the store's categories as 22 pt hover rows, with the projects the brain created
 //! under them and topics under those, collapsible per node (a disclosure triangle on rows with
 //! children, indented SwiftInvert-style); a "+" header icon that reveals an inline field to add
@@ -470,11 +470,12 @@ fn group_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {
 
 /// The "Views" group, in order. `View::Notes` is the Conversations view (the variant keeps its
 /// name so saved prefs still load).
-pub const VIEW_ROWS: [(&str, View); 4] = [
+pub const VIEW_ROWS: [(&str, View); 5] = [
     ("Transcripts", View::Transcripts),
     ("Conversations", View::Notes),
     ("Calendar", View::Calendar),
     ("Todos", View::Todos),
+    ("Media", View::Media),
 ];
 
 /// A 22 pt sidebar row: hover fill, the selected row in an accent-alpha fill, indented by
@@ -656,7 +657,7 @@ mod tests {
         assert!(!labels.contains(&"Notes"));
         assert_eq!(
             labels,
-            ["Transcripts", "Conversations", "Calendar", "Todos"],
+            ["Transcripts", "Conversations", "Calendar", "Todos", "Media"],
             "no Today, no All transcripts"
         );
     }

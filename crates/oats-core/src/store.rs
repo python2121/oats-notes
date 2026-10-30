@@ -37,6 +37,7 @@
 //!   budget is summed from here); `changes(…)` — structural changes a run made (node
 //!   merges/renames/moves, episode merges) with before/after JSON for audit and undo.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::engine::AudioSourceKind;
@@ -94,6 +95,11 @@ pub struct SearchResults {
     pub segments: Vec<TranscriptRow>,
     pub episodes: Vec<Episode>,
     pub events: Vec<Event>,
+    /// Tags (episode topics) matching the query: `(name, notes carrying it)`, the best match
+    /// first (see [`Store::search_tags`]).
+    pub tags: Vec<(String, i64)>,
+    /// Media plays whose title or URL matches, newest first (calls left out).
+    pub media: Vec<crate::media::MediaPlay>,
 }
 
 /// What kind of node in the tree.
@@ -542,6 +548,8 @@ pub enum View {
     Calendar,
     /// The todo list (reminders are todos with a due time).
     Todos,
+    /// The watch history: every media play (`media_plays`), newest first.
+    Media,
 }
 
 /// The default categories, in sidebar order.
@@ -552,6 +560,9 @@ pub struct Store {
 }
 
 const SCHEMA_VERSION: i64 = 8;
+
+/// At most this many tags in a search's Tags section.
+pub const TAG_LIMIT: usize = 40;
 
 /// The v2 schema, first half (meta, sessions, nodes, episodes); every statement is idempotent so
 /// it doubles as the "make sure everything exists" step.
@@ -1540,7 +1551,7 @@ impl Store {
                 ),
                 &[id],
             ),
-            View::Notes | View::Calendar | View::Todos => Ok(Vec::new()),
+            View::Notes | View::Calendar | View::Todos | View::Media => Ok(Vec::new()),
         }
     }
 
@@ -2217,10 +2228,14 @@ impl Store {
         let events = stmt
             .query_map(rusqlite::params![pat, limit], row_to_event)?
             .collect::<Result<Vec<_>, _>>()?;
+        let tags = self.search_tags(q, TAG_LIMIT)?;
+        let media = self.search_media_plays(&pat, limit)?;
         Ok(SearchResults {
             segments,
             episodes,
             events,
+            tags,
+            media,
         })
     }
 
@@ -2929,6 +2944,70 @@ impl Store {
         Ok(rows)
     }
 
+    /// Tags (the topics on notes) matching `query`, as `(name, notes carrying it)`, at most
+    /// `limit`. One word: the tags containing it (case-insensitive). Several words: the tags
+    /// containing ANY of them (one-letter words are ignored then), ranked by how many of the
+    /// words they contain, then by notes, then by name. Spellings that differ only in case or
+    /// spacing ("COD delay" / "cod  delay") are one tag, named by the most common spelling.
+    pub fn search_tags(&self, query: &str, limit: usize) -> Result<Vec<(String, i64)>, StoreError> {
+        let mut words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if words.len() > 1 {
+            words.retain(|w| w.chars().count() > 1);
+        }
+        words.sort();
+        words.dedup();
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT episodes.id, j.value FROM episodes,
+                 json_each(CASE WHEN json_valid(episodes.topics_json)
+                           THEN episodes.topics_json ELSE '[]' END) AS j
+             WHERE j.type = 'text'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        // key → (spelling → uses, notes)
+        type Tag = (HashMap<String, i64>, HashSet<i64>);
+        let mut tags: HashMap<String, Tag> = HashMap::new();
+        for (episode, name) in rows {
+            let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+            if name.is_empty() {
+                continue;
+            }
+            let key = name.to_lowercase();
+            let entry = tags.entry(key).or_default();
+            *entry.0.entry(name).or_default() += 1;
+            entry.1.insert(episode);
+        }
+        let mut found: Vec<(usize, i64, String)> = tags
+            .into_iter()
+            .filter_map(|(key, (spellings, notes))| {
+                let matched = words.iter().filter(|w| key.contains(w.as_str())).count();
+                if matched == 0 {
+                    return None;
+                }
+                let name = spellings
+                    .into_iter()
+                    .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                    .map(|(n, _)| n)
+                    .unwrap_or(key);
+                Some((matched, notes.len() as i64, name))
+            })
+            .collect();
+        found.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(b.1.cmp(&a.1))
+                .then_with(|| a.2.to_lowercase().cmp(&b.2.to_lowercase()))
+        });
+        Ok(found
+            .into_iter()
+            .take(limit)
+            .map(|(_, n, name)| (name, n))
+            .collect())
+    }
+
     /// Set (or, with `None`, clear) a todo's due time. A changed due time clears the snooze,
     /// as re-dictating it does.
     pub fn set_todo_due(&self, id: i64, due: Option<i64>) -> Result<(), StoreError> {
@@ -2946,6 +3025,66 @@ mod tests {
     use super::*;
 
     type R = Result<(), StoreError>;
+
+    fn tagged(s: &Store, at: i64, topics: &[&str]) -> Result<i64, StoreError> {
+        Ok(s.insert_episode(
+            at,
+            at + 60_000,
+            &EpisodeContent {
+                title: format!("note {at}"),
+                topics: topics.iter().map(|t| (*t).to_owned()).collect(),
+                ..Default::default()
+            },
+            0,
+        )?
+        .id)
+    }
+
+    #[test]
+    fn tag_search_matches_any_word_and_ranks_by_words_then_notes() -> R {
+        let s = Store::open_in_memory()?;
+        tagged(&s, 0, &["Commerce", "COD delay"])?;
+        tagged(&s, 1, &["commerce", "Q4 roadmap"])?;
+        tagged(&s, 2, &["commerce", "cod  delay"])?;
+        tagged(&s, 3, &["E-commerce launch", "delivery"])?;
+        tagged(&s, 4, &["Cod liver oil"])?;
+        tagged(&s, 5, &["Commerce cod delay plan"])?;
+        // one word: tags containing it, case-insensitive, most notes first
+        assert_eq!(
+            s.search_tags("COMMERCE", 10)?,
+            [
+                ("commerce".to_owned(), 3),
+                ("Commerce cod delay plan".to_owned(), 1),
+                ("E-commerce launch".to_owned(), 1),
+            ]
+        );
+        // several words: any of them; the more words a tag contains the higher it ranks
+        let multi = s.search_tags("commerce cod delay", 10)?;
+        let want: Vec<(String, i64)> = [
+            ("Commerce cod delay plan", 1), // 3 words
+            ("COD delay", 2),               // 2 words
+            ("commerce", 3),                // 1 word, 3 notes
+            ("Cod liver oil", 1),           // 1 word, 1 note, by name
+            ("E-commerce launch", 1),
+        ]
+        .into_iter()
+        .map(|(n, c)| (n.to_owned(), c))
+        .collect();
+        assert_eq!(multi, want);
+        // the spellings of one tag count as one (spacing and case folded)
+        assert_eq!(
+            s.search_tags("cod delay", 10)?[0],
+            ("COD delay".to_owned(), 2)
+        );
+        assert!(s.search_tags("   ", 10)?.is_empty());
+        assert!(s.search_tags("zebra", 10)?.is_empty());
+        // and Store::search carries them
+        assert_eq!(
+            s.search("roadmap", 10)?.tags,
+            [("Q4 roadmap".to_owned(), 1)]
+        );
+        Ok(())
+    }
 
     fn version(s: &Store) -> Result<String, StoreError> {
         Ok(s.conn.query_row(
@@ -4173,4 +4312,7 @@ mod tests {
 // `media_plays`) — kept in its own file.
 #[path = "store_media.rs"]
 mod media;
-pub use media::{EPISODE_CONVERSATION, EPISODE_MEDIA, MEDIA_CATEGORY, Relabel};
+pub use media::{
+    EPISODE_CONVERSATION, EPISODE_MEDIA, MEDIA_CATEGORY, MEDIA_COLLAPSE_MS, MediaEntry, Relabel,
+    collapse_plays,
+};

@@ -1,6 +1,7 @@
 //! Search (⌘F): the bar under the control bar and the results view that replaces the current
-//! view while it is open — Notes (episode cards), Calendar (event rows), Transcript (lines
-//! with day headings) — with the matched text marked in the accent colour. The query runs in
+//! view while it is open — Tags first (the topics on notes; a chip opens the Topic view), then
+//! Notes (episode cards), Calendar (event rows), Media (plays; a row opens the Media view) and
+//! Transcript (lines with day headings) — with the matched text marked in the accent colour. The query runs in
 //! the store (`Store::search`); this module only draws and reports what was clicked.
 
 use std::ops::Range;
@@ -8,7 +9,7 @@ use std::ops::Range;
 use chrono::{Datelike, Local};
 use egui::text::{CCursor, CCursorRange, LayoutJob};
 use egui::{Align2, Id, RichText, Sense, TextFormat, pos2, vec2};
-use oats_core::{Event, Node, SearchResults, TranscriptRow};
+use oats_core::{Event, MediaPlay, Node, SearchResults, TranscriptRow};
 
 use crate::notes::{NotesAction, NotesState, chip, episode_card, node_path};
 use crate::sidebar::{HeaderIcon, header_icon};
@@ -63,6 +64,9 @@ impl SearchState {
             format!("{num} {}", if len == 1 { one } else { many })
         };
         let mut parts = Vec::new();
+        if !r.tags.is_empty() {
+            parts.push(n(r.tags.len(), "tag", "tags"));
+        }
         if !r.episodes.is_empty() {
             parts.push(n(r.episodes.len(), "note", "notes"));
         }
@@ -71,6 +75,9 @@ impl SearchState {
         }
         if !r.events.is_empty() {
             parts.push(n(r.events.len(), "event", "events"));
+        }
+        if !r.media.is_empty() {
+            parts.push(n(r.media.len(), "play", "plays"));
         }
         if parts.is_empty() {
             "No matches".to_owned()
@@ -89,6 +96,10 @@ pub enum SearchAction {
     /// Show this transcript segment (id) in the Transcripts view.
     OpenSegment(i64),
     OpenEvent(i64),
+    /// Open the Topic view for this tag.
+    OpenTag(String),
+    /// Show this play (`media_plays.id`) in the Media view.
+    OpenMedia(i64),
     /// A notes-card action (Re-interpret, …).
     Notes(NotesAction),
 }
@@ -344,6 +355,98 @@ fn event_hit(
     .clicked()
 }
 
+/// A tag chip: "name · N", clickable (opens the Topic view).
+fn tag_chip(ui: &mut egui::Ui, t: &Tokens, name: &str, count: i64, hl: &str) -> egui::Response {
+    let mut job = LayoutJob::default();
+    let base = TextFormat {
+        font_id: t.font(12.0),
+        color: t.text,
+        ..Default::default()
+    };
+    // every query word marked (a multi-word query matches tags by any of its words)
+    let mut ranges: Vec<Range<usize>> = hl
+        .split_whitespace()
+        .flat_map(|w| match_ranges(name, w))
+        .collect();
+    ranges.sort_by_key(|r| r.start);
+    let mut at = 0;
+    for r in ranges {
+        if r.start < at {
+            continue;
+        }
+        if r.start > at {
+            job.append(&name[at..r.start], 0.0, base.clone());
+        }
+        let mut f = base.clone();
+        f.color = t.accent;
+        job.append(&name[r.clone()], 0.0, f);
+        at = r.end;
+    }
+    if at < name.len() {
+        job.append(&name[at..], 0.0, base.clone());
+    }
+    job.append(
+        &format!(" · {count}"),
+        0.0,
+        TextFormat {
+            font_id: t.font(11.0),
+            color: t.text_tertiary,
+            ..Default::default()
+        },
+    );
+    let galley = ui.painter().layout_job(job);
+    let size = vec2(galley.size().x + 18.0, 22.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let label = format!("{name} · {count}");
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+    if ui.is_rect_visible(rect) {
+        let fill = if resp.hovered() {
+            t.accent_alpha(0.28)
+        } else {
+            t.accent_alpha(0.14)
+        };
+        ui.painter().rect(
+            rect,
+            11.0,
+            fill,
+            egui::Stroke::new(1.0, t.accent_alpha(0.35)),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, t.text);
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(format!("Notes tagged “{name}” ({count})"))
+}
+
+fn media_hit(ui: &mut egui::Ui, t: &Tokens, p: &MediaPlay, hl: &str) -> bool {
+    clickable_row(ui, t, ui.id().with(("hit-media", p.id)), |ui| {
+        ui.add_space(8.0);
+        let (time_rect, _) = ui.allocate_exact_size(vec2(60.0, 18.0), Sense::hover());
+        ui.painter().text(
+            pos2(time_rect.left() + 4.0, time_rect.top() + 3.0),
+            Align2::LEFT_TOP,
+            crate::timefmt::clock_col(p.started_at, &Local),
+            t.mono(10.5),
+            t.text_tertiary,
+        );
+        ui.vertical(|ui| {
+            ui.set_width((ui.available_width() - 44.0).max(60.0));
+            ui.add_space(1.0);
+            marked_label(ui, t, &crate::media::entry_title(p), hl, 13.0, t.text);
+            let mut line = crate::media::source_line(p);
+            if let Some(url) = &p.url {
+                line.push_str(" · ");
+                line.push_str(url);
+            }
+            marked_label(ui, t, &line, hl, 11.0, t.text_tertiary);
+        });
+    })
+    .clicked()
+}
+
 /// The results view, in `ui`'s rect.
 pub fn search_results(
     ui: &mut egui::Ui,
@@ -354,7 +457,12 @@ pub fn search_results(
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
     let r = &state.results;
-    if r.segments.is_empty() && r.episodes.is_empty() && r.events.is_empty() {
+    if r.segments.is_empty()
+        && r.episodes.is_empty()
+        && r.events.is_empty()
+        && r.tags.is_empty()
+        && r.media.is_empty()
+    {
         let text = if state.query.trim().is_empty() {
             "Type to search the transcript, the notes and the calendar."
         } else {
@@ -377,6 +485,22 @@ pub fn search_results(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            if !r.tags.is_empty() {
+                heading(ui, &t, "Tags", r.tags.len());
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.set_max_width((ui.available_width() - 14.0).max(100.0));
+                        ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                        for (name, count) in &r.tags {
+                            if tag_chip(ui, &t, name, *count, hl).clicked() {
+                                actions.push(SearchAction::OpenTag(name.clone()));
+                            }
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+            }
             if !r.episodes.is_empty() {
                 heading(ui, &t, "Notes", r.episodes.len());
                 let mut last_day = None;
@@ -409,6 +533,20 @@ pub fn search_results(
                 for e in &r.events {
                     if event_hit(ui, &t, e, nodes, hl, year) {
                         actions.push(SearchAction::OpenEvent(e.id));
+                    }
+                }
+            }
+            if !r.media.is_empty() {
+                heading(ui, &t, "Media", r.media.len());
+                let mut last_day = None;
+                for p in &r.media {
+                    let day = day_of(p.started_at, &Local);
+                    if last_day != Some(day) {
+                        last_day = Some(day);
+                        day_label(ui, &t, p.started_at, year);
+                    }
+                    if media_hit(ui, &t, p, hl) {
+                        actions.push(SearchAction::OpenMedia(p.id));
                     }
                 }
             }

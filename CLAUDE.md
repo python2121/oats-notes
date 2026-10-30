@@ -36,7 +36,7 @@ crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mi
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
-crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Conversations / Calendar (month grid) / Todos views, node view (notes + projects), reminder + confirmation pop-ups, drag-to-merge (merge.rs)
+crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Conversations / Calendar (month grid) / Todos / Media views, node view (notes + projects), reminder + confirmation pop-ups, drag-to-merge (merge.rs)
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
 vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
 vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream and a voice-processing input stream (macOS); NOT a workspace member
@@ -278,6 +278,43 @@ back; ⌘F again re-selects the field. Clicking a note opens its node view (Conv
 event opens Calendar, a line opens Transcripts around that segment, scrolled to the row and flashed
 (same jump as the calendar and todos, see below).
 `--selftest out.png --search TEXT` renders it.
+
+**Tags in search**: topics (the chips on notes) are the tags. `Store::search` also returns
+`tags: Vec<(name, notes)>` (`Store::search_tags`, from `episodes.topics_json`, case- and
+spacing-insensitive, one tag named by its most common spelling, at most `TAG_LIMIT` = 40) and
+`media` (plays whose title or URL matches, calls left out). One word: tags containing it.
+Several words: tags containing ANY word (one-letter words dropped), ranked by how many words
+match, then notes, then name — "commerce cod delay" lists "COD delay" before "Commerce"; the
+other sections keep matching the whole query as a substring. The results show a **Tags**
+section ABOVE the others (chips "name · N"; a click opens the Topic view, "Tagged “name”"),
+and a **Media** section (a row opens the Media view at that play, paged back until loaded,
+scrolled to and flashed). `--selftest out.png --search "commerce cod delay"` seeds tagged notes.
+
+**Media view** (`View::Media`, ⌘6, View → Media, the last row under Views;
+`oats-ui/src/media.rs`): the watch history from `media_plays` (calls left out), newest first,
+under day headings. Consecutive plays of the same URL at most 10 min apart fold into one row
+(`oats_core::store::collapse_plays`, `MediaEntry`, durations summed, gaps not counted; folding
+works across page boundaries). A row: 96×54 thumbnail slot, title (medium face), "YouTube ·
+Firefox" / "Spotify" / "Spotify · Firefox", "2:05–2:41 pm · 36 min", the URL as a link
+(`ctx.open_url`, tooltip = full URL). Right-click: Open in browser, Copy link, Mark as a call
+(each play of the row; `Store::mark_play_as_call`), Show transcript (only when the plays have
+transcribed segments: `Store::first_segment_of_plays` → the usual jump), Delete
+(`Store::delete_media_plays` + a WAL checkpoint). Paged by `Store::media_history_page(before,
+limit)` 200 plays at a time; the next (older) page loads when the bottom "Loading older…" marker
+comes within 1.5 viewports. Empty: "Nothing watched yet." `--selftest out.png --media`.
+
+**Thumbnails are opt-in (privacy rule)**: the app makes no network calls of its own except the
+model download and the `claude` CLI. Preferences "Fetch video thumbnails (contacts YouTube's
+image servers)" (`AppPrefs::fetch_thumbnails`, default OFF) is the single exception: while it
+is on, a YouTube play's `https://i.ytimg.com/vi/<video_id>/mqdefault.jpg` is fetched ONCE by
+`/usr/bin/curl -q --silent --fail --max-time 5 --proto =https --output <file>` (no HTTP crate;
+skipped when curl is missing) on the "oats-thumbs" thread into `<data dir>/thumbs/<id>.jpg`
+(dir 0700, file 0600; ids are `[A-Za-z0-9_-]` only, `thumbs::thumb_path`), decoded there (the
+`image` crate, png + jpeg) and cached in memory as a texture for the session; failures are not
+retried until the next launch. While off nothing is read, fetched or started
+(`thumbs::Thumbs::get(.., enabled = false)`), and the slot is a flat `t.field` rectangle with a
+▶ (also for non-YouTube plays). Deleting plays deletes a cached file only when no remaining
+play shows that video. Fetches log at debug with the video id only.
 
 Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui::Window` anchored
 centre with one field, "Your name", saved on Enter / blur / close via `Store::set_user_name`
@@ -880,4 +917,5 @@ from a video creates nothing), and what was watched is recorded.
 Commands block — add:
 OATS_MEDIA_POLICY=ignore|log|transcribe …  # media on system audio (default transcribe; Preferences sets meta.media_policy)
 cargo run -p oats-notes -- --selftest out.png --prefs   # Preferences over seeded apps (the Apps table)
+cargo run -p oats-notes -- --selftest out.png --media   # the Media view (seeded plays over two days, thumbnails off)
 OATS_MEDIA=off …                            # no media detection (no producer polling, no Firefox reads)

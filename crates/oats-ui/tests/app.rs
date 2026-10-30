@@ -2518,3 +2518,177 @@ fn merging_into_a_hand_edited_note_asks_to_replace_the_edits() {
     assert_eq!(e.title, "Pricing sync (mine)", "kept");
     assert!(rig.app().warning().is_none(), "no re-interpret was sent");
 }
+
+// ---- the Media view (watch history) and tag search ------------------------------------------
+
+/// Three plays: one YouTube video watched in two sittings 5 min apart (folded into one row),
+/// a Spotify play. Returns `(the folded pair, spotify)`.
+fn seed_plays(db: &Path) -> ([i64; 2], i64) {
+    use oats_core::{MediaClass, MediaStamp};
+    let s = Store::open(db).unwrap();
+    let now = now_ms();
+    let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    let yt = MediaStamp::new(
+        MediaClass::YouTube,
+        Some(url.into()),
+        "Never gonna give you up",
+        "Firefox",
+    );
+    let a = s.begin_media_play(now - 3_600_000, &yt).unwrap();
+    s.update_media_play(a, now - 3_000_000, 0).unwrap();
+    let b = s.begin_media_play(now - 2_700_000, &yt).unwrap();
+    s.update_media_play(b, now - 2_400_000, 0).unwrap();
+    let sp = s
+        .begin_media_play(
+            now - 600_000,
+            &MediaStamp::new(MediaClass::Music, None, "Deep focus", "Spotify"),
+        )
+        .unwrap();
+    s.update_media_play(sp, now - 60_000, 0).unwrap();
+    ([a, b], sp)
+}
+
+#[test]
+fn the_media_view_says_nothing_watched_yet_when_empty() {
+    let dir = TempDir::new("media-empty");
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowMediaView);
+    rig.harness.run_steps(3);
+    assert_eq!(rig.app().prefs().view, View::Media);
+    assert!(rig.shows("Nothing watched yet."));
+}
+
+#[test]
+fn the_media_view_lists_plays_folded_and_open_in_browser_opens_the_url() {
+    let dir = TempDir::new("media-view");
+    let ([a, b], sp) = seed_plays(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.harness.run_steps(2);
+    // ⌘6 is the view's shortcut (the in-window menu: the key monitor runs it)
+    rig.harness
+        .key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num6);
+    rig.harness.run_steps(3);
+    assert_eq!(rig.app().prefs().view, View::Media);
+    assert_eq!(
+        rig.app().media_rows(),
+        [
+            ("Deep focus".to_owned(), vec![sp]),
+            ("Never gonna give you up".to_owned(), vec![b, a]),
+        ],
+        "newest first; the two sittings are one row"
+    );
+    assert!(rig.shows("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+    // right-click → Open in browser: the app asks egui to open the URL
+    rig.harness
+        .get_by_label("Never gonna give you up")
+        .click_secondary();
+    rig.harness.run_steps(2);
+    assert!(rig.shows("Copy link"));
+    assert!(rig.shows("Mark as a call"));
+    assert!(!rig.shows("Show transcript"), "nothing was transcribed");
+    rig.harness.get_by_label("Open in browser").click();
+    rig.harness.run_steps(2);
+    assert_eq!(
+        rig.app().last_opened_url(),
+        Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    );
+    // Delete removes the whole folded row
+    rig.harness
+        .get_by_label("Never gonna give you up")
+        .click_secondary();
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Delete").click();
+    rig.harness.run_steps(3);
+    assert_eq!(
+        rig.app().media_rows(),
+        [("Deep focus".to_owned(), vec![sp])]
+    );
+    let s = Store::open(&dir.db()).unwrap();
+    assert!(s.media_play(a).unwrap().is_none() && s.media_play(b).unwrap().is_none());
+}
+
+#[test]
+fn a_media_search_hit_opens_the_media_view_at_its_row() {
+    let dir = TempDir::new("media-search");
+    let ([_, b], _) = seed_plays(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::Search);
+    rig.harness.run_steps(2);
+    rig.harness
+        .event(egui::Event::Text("gonna give".to_owned()));
+    rig.harness.run_steps(3);
+    assert!(rig.shows("2 plays"));
+    rig.harness
+        .get_all_by_label_contains("Never gonna give you up")
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(1);
+    assert!(!rig.app().search_open());
+    assert_eq!(rig.app().prefs().view, View::Media);
+    rig.harness.run_steps(3);
+    assert!(rig.app().pending_media_focus().is_none_or(|p| p == b));
+}
+
+/// Notes tagged around a commerce project.
+fn seed_tagged(db: &Path) {
+    use oats_core::EpisodeContent;
+    let s = Store::open(db).unwrap();
+    let now = now_ms();
+    for (i, (title, topics)) in [
+        ("Commerce checkout review", vec!["Commerce", "COD delay"]),
+        ("Courier escalation", vec!["COD delay"]),
+        ("Weekly sync", vec!["commerce"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = now - (i as i64 + 1) * 3_600_000;
+        s.insert_episode(
+            at,
+            at + 600_000,
+            &EpisodeContent {
+                title: title.into(),
+                summary: "- seeded".into(),
+                topics: topics.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn search_shows_tags_first_and_a_tag_opens_its_topic_view() {
+    let dir = TempDir::new("tag-search");
+    seed_tagged(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::Search);
+    rig.harness.run_steps(2);
+    rig.harness.event(egui::Event::Text("commerce".to_owned()));
+    rig.harness.run_steps(3);
+    // a note title matches too: the Tags section sits above the Notes section
+    let tags = rig.harness.get_by_label("Tags").rect();
+    let notes = rig.harness.get_by_label("Notes").rect();
+    assert!(tags.top() < notes.top(), "Tags first");
+    assert!(rig.shows("Commerce · 2"));
+    // several words: any of them, the better match first
+    rig.harness
+        .key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    rig.harness
+        .event(egui::Event::Text("commerce cod delay".to_owned()));
+    rig.harness.run_steps(3);
+    let cod = rig.harness.get_by_label("COD delay · 2").rect();
+    let commerce = rig.harness.get_by_label("Commerce · 2").rect();
+    assert!(cod.left() < commerce.left(), "two words beat one");
+    rig.harness.get_by_label("Commerce · 2").click();
+    rig.harness.run_steps(3);
+    assert!(!rig.app().search_open());
+    assert!(rig.app().topic_open());
+    assert!(rig.shows("Tagged “Commerce”"));
+    assert!(
+        rig.shows("Weekly sync"),
+        "case-insensitive: the lower-case tag too"
+    );
+}

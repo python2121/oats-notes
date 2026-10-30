@@ -12,7 +12,7 @@ workspace = true
 [features]
 default = ["selftest"]
 # `oats_ui::selftest`: render the whole window offscreen to a PNG (egui_kittest over wgpu).
-selftest = ["dep:egui_kittest", "dep:image"]
+selftest = ["dep:egui_kittest"]
 
 [dependencies]
 oats-core = { workspace = true }
@@ -30,7 +30,8 @@ chrono = { workspace = true }
 # epaint itself uses, so nothing is built twice.
 skrifa = "=0.44.0"
 egui_kittest = { workspace = true, optional = true, features = ["wgpu", "eframe"] }
-image = { workspace = true, optional = true }
+# PNG for the selftest, JPEG for the Media view's (opt-in) video thumbnails.
+image = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { workspace = true, features = ["wgpu", "persistence", "x11", "wayland"] }
