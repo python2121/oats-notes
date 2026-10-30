@@ -21,6 +21,8 @@ pub struct MoveDraft {
     pub sent: bool,
     /// The node the item was filed under when the field opened (a changed home = it moved).
     pub from: Option<i64>,
+    /// Opened from the sidebar: the field shows under the sidebar row, not on the card.
+    pub sidebar: bool,
 }
 
 impl MoveDraft {
@@ -31,7 +33,14 @@ impl MoveDraft {
             focus: true,
             sent: false,
             from,
+            sidebar: false,
         }
+    }
+
+    /// The same, opened from a sidebar row.
+    pub fn in_sidebar(mut self) -> Self {
+        self.sidebar = true;
+        self
     }
 }
 
@@ -43,22 +52,45 @@ pub fn move_field(
     draft: &mut Option<MoveDraft>,
     target: MoveTarget,
 ) -> Option<String> {
-    let d = draft.as_mut().filter(|d| d.target == target)?;
+    move_field_in(ui, t, draft, target, false)
+}
+
+/// [`move_field`] for the card (`sidebar = false`) or for a sidebar row (`true`: narrower,
+/// only a draft opened from the sidebar).
+pub fn move_field_in(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    draft: &mut Option<MoveDraft>,
+    target: MoveTarget,
+    sidebar: bool,
+) -> Option<String> {
+    let d = draft
+        .as_mut()
+        .filter(|d| d.target == target && d.sidebar == sidebar)?;
     let mut submit = None;
     let mut cancel = false;
     ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        ui.label(RichText::new("Move to").color(t.text_secondary).size(11.5));
+        ui.add_space(if sidebar { 6.0 } else { 12.0 });
+        if !sidebar {
+            ui.label(RichText::new("Move to").color(t.text_secondary).size(11.5));
+        }
+        let width = if sidebar {
+            (ui.available_width() - if d.sent { 30.0 } else { 6.0 }).max(60.0)
+        } else {
+            320.0
+        };
         let r = ui.add_enabled(
             !d.sent,
             egui::TextEdit::singleline(&mut d.text)
-                .desired_width(320.0)
-                .hint_text(PLACEHOLDER)
+                .desired_width(width)
+                .hint_text(if sidebar { "Move to…" } else { PLACEHOLDER })
                 .font(t.font(12.5)),
         );
         if d.sent {
             ui.add(egui::Spinner::new().size(12.0));
-            ui.label(RichText::new("Moving…").color(t.text_tertiary).size(11.5));
+            if !sidebar {
+                ui.label(RichText::new("Moving…").color(t.text_tertiary).size(11.5));
+            }
         } else {
             if d.focus {
                 r.request_focus();

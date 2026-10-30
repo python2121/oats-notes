@@ -802,6 +802,10 @@ impl Session<'_> {
                     }
                     lane.signal |= !silent;
                     if lane.kind == AudioSourceKind::System {
+                        if !silent {
+                            // the media watcher's "the call's audio goes on"
+                            self.out.media_feed.note_system_signal(now_ms());
+                        }
                         self.media.skip_system = self.media_skips();
                     }
                     self.feed(

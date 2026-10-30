@@ -46,6 +46,13 @@ pub enum NotesAction {
         episode: i64,
         text: String,
     },
+    /// A note was dragged onto another one and dropped at `at`: the app asks before merging
+    /// `dragged` INTO `into`.
+    MergeDrop {
+        dragged: i64,
+        into: i64,
+        at: egui::Pos2,
+    },
 }
 
 /// What the strip shows about the brain.
@@ -88,6 +95,7 @@ pub fn run_toast(run: &BrainRun) -> (String, bool) {
         "review" => "Review",
         "reorganise" => "Reorganise",
         "summarise" => "Summarise",
+        "rewrite" => "Re-interpret",
         other => other,
     };
     if !run.ok {
@@ -149,7 +157,7 @@ pub fn busy_label(kind: &str) -> &'static str {
         "interpret" => "Interpreting…",
         "review" => "Reviewing…",
         "reorganise" => "Reorganising…",
-        "reinterpret" => "Re-interpreting…",
+        "reinterpret" | "rewrite" => "Re-interpreting…",
         "summarise" => "Summarising…",
         "move" | "move_segment" => "Moving…",
         _ => "Working…",
@@ -337,6 +345,8 @@ pub struct NotesState {
     pub media_convertible: std::collections::HashSet<i64>,
     /// "Move to…": the open inline field, for a note or a transcript segment.
     pub move_draft: Option<crate::move_to::MoveDraft>,
+    /// A note dropped on another, waiting for the user's Yes / No.
+    pub confirm_merge: Option<crate::merge::MergeConfirm>,
 }
 
 /// The text fields of a note being edited. Decisions: one per line. Action items: one per
@@ -657,11 +667,12 @@ fn move_field(
     state: &mut NotesState,
     actions: &mut Vec<NotesAction>,
 ) {
-    if let Some(text) = crate::move_to::move_field(
+    if let Some(text) = crate::move_to::move_field_in(
         ui,
         t,
         &mut state.move_draft,
         oats_brain::MoveTarget::Episode(e.id),
+        false,
     ) {
         actions.push(NotesAction::MoveText {
             episode: e.id,
@@ -917,6 +928,21 @@ impl StrikeIf for RichText {
     }
 }
 
+/// `rect` (a card or a note row) as a drop zone for a dragged note: a drop asks to merge it
+/// into `into`.
+fn merge_drop(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    rect: Rect,
+    into: i64,
+    actions: &mut Vec<NotesAction>,
+) {
+    if let Some(dragged) = crate::merge::drop_zone(ui, t, rect, into) {
+        let at = ui.ctx().pointer_latest_pos().unwrap_or(rect.center());
+        actions.push(NotesAction::MergeDrop { dragged, into, at });
+    }
+}
+
 /// One episode card. `hl` is a search string to mark in the text ("" for none); `open`, when
 /// given, makes the title clickable and receives the episode's id on a click (search results).
 pub(crate) fn episode_card(
@@ -963,8 +989,14 @@ pub(crate) fn episode_card(
                         ..Default::default()
                     },
                 );
-                // clickable for its context menu (Mark as a call / Mark as media / Summarise)
-                let mut resp = ui.add(egui::Label::new(title_job).sense(Sense::click()).truncate());
+                // clickable for its context menu (Mark as a call / Mark as media / Summarise),
+                // draggable onto another note to merge into it
+                let mut resp = ui.add(
+                    egui::Label::new(title_job)
+                        .sense(Sense::click_and_drag())
+                        .truncate(),
+                );
+                crate::merge::drag_source(ui, t, &resp, e.id, &e.title);
                 let convertible = state.media_convertible.contains(&e.id);
                 if e.is_media() || convertible {
                     resp = resp.on_hover_text(if e.is_media() {
@@ -1184,6 +1216,7 @@ pub(crate) fn episode_card(
             t.inset.gamma_multiply(if e.low_signal { 0.5 } else { 1.0 }),
         ),
     );
+    merge_drop(ui, t, rect, e.id, actions);
     focus_card(ui, t, state, e.id, rect);
     ui.add_space(6.0);
     rect
@@ -1202,7 +1235,13 @@ fn edit_card(
     let left = ui.max_rect().left();
     let right = ui.max_rect().right();
     let mut save = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
-    let mut cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    // Escape in the open "Move to" field closes that field, not the edit
+    let moving = state
+        .move_draft
+        .as_ref()
+        .is_some_and(|d| d.target == oats_brain::MoveTarget::Episode(e.id) && !d.sidebar);
+    let mut cancel = !moving && ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let mut open_move = false;
     let inner = ui
         .vertical(|ui| {
             ui.add_space(6.0);
@@ -1275,6 +1314,11 @@ fn edit_card(
                         if small_button(ui, "Cancel", true) {
                             cancel = true;
                         }
+                        // moving is independent of the draft: the edit stays open, Save
+                        // still writes it
+                        if small_button(ui, "Move to…", true) {
+                            open_move = true;
+                        }
                         ui.label(
                             RichText::new("⌘S saves · Esc cancels")
                                 .color(t.text_tertiary)
@@ -1283,9 +1327,18 @@ fn edit_card(
                     });
                 });
             });
+            if state.editing.is_some() {
+                move_field(ui, t, e, state, actions);
+            }
             ui.add_space(6.0);
         })
         .response;
+    if open_move {
+        state.move_draft = Some(crate::move_to::MoveDraft::new(
+            oats_brain::MoveTarget::Episode(e.id),
+            e.node_id,
+        ));
+    }
     if save && let Some(d) = state.editing.take() {
         actions.push(NotesAction::SaveEdit(e.id, d.to_content_keeping(e)));
     } else if cancel {
@@ -1856,7 +1909,7 @@ fn project_notes(
         if state
             .move_draft
             .as_ref()
-            .is_some_and(|d| d.target == oats_brain::MoveTarget::Episode(e.id))
+            .is_some_and(|d| d.target == oats_brain::MoveTarget::Episode(e.id) && !d.sidebar)
         {
             state.open_notes.insert(e.id);
         }
@@ -1884,10 +1937,13 @@ fn note_row(
     open: bool,
     actions: &mut Vec<NotesAction>,
 ) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click_and_drag());
     resp.context_menu(|ui| {
         move_menu(ui, e, state);
     });
+    crate::merge::drag_source(ui, t, &resp, e.id, &e.title);
+    merge_drop(ui, t, rect.shrink2(vec2(6.0, 0.0)), e.id, actions);
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Note: {}", e.title))

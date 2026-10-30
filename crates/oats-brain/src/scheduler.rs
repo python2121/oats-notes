@@ -40,7 +40,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, TimeZone, Timelike};
-use oats_core::{BrainRun, EpisodeContent, RunOutcome, Store, TranscriptRow};
+use oats_core::{BrainRun, Episode, EpisodeContent, RunOutcome, Store, TranscriptRow};
 
 use crate::claude_cli::{ClaudeCli, CliError, Request, resolve_binary};
 use crate::episodes::{self, Chunk, EpisodeRule, cut};
@@ -237,6 +237,10 @@ pub enum BrainCommand {
     /// only; no decisions, action items or events). Media is otherwise filed without a model
     /// call.
     Summarise(i64),
+    /// Re-interpret one note IN PLACE from its own transcript, as one chunk (no re-cut, the
+    /// same row revised) — after the user merged a note into it by hand, so the text covers
+    /// both. A hand-edited note's text is replaced (the UI asked "Replace your edits?").
+    Rewrite(i64),
     UndoChange(i64),
     /// "Move to…" with text the local resolver could not settle: haiku picks an existing node
     /// or proposes one new project, and the item is moved there. `current_node` is where the
@@ -544,6 +548,7 @@ struct Worker {
     pending_commands: VecDeque<PendingCommand>,
     reinterpret: VecDeque<i64>,
     summarise: VecDeque<i64>,
+    rewrite: VecDeque<i64>,
     moves: VecDeque<(crate::moveto::MoveTarget, String, Option<i64>)>,
     undo: VecDeque<i64>,
     categorise_due: Option<Instant>,
@@ -645,6 +650,7 @@ impl Worker {
             pending_commands: VecDeque::new(),
             reinterpret: VecDeque::new(),
             summarise: VecDeque::new(),
+            rewrite: VecDeque::new(),
             moves: VecDeque::new(),
             undo: VecDeque::new(),
             categorise_due: None,
@@ -892,8 +898,13 @@ impl Worker {
                 }
             } else {
                 if let Some(id) = self.summarise.pop_front() {
-                    self.run_summarise(id);
+                    self.run_in_place(id, InPlace::Summarise);
                     self.settled("summarise", Some(id));
+                    continue;
+                }
+                if let Some(id) = self.rewrite.pop_front() {
+                    self.run_in_place(id, InPlace::Rewrite);
+                    self.settled("rewrite", Some(id));
                     continue;
                 }
                 if due(self.categorise_due) {
@@ -980,6 +991,10 @@ impl Worker {
             BrainCommand::Summarise(id) => {
                 self.queued("summarise", Some(id));
                 self.summarise.push_back(id);
+            }
+            BrainCommand::Rewrite(id) => {
+                self.queued("rewrite", Some(id));
+                self.rewrite.push_back(id);
             }
             BrainCommand::ResolveMove {
                 target,
@@ -1506,23 +1521,30 @@ impl Worker {
 
     // ---- tier 1: rolling-window interpretation --------------------------------------------
 
-    /// "Summarise" on a media episode: one interpretation of its transcript with the media
-    /// prompt, revising it in place (the media rules apply: title, Media, nothing actionable).
-    fn run_summarise(&mut self, id: i64) {
+    /// One interpretation of an episode's own transcript, revising it in place.
+    /// [`InPlace::Summarise`]: "Summarise" on a media episode (the media rules apply: title,
+    /// Media, nothing actionable; a hand-edited note is left alone). [`InPlace::Rewrite`]: a
+    /// note the user merged another into ([`BrainCommand::Rewrite`]): any episode, its edits
+    /// replaced (`user_edited_at` cleared with the revision, in one savepoint).
+    fn run_in_place(&mut self, id: i64, how: InPlace) {
+        let kind = how.kind();
         let ep = match self.store.episode(id) {
-            Ok(Some(ep)) if ep.is_media() => ep,
-            Ok(_) => {
+            Ok(Some(ep)) if ep.is_media() || how == InPlace::Rewrite => ep,
+            Ok(Some(_)) => {
                 return self.out.send(BrainEvent::Warning(format!(
-                    "summarise: episode {id} is not a media note"
+                    "{kind}: episode {id} is not a media note"
                 )));
             }
-            Err(e) => {
+            Ok(None) => {
                 return self
                     .out
-                    .send(BrainEvent::Warning(format!("summarise: {e}")));
+                    .send(BrainEvent::Warning(format!("{kind}: episode {id} is gone")));
+            }
+            Err(e) => {
+                return self.out.send(BrainEvent::Warning(format!("{kind}: {e}")));
             }
         };
-        if ep.user_edited_at.is_some() {
+        if ep.user_edited_at.is_some() && how == InPlace::Summarise {
             return self.out.send(BrainEvent::Warning(
                 "summarise: you edited this note; its text is left alone".to_owned(),
             ));
@@ -1530,15 +1552,18 @@ impl Worker {
         let segments = match self.store.segments_of_episode(id) {
             Ok(s) if !s.is_empty() => s,
             Ok(_) => {
-                return self.out.send(BrainEvent::Warning(
-                    "summarise: no transcript was kept for this media".to_owned(),
-                ));
+                return self.out.send(BrainEvent::Warning(format!(
+                    "{kind}: no transcript was kept for this note"
+                )));
             }
             Err(e) => {
-                return self
-                    .out
-                    .send(BrainEvent::Warning(format!("summarise: {e}")));
+                return self.out.send(BrainEvent::Warning(format!("{kind}: {e}")));
             }
+        };
+        // the user chose to replace their edits: the revision goes in place, not beside it
+        let ep = Episode {
+            user_edited_at: None,
+            ..ep
         };
         if !self.within_budget(Tier::Rolling) {
             return;
@@ -1549,7 +1574,7 @@ impl Worker {
             segments,
         };
         let model = self.cfg.models.rolling.clone();
-        let _ = self.run_job(Tier::Rolling, "summarise", |w, run_id| {
+        let _ = self.run_job(Tier::Rolling, kind, |w, run_id| {
             let now = now_ms();
             let tree = w.store.nodes().map_err(|e| e.to_string())?;
             let titles = interpret::media_titles(&w.store, chunk.started_at, chunk.ended_at);
@@ -1570,25 +1595,36 @@ impl Worker {
                 .ok_or_else(|| "no structured output".to_owned())
                 .and_then(|v| interpret::parse_interpretation(v).map_err(|e| e.to_string()))?;
             let model_name = resp.model.clone().unwrap_or_else(|| model.clone());
-            let applied = interpret::apply_interpretation(
-                &w.store,
-                &tree,
-                &chunk,
-                &interp,
-                Some(&ep),
-                &model_name,
-                resp.cost_usd,
-                Some(run_id),
-                0,
-                now,
-            )
-            .map_err(|e| e.to_string())?;
+            let applied = w
+                .store
+                .with_savepoint(|s| {
+                    if how == InPlace::Rewrite {
+                        s.clear_user_edit(ep.id)?;
+                    }
+                    interpret::apply_interpretation(
+                        s,
+                        &tree,
+                        &chunk,
+                        &interp,
+                        Some(&ep),
+                        &model_name,
+                        resp.cost_usd,
+                        Some(run_id),
+                        0,
+                        now,
+                    )
+                })
+                .map_err(|e| e.to_string())?;
+            let (done, line) = match how {
+                InPlace::Summarise => ("summarised", "Summarised"),
+                InPlace::Rewrite => ("re-interpreted", "Re-interpreted"),
+            };
             Ok(JobOutput {
-                summary: format!("summarised '{}'", applied.episode.title),
+                summary: format!("{done} '{}'", applied.episode.title),
                 cost_usd: resp.cost_usd,
                 duration_ms: resp.duration_ms,
                 model: resp.model.clone(),
-                lines: vec![format!("Summarised '{}'", applied.episode.title)],
+                lines: vec![format!("{line} '{}'", applied.episode.title)],
                 changed: true,
             })
         });
@@ -1765,7 +1801,8 @@ impl Worker {
         let now = now_ms();
         // an episode that ended within a gap before this chunk continues it: revise — unless
         // it is already at the episode caps (the chunk was split off by a cap, not by a gap):
-        // revising then would slide the window and overwrite the earlier part's summary
+        // revising then would slide the window and overwrite the earlier part's summary. The
+        // caps are the cutter's (`joined_one`): inside a call only the length cap counts
         let gap = rule.gap.as_millis() as i64;
         let max_len = rule.max_len.as_millis() as i64;
         let candidate = self
@@ -1796,7 +1833,6 @@ impl Worker {
             };
             if same_kind
                 && joined_one
-                && segs.len() + chunk.segments.len() <= rule.max_segments
                 && chunk.ended_at - p.started_at.min(chunk.started_at) <= max_len
             {
                 segs.extend(chunk.segments.iter().cloned());
@@ -2008,6 +2044,24 @@ impl Worker {
                 lines,
             })
         });
+    }
+}
+
+/// What [`Worker::run_in_place`] is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InPlace {
+    /// "Summarise" on a media note.
+    Summarise,
+    /// A note the user merged another into ([`BrainCommand::Rewrite`]).
+    Rewrite,
+}
+
+impl InPlace {
+    fn kind(self) -> &'static str {
+        match self {
+            InPlace::Summarise => "summarise",
+            InPlace::Rewrite => "rewrite",
+        }
     }
 }
 
@@ -2478,6 +2532,63 @@ esac
         let all = w.store.episodes(10).unwrap();
         assert_eq!(all.len(), 2, "the continuation became its own episode");
         assert!(all.iter().any(|e| e.summary == "model summary"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_revises_a_merged_note_in_place_without_re_cutting_it() {
+        let dir = temp_dir("rewrite");
+        let ok = r#"{"type":"result","is_error":false,"result":"","total_cost_usd":0.01,"structured_output":{"title":"Both parts","summary":"covers both","low_signal":false,"node_id":null,"new_project":null,"new_topic":null,"decisions":[],"action_items":[],"topics":[],"events":[]}}"#;
+        let mut w = bare_worker(script_cli(&dir, &format!("echo '{ok}'")));
+        let sid = w.store.begin_session(0, "e").unwrap();
+        let t = now_ms() - 86_400_000;
+        // two parts an hour apart (a re-cut would split them again), merged by hand into one
+        let a = w
+            .store
+            .insert_segment(sid, t, t + 5_000, LONG_TEXT, None)
+            .unwrap();
+        let b = w
+            .store
+            .insert_segment(sid, t + 3_600_000, t + 3_605_000, LONG_TEXT, None)
+            .unwrap();
+        let note = w
+            .store
+            .insert_episode(
+                t,
+                t + 3_605_000,
+                &EpisodeContent {
+                    title: "Mine".into(),
+                    ..Default::default()
+                },
+                t,
+            )
+            .unwrap();
+        w.store
+            .mark_segments_interpreted(&[a.id, b.id], note.id, t)
+            .unwrap();
+        w.store
+            .update_episode_content(
+                note.id,
+                &EpisodeContent {
+                    title: "Mine".into(),
+                    summary: "my words".into(),
+                    ..Default::default()
+                },
+                t + 1,
+            )
+            .unwrap();
+        w.handle(BrainCommand::Rewrite(note.id));
+        let id = w.rewrite.pop_front().unwrap();
+        w.run_in_place(id, InPlace::Rewrite);
+        let e = w.store.episode(note.id).unwrap().unwrap();
+        assert_eq!(e.title, "Both parts", "revised in place");
+        assert!(
+            e.user_edited_at.is_none(),
+            "the user asked to replace the edits"
+        );
+        assert_eq!(e.revision, 2);
+        assert_eq!(w.store.segments_of_episode(note.id).unwrap().len(), 2);
+        assert_eq!(w.store.episodes(10).unwrap().len(), 1, "not split again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

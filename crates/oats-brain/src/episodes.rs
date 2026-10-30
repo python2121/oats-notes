@@ -2,7 +2,8 @@
 //! sees it — pure logic. The only signal we have is the transcript itself, so the rule is the
 //! one meeting detectors fall back to (screenpipe ends a meeting on silence): a gap of more
 //! than [`EpisodeRule::gap`] between segments starts a new episode, and an episode is capped
-//! in length and segment count so a prompt stays a sane size.
+//! in length and segment count so a prompt stays a sane size (inside a call only in length:
+//! a call is never split by its segment count).
 //!
 //! System audio ("them": a call, a video) is a continuity signal: within an episode that
 //! already has system-audio segments, a further system segment continues it across a silence
@@ -59,7 +60,8 @@ pub struct EpisodeRule {
     pub gap: Duration,
     /// An episode never spans more than this.
     pub max_len: Duration,
-    /// … nor more segments than this.
+    /// … nor more segments than this — outside a call: inside one only the length cap
+    /// applies (a lively call's system lane yields ~8–10 short segments a minute).
     pub max_segments: usize,
 }
 
@@ -68,7 +70,7 @@ impl Default for EpisodeRule {
         EpisodeRule {
             gap: Duration::from_secs(10 * 60),
             max_len: Duration::from_secs(3 * 60 * 60),
-            max_segments: 400,
+            max_segments: 1500,
         }
     }
 }
@@ -183,11 +185,13 @@ pub fn cut(rows: &[TranscriptRow], rule: &EpisodeRule) -> Vec<Chunk> {
                     (Some((_, last)), None) => row.started_at - last >= MEETING_END_MS,
                     (None, None) => false,
                 };
+                // inside a call only the length cap cuts: a call is one note
+                let in_meeting = cm.is_some() && !meeting_changes;
                 meeting_changes
                     || media_changes
                     || (silence > gap && !call_continues)
                     || row.ended_at - c.started_at > max_len
-                    || c.segments.len() >= rule.max_segments
+                    || (!in_meeting && c.segments.len() >= rule.max_segments)
             }
         };
         if new_chunk {
@@ -503,5 +507,40 @@ mod tests {
         }];
         assert!(cut(&echo, &rule).is_empty());
         assert!(!cut(&[row(1, 0, 1)], &rule)[0].has_system_audio());
+    }
+
+    #[test]
+    fn an_hour_of_meeting_is_one_episode_whatever_its_segment_count() {
+        let rule = EpisodeRule::default();
+        let call = |id: i64, start_s: i64| TranscriptRow {
+            media_kind: Some(MediaClass::Meeting),
+            media_ref: Some("https://meet.google.com/abc".into()),
+            ..them(id, start_s, 4)
+        };
+        // 60 min at 10 segments a minute, mixed with the user's own speech
+        let rows: Vec<TranscriptRow> = (0..600)
+            .map(|i| {
+                if i % 5 == 4 {
+                    row(i, i * 6, 4)
+                } else {
+                    call(i, i * 6)
+                }
+            })
+            .collect();
+        let chunks = cut(&rows, &rule);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].segments.len(), 600);
+        // even with a tiny count cap a call is cut by length only
+        let tight = EpisodeRule {
+            max_segments: 50,
+            ..rule
+        };
+        assert_eq!(cut(&rows, &tight).len(), 1);
+        // outside a call the count cap still applies
+        let plain: Vec<TranscriptRow> = (0..120).map(|i| row(i, i * 6, 4)).collect();
+        assert_eq!(cut(&plain, &tight).len(), 3);
+        // the length cap still cuts a call: 3 h 10 min of call is two episodes
+        let long: Vec<TranscriptRow> = (0..1_140).map(|i| call(i, i * 10)).collect();
+        assert_eq!(cut(&long, &tight).len(), 2);
     }
 }

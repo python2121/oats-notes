@@ -8,7 +8,7 @@
 //! built-in classification ([`ProducerClass`], `producer_overrides` in the store) and let a
 //! media app be transcribed anyway ([`MediaStamp::policy`]). Pure, no platform code.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What is playing, as stored in `segments.media_kind` / `media_plays.kind`.
@@ -334,6 +334,10 @@ pub struct MediaPlay {
 #[derive(Clone, Debug, Default)]
 pub struct MediaFeed {
     inner: Arc<(AtomicU64, Mutex<Option<MediaStamp>>)>,
+    /// Wall-clock ms of the last system-lane chunk that was not digital silence (0: never) —
+    /// the pipeline writes it (one atomic store per chunk), the media watcher reads it to know
+    /// whether a call's audio goes on.
+    signal_at: Arc<AtomicI64>,
 }
 
 impl MediaFeed {
@@ -361,6 +365,17 @@ impl MediaFeed {
     /// Bumped by every change.
     pub fn version(&self) -> u64 {
         self.inner.0.load(Ordering::Acquire)
+    }
+
+    /// The system lane delivered sound (not digital silence) at `now_ms` (wall clock).
+    pub fn note_system_signal(&self, now_ms: i64) {
+        self.signal_at.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// When the system lane last delivered sound (wall-clock ms; `None`: never).
+    pub fn last_system_signal(&self) -> Option<i64> {
+        let at = self.signal_at.load(Ordering::Relaxed);
+        (at > 0).then_some(at)
     }
 }
 

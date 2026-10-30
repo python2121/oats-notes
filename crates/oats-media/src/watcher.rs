@@ -15,7 +15,9 @@ use oats_core::{MediaFeed, Store};
 use oats_sources::{AudioProducers, ProducerWatch};
 
 use crate::firefox::FirefoxSession;
-use crate::{MediaContext, ProducerOverrides, WindowTab, is_firefox, resolve};
+use crate::{
+    MediaContext, MeetingLatch, ProducerOverrides, WindowTab, is_firefox, pick, resolve_each,
+};
 
 /// How often the watcher looks.
 #[derive(Clone, Copy, Debug)]
@@ -82,6 +84,7 @@ impl MediaWatcher {
                     store: None,
                     overrides: ProducerOverrides::default(),
                     last_overrides: None,
+                    latch: MeetingLatch::default(),
                 };
                 w.run(&rx);
             })
@@ -121,7 +124,12 @@ struct Worker {
     store: Option<Store>,
     overrides: ProducerOverrides,
     last_overrides: Option<Instant>,
+    /// Calls that stick to their producer across tab switches.
+    latch: MeetingLatch,
 }
+
+/// The system lane counts as sounding when it delivered signal this recently.
+const SIGNAL_RECENT_MS: i64 = 5_000;
 
 impl Worker {
     fn run(&mut self, rx: &Receiver<Msg>) {
@@ -149,6 +157,7 @@ impl Worker {
                     if !active {
                         self.watch = ProducerWatch::new();
                         self.playing.clear();
+                        self.latch = MeetingLatch::default();
                         self.publish(None);
                         continue;
                     }
@@ -236,8 +245,29 @@ impl Worker {
             self.tabs.clear();
             changed = true;
         }
-        if changed {
-            let ctx = resolve(&self.playing, &self.tabs, &self.overrides);
+        // while a call is latched every look re-resolves (its hangover runs on the clock)
+        if changed || !self.latch.is_empty() {
+            let now = now_ms();
+            // the producers in `playing` run output; whether it is sound and not silence the
+            // pipeline tells through the feed (the system lane's last non-zero chunk)
+            let audio = self
+                .feed
+                .last_system_signal()
+                .is_some_and(|t| now - t < SIGNAL_RECENT_MS);
+            let contexts: Vec<MediaContext> =
+                resolve_each(&self.playing, &self.tabs, &self.overrides)
+                    .into_iter()
+                    .map(|c| {
+                        let browser = c
+                            .producer
+                            .as_ref()
+                            .is_some_and(|p| is_firefox(&p.bundle_id));
+                        let tabs = browser.then_some(self.tabs.as_slice());
+                        self.latch.apply(c, audio, tabs, now)
+                    })
+                    .collect();
+            self.latch.expire(now);
+            let ctx = pick(contexts);
             let ctx = ctx.stamp().is_some().then_some(ctx);
             self.publish(ctx);
         }

@@ -2052,6 +2052,16 @@ impl Store {
         Ok(())
     }
 
+    /// Forget that the user edited a note by hand (`user_edited_at = NULL`): they asked for
+    /// its text to be replaced by a fresh interpretation.
+    pub fn clear_user_edit(&self, id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE episodes SET user_edited_at = NULL WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     /// The user's own edit of a note: replaces title, summary, decisions, action items and
     /// topics (not the node, low-signal flag, model or cost), stamps `user_edited_at = now`
     /// and leaves `revision` alone. One transaction. The brain never content-revises an

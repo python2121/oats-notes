@@ -475,27 +475,177 @@ pub fn resolve(
     firefox_tabs: &[WindowTab],
     overrides: &ProducerOverrides,
 ) -> MediaContext {
+    pick(resolve_each(producers, firefox_tabs, overrides))
+}
+
+/// [`resolve`] per producer, before the most decisive one is picked (same order).
+pub fn resolve_each(
+    producers: &[Producer],
+    firefox_tabs: &[WindowTab],
+    overrides: &ProducerOverrides,
+) -> Vec<MediaContext> {
+    producers
+        .iter()
+        .map(|p| {
+            let mut ctx = MediaContext {
+                producer: Some(p.clone()),
+                tab: None,
+                kind: classify_bundle(&p.bundle_id),
+                ignored: false,
+                transcribe_anyway: false,
+            };
+            let mut override_id = p.bundle_id.as_str();
+            if is_firefox(&p.bundle_id)
+                && let Some(app) = firefox_context(&mut ctx, firefox_tabs)
+            {
+                override_id = app;
+            }
+            apply_override(&mut ctx, overrides.get(override_id));
+            ctx
+        })
+        .collect()
+}
+
+/// The most decisive of several producers' contexts (ties go to the first; none = nothing).
+pub fn pick(contexts: impl IntoIterator<Item = MediaContext>) -> MediaContext {
     let mut best: Option<MediaContext> = None;
-    for p in producers {
-        let mut ctx = MediaContext {
-            producer: Some(p.clone()),
-            tab: None,
-            kind: classify_bundle(&p.bundle_id),
-            ignored: false,
-            transcribe_anyway: false,
-        };
-        let mut override_id = p.bundle_id.as_str();
-        if is_firefox(&p.bundle_id)
-            && let Some(app) = firefox_context(&mut ctx, firefox_tabs)
-        {
-            override_id = app;
-        }
-        apply_override(&mut ctx, overrides.get(override_id));
+    for ctx in contexts {
         if best.as_ref().is_none_or(|b| ctx.rank() > b.rank()) {
             best = Some(ctx);
         }
     }
     best.unwrap_or_else(MediaContext::nothing)
+}
+
+/// A call's audio may pause this long (and the producer may show another page meanwhile)
+/// before the call is over — the episode cutter's meeting hangover.
+pub const MEETING_HANGOVER_MS: i64 = 3 * 60 * 1000;
+
+/// Meeting continuity across tab switches: once a producer's audio was classified as a call
+/// (by its selected tab, or by its app), that classification sticks to the producer while its
+/// audio goes on — switching Firefox's selected tab to Slack, YouTube or a news page during a
+/// call does not end the call. The call ends when the producer's audio has stopped for
+/// [`MEETING_HANGOVER_MS`], when the producer shows a DIFFERENT call (another Meet URL: a new
+/// meeting), or when the call's tab is no longer open in the browser. Only a call the
+/// producer is showing starts one, so an idle background call tab never does.
+#[derive(Clone, Debug, Default)]
+pub struct MeetingLatch {
+    /// Per producer (bundle id, lower case): the call it is on.
+    active: HashMap<String, ActiveMeeting>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveMeeting {
+    /// The call's context as it was classified (its tab, title, app).
+    ctx: MediaContext,
+    /// Wall-clock ms the producer's audio was last heard.
+    last_audio_at: i64,
+}
+
+impl MeetingLatch {
+    /// The call `ctx`'s producer is on, if any, given what it is showing now. `audio`: the
+    /// producer's sound is heard at `now_ms` (it plays and the system lane has signal);
+    /// `tabs`: the browser's open tabs (`None`: not a browser / unknown — a closed call tab
+    /// then can't end the call).
+    pub fn apply(
+        &mut self,
+        ctx: MediaContext,
+        audio: bool,
+        tabs: Option<&[WindowTab]>,
+        now_ms: i64,
+    ) -> MediaContext {
+        let Some(key) = ctx
+            .producer
+            .as_ref()
+            .map(|p| p.bundle_id.to_ascii_lowercase())
+        else {
+            return ctx;
+        };
+        if matches!(ctx.kind, MediaKind::Meeting(_)) && !ctx.ignored {
+            match self.active.get_mut(&key) {
+                Some(m) if meeting_ref(&m.ctx) == meeting_ref(&ctx) => {
+                    // the same call: keep its first stamp (a stable URL keeps one episode)
+                    m.last_audio_at = now_ms;
+                    return m.ctx.clone();
+                }
+                _ => {
+                    if self.active.contains_key(&key) {
+                        log::info!("media: a different call on the same app — a new meeting");
+                    }
+                    self.active.insert(
+                        key,
+                        ActiveMeeting {
+                            ctx: ctx.clone(),
+                            last_audio_at: now_ms,
+                        },
+                    );
+                }
+            }
+            return ctx;
+        }
+        let Some(m) = self.active.get_mut(&key) else {
+            return ctx;
+        };
+        let tab_gone = match (tabs, m.ctx.tab.as_ref()) {
+            // an empty list is an unreadable session file, not "every tab closed"
+            (Some(tabs), Some(call_tab)) if !tabs.is_empty() => {
+                let r = call_ref(&call_tab.url);
+                !tabs.iter().any(|t| call_ref(&t.tab.url) == r)
+            }
+            _ => false,
+        };
+        // the silence so far decides before new sound refreshes it: sound after 3 min of
+        // silence is something else
+        if tab_gone || now_ms - m.last_audio_at >= MEETING_HANGOVER_MS {
+            log::info!(
+                "media: call over ({})",
+                if tab_gone {
+                    "its tab was closed"
+                } else {
+                    "no audio for 3 min"
+                }
+            );
+            self.active.remove(&key);
+            return ctx;
+        }
+        if audio {
+            m.last_audio_at = now_ms;
+        }
+        // still on the call: keep its stamp, the selected page is not what is heard
+        m.ctx.clone()
+    }
+
+    /// Forget calls whose audio stopped more than the hangover ago (producers no longer
+    /// playing are never passed to [`Self::apply`]).
+    pub fn expire(&mut self, now_ms: i64) {
+        self.active
+            .retain(|_, m| now_ms - m.last_audio_at < MEETING_HANGOVER_MS);
+    }
+
+    /// Whether any producer is on a call (the watcher then re-resolves on every look).
+    pub fn is_empty(&self) -> bool {
+        self.active.is_empty()
+    }
+}
+
+/// What identifies one call: its tab URL (without query / fragment), else the app.
+fn meeting_ref(ctx: &MediaContext) -> String {
+    match ctx.tab.as_ref() {
+        Some(t) => call_ref(&t.url).to_owned(),
+        None => format!(
+            "{:?}/{}",
+            ctx.kind,
+            ctx.producer
+                .as_ref()
+                .map(|p| p.bundle_id.as_str())
+                .unwrap_or("")
+        ),
+    }
+}
+
+/// A call URL without its query and fragment (`?authuser=0`, `#…` don't make another call).
+fn call_ref(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
 }
 
 /// [`resolve`]'s per-app class.
@@ -887,5 +1037,109 @@ mod tests {
         );
         assert_eq!(ctx.kind, MediaKind::Browser);
         assert!(ctx.tab.is_none());
+    }
+
+    /// The tabs of a Firefox window with `selected` shown and `others` open in the background.
+    fn window(selected: (&str, &str), others: &[(&str, &str)]) -> Vec<WindowTab> {
+        let mut tabs = vec![tab(selected.0, selected.1, true)];
+        tabs.extend(others.iter().map(|(u, t)| background(u, t, 1)));
+        tabs
+    }
+
+    fn latched(
+        latch: &mut MeetingLatch,
+        tabs: &[WindowTab],
+        audio: bool,
+        now: i64,
+    ) -> MediaContext {
+        let ctx = ff_ctx(tabs, &none());
+        latch.apply(ctx, audio, Some(tabs), now)
+    }
+
+    const MEET: (&str, &str) = ("https://meet.google.com/abc-defg-hij", "Meet - abc");
+    const SLACK: (&str, &str) = ("https://app.slack.com/client/T1/C2", "general - Slack");
+
+    #[test]
+    fn a_call_sticks_while_another_tab_is_selected_and_its_audio_goes_on() {
+        let mut latch = MeetingLatch::default();
+        let on_meet = window(MEET, &[SLACK]);
+        let ctx = latched(&mut latch, &on_meet, true, 0);
+        assert_eq!(ctx.kind, MediaKind::Meeting(MeetingApp::Meet));
+        // the user switches to Slack during the call: still the call, same stamp
+        let on_slack = window(SLACK, &[MEET]);
+        for t in [2_000, 60_000, 170_000, 300_000] {
+            let ctx = latched(&mut latch, &on_slack, true, t);
+            assert_eq!(ctx.kind, MediaKind::Meeting(MeetingApp::Meet), "at {t}");
+            assert_eq!(ctx.stamp().unwrap().url.as_deref(), Some(MEET.0));
+        }
+        // YouTube or a news page selected: the same
+        let yt = window(
+            ("https://www.youtube.com/watch?v=x", "X - YouTube"),
+            &[MEET],
+        );
+        assert_eq!(
+            latched(&mut latch, &yt, true, 310_000).kind,
+            MediaKind::Meeting(MeetingApp::Meet)
+        );
+        // without a call first, the Slack page is app media (the earlier rule)
+        let mut fresh = MeetingLatch::default();
+        assert_eq!(
+            latched(&mut fresh, &on_slack, true, 0).kind,
+            MediaKind::AppMedia
+        );
+        // an idle background call tab never starts one
+        assert!(fresh.is_empty());
+    }
+
+    #[test]
+    fn a_call_ends_after_three_minutes_without_audio() {
+        let mut latch = MeetingLatch::default();
+        latched(&mut latch, &window(MEET, &[SLACK]), true, 0);
+        let on_slack = window(SLACK, &[MEET]);
+        // silence (the producer's audio stopped) — still the call inside the hangover
+        assert_eq!(
+            latched(&mut latch, &on_slack, false, 2 * 60_000).kind,
+            MediaKind::Meeting(MeetingApp::Meet)
+        );
+        // 3 min of silence: the Slack page is app media again
+        assert_eq!(
+            latched(&mut latch, &on_slack, true, 3 * 60_000).kind,
+            MediaKind::AppMedia
+        );
+        assert!(latch.is_empty());
+        // expire() forgets a call whose producer stopped playing altogether
+        latched(&mut latch, &window(MEET, &[]), true, 0);
+        latch.expire(60_000);
+        assert!(!latch.is_empty());
+        latch.expire(3 * 60_000);
+        assert!(latch.is_empty());
+    }
+
+    #[test]
+    fn a_different_call_url_is_a_new_meeting_and_a_closed_call_tab_ends_it() {
+        let mut latch = MeetingLatch::default();
+        latched(&mut latch, &window(MEET, &[]), true, 0);
+        // the same call with a query string is the same call (stable stamp)
+        let same = window(
+            ("https://meet.google.com/abc-defg-hij?authuser=0", "Meet"),
+            &[],
+        );
+        assert_eq!(
+            latched(&mut latch, &same, true, 1_000)
+                .stamp()
+                .unwrap()
+                .url
+                .as_deref(),
+            Some(MEET.0)
+        );
+        let other = ("https://meet.google.com/xyz-uvwx-rst", "Meet - xyz");
+        let ctx = latched(&mut latch, &window(other, &[MEET]), true, 5_000);
+        assert_eq!(ctx.stamp().unwrap().url.as_deref(), Some(other.0));
+        // back on Slack: the NEW call sticks
+        let ctx = latched(&mut latch, &window(SLACK, &[MEET, other]), true, 6_000);
+        assert_eq!(ctx.stamp().unwrap().url.as_deref(), Some(other.0));
+        // the call's tab closed: over at once
+        let ctx = latched(&mut latch, &window(SLACK, &[MEET]), true, 7_000);
+        assert_eq!(ctx.kind, MediaKind::AppMedia);
     }
 }

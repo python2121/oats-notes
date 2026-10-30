@@ -2,8 +2,10 @@
 //! group — the store's categories as 22 pt hover rows, with the projects the brain created
 //! under them and topics under those, collapsible per node (a disclosure triangle on rows with
 //! children, indented SwiftInvert-style); a "+" header icon that reveals an inline field to add
-//! a category; right-click → Rename / Delete with an inline rename. Selecting a node shows
-//! its notes (see `notes::node_view`).
+//! a category; right-click → Rename / Move to… (re-parent, resolved in the tree) / Delete with
+//! an inline field. Selecting a node shows its notes (see `notes::node_view`). A project's
+//! note rows have the card's context menu (Move to…, Mark as a call / Mark as media) and are
+//! drag sources and drop zones for merging one note into another (`merge`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,6 +22,8 @@ pub struct SidebarState {
     pub adding: Option<String>,
     /// The node being renamed and the field's text.
     pub renaming: Option<(i64, String)>,
+    /// The node being moved ("Move to…": a new parent typed by name) and the field's text.
+    pub reparenting: Option<(i64, String)>,
     /// Give the open field keyboard focus this frame.
     pub focus: bool,
     /// Nodes whose children are hidden.
@@ -35,6 +39,12 @@ pub struct SidebarEpisode {
     pub id: i64,
     pub title: String,
     pub started_at: i64,
+    /// The node the note is filed under (the project or a topic below it).
+    pub node_id: Option<i64>,
+    /// A media note ("Mark as a call" is offered).
+    pub is_media: bool,
+    /// A conversation heard from an app classed Media ("Mark as media" is offered).
+    pub convertible: bool,
 }
 
 /// How many notes a project lists in the sidebar.
@@ -50,8 +60,23 @@ pub enum SidebarAction {
     EpisodesToggled,
     Add(String),
     Rename(i64, String),
+    /// "Move to…" on a project / topic: the new parent's name as typed.
+    Reparent(i64, String),
     Delete(i64),
     ToggleSidebar,
+    /// "Move to…" on a note row: the text typed in its field.
+    MoveEpisode {
+        episode: i64,
+        text: String,
+    },
+    MarkAsCall(i64),
+    MarkAsMedia(i64),
+    /// A note dropped onto another note's row (see `NotesAction::MergeDrop`).
+    MergeDrop {
+        dragged: i64,
+        into: i64,
+        at: egui::Pos2,
+    },
 }
 
 /// The visible rows of the tree in order: `(node, depth)`; archived nodes and the children
@@ -92,6 +117,7 @@ pub fn sidebar_panel(
     nodes: &[Node],
     episodes: &HashMap<i64, Vec<SidebarEpisode>>,
     focus_episode: Option<i64>,
+    move_draft: &mut Option<crate::move_to::MoveDraft>,
 ) -> Vec<SidebarAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
@@ -173,6 +199,23 @@ pub fn sidebar_panel(
                     }
                     continue;
                 }
+                if let Some((id, text)) = &mut state.reparenting
+                    && *id == n.id
+                {
+                    let id = *id;
+                    match inline_field_hint(ui, text, &mut state.focus, "Move to (name)") {
+                        Field::Commit => {
+                            let to = text.trim().to_owned();
+                            if !to.is_empty() {
+                                actions.push(SidebarAction::Reparent(id, to));
+                            }
+                            state.reparenting = None;
+                        }
+                        Field::Cancel => state.reparenting = None,
+                        Field::Editing => {}
+                    }
+                    continue;
+                }
                 let is_project = n.kind == NodeKind::Project;
                 let project_eps = episodes.get(&n.id).map_or(&[][..], Vec::as_slice);
                 let disclosure = if is_project {
@@ -183,6 +226,18 @@ pub fn sidebar_panel(
                 };
                 let selected = view == View::Node(n.id) && focus_episode.is_none();
                 let resp = hover_row(ui, &t, &n.name, selected, depth, disclosure);
+                let kind = match n.kind {
+                    NodeKind::Category => "Category",
+                    NodeKind::Project => "Project",
+                    NodeKind::Topic => "Topic",
+                };
+                resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        format!("{kind}: {}", n.name),
+                    )
+                });
                 if resp.clicked() {
                     // a click on the triangle folds; anywhere else selects
                     let on_triangle = disclosure.is_some()
@@ -204,6 +259,14 @@ pub fn sidebar_panel(
                 resp.context_menu(|ui| {
                     if ui.button("Rename…").clicked() {
                         state.renaming = Some((n.id, n.name.clone()));
+                        state.reparenting = None;
+                        state.adding = None;
+                        state.focus = true;
+                        ui.close();
+                    }
+                    if n.parent_id.is_some() && ui.button("Move to…").clicked() {
+                        state.reparenting = Some((n.id, String::new()));
+                        state.renaming = None;
                         state.adding = None;
                         state.focus = true;
                         ui.close();
@@ -232,6 +295,27 @@ pub fn sidebar_panel(
                         let r = episode_row(ui, &t, ep, focus_episode == Some(ep.id), depth + 1);
                         if r.clicked() {
                             actions.push(SidebarAction::SelectEpisode(ep.id, n.id));
+                        }
+                        crate::merge::drag_source(ui, &t, &r, ep.id, &ep.title);
+                        if let Some(dragged) = crate::merge::drop_zone(ui, &t, r.rect, ep.id) {
+                            let at = ui.ctx().pointer_latest_pos().unwrap_or(r.rect.center());
+                            actions.push(SidebarAction::MergeDrop {
+                                dragged,
+                                into: ep.id,
+                                at,
+                            });
+                        }
+                        r.context_menu(|ui| {
+                            episode_menu(ui, ep, move_draft, &mut actions);
+                        });
+                        let target = oats_brain::MoveTarget::Episode(ep.id);
+                        if let Some(text) =
+                            crate::move_to::move_field_in(ui, &t, move_draft, target, true)
+                        {
+                            actions.push(SidebarAction::MoveEpisode {
+                                episode: ep.id,
+                                text,
+                            });
                         }
                     }
                 }
@@ -266,6 +350,47 @@ pub fn sidebar_panel(
     actions
 }
 
+/// A note row's context menu, as on the card's title: "Move to…" (the field opens under the
+/// row), and "Mark as a call" / "Mark as media" when they apply.
+fn episode_menu(
+    ui: &mut egui::Ui,
+    ep: &SidebarEpisode,
+    move_draft: &mut Option<crate::move_to::MoveDraft>,
+    actions: &mut Vec<SidebarAction>,
+) {
+    if ui.button("Move to…").clicked() {
+        *move_draft = Some(
+            crate::move_to::MoveDraft::new(oats_brain::MoveTarget::Episode(ep.id), ep.node_id)
+                .in_sidebar(),
+        );
+        ui.close();
+    }
+    if ep.is_media {
+        ui.separator();
+        if ui
+            .button("Mark as a call")
+            .on_hover_text(
+                "This was a conversation, not media: file it with your conversations and \
+                 re-interpret it as a meeting",
+            )
+            .clicked()
+        {
+            actions.push(SidebarAction::MarkAsCall(ep.id));
+            ui.close();
+        }
+    } else if ep.convertible {
+        ui.separator();
+        if ui
+            .button("Mark as media")
+            .on_hover_text("Not a conversation of yours: file it under Media (no todos, no events)")
+            .clicked()
+        {
+            actions.push(SidebarAction::MarkAsMedia(ep.id));
+            ui.close();
+        }
+    }
+}
+
 /// A muted, non-interactive placeholder row one level under a category.
 fn empty_row(ui: &mut egui::Ui, t: &Tokens, label: &str) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::hover());
@@ -289,7 +414,8 @@ fn episode_row(
     selected: bool,
     depth: usize,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::click());
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::click_and_drag());
     let date = crate::notes::short_date(ep.started_at);
     let resp = resp.on_hover_text(format!("{} · {date}", ep.title));
     resp.widget_info(|| {
@@ -306,7 +432,7 @@ fn episode_row(
     let fill_rect = rect.shrink2(vec2(2.0, 1.0));
     if selected {
         p.rect_filled(fill_rect, 4.0, t.accent_alpha(0.35));
-    } else if resp.hovered() {
+    } else if resp.hovered() || resp.context_menu_opened() {
         p.rect_filled(fill_rect, 4.0, t.hover);
     }
     let text_x = 12.0 + depth as f32 * 14.0 + 12.0;
@@ -423,13 +549,18 @@ enum Field {
 /// The inline text field (new category, rename): Enter commits, Escape (or clicking away with
 /// nothing typed) cancels.
 fn inline_field(ui: &mut egui::Ui, text: &mut String, focus: &mut bool) -> Field {
+    inline_field_hint(ui, text, focus, "Name")
+}
+
+/// [`inline_field`] with its own hint text.
+fn inline_field_hint(ui: &mut egui::Ui, text: &mut String, focus: &mut bool, hint: &str) -> Field {
     let mut out = Field::Editing;
     ui.horizontal(|ui| {
         ui.add_space(6.0);
         let resp = ui.add(
             egui::TextEdit::singleline(text)
                 .desired_width(ui.available_width() - 6.0)
-                .hint_text("Name"),
+                .hint_text(hint),
         );
         if *focus {
             resp.request_focus();

@@ -36,7 +36,7 @@ crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mi
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
-crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Conversations / Calendar (month grid) / Todos views, node view (notes + projects), reminder + confirmation pop-ups
+crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Conversations / Calendar (month grid) / Todos views, node view (notes + projects), reminder + confirmation pop-ups, drag-to-merge (merge.rs)
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
 vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
 vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream and a voice-processing input stream (macOS); NOT a workspace member
@@ -393,7 +393,10 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   `Offline` (connection / DNS errors), `Refused`, `Timeout`, `Exit` (model text is never
   classified). `CliError::unavailable_reason()` says which mean "claude as a whole is down".
 - `episodes`: pure cut of segments into episodes — a gap > 10 min starts a new one, capped at
-  3 h / 400 segments. Calls bound episodes (`episodes::cut`): the first system segment stamped
+  3 h / 1500 segments; inside a call (the chunk's meeting goes on) only the 3 h cap cuts, never
+  the segment count (a lively call's system lane yields ~8–10 short segments a minute: the old
+  400 cap split a 50-min call). The scheduler's revise check is the cutter's (`joined_one`), so
+  a call's continuation revises it up to 3 h. Calls bound episodes (`episodes::cut`): the first system segment stamped
   `meeting` after anything that is not that call starts a new episode at its start, and mic
   segments up to 2 min before it join it (the user joining); a call ends when 3 min pass with
   no meeting-stamped system segment while other speech continues (that speech starts a new
@@ -496,7 +499,30 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   ding show. Kinds in `Queued` / `Settled`: `move` (episode id) and `move_segment`. Tier-0
   caps apply. While it runs the field is disabled with a spinner; on failure (or when the wait
   ends) it reopens with the text and a warning toast. Needs claude: without it only names in
-  the tree work.
+  the tree work. Also in a note's EDIT view: "Move to…" next to Save / Cancel opens the same
+  field under the form; a move does not touch the draft (Escape in the field closes only the
+  field), the edit follows the note to its new project (single-note view, draft kept;
+  `OatsApp::follow_moved_episode`) and Save still writes it. Sidebar: a project's note rows
+  have the card's context menu ("Move to…" — the field opens under the row,
+  `MoveDraft::sidebar` — and "Mark as a call" / "Mark as media" when they apply); project /
+  topic rows have "Rename…" and "Move to…" (re-parent: an inline field resolved by
+  `resolve_local` only, NO model call — ambiguous / unknown names are a warning; a project goes
+  under a category or project, a topic anywhere below; never into its own subtree or Media;
+  a `node_move` change, undoable). Tree rows carry AccessKit labels "Category: …" / "Project:
+  …" / "Topic: …".
+- Drag-to-merge (`oats-ui::merge`): a note card's title, a project-page note row and a sidebar
+  note row are egui drag sources (payload `DraggedNote(episode id)`, the title follows the
+  pointer); cards and note rows are drop zones (accent outline while a note hovers). A drop
+  opens a small pop-up at the drop point: "Merge “A” into “B”? Undo not available." Yes / No;
+  if either note was hand-edited, then "Replace your edits?" (Yes / Keep my text / Cancel).
+  Only then `merge::apply_merge` (one savepoint): `Store::merge_episodes(dragged, into)` —
+  segments and events re-pointed, span extended, the dragged row deleted — plus an
+  `episode_merge` change (`by: user`; recorded, not undoable). Media and conversation are
+  never merged. Then `BrainCommand::Rewrite(into)` (kind `rewrite`, tier 1): the note
+  re-interpreted IN PLACE from its own segments as one chunk (`run_in_place`; a plain
+  Re-interpret would reset and re-cut it by its gaps, splitting the merge apart), clearing
+  `user_edited_at` in the same savepoint; "Keep my text" skips it. Toast "Merged into B — undo
+  not available".
 - `scheduler`: one worker thread (`Brain::spawn() -> BrainHandle`, same shape as the
   pipeline), one job at a time, blocks on `recv_timeout` until the next due job. Tiers:
   0 reactive (haiku): hotword commands at once; categorisation 3 min after the first new
@@ -795,6 +821,16 @@ from a video creates nothing), and what was watched is recorded.
   every 2 s, Firefox every 5 s while Firefox plays; publishes `MediaStamp { class, url, title,
   producer }` into the pipeline's `MediaFeed` (`PipelineHandle::media_feed()`; read per system
   chunk via an atomic version) and wakes the UI on change. `OATS_MEDIA=off` disables it.
+  Meeting continuity (`oats_media::MeetingLatch`, per producer bundle id): once a producer's
+  audio was classified as a call (its selected tab, or its app), the call STICKS to that
+  producer while its audio goes on — selecting Slack / YouTube / a news tab mid-call keeps the
+  call's stamp (its first URL, so one episode). It ends after 3 min without the producer's
+  audio (`MEETING_HANGOVER_MS`, the cutter's hangover; "audio" = the producer runs output AND
+  the system lane had non-zero sound in the last 5 s: `MediaFeed::note_system_signal`, one
+  atomic store per non-silent system chunk by the pipeline), when the producer shows a
+  DIFFERENT call URL (a new meeting; query / fragment ignored), or when the call's tab is no
+  longer open. Only a call the producer shows starts one (idle background call tabs never do).
+  While a call is latched the watcher re-resolves on every 2 s look.
 - Policy `oats_core::MediaPolicy { Ignore, LogOnly, Transcribe (default since 2026-10-29) }`,
   media only (YouTube / music / media apps; an app's own `policy` wins): stored in
   `meta.media_policy` (nothing ever seeded it, so an absent key = never chosen = the default; a
@@ -820,7 +856,7 @@ from a video creates nothing), and what was watched is recorded.
   `meeting: true`. Media chunks are filed WITHOUT a model call (`file_media_without_call`,
   continuing the same media's episode within the gap; title from the play, else the URL / app);
   `BrainCommand::Summarise(id)` ("Summarise" on a media note) runs one interpretation with the
-  media prompt, revising the note in place. `apply_interpretation` enforces the media rules
+  media prompt, revising the note in place (`run_in_place`, shared with `Rewrite`). `apply_interpretation` enforces the media rules
   for media chunks: title = the video, node = Media, summary header `**Media:** [title](url)`,
   no decisions/action items/events/new projects, `episodes.kind = media`; the review
   never merges media with conversation nor re-files a media episode; categorisation files

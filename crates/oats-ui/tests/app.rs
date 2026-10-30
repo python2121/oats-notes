@@ -2233,3 +2233,288 @@ fn toggling_24_hour_time_in_preferences_rerenders_transcript_times() {
     );
     assert!(!rig.shows(&twelve) || twelve.starts_with(&twenty_four));
 }
+
+// ---- move while editing, the sidebar note menu, drag-to-merge -------------------------------
+
+fn lease_id(db: &Path) -> i64 {
+    Store::open(db)
+        .unwrap()
+        .nodes()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "Apartment lease")
+        .unwrap()
+        .id
+}
+
+#[test]
+fn moving_a_note_while_editing_keeps_the_draft_and_save_writes_it() {
+    let dir = TempDir::new("edit-move");
+    let (commerce, pricing, _launch) = seed_project_notes(&dir.db());
+    let lease = lease_id(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Note: Pricing sync").click();
+    rig.harness.run_steps(2);
+    rig.harness.get_all_by_label("Edit").next().unwrap().click();
+    rig.harness.run_steps(2);
+    let title = rig
+        .harness
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .next()
+        .unwrap();
+    title.focus();
+    rig.harness.run_steps(1);
+    rig.harness
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .next()
+        .unwrap()
+        .type_text(" EDITED");
+    rig.harness.run_steps(2);
+    // "Move to…" next to Save / Cancel opens the move field (focused)
+    rig.harness.get_by_label("Move to…").click();
+    rig.harness.run_steps(3);
+    rig.harness
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .last()
+        .unwrap()
+        .type_text("apartment");
+    rig.harness.run_steps(2);
+    rig.harness.key_press(egui::Key::Enter);
+    rig.harness.run_steps(3);
+    let s = Store::open(&dir.db()).unwrap();
+    let e = s.episode(pricing).unwrap().unwrap();
+    assert_eq!(e.node_id, Some(lease), "moved at once");
+    assert_eq!(
+        e.title, "Pricing sync",
+        "the draft is not saved by the move"
+    );
+    assert_eq!(
+        rig.app().prefs().view,
+        View::Node(lease),
+        "the edit followed it"
+    );
+    assert_eq!(rig.app().focus_episode(), Some(pricing));
+    assert!(rig.shows("Save"), "still editing");
+    rig.harness.get_by_label("Save").click();
+    rig.harness.run_steps(3);
+    let e = s.episode(pricing).unwrap().unwrap();
+    assert_eq!(e.title, "Pricing sync EDITED");
+    assert_eq!(e.node_id, Some(lease));
+    assert!(e.user_edited_at.is_some());
+}
+
+#[test]
+fn a_sidebar_note_row_has_move_to() {
+    let dir = TempDir::new("sidebar-move");
+    let (commerce, pricing, _launch) = seed_project_notes(&dir.db());
+    let lease = lease_id(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().open_project_layer(commerce);
+    rig.harness.run_steps(3);
+    rig.harness
+        .get_by_label("Note: Pricing sync")
+        .click_secondary();
+    rig.harness.run_steps(2);
+    assert!(!rig.shows("Mark as a call"), "not a media note");
+    rig.harness.get_by_label("Move to…").click();
+    rig.harness.run_steps(3);
+    rig.harness
+        .get_by_role(egui::accesskit::Role::TextInput)
+        .type_text("apartment");
+    rig.harness.run_steps(2);
+    rig.harness.key_press(egui::Key::Enter);
+    rig.harness.run_steps(3);
+    let s = Store::open(&dir.db()).unwrap();
+    assert_eq!(s.episode(pricing).unwrap().unwrap().node_id, Some(lease));
+    assert!(rig.shows("Moved to Work › Apartment lease"));
+}
+
+#[test]
+fn a_sidebar_project_moves_under_another_category_by_name() {
+    let dir = TempDir::new("sidebar-reparent");
+    let (_commerce, _pricing, _launch) = seed_project_notes(&dir.db());
+    let lease = lease_id(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.harness.run_steps(2);
+    rig.harness
+        .get_by_label("Project: Apartment lease")
+        .click_secondary();
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Move to…").click();
+    rig.harness.run_steps(3);
+    rig.harness
+        .get_by_role(egui::accesskit::Role::TextInput)
+        .type_text("Personal");
+    rig.harness.run_steps(2);
+    rig.harness.key_press(egui::Key::Enter);
+    rig.harness.run_steps(3);
+    let s = Store::open(&dir.db()).unwrap();
+    let personal = s
+        .categories()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == "Personal")
+        .unwrap()
+        .id;
+    assert_eq!(s.node(lease).unwrap().unwrap().parent_id, Some(personal));
+    assert!(s.changes(5).unwrap().iter().any(|c| c.kind == "node_move"));
+}
+
+/// Give each seeded note a segment of its own (so a re-interpretation has a transcript).
+fn add_note_segments(db: &Path, notes: &[(i64, &str)]) {
+    let s = Store::open(db).unwrap();
+    for (ep, text) in notes {
+        let e = s.episode(*ep).unwrap().unwrap();
+        let sid = s.begin_session(e.started_at, "seed").unwrap();
+        let seg = s
+            .insert_segment(sid, e.started_at, e.started_at + 5_000, text, None)
+            .unwrap();
+        s.mark_segments_interpreted(&[seg.id], *ep, e.started_at)
+            .unwrap();
+    }
+}
+
+fn drag(rig: &mut Rig, from: egui::Pos2, to: egui::Pos2) {
+    let h = &rig.harness;
+    h.event(egui::Event::PointerMoved(from));
+    h.event(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    rig.harness.step();
+    for i in 1..=6 {
+        let p = from + (to - from) * (i as f32 / 6.0);
+        rig.harness.event(egui::Event::PointerMoved(p));
+        rig.harness.step();
+    }
+    rig.harness.event(egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    // the pop-up's first frame is egui's sizing pass: let it settle before it is queried
+    rig.harness.run_steps(3);
+}
+
+#[test]
+fn dropping_a_note_on_another_asks_then_merges_and_reinterprets_the_target() {
+    let dir = TempDir::new("drag-merge");
+    let (commerce, pricing, launch) = seed_project_notes(&dir.db());
+    add_note_segments(
+        &dir.db(),
+        &[
+            (pricing, "the price table needs a VAT column"),
+            (launch, "we book the launch room for Thursday"),
+        ],
+    );
+    let brain = Brain {
+        config: BrainConfig {
+            cli: fake_cli_logging(&dir.0),
+            ..BrainConfig::default()
+        },
+        store_path: dir.db(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    let mut rig = build(&dir.db(), None, Some(brain));
+    rig.app().selftest_view_node(commerce);
+    rig.until("the brain to report in", |app| {
+        interpret_enabled(app) == Some(true)
+    });
+    rig.harness.run_steps(3);
+    let from = rig
+        .harness
+        .get_by_label("Note: Launch review")
+        .rect()
+        .center();
+    let to = rig
+        .harness
+        .get_by_label("Note: Pricing sync")
+        .rect()
+        .center();
+    drag(&mut rig, from, to);
+    assert!(
+        rig.shows("Merge “Launch review” into “Pricing sync”?"),
+        "asks before merging"
+    );
+    let s = Store::open(&dir.db()).unwrap();
+    assert!(s.episode(launch).unwrap().is_some(), "nothing merged yet");
+    // No: nothing happens
+    rig.harness.get_by_label("No").click();
+    rig.harness.run_steps(2);
+    assert!(!rig.shows("Undo not available"));
+    assert!(s.episode(launch).unwrap().is_some());
+    // again, Yes
+    drag(&mut rig, from, to);
+    rig.harness.get_by_label("Yes").click();
+    rig.harness.run_steps(2);
+    assert!(
+        s.episode(launch).unwrap().is_none(),
+        "the dragged note is gone"
+    );
+    // (the segments' re-pointing is checked in `merge::tests`: the brain may already be
+    // re-interpreting here)
+    assert!(
+        s.changes(5)
+            .unwrap()
+            .iter()
+            .any(|c| c.kind == "episode_merge")
+    );
+    assert!(rig.shows("Merged into Pricing sync — undo not available"));
+    // the target is re-interpreted with both transcripts
+    let prompts = dir.0.join("prompts");
+    rig.until("the re-interpretation", |_| {
+        std::fs::read_to_string(&prompts)
+            .is_ok_and(|p| p.contains("VAT column") && p.contains("launch room"))
+    });
+    // in place: the same note, revised, not split apart again by the 30 min between the parts
+    rig.until("the rewrite to land", |_| {
+        s.episode(pricing)
+            .unwrap()
+            .is_some_and(|e| e.title == "Release planning")
+    });
+    assert_eq!(s.segments_of_episode(pricing).unwrap().len(), 2);
+}
+
+#[test]
+fn merging_into_a_hand_edited_note_asks_to_replace_the_edits() {
+    let dir = TempDir::new("merge-edited");
+    let (commerce, pricing, launch) = seed_project_notes(&dir.db());
+    let s = Store::open(&dir.db()).unwrap();
+    let mut content = oats_core::EpisodeContent {
+        title: "Pricing sync (mine)".into(),
+        ..Default::default()
+    };
+    content.summary = "- my own words".into();
+    s.update_episode_content(pricing, &content, now_ms())
+        .unwrap();
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(3);
+    let from = rig
+        .harness
+        .get_by_label("Note: Launch review")
+        .rect()
+        .center();
+    let to = rig
+        .harness
+        .get_by_label("Note: Pricing sync (mine)")
+        .rect()
+        .center();
+    drag(&mut rig, from, to);
+    rig.harness.get_by_label("Yes").click();
+    rig.harness.run_steps(2);
+    assert!(rig.shows("Replace your edits?"));
+    assert!(s.episode(launch).unwrap().is_some(), "still nothing merged");
+    rig.harness.get_by_label("Keep my text").click();
+    rig.harness.run_steps(2);
+    assert!(s.episode(launch).unwrap().is_none());
+    let e = s.episode(pricing).unwrap().unwrap();
+    assert_eq!(e.title, "Pricing sync (mine)", "kept");
+    assert!(rig.app().warning().is_none(), "no re-interpret was sent");
+}

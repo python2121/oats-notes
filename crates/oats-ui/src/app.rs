@@ -998,6 +998,7 @@ impl OatsApp {
             BrainCommand::ReorganiseNow => ("reorganise", None),
             BrainCommand::Reinterpret(id) => ("reinterpret", Some(*id)),
             BrainCommand::Summarise(id) => ("summarise", Some(*id)),
+            BrainCommand::Rewrite(id) => ("rewrite", Some(*id)),
             BrainCommand::ResolveMove { target, .. } => {
                 let (kind, id) = target.kind_and_id();
                 (kind, Some(id))
@@ -1308,24 +1309,33 @@ impl OatsApp {
     /// The last [`SIDEBAR_EPISODES`] notes (low-signal ones left out) of every project.
     fn reload_sidebar_episodes(&mut self) {
         let mut map = HashMap::new();
-        for n in self
+        let projects: Vec<i64> = self
             .nodes
             .iter()
             .filter(|n| n.kind == oats_core::NodeKind::Project && !n.archived)
-        {
-            match self.store.episodes_under(n.id, 40) {
+            .map(|n| n.id)
+            .collect();
+        for project in projects {
+            match self.store.episodes_under(project, 40) {
                 Ok(eps) => {
-                    let list: Vec<SidebarEpisode> = eps
+                    let eps: Vec<Episode> = eps
                         .into_iter()
                         .filter(|e| !e.low_signal)
                         .take(SIDEBAR_EPISODES)
+                        .collect();
+                    let convertible = self.media_convertible_of(&eps);
+                    let list: Vec<SidebarEpisode> = eps
+                        .into_iter()
                         .map(|e| SidebarEpisode {
                             id: e.id,
+                            is_media: e.is_media(),
+                            convertible: convertible.contains(&e.id),
+                            node_id: e.node_id,
                             title: e.title,
                             started_at: e.started_at,
                         })
                         .collect();
-                    map.insert(n.id, list);
+                    map.insert(project, list);
                 }
                 Err(e) => {
                     self.store_error(e);
@@ -1547,12 +1557,22 @@ impl OatsApp {
     /// The listed conversation notes heard (partly) from an app classed Media: "Mark as
     /// media" is offered on them.
     fn media_convertible(&mut self) -> std::collections::HashSet<i64> {
-        let ids: Vec<i64> = self
-            .episodes
+        let episodes = std::mem::take(&mut self.episodes);
+        let found = self.media_convertible_of(&episodes);
+        self.episodes = episodes;
+        found
+    }
+
+    /// Which of `episodes` are conversations heard (partly) from an app classed Media.
+    fn media_convertible_of(&mut self, episodes: &[Episode]) -> std::collections::HashSet<i64> {
+        let ids: Vec<i64> = episodes
             .iter()
             .filter(|e| !e.is_media())
             .map(|e| e.id)
             .collect();
+        if ids.is_empty() {
+            return Default::default();
+        }
         let found = self.store.episode_media_apps(&ids).and_then(|apps| {
             let o = oats_media::ProducerOverrides::new(self.store.producer_overrides()?);
             Ok(apps
@@ -1784,11 +1804,8 @@ impl OatsApp {
         match home {
             Some(n) if n != d.from => {
                 self.notes_state.move_draft = None;
-                if let (MoveTarget::Episode(ep), Some(node)) = (d.target, n)
-                    && self.focus_episode == Some(ep)
-                {
-                    self.set_view(View::Node(node));
-                    self.focus_episode = Some(ep);
+                if let (MoveTarget::Episode(ep), Some(node)) = (d.target, n) {
+                    self.follow_moved_episode(ep, node);
                 }
                 true
             }
@@ -2042,6 +2059,17 @@ impl OatsApp {
                     Ok(()) => changed = true,
                     Err(e) => self.store_error(e),
                 },
+                SidebarAction::Reparent(id, text) => {
+                    if self.reparent_node(id, &text) {
+                        changed = true;
+                    }
+                }
+                SidebarAction::MoveEpisode { episode, text } => {
+                    self.submit_move(MoveTarget::Episode(episode), text)
+                }
+                SidebarAction::MarkAsCall(id) => self.mark_episode_as_call(id),
+                SidebarAction::MarkAsMedia(id) => self.mark_episode_as_media(id),
+                SidebarAction::MergeDrop { dragged, into, at } => self.ask_merge(dragged, into, at),
                 SidebarAction::Delete(id) => match self.store.delete_node(id) {
                     Ok(()) => {
                         if self.prefs.view == View::Node(id) {
@@ -2145,6 +2173,143 @@ impl OatsApp {
                     }
                 }
                 NotesAction::OpenTopic(topic) => self.open_topic(topic),
+                NotesAction::MergeDrop { dragged, into, at } => self.ask_merge(dragged, into, at),
+            }
+        }
+    }
+
+    /// A note dropped onto another: open the confirmation (nothing is merged before Yes).
+    fn ask_merge(&mut self, dragged: i64, into: i64, at: egui::Pos2) {
+        let (from, to) = match (self.store.episode(dragged), self.store.episode(into)) {
+            (Ok(Some(f)), Ok(Some(t))) => (f, t),
+            (Err(e), _) | (_, Err(e)) => return self.store_error(e),
+            _ => return,
+        };
+        if from.is_media() != to.is_media() {
+            self.warning = Some("Media and conversations aren't merged".to_owned());
+            return;
+        }
+        self.notes_state.confirm_merge = Some(crate::merge::MergeConfirm {
+            dragged,
+            into,
+            edited: from.user_edited_at.is_some() || to.user_edited_at.is_some(),
+            dragged_title: from.title,
+            into_title: to.title,
+            asking_edits: false,
+            at,
+        });
+    }
+
+    /// A confirmed merge: the dragged note folded into the target (recorded, not undoable),
+    /// then the target re-interpreted in place (`BrainCommand::Rewrite`) so its text covers
+    /// both (unless the user kept their edited text).
+    pub fn merge_notes(&mut self, ctx: &egui::Context, merge: crate::merge::MergeAction) {
+        let now = chrono::Local::now().timestamp_millis();
+        match crate::merge::apply_merge(&self.store, &merge, now) {
+            Ok(title) => {
+                if self.focus_episode == Some(merge.dragged) {
+                    self.focus_episode = Some(merge.into);
+                }
+                if self
+                    .notes_state
+                    .editing
+                    .as_ref()
+                    .is_some_and(|d| d.episode_id == merge.dragged)
+                {
+                    self.notes_state.editing = None;
+                }
+                // re-interpreted in place: a plain Re-interpret would re-cut the transcript by
+                // its gaps and split the merged note apart again
+                if merge.reinterpret {
+                    self.brain_send(BrainCommand::Rewrite(merge.into));
+                }
+                let text = format!("Merged into {title} — undo not available");
+                self.last_command = Some(text.clone());
+                self.brain_toast(ctx, text, false);
+                self.reload();
+            }
+            Err(e) => self.warning = Some(e),
+        }
+    }
+
+    /// "Move to…" on a project / topic: the typed name resolved in the tree (no model call);
+    /// a project goes under a category or project, a topic under a project or topic, never
+    /// into its own subtree or under Media. `true` when it moved.
+    fn reparent_node(&mut self, id: i64, text: &str) -> bool {
+        use oats_core::NodeKind;
+        let Some(node) = self.nodes.iter().find(|n| n.id == id).cloned() else {
+            return false;
+        };
+        let candidates: Vec<oats_core::Node> = self
+            .nodes
+            .iter()
+            // a project goes under a category or a project, a topic anywhere below one
+            .filter(|n| n.id != id && (node.kind == NodeKind::Topic || n.kind != NodeKind::Topic))
+            .cloned()
+            .collect();
+        let parent = match oats_brain::resolve_local(&candidates, text) {
+            oats_brain::LocalMove::One(p) => p,
+            oats_brain::LocalMove::Many(_) => {
+                self.warning = Some(format!(
+                    "“{text}” matches several places; type more of the name or a path"
+                ));
+                return false;
+            }
+            oats_brain::LocalMove::None => {
+                self.warning = Some(format!("No category or project named “{text}”"));
+                return false;
+            }
+        };
+        let media = self.nodes.iter().any(|n| {
+            n.id == parent && n.parent_id.is_none() && n.name == oats_core::store::MEDIA_CATEGORY
+        });
+        let below = self.store.subtree_ids(id).unwrap_or_default();
+        if below.contains(&parent) || media {
+            self.warning = Some("It can't go there".to_owned());
+            return false;
+        }
+        if node.parent_id == Some(parent) {
+            return false;
+        }
+        match self.store.move_node(id, Some(parent)) {
+            Ok(()) => {
+                let path = oats_brain::moveto::node_path(&self.nodes, parent);
+                let now = chrono::Local::now().timestamp_millis();
+                if let Err(e) = self.store.record_change(
+                    None,
+                    "node_move",
+                    &format!("Moved '{}' under {path} (by you)", node.name),
+                    &serde_json::json!({"node_id": id, "parent_id": node.parent_id}),
+                    &serde_json::json!({"node_id": id, "parent_id": parent}),
+                    now,
+                ) {
+                    log::warn!("recording the move: {e}");
+                }
+                self.pending_confirms
+                    .push(format!("Moved {} under {path}", node.name));
+                true
+            }
+            Err(e) => {
+                self.store_error(e);
+                false
+            }
+        }
+    }
+
+    /// The note `ep` moved to `node`: a single-note view (or an open edit of it) follows it
+    /// there, keeping the unsaved draft.
+    fn follow_moved_episode(&mut self, ep: i64, node: i64) {
+        let editing = self
+            .notes_state
+            .editing
+            .as_ref()
+            .is_some_and(|d| d.episode_id == ep);
+        if self.focus_episode == Some(ep) || editing {
+            let draft = self.notes_state.editing.take();
+            self.set_view(View::Node(node));
+            self.focus_episode = Some(ep);
+            if editing {
+                self.notes_state.editing = draft;
             }
         }
     }
@@ -2197,11 +2362,8 @@ impl OatsApp {
                 });
                 self.last_command = Some(format!("Moved to {path}"));
                 self.notes_state.move_draft = None;
-                if let MoveTarget::Episode(ep) = target
-                    && self.focus_episode == Some(ep)
-                {
-                    self.set_view(View::Node(node));
-                    self.focus_episode = Some(ep);
+                if let MoveTarget::Episode(ep) = target {
+                    self.follow_moved_episode(ep, node);
                 }
                 self.reload();
                 if matches!(target, MoveTarget::Segment(_)) {
@@ -2959,6 +3121,8 @@ impl eframe::App for OatsApp {
             && self.topic.is_none()
             && self.prefs_window.is_none()
             && self.notes_state.editing.is_none()
+            && self.notes_state.move_draft.is_none()
+            && self.notes_state.confirm_merge.is_none()
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
         {
             // back from a single note to its project's page
@@ -3001,6 +3165,7 @@ impl eframe::App for OatsApp {
                         &self.nodes,
                         &self.sidebar_episodes,
                         self.focus_episode,
+                        &mut self.notes_state.move_draft,
                     );
                 });
             let w = resp.response.rect.width();
@@ -3247,6 +3412,12 @@ impl eframe::App for OatsApp {
         // the pop-ups: over every view, in the content area's upper right
         let toast_actions = toasts(&ctx, list_top, &self.due_now, &mut self.toasts);
         self.preferences_window(&ctx, &t);
+        // a note dropped on another: the Yes / No before the (irreversible) merge
+        if let Some(merge) =
+            crate::merge::confirm_popup(&ctx, &t, &mut self.notes_state.confirm_merge)
+        {
+            self.merge_notes(&ctx, merge);
+        }
         self.apply_sidebar(sidebar_actions, &mut cmds);
         self.apply_transcript(&ctx, transcript_actions);
         self.apply_notes(notes_actions);
