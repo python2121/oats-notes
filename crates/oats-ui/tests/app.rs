@@ -940,6 +940,55 @@ fn the_todos_view_lists_open_then_completed_and_adds_by_hand() {
     assert!(rig.app().todos()[0].id != first);
 }
 
+/// ⌘Z undoes the user's own quick edit (a todo ticked off), ⇧⌘Z redoes it; with nothing
+/// left, ⌘Z changes nothing. A focused text field keeps ⌘Z for itself.
+#[test]
+fn cmd_z_undoes_and_shift_cmd_z_redoes_a_completed_todo() {
+    use egui::accesskit::Role;
+    let dir = TempDir::new("undo-todo");
+    let id = add_todo(&dir.db(), "Water the plants", None);
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    let done = |_: &mut Rig| {
+        Store::open(&dir.db())
+            .unwrap()
+            .todo(id)
+            .unwrap()
+            .unwrap()
+            .done()
+    };
+    rig.harness
+        .get_all_by_role(Role::CheckBox)
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(2);
+    assert!(done(&mut rig));
+    rig.harness
+        .key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    rig.harness.run_steps(2);
+    assert!(!done(&mut rig), "undone");
+    assert!(rig.shows("Undo: Complete todo"));
+    rig.harness.key_press_modifiers(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::Z,
+    );
+    rig.harness.run_steps(2);
+    assert!(done(&mut rig), "redone");
+    // in the add-todo field ⌘Z is the field's own: the todo stays done
+    rig.harness
+        .get_all_by_role(Role::TextInput)
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(1);
+    rig.harness
+        .key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    rig.harness.run_steps(2);
+    assert!(done(&mut rig), "a focused text field keeps ⌘Z");
+}
+
 #[test]
 fn a_dated_todo_lands_on_the_calendar_and_set_due_dates_an_undated_one() {
     use chrono::{Duration, Local, Timelike};
@@ -1515,7 +1564,7 @@ fn editing_a_note_saves_to_the_store_and_cancel_discards() {
     rig.harness.get_by_label("Note: Pricing sync").click();
     rig.harness.run_steps(2);
     // cancel first: nothing is written
-    rig.harness.get_all_by_label("Edit").next().unwrap().click();
+    rig.harness.get_all_by_label("Edit").last().unwrap().click(); // the card's, not the Edit menu
     rig.harness.run_steps(2);
     let inputs: Vec<_> = rig
         .harness
@@ -1541,7 +1590,7 @@ fn editing_a_note_saves_to_the_store_and_cancel_discards() {
             .is_none()
     );
     // now edit and save
-    rig.harness.get_all_by_label("Edit").next().unwrap().click();
+    rig.harness.get_all_by_label("Edit").last().unwrap().click(); // the card's, not the Edit menu
     rig.harness.run_steps(2);
     let summary = rig
         .harness
@@ -2266,7 +2315,7 @@ fn moving_a_note_while_editing_keeps_the_draft_and_save_writes_it() {
     rig.harness.run_steps(2);
     rig.harness.get_by_label("Note: Pricing sync").click();
     rig.harness.run_steps(2);
-    rig.harness.get_all_by_label("Edit").next().unwrap().click();
+    rig.harness.get_all_by_label("Edit").last().unwrap().click(); // the card's, not the Edit menu
     rig.harness.run_steps(2);
     let title = rig
         .harness

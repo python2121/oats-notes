@@ -49,7 +49,7 @@ path as the header, its child projects (topics, under a project) as clickable ro
 count and last activity, the notes (episode cards, `Store::episodes_under`, newest first) of
 the subtree, and "Show transcript (N segments)" — the raw segments filed under the subtree,
 collapsed by default (`NotesState::show_transcript`, reset on every view change). Transcripts
-(`View::Transcripts`, ⌘1; there is no Today view — old prefs saying `Today` / `All` load as it) stays a transcript view, paged by day (below); Conversations (`View::Notes`, name kept for the saved pref; ⌘3) shows only UNFILED episodes (`Store::episodes_unfiled`: no node or a top-level category, i.e. not under a project or topic; low-signal included); filed ones live on the project pages. The app menu formerly titled "Notes" is now "Brain". The sidebar shows a muted
+(`View::Transcripts`, ⌘1; there is no Today view — old prefs saying `Today` / `All` load as it) stays a transcript view, paged by day (below); Conversations (`View::Notes`, name kept for the saved pref; ⌘3) shows only UNFILED episodes (`Store::episodes_unfiled`: no node or a top-level category, i.e. not under a project or topic; low-signal included); filed ones live on the project pages. The app menus are File, Edit, Listen, View, Brain (the one formerly titled "Notes" is now "Brain"). The sidebar shows a muted
 "No projects yet" row under a category without projects. `--selftest out.png --work` renders
 the Work view offscreen.
 
@@ -330,6 +330,22 @@ retried until the next launch. While off nothing is read, fetched or started
 (`thumbs::Thumbs::get(.., enabled = false)`), and the slot is a flat `t.field` rectangle with a
 ▶ (also for non-YouTube plays). Deleting plays deletes a cached file only when no remaining
 play shows that video. Fetches log at debug with the video id only.
+
+**Undo / redo** (`oats-ui/src/undo.rs`; Edit ▸ Undo / Redo, ⌘Z / ⇧⌘Z): an in-memory,
+in-session history of the user's own quick edits, at most 50 steps, nothing persisted and
+nothing written to `changes` (the brain's log keeps its own Undo). Covered: an action item
+ticked / unticked (the first `done_at` comes back), a todo's done / snooze / due / text (its
+`TodoState` before and after, `Store::restore_todo_state`; the pop-ups' Done / Snooze too), a
+hand edit of a note (content + `user_edited_at`, `Store::restore_episode_content`), and a note
+moved by "Move to…" when the tree resolved the name (`Store::restore_episode_node`, no change
+row). Not recorded (and not clearing it): deletes, merges, brain moves and runs, node
+re-parenting, preferences. A new edit clears the redo list; undo / redo apply straight to the
+store, reload, and pop a 4 s toast ("Undo: Mark complete", "Nothing to undo", "Couldn't undo:
+… (it no longer exists)" — that step is dropped). The menu items read "Undo Mark complete" and
+grey out when empty, but carry NO accelerator (`UNDO_SHORTCUT` / `REDO_SHORTCUT` are not in
+`SHORTCUTS`): AppKit would hand ⌘Z to the menu before a focused text field, whose own undo must
+keep working. Instead `OatsApp::undo_keys` reads ⇧⌘Z then ⌘Z from egui's input every frame,
+native menu or not, only while `!egui_wants_keyboard_input()` (the ⌘S-in-edit-mode pattern).
 
 Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui::Window` anchored
 centre with one field, "Your name", saved on Enter / blur / close via `Store::set_user_name`
@@ -772,6 +788,8 @@ VENDORED.md's list of our modifications current. Attribution: `THIRD_PARTY.md`.
 - The UI shell's look is ported from the SwiftInvert Rust app (same egui/eframe 0.36 stack,
   `craft-ui` theme helpers, SF Pro read from the system with `opsz`/`GRAD` tweaks, `muda` native
   menu generated from the same `menu_model()` as the in-window fallback). Keep that parity.
+  Menu key equivalents live in `SHORTCUTS` (muda accelerators, ⌘-chords only); a chord a focused
+  text field must keep (⌘Z / ⇧⌘Z) is never one — read it from egui input instead.
 - Brain actions give feedback: Interpret / Review / Reorganise (strip, Brain menu, ⌘I) and the cards' Summarise / Re-interpret go pending the moment they are triggered (`BrainStatus::queue`, confirmed by `BrainEvent::Queued`, ended by `Settled`, which the scheduler sends even when no run came out of it), grey out with a spinner and "Interpreting…" etc., ignore further clicks, and re-enable after 5 min with "Timed out waiting for the brain"; unavailable shows the backlog reason as the tooltip. The spinner repaints only while something is pending. `BrainEvent::Progress` (phase boundaries only: interpret "chunk i/n", review / reorganise gathering → asking claude → applying) feeds the strip line and the button label ("Interpreting 2/3…"); a finished user-triggered run pops one 4 s toast (`notes::run_toast`: "Interpreted: …", "Nothing new to interpret", or "<Kind> failed: …" in the danger colour).
 - Clock times: every displayed time of day goes through `oats-ui::timefmt` (12-hour "2:05 pm" by default, `AppPrefs::clock_24h` / Preferences "Use 24-hour time" → "14:05"; ranges drop a shared am/pm; monospace columns use `clock_col`). Never write `%H:%M` in UI code (the due editor's input text is the one exception).
 - Diagnostics: the binary logs to stderr AND appends to `<data dir>/oats.log` (0600; at start only the last 2 MB are kept; level via `RUST_LOG`, default info; not for `--help` / `--selftest`; named in `--help`). A failed transcription is retried once after 200 ms (`pipeline::TRANSCRIBE_RETRY_DELAY`); only a second failure warns (`EchoStats::transcribe_failed` / `transcribe_retried_ok`, logged at session end; the warn log has lane, length and error, never text). The vendored bridge carries the Swift error text (`fluidaudio_last_error`, VENDORED.md modification 3). Status-strip warnings clear themselves after `WARNING_TTL` (60 s, one scheduled repaint; `OatsApp::expire_warning`), and a stored segment clears a "transcription failed…" warning; the claude-unavailable / backlog and "system audio: no signal" lines are separate and exempt.

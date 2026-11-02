@@ -46,5 +46,5 @@ pub use segmenter::{Segment, Segmenter, SegmenterConfig};
 pub use store::{
     ActionItem, BrainRun, Change, Decision, Episode, EpisodeContent, Event, NewEvent, NewTodo,
     Node, NodeKind, Note, NoteItem, Origin, RunOutcome, SearchResults, Session, Store, StoreError,
-    Todo, TodoFilter, TranscriptRow, View,
+    Todo, TodoFilter, TodoState, TranscriptRow, View,
 };

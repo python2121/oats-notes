@@ -258,6 +258,11 @@ pub enum Command {
     ReviewNow,
     /// Run the (expensive) reorganisation of the node tree, now.
     Reorganise,
+    /// Undo the last of the user's own quick edits ([`crate::undo`]; ⌘Z, read from egui input,
+    /// not a menu accelerator).
+    Undo,
+    /// Redo the last undone edit (⇧⌘Z, likewise).
+    Redo,
 }
 
 const fn sc(m: Modifiers, k: Key) -> KeyboardShortcut {
@@ -289,6 +294,23 @@ pub const SHORTCUTS: &[(KeyboardShortcut, Command)] = &[
     (sc(Modifiers::COMMAND, Key::Comma), Command::Preferences),
 ];
 
+/// ⌘Z / ⇧⌘Z. Deliberately NOT in [`SHORTCUTS`]: a menu key equivalent (a muda accelerator)
+/// would take ⌘Z from every text field, whose own undo must keep working. They are read from
+/// egui's input each frame while no text field has focus ([`OatsApp::undo_keys`]), with or
+/// without the native menu; the Edit menu items carry no accelerator.
+pub const UNDO_SHORTCUT: KeyboardShortcut = sc(Modifiers::COMMAND, Key::Z);
+pub const REDO_SHORTCUT: KeyboardShortcut = sc(CMD_SHIFT, Key::Z);
+
+/// The shortcut shown next to a command in the in-window menu and in tooltips: the menu key
+/// equivalent, or ⌘Z / ⇧⌘Z for Undo / Redo.
+pub fn shown_shortcut(cmd: Command) -> Option<KeyboardShortcut> {
+    match cmd {
+        Command::Undo => Some(UNDO_SHORTCUT),
+        Command::Redo => Some(REDO_SHORTCUT),
+        _ => menu_shortcut(cmd),
+    }
+}
+
 /// The menu key equivalent of a command.
 pub fn menu_shortcut(cmd: Command) -> Option<KeyboardShortcut> {
     SHORTCUTS.iter().find(|(_, c)| *c == cmd).map(|(s, _)| *s)
@@ -296,7 +318,7 @@ pub fn menu_shortcut(cmd: Command) -> Option<KeyboardShortcut> {
 
 /// `"{label} ({shortcut})"` for a tooltip, in the platform's own spelling.
 pub fn with_shortcut(ctx: &egui::Context, label: &str, cmd: Command) -> String {
-    match menu_shortcut(cmd) {
+    match shown_shortcut(cmd) {
         Some(s) => format!("{label} ({})", ctx.format_shortcut(&s)),
         None => label.to_owned(),
     }
@@ -343,6 +365,9 @@ pub struct MenuState {
     pub brain_ready: bool,
     /// Interpret / Review / Reorganise queued or running (their menu items grey out).
     pub brain_busy: [bool; 3],
+    /// The label of the step Undo / Redo would take (`None`: nothing, the item greys out).
+    pub undo_label: Option<String>,
+    pub redo_label: Option<String>,
 }
 
 /// The menu bar as data, from `s` (pure; [`OatsApp::menu_model`] feeds it the app's state).
@@ -368,6 +393,25 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                 item("New Category…", Command::NewCategory, true),
                 Separator,
                 item("Preferences…", Command::Preferences, true),
+            ],
+        },
+        MenuSection {
+            title: "Edit",
+            entries: vec![
+                item(
+                    &s.undo_label
+                        .as_ref()
+                        .map_or("Undo".to_owned(), |l| format!("Undo {l}")),
+                    Command::Undo,
+                    s.undo_label.is_some(),
+                ),
+                item(
+                    &s.redo_label
+                        .as_ref()
+                        .map_or("Redo".to_owned(), |l| format!("Redo {l}")),
+                    Command::Redo,
+                    s.redo_label.is_some(),
+                ),
             ],
         },
         MenuSection {
@@ -580,6 +624,10 @@ pub struct OatsApp {
     /// Confirmation pop-ups raised where no `Context` is at hand (a local "Move to…"); shown
     /// at the next brain-event pass.
     pending_confirms: Vec<String>,
+    /// Plain 4 s pop-ups (`text`, `error`) raised where no `Context` is at hand (undo / redo).
+    pending_toasts: Vec<(String, bool)>,
+    /// The in-session undo / redo of the user's own quick edits ([`crate::undo`]).
+    undo: crate::undo::UndoStack<crate::undo::Entry>,
     episodes: Vec<Episode>,
     /// A project page's items filed there from notes homed elsewhere
     /// ([`Store::items_filed_under`]); empty outside a Node view.
@@ -706,6 +754,8 @@ impl OatsApp {
             brain_status: BrainStatus::default(),
             last_command: None,
             pending_confirms: Vec::new(),
+            pending_toasts: Vec::new(),
+            undo: Default::default(),
             episodes: Vec::new(),
             filed_items: Vec::new(),
             events: Vec::new(),
@@ -1151,6 +1201,8 @@ impl OatsApp {
                 self.brain_status.busy("review", None),
                 self.brain_status.busy("reorganise", None),
             ],
+            undo_label: self.undo.peek_undo().map(|e| e.label.clone()),
+            redo_label: self.undo.peek_redo().map(|e| e.label.clone()),
         })
     }
 
@@ -1250,6 +1302,8 @@ impl OatsApp {
             Command::ShowCalendar => self.set_view(View::Calendar),
             Command::ShowTodos => self.set_view(View::Todos),
             Command::ShowMediaView => self.set_view(View::Media),
+            Command::Undo => self.undo_step(true),
+            Command::Redo => self.undo_step(false),
             Command::InterpretNow | Command::ReviewNow | Command::Reorganise => {
                 // unavailable: the buttons and menu items are greyed out; the shortcut does nothing
                 if self.brain.is_some() && !self.brain_status.available() {
@@ -2033,6 +2087,7 @@ impl OatsApp {
         if !local.is_empty() {
             self.confirm(ctx, local);
         }
+        self.flush_toasts(ctx);
         let events: Vec<BrainEvent> = match &self.brain {
             Some(b) => b.poll(),
             None => Vec::new(),
@@ -2157,6 +2212,65 @@ impl OatsApp {
                 self.brain_toast(ctx, "Couldn't move it; try another name".to_owned(), true);
                 false
             }
+        }
+    }
+
+    /// Show the pop-ups queued in [`Self::pending_toasts`].
+    fn flush_toasts(&mut self, ctx: &egui::Context) {
+        for (text, error) in std::mem::take(&mut self.pending_toasts) {
+            self.brain_toast(ctx, text, error);
+        }
+    }
+
+    /// A step of the user's own history: recorded unless it is empty.
+    fn record(&mut self, label: &str, edit: crate::undo::Edit) {
+        self.undo.push(crate::undo::Entry::new(label, edit));
+    }
+
+    /// Undo (or redo) one step straight against the store (nothing new is recorded), reload
+    /// what it touched and say so in a pop-up. A step whose target is gone is dropped.
+    fn undo_step(&mut self, undo: bool) {
+        let (verb, taken) = if undo {
+            ("Undo", self.undo.take_undo())
+        } else {
+            ("Redo", self.undo.take_redo())
+        };
+        let Some(entry) = taken else {
+            let what = if undo { "undo" } else { "redo" };
+            self.pending_toasts
+                .push((format!("Nothing to {what}"), false));
+            return;
+        };
+        match entry.apply(&self.store, undo) {
+            Ok(true) => {
+                self.pending_toasts
+                    .push((format!("{verb}: {}", entry.label), false));
+                if let Some((ep, Some(node))) = entry.moved_to(undo) {
+                    self.follow_moved_episode(ep, node);
+                }
+                let todo = matches!(entry.edit, crate::undo::Edit::Todo { .. });
+                if undo {
+                    self.undo.undone(entry);
+                } else {
+                    self.undo.redone(entry);
+                }
+                if todo {
+                    self.reload_brain_data();
+                } else {
+                    self.reload();
+                }
+            }
+            Ok(false) => self.pending_toasts.push((
+                format!(
+                    "Couldn't {}: {} (it no longer exists)",
+                    verb.to_lowercase(),
+                    entry.label
+                ),
+                true,
+            )),
+            Err(e) => self
+                .pending_toasts
+                .push((format!("Couldn't {}: {e}", verb.to_lowercase()), true)),
         }
     }
 
@@ -2333,6 +2447,24 @@ impl OatsApp {
         cmds
     }
 
+    /// ⌘Z / ⇧⌘Z from egui's input, with or without the native menu (they are not menu key
+    /// equivalents, see [`UNDO_SHORTCUT`]), and only while no text field has focus: a focused
+    /// field keeps its own undo. ⇧⌘Z is checked first so it never reads as ⌘Z.
+    fn undo_keys(&mut self, ctx: &egui::Context) -> Option<Command> {
+        if ctx.egui_wants_keyboard_input() {
+            return None;
+        }
+        ctx.input_mut(|i| {
+            if i.consume_shortcut(&REDO_SHORTCUT) {
+                Some(Command::Redo)
+            } else if i.consume_shortcut(&UNDO_SHORTCUT) {
+                Some(Command::Undo)
+            } else {
+                None
+            }
+        })
+    }
+
     /// The in-window egui menu bar, drawn from [`Self::menu_model`].
     fn menu_bar(&mut self, ui: &mut egui::Ui) -> Vec<Command> {
         let mut cmds = Vec::new();
@@ -2359,7 +2491,7 @@ impl OatsApp {
                                     _ => label.clone(),
                                 };
                                 let mut b = egui::Button::new(text);
-                                if let Some(s) = menu_shortcut(*cmd) {
+                                if let Some(s) = shown_shortcut(*cmd) {
                                     b = b.shortcut_text(ui.ctx().format_shortcut(&s));
                                 }
                                 if ui.add_enabled(*enabled, b).clicked() {
@@ -2513,11 +2645,35 @@ impl OatsApp {
                     done,
                 } => {
                     let now = chrono::Local::now().timestamp_millis();
+                    // unticking: its completion time, so an undo puts the same one back
+                    let stamp = if done {
+                        Some(now)
+                    } else {
+                        self.store.episode(episode_id).ok().flatten().and_then(|e| {
+                            e.action_items
+                                .iter()
+                                .find(|a| a.text.trim() == text.trim() && a.done_at.is_some())
+                                .and_then(|a| a.done_at)
+                        })
+                    };
                     match self
                         .store
                         .set_action_item_done(episode_id, &text, done, now)
                     {
-                        Ok(true) => self.reload(),
+                        Ok(true) => {
+                            if let Some(stamp) = stamp {
+                                self.record(
+                                    if done { "Mark complete" } else { "Mark open" },
+                                    crate::undo::Edit::ActionItemDone {
+                                        episode_id,
+                                        text,
+                                        done,
+                                        stamp,
+                                    },
+                                );
+                            }
+                            self.reload();
+                        }
                         Ok(false) => {}
                         Err(e) => self.store_error(e),
                     }
@@ -2527,8 +2683,23 @@ impl OatsApp {
                 }
                 NotesAction::SaveEdit(id, content) => {
                     let now = chrono::Local::now().timestamp_millis();
+                    let before = self.store.episode(id).ok().flatten();
                     match self.store.update_episode_content(id, &content, now) {
-                        Ok(()) => self.reload(),
+                        Ok(()) => {
+                            if let (Some(b), Ok(Some(a))) = (before, self.store.episode(id)) {
+                                self.record(
+                                    "Edit note",
+                                    crate::undo::Edit::NoteContent {
+                                        id,
+                                        before: Box::new(b.content()),
+                                        before_edited: b.user_edited_at,
+                                        after: Box::new(a.content()),
+                                        after_edited: a.user_edited_at,
+                                    },
+                                );
+                            }
+                            self.reload()
+                        }
                         Err(e) => self.store_error(e),
                     }
                 }
@@ -2708,6 +2879,10 @@ impl OatsApp {
     /// note), confirmed with a pop-up.
     fn move_local(&mut self, target: MoveTarget, node: i64) {
         let now = chrono::Local::now().timestamp_millis();
+        let from = match target {
+            MoveTarget::Episode(id) => self.store.episode(id).ok().flatten().map(|e| e.node_id),
+            MoveTarget::Segment(_) => None,
+        };
         let moved = match target {
             MoveTarget::Episode(id) => self.store.move_episode(id, node, now),
             MoveTarget::Segment(id) => self.store.set_segment_node(id, Some(node)).map(|_| true),
@@ -2723,6 +2898,16 @@ impl OatsApp {
                 self.last_command = Some(format!("Moved to {path}"));
                 self.notes_state.move_draft = None;
                 if let MoveTarget::Episode(ep) = target {
+                    if moved && let Some(from) = from {
+                        self.record(
+                            "Move note",
+                            crate::undo::Edit::MoveNote {
+                                id: ep,
+                                from,
+                                to: node,
+                            },
+                        );
+                    }
                     self.follow_moved_episode(ep, node);
                 }
                 self.reload();
@@ -2769,6 +2954,20 @@ impl OatsApp {
         let now = chrono::Local::now().timestamp_millis();
         let mut changed = false;
         for a in actions {
+            // a hand edit of one todo: its fields before, recorded for undo when they changed
+            let undoable = match &a {
+                TodoAction::SetDue(id, _) => Some((*id, "Change due")),
+                TodoAction::SetDone(id, true) => Some((*id, "Complete todo")),
+                TodoAction::SetDone(id, false) => Some((*id, "Reopen todo")),
+                TodoAction::Snooze { id, .. } => Some((*id, "Snooze todo")),
+                TodoAction::ClearSnooze(id) => Some((*id, "Clear snooze")),
+                TodoAction::SetText(id, _) => Some((*id, "Edit todo")),
+                _ => None,
+            };
+            let before = undoable.and_then(|(id, label)| {
+                let state = self.store.todo(id).ok().flatten()?.state();
+                Some((id, label, state))
+            });
             let r = match a {
                 TodoAction::Show(id) => {
                     let seg = self.todo_source(id);
@@ -2798,8 +2997,23 @@ impl OatsApp {
                 }),
             };
             changed = true;
-            if let Err(e) = r {
-                self.store_error(e);
+            match r {
+                Ok(()) => {
+                    if let Some((id, label, before)) = before
+                        && let Ok(Some(t)) = self.store.todo(id)
+                        && t.state() != before
+                    {
+                        self.record(
+                            label,
+                            crate::undo::Edit::Todo {
+                                id,
+                                before,
+                                after: t.state(),
+                            },
+                        );
+                    }
+                }
+                Err(e) => self.store_error(e),
             }
         }
         if changed {
@@ -3478,6 +3692,7 @@ impl eframe::App for OatsApp {
         let ctx = ui.ctx().clone();
         let t = Tokens::get(&ctx);
         let mut cmds = self.handle_keys(&ctx);
+        cmds.extend(self.undo_keys(&ctx));
         // Escape closes the search, also from the field (taken before the text edit sees it)
         if self.search.is_some()
             && self.prefs_window.is_none()
@@ -3814,6 +4029,8 @@ impl eframe::App for OatsApp {
         for c in cmds {
             self.run(c);
         }
+        // an undo's pop-up now, not at the next brain-event pass
+        self.flush_toasts(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -3978,6 +4195,8 @@ mod tests {
             view: View::Transcripts,
             brain_ready: false,
             brain_busy: [false; 3],
+            undo_label: None,
+            redo_label: None,
         };
         assert_eq!(
             listen_item(&build_menu_model(&s)),
@@ -4001,7 +4220,7 @@ mod tests {
             Some(("Start Listening".to_owned(), false))
         );
         let titles: Vec<_> = build_menu_model(&s).iter().map(|m| m.title).collect();
-        assert_eq!(titles, ["File", "Listen", "View", "Brain"]);
+        assert_eq!(titles, ["File", "Edit", "Listen", "View", "Brain"]);
         // the lane toggles are checked items in the Listen menu, following the session
         let lane = |model: &[MenuSection], c: Command| {
             model
@@ -4054,6 +4273,61 @@ mod tests {
         assert_eq!(interpret(&build_menu_model(&s)), Some(false));
         s.brain_ready = true;
         assert_eq!(interpret(&build_menu_model(&s)), Some(true));
+    }
+
+    #[test]
+    fn edit_menu_has_undo_and_redo_without_accelerators() {
+        let item = |model: &[MenuSection], c: Command| {
+            model.iter().find(|s| s.title == "Edit").and_then(|s| {
+                s.entries.iter().find_map(|e| match e {
+                    MenuEntry::Item {
+                        cmd,
+                        label,
+                        enabled,
+                        ..
+                    } if *cmd == c => Some((label.clone(), *enabled)),
+                    _ => None,
+                })
+            })
+        };
+        let mut s = MenuState {
+            listening: false,
+            mic_on: false,
+            on_call: false,
+            system_on: false,
+            show_media: false,
+            status: PipelineStatus::Idle,
+            sidebar_visible: true,
+            view: View::Transcripts,
+            brain_ready: false,
+            brain_busy: [false; 3],
+            undo_label: None,
+            redo_label: None,
+        };
+        let m = build_menu_model(&s);
+        assert_eq!(item(&m, Command::Undo), Some(("Undo".to_owned(), false)));
+        assert_eq!(item(&m, Command::Redo), Some(("Redo".to_owned(), false)));
+        s.undo_label = Some("Mark complete".to_owned());
+        s.redo_label = Some("Snooze todo".to_owned());
+        let m = build_menu_model(&s);
+        assert_eq!(
+            item(&m, Command::Undo),
+            Some(("Undo Mark complete".to_owned(), true))
+        );
+        assert_eq!(
+            item(&m, Command::Redo),
+            Some(("Redo Snooze todo".to_owned(), true))
+        );
+        // not menu key equivalents: ⌘Z must stay with focused text fields
+        assert_eq!(menu_shortcut(Command::Undo), None);
+        assert_eq!(menu_shortcut(Command::Redo), None);
+        assert!(
+            SHORTCUTS
+                .iter()
+                .all(|(k, _)| *k != UNDO_SHORTCUT && *k != REDO_SHORTCUT)
+        );
+        assert_eq!(shown_shortcut(Command::Undo), Some(UNDO_SHORTCUT));
+        assert_eq!(shown_shortcut(Command::Redo), Some(REDO_SHORTCUT));
     }
 
     /// Records what it was told to show; hands out whatever the test queued.

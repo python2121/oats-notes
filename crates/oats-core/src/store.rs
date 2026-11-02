@@ -442,7 +442,26 @@ pub struct Todo {
     pub created_at: i64,
 }
 
+/// The fields of a todo the user edits by hand ([`Todo::state`],
+/// [`Store::restore_todo_state`]): what an undo puts back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TodoState {
+    pub text: String,
+    pub due: Option<i64>,
+    pub snoozed_until: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
 impl Todo {
+    pub fn state(&self) -> TodoState {
+        TodoState {
+            text: self.text.clone(),
+            due: self.due,
+            snoozed_until: self.snoozed_until,
+            completed_at: self.completed_at,
+        }
+    }
+
     pub fn done(&self) -> bool {
         self.completed_at.is_some()
     }
@@ -2086,8 +2105,31 @@ impl Store {
         content: &EpisodeContent,
         now: i64,
     ) -> Result<(), StoreError> {
+        self.write_episode_content(id, content, Some(now))
+            .map(|_| ())
+    }
+
+    /// Put back a note's text as it was (the UI's in-session undo / redo of a hand edit):
+    /// title, summary, decisions, action items (with their `done_at`) and topics, and
+    /// `user_edited_at` exactly as given (`None` = never edited). `false` when the episode
+    /// is gone.
+    pub fn restore_episode_content(
+        &self,
+        id: i64,
+        content: &EpisodeContent,
+        user_edited_at: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        self.write_episode_content(id, content, user_edited_at)
+    }
+
+    fn write_episode_content(
+        &self,
+        id: i64,
+        content: &EpisodeContent,
+        user_edited_at: Option<i64>,
+    ) -> Result<bool, StoreError> {
         self.with_savepoint(|s| {
-            s.conn.execute(
+            let n = s.conn.execute(
                 "UPDATE episodes SET title = ?2, summary = ?3, decisions_json = ?4,
                      action_items_json = ?5, topics_json = ?6, user_edited_at = ?7
                  WHERE id = ?1",
@@ -2098,11 +2140,23 @@ impl Store {
                     serde_json::to_string(&content.decisions)?,
                     serde_json::to_string(&content.action_items)?,
                     serde_json::to_string(&content.topics)?,
-                    now
+                    user_edited_at
                 ],
             )?;
-            Ok(())
+            Ok(n > 0)
         })
+    }
+
+    /// Put a note back under `node_id` (`None` = unfiled) without recording a change (the
+    /// UI's in-session undo / redo of its own move). `false` when the episode or the node
+    /// is gone.
+    pub fn restore_episode_node(&self, id: i64, node_id: Option<i64>) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "UPDATE episodes SET node_id = ?2
+             WHERE id = ?1 AND (?2 IS NULL OR EXISTS (SELECT 1 FROM nodes WHERE id = ?2))",
+            rusqlite::params![id, node_id],
+        )?;
+        Ok(n > 0)
     }
 
     /// Mark the action item(s) of episode `id` whose trimmed text is `text` complete
@@ -2772,6 +2826,24 @@ impl Store {
             rusqlite::params![id, text.trim()],
         )?;
         Ok(())
+    }
+
+    /// Put a todo's text, due time, snooze and completion back to `state` (the UI's
+    /// in-session undo / redo). `false` when the todo is gone.
+    pub fn restore_todo_state(&self, id: i64, state: &TodoState) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "UPDATE reminders SET text = ?2, due = ?3, snoozed_until = ?4, completed_at = ?5,
+                 done = ?5 IS NOT NULL
+             WHERE id = ?1",
+            rusqlite::params![
+                id,
+                state.text,
+                state.due,
+                state.snoozed_until,
+                state.completed_at
+            ],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn delete_todo(&self, id: i64) -> Result<(), StoreError> {
@@ -3894,6 +3966,107 @@ mod tests {
             .episode(e.id)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         assert_eq!(got.action_items[0].done_at, None);
+        Ok(())
+    }
+
+    /// The UI's undo puts a note's text back with its `user_edited_at` exactly (NULL when it
+    /// had never been edited), keeps the items' `done_at`, and reports a missing note.
+    #[test]
+    fn restore_episode_content_puts_back_text_and_user_edited_at() -> R {
+        let s = Store::open_in_memory()?;
+        let original = EpisodeContent {
+            title: "Sync".into(),
+            action_items: vec![ActionItem {
+                text: "ship it".into(),
+                done_at: Some(42),
+                ..Default::default()
+            }],
+            topics: vec!["t".into()],
+            ..Default::default()
+        };
+        let e = s.insert_episode(0, 10, &original, 1)?;
+        let before = s
+            .episode(e.id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        s.update_episode_content(
+            e.id,
+            &EpisodeContent {
+                title: "Mine".into(),
+                ..Default::default()
+            },
+            777,
+        )?;
+        assert!(s.restore_episode_content(e.id, &before.content(), before.user_edited_at)?);
+        let got = s
+            .episode(e.id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        assert_eq!(got.title, "Sync");
+        assert_eq!(got.user_edited_at, None);
+        assert_eq!(got.action_items[0].done_at, Some(42));
+        assert_eq!(got.topics, ["t"]);
+        assert!(s.restore_episode_content(e.id, &got.content(), Some(777))?);
+        assert_eq!(
+            s.episode(e.id)?.and_then(|e| e.user_edited_at),
+            Some(777),
+            "redo stamps the edit back"
+        );
+        assert!(!s.restore_episode_content(9999, &original, None)?);
+        Ok(())
+    }
+
+    /// A note goes back under its old node (or unfiled) with no `changes` row; a missing note
+    /// or node is reported.
+    #[test]
+    fn restore_episode_node_moves_back_without_a_change() -> R {
+        let s = Store::open_in_memory()?;
+        let work = s.categories()?[0].id;
+        let a = s.add_node(Some(work), NodeKind::Project, "A", "", Origin::Auto)?;
+        let e = s.insert_episode(0, 10, &EpisodeContent::default(), 1)?;
+        assert!(s.move_episode(e.id, a.id, 5)?);
+        let changes = s.changes(50)?.len();
+        assert!(s.restore_episode_node(e.id, None)?);
+        assert_eq!(s.episode(e.id)?.and_then(|e| e.node_id), None);
+        assert!(s.restore_episode_node(e.id, Some(a.id))?);
+        assert_eq!(s.episode(e.id)?.and_then(|e| e.node_id), Some(a.id));
+        assert_eq!(s.changes(50)?.len(), changes);
+        assert!(!s.restore_episode_node(e.id, Some(9999))?);
+        assert!(!s.restore_episode_node(9999, None)?);
+        Ok(())
+    }
+
+    /// A todo's hand-edited fields come back as they were; a deleted todo is reported.
+    #[test]
+    fn restore_todo_state_puts_back_every_field() -> R {
+        let s = Store::open_in_memory()?;
+        let t = s.add_todo(
+            &NewTodo {
+                text: "call".into(),
+                due: Some(1_000),
+                ..Default::default()
+            },
+            1,
+        )?;
+        s.snooze_todo(t.id, 2_000)?;
+        let before = s
+            .todo(t.id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+            .state();
+        s.complete_todo(t.id, 3_000)?;
+        s.set_todo_text(t.id, "call mum")?;
+        let after = s.todo(t.id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        assert!(after.done() && after.snoozed_until.is_none());
+        assert!(s.restore_todo_state(t.id, &before)?);
+        let got = s.todo(t.id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        assert_eq!(got.state(), before);
+        assert!(!got.done());
+        assert_eq!(got.snoozed_until, Some(2_000));
+        assert!(s.restore_todo_state(t.id, &after.state())?);
+        assert_eq!(
+            s.todo(t.id)?.map(|t| (t.done(), t.text)),
+            Some((true, "call mum".to_owned()))
+        );
+        s.delete_todo(t.id)?;
+        assert!(!s.restore_todo_state(t.id, &before)?);
         Ok(())
     }
 

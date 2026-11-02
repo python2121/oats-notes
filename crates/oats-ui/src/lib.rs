@@ -29,6 +29,7 @@ pub mod toast;
 pub mod todos;
 pub mod topic;
 pub mod transcript;
+pub mod undo;
 
 pub use app::{
     AppOptions, AppPrefs, AudioRequest, AudioStarter, Chime, Command, Lanes, MenuEntry,

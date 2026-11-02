@@ -162,7 +162,8 @@ impl NativeMenu {
         }
         ok(menu.append(&app_menu));
 
-        // File / Listen / View from the shared model
+        // File / Edit / Listen / View / Brain from the shared model (Edit's Undo / Redo carry no
+        // accelerator: `menu_shortcut` has none for them, see `app::UNDO_SHORTCUT`)
         for section in app.menu_model() {
             let sub = Submenu::new(section.title, true);
             for entry in &section.entries {
@@ -360,6 +361,14 @@ mod tests {
                 a.is_some_and(|a| a.modifiers().contains(Modifiers::META)),
                 "{cmd:?}: menu key equivalents must carry Cmd to reach the menu"
             );
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_have_no_accelerator() {
+        // AppKit would hand ⌘Z to the menu before any focused text field saw it
+        for cmd in [Command::Undo, Command::Redo] {
+            assert_eq!(menu_shortcut(cmd).as_ref().and_then(accelerator), None);
         }
     }
 
