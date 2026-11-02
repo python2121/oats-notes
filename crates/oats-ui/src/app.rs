@@ -41,6 +41,9 @@ use oats_brain::MoveTarget;
 use serde::Deserialize as _;
 
 /// eframe storage key for [`AppPrefs`] (RON).
+/// How long a warning stays in the status strip before it clears itself.
+pub const WARNING_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub const PREFS_KEY: &str = "oatsnotes.prefs";
 /// Height of the Transcripts view's header strip ("Show media").
 const TRANSCRIPTS_BAR_H: f32 = 30.0;
@@ -600,6 +603,8 @@ pub struct OatsApp {
     chime: Chime,
     /// The last non-fatal problem (pipeline warning, store or microphone error).
     warning: Option<String>,
+    /// The warning text last seen and when it first showed (for [`WARNING_TTL`]).
+    warning_seen: Option<(String, std::time::Instant)>,
     /// Start listening as soon as the engine reports Idle (prefs said we were listening).
     auto_listen: bool,
     sidebar: SidebarState,
@@ -715,6 +720,7 @@ impl OatsApp {
             transcript_focus: TranscriptFocus::default(),
             chime: Box::new(|| {}),
             warning: None,
+            warning_seen: None,
             sidebar: SidebarState {
                 episodes_open: sidebar_open,
                 ..SidebarState::default()
@@ -762,6 +768,42 @@ impl OatsApp {
     /// The transcript row the list will scroll to and flash when it lays it out.
     pub fn pending_segment_focus(&self) -> Option<i64> {
         self.transcript_focus.pending
+    }
+
+    /// Clear a warning that has shown for [`WARNING_TTL`]; returns how long until it does
+    /// (for one `request_repaint_after`). A changed text restarts the clock.
+    fn expire_warning(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let Some(w) = self.warning.clone() else {
+            self.warning_seen = None;
+            return None;
+        };
+        let since = match &self.warning_seen {
+            Some((seen, at)) if *seen == w => *at,
+            _ => {
+                self.warning_seen = Some((w, now));
+                now
+            }
+        };
+        let age = now.saturating_duration_since(since);
+        if age >= WARNING_TTL {
+            self.warning = None;
+            self.warning_seen = None;
+            None
+        } else {
+            Some(WARNING_TTL - age)
+        }
+    }
+
+    /// A segment was transcribed: a stale "transcription failed" warning is superseded.
+    fn supersede_transcription_warning(&mut self) {
+        if self
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.starts_with("transcription failed"))
+        {
+            self.warning = None;
+            self.warning_seen = None;
+        }
     }
 
     /// The status strip's warning, if any.
@@ -2210,6 +2252,7 @@ impl OatsApp {
                     self.system_no_signal = !signal && self.system_on;
                 }
                 PipelineEvent::Segment(row) => {
+                    self.supersede_transcription_warning();
                     if row.started_at >= self.today_start {
                         self.today_count += 1;
                     }
@@ -3408,6 +3451,9 @@ impl eframe::App for OatsApp {
         self.sync_status_item(ctx);
         self.handle_close(ctx);
         self.sync_levels(ctx);
+        if let Some(left) = self.expire_warning(std::time::Instant::now()) {
+            ctx.request_repaint_after(left + std::time::Duration::from_millis(50));
+        }
         // "Today" rolls over at local midnight even when nothing else wakes the UI: one
         // repaint scheduled for then (not a continuous one)
         ctx.request_repaint_after(until_local_midnight());
@@ -4063,6 +4109,23 @@ mod tests {
         // without a brain, Interpret Now says so instead of doing nothing
         app.run(Command::InterpretNow);
         assert!(app.warning.as_deref().is_some_and(|w| w.contains("brain")));
+        app.warning = None;
+        // a warning clears itself after the TTL, and a transcribed segment supersedes a
+        // transcription failure
+        let t0 = std::time::Instant::now();
+        app.warning = Some("something odd".to_owned());
+        assert_eq!(app.expire_warning(t0), Some(WARNING_TTL));
+        let half = WARNING_TTL / 2;
+        assert_eq!(app.expire_warning(t0 + half), Some(WARNING_TTL - half));
+        assert!(app.warning.is_some());
+        assert_eq!(app.expire_warning(t0 + WARNING_TTL), None);
+        assert!(app.warning.is_none());
+        app.warning = Some("transcription failed: boom".to_owned());
+        app.supersede_transcription_warning();
+        assert!(app.warning.is_none());
+        app.warning = Some("Microphone: stopped".to_owned());
+        app.supersede_transcription_warning();
+        assert!(app.warning.is_some());
         app.warning = None;
         // the status item follows the app's state, and is only told about changes
         app.sync_status_item(&cc.egui_ctx);

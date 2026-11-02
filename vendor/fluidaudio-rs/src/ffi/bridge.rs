@@ -193,6 +193,7 @@ extern "C" {
 
     // String free
     fn fluidaudio_free_string(s: *mut i8);
+    fn fluidaudio_last_error(bridge: *mut std::ffi::c_void) -> *mut i8;
 
     // Kokoro TTS
     fn fluidaudio_initialize_kokoro(
@@ -439,7 +440,7 @@ impl FluidAudioBridge {
         };
 
         if result != 0 {
-            return Err("Transcription failed".to_string());
+            return Err(format!("transcription failed: {}", self.last_error()));
         }
 
         let text = if text_ptr.is_null() {
@@ -459,6 +460,16 @@ impl FluidAudioBridge {
             processing_time,
             rtfx,
         })
+    }
+
+    /// OatsNotes: the Swift error text of the last failed call on this bridge.
+    fn last_error(&self) -> String {
+        let text = unsafe { take_c_string(fluidaudio_last_error(self.ptr)) };
+        if text.is_empty() {
+            "no error text".to_string()
+        } else {
+            text
+        }
     }
 
     pub fn transcribe_samples(&self, samples: &[f32]) -> Result<AsrResult, String> {
@@ -972,7 +983,7 @@ impl FluidAudioBridge {
         };
 
         if status != 0 {
-            return Err("VAD process samples failed".to_string());
+            return Err(format!("VAD process samples failed: {}", self.last_error()));
         }
 
         Ok(unsafe { collect_vad_frames(probs_ptr, voice_ptr, times_ptr, count) })

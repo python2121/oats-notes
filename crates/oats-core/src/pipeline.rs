@@ -49,6 +49,9 @@ use crate::store::{Store, TranscriptRow};
 const AUDIO_POLL: Duration = Duration::from_millis(100);
 /// Minimum spacing of `Level` events (~4 Hz).
 const LEVEL_INTERVAL: Duration = Duration::from_millis(250);
+/// A failed transcription is retried once after this pause.
+const TRANSCRIBE_RETRY_DELAY: Duration = Duration::from_millis(200);
+
 /// A lane that delivered nothing for this long reads as silent in `Level` events.
 const LEVEL_STALE: Duration = Duration::from_secs(1);
 /// Both captures deliver a 100 ms chunk every 100 ms, silence included, into one channel:
@@ -141,6 +144,10 @@ pub struct EchoStats {
     pub echo_discarded: u32,
     /// Transcribed microphone segments the text rule marked as echoes (at insert or later).
     pub echo_marked_by_text: u32,
+    /// Segments whose transcription failed twice (first try and the retry): dropped.
+    pub transcribe_failed: u32,
+    /// Transcriptions that failed once and worked on the retry.
+    pub transcribe_retried_ok: u32,
 }
 
 /// What a listening session expects from its audio.
@@ -1092,6 +1099,14 @@ impl Session<'_> {
     /// Log the session's echo counters and publish them for [`PipelineHandle::echo_stats`].
     fn end_echo_stats(&mut self, session_id: i64) {
         let s = self.echo.stats;
+        if s.transcribe_failed > 0 || s.transcribe_retried_ok > 0 {
+            log::info!(
+                "session {session_id} transcription: {} segments failed twice (dropped), {} \
+                 recovered on the retry",
+                s.transcribe_failed,
+                s.transcribe_retried_ok
+            );
+        }
         if s != EchoStats::default() {
             log::info!(
                 "session {session_id} echoes: {} mic segments transcribed, {} skipped by the \
@@ -1156,7 +1171,30 @@ impl Session<'_> {
         }
         let t = match self.engine.transcribe(&seg.samples) {
             Ok(t) => t,
-            Err(e) => return self.out.send(PipelineEvent::Warning(e.to_string())),
+            Err(first) => {
+                log::warn!(
+                    "{} lane: transcription of a {} ms segment failed, retrying once: {first}",
+                    source.as_str(),
+                    seg.duration_ms()
+                );
+                std::thread::sleep(TRANSCRIBE_RETRY_DELAY);
+                match self.engine.transcribe(&seg.samples) {
+                    Ok(t) => {
+                        self.echo.stats.transcribe_retried_ok += 1;
+                        t
+                    }
+                    Err(e) => {
+                        self.echo.stats.transcribe_failed += 1;
+                        log::warn!(
+                            "{} lane: transcription of a {} ms segment failed again, segment \
+                             dropped: {e}",
+                            source.as_str(),
+                            seg.duration_ms()
+                        );
+                        return self.out.send(PipelineEvent::Warning(e.to_string()));
+                    }
+                }
+            }
         };
         let text = t.text.trim();
         if text.is_empty() {
@@ -1495,6 +1533,145 @@ mod tests {
         assert_eq!(c.ms_at(161_600 + 16_000), 1_011_100 + hour);
         let woke = 1_010_100 + hour;
         assert!(c.ms_at(160_000) < woke);
+    }
+
+    /// Wraps the null engine; the first `failures` transcriptions fail.
+    struct Flaky {
+        failures: u32,
+        calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl SpeechEngine for Flaky {
+        fn name(&self) -> String {
+            "flaky".into()
+        }
+        fn load(&mut self, s: &mut dyn FnMut(String)) -> Result<(), crate::EngineError> {
+            NullEngine.load(s)
+        }
+        fn vad_frame_len(&self) -> Option<usize> {
+            None
+        }
+        fn vad(&mut self, _s: &[f32]) -> Result<Vec<crate::VadFrame>, crate::EngineError> {
+            Ok(Vec::new())
+        }
+        fn transcribe(&mut self, s: &[f32]) -> Result<crate::Transcription, crate::EngineError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.failures {
+                return Err(crate::EngineError::Transcribe("scripted failure".into()));
+            }
+            NullEngine.transcribe(s)
+        }
+    }
+
+    /// Speak one segment into a pipeline whose engine fails `failures` times; returns the
+    /// events seen up to the session end and the engine's call count.
+    fn run_flaky(failures: u32, tag: &str) -> (Vec<PipelineEvent>, u32, Vec<String>) {
+        let path = temp_db(tag);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let c2 = calls.clone();
+        let h = Pipeline {
+            engine: Box::new(move || {
+                Ok(Box::new(Flaky {
+                    failures,
+                    calls: c2.clone(),
+                }) as Box<dyn SpeechEngine>)
+            }),
+            store_path: path.clone(),
+            segmenter: SegmenterConfig::default(),
+            wake: Box::new(|| {}),
+        }
+        .spawn();
+        wait_for(&h, "idle", |e| {
+            matches!(e, PipelineEvent::Status(PipelineStatus::Idle))
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.start(rx);
+        wait_for(&h, "session start", |e| {
+            matches!(e, PipelineEvent::SessionStarted(_))
+        });
+        let mut n = 0usize;
+        for i in 0..35 {
+            let loud = i < 20;
+            let chunk: Vec<f32> = (0..1600)
+                .map(|_| {
+                    n += 1;
+                    if loud {
+                        0.3 * (n as f32 * 2.0 * std::f32::consts::PI * 440.0 / 16_000.0).sin()
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let _ = tx.send(chunk);
+        }
+        // The trailing 1.5 s of silence closes the segment on its own; wait for its outcome
+        // (a stored segment, or the warning after the retry) BEFORE stopping, otherwise a
+        // loaded machine can deliver `Stop` before the audio was consumed.
+        let mut events = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match h.recv_timeout(left) {
+                Some(e @ (PipelineEvent::Segment(_) | PipelineEvent::Warning(_))) => {
+                    events.push(e);
+                    break;
+                }
+                Some(e) => events.push(e),
+                None => break,
+            }
+        }
+        h.stop();
+        let deadline = Instant::now() + TIMEOUT;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match h.recv_timeout(left) {
+                Some(PipelineEvent::SessionEnded(_)) => break,
+                Some(e) => events.push(e),
+                None => break,
+            }
+        }
+        drop(tx);
+        drop(h);
+        let texts = Store::open(&path)
+            .and_then(|s| s.segments(View::Transcripts))
+            .map(|r| r.into_iter().map(|x| x.text).collect())
+            .unwrap_or_default();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        (events, calls.load(Ordering::SeqCst), texts)
+    }
+
+    #[test]
+    fn a_transcription_that_fails_once_is_retried_without_a_warning() {
+        let (events, calls, texts) = run_flaky(1, "flaky1");
+        assert_eq!(calls, 2);
+        assert_eq!(texts.len(), 1);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::Segment(_)))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::Warning(_)))
+        );
+    }
+
+    #[test]
+    fn a_transcription_that_fails_twice_warns_and_drops_the_segment() {
+        let (events, calls, texts) = run_flaky(2, "flaky2");
+        assert_eq!(calls, 2);
+        assert!(texts.is_empty());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::Segment(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PipelineEvent::Warning(_)))
+        );
     }
 
     #[test]

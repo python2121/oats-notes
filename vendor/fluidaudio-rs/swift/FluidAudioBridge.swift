@@ -36,6 +36,14 @@ class FluidAudioBridgeInternal {
     private var qwen3AsrManagerStorage: Any?
     private var qwen3StreamingManagerStorage: Any?
 
+    // OatsNotes: the message of the last error caught at the C boundary, for `fluidaudio_last_error`.
+    private let lastErrorLock = NSLock()
+    private var lastErrorText: String = ""
+    var lastError: String {
+        get { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; return lastErrorText }
+        set { lastErrorLock.lock(); defer { lastErrorLock.unlock() }; lastErrorText = newValue }
+    }
+
     init() {}
 
     func initializeAsr() throws {
@@ -1105,6 +1113,7 @@ public func fluidaudio_transcribe_file(
         return 0
     } catch {
         print("Transcribe error: \(error)")
+        bridge.lastError = "\(error)"
         return -1
     }
 }
@@ -1142,6 +1151,7 @@ public func fluidaudio_transcribe_samples(
         return 0
     } catch {
         print("Transcribe samples error: \(error)")
+        bridge.lastError = "\(error)"
         return -1
     }
 }
@@ -1409,6 +1419,15 @@ public func fluidaudio_cleanup(_ ptr: UnsafeMutableRawPointer?) {
     guard let ptr = ptr else { return }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
     bridge.cleanup()
+}
+
+/// OatsNotes: the last error message caught for this bridge ("" when none). The returned
+/// string is strdup'd; free it with fluidaudio_free_string.
+@_cdecl("fluidaudio_last_error")
+public func fluidaudio_last_error(_ ptr: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? {
+    guard let ptr = ptr else { return strdup("") }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    return strdup(bridge.lastError)
 }
 
 @_cdecl("fluidaudio_free_string")
@@ -1700,6 +1719,7 @@ public func fluidaudio_vad_process_file(
         return 0
     } catch {
         print("VAD process file error: \(error)")
+        bridge.lastError = "\(error)"
         return -1
     }
 }
@@ -1733,6 +1753,7 @@ public func fluidaudio_vad_process_samples(
         return 0
     } catch {
         print("VAD process samples error: \(error)")
+        bridge.lastError = "\(error)"
         return -1
     }
 }

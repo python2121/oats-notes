@@ -1165,6 +1165,7 @@ fn an_acoustic_echo_is_not_transcribed_and_is_linked_to_its_system_segment() {
             echo_linked: 1,
             echo_discarded: 0,
             echo_marked_by_text: 0,
+            ..EchoStats::default()
         }
     );
     let reported = segments(&o.seen);
@@ -1276,6 +1277,7 @@ fn a_suspected_echo_without_a_system_segment_is_discarded_after_the_timeout() {
             echo_linked: 0,
             echo_discarded: 1,
             echo_marked_by_text: 0,
+            ..EchoStats::default()
         }
     );
     stop_and_wait(&rig, &mut seen, sid);
@@ -1315,6 +1317,7 @@ fn with_the_audio_check_off_the_echo_is_transcribed_and_marked_by_text() {
             echo_linked: 0,
             echo_discarded: 0,
             echo_marked_by_text: 1,
+            ..EchoStats::default()
         }
     );
 }

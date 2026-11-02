@@ -87,13 +87,29 @@ mod mac {
                 let stream = self
                     .fluid
                     .vad_stream_start()
-                    .map_err(|e| EngineError::Vad(e.to_string()))?;
+                    .map_err(|e| EngineError::Vad(bridge_reason(&e)))?;
                 log::info!("FluidAudio VAD stream for the {} lane", lane.as_str());
                 *slot = Some(stream);
             }
             slot.as_mut()
                 .ok_or_else(|| EngineError::Vad("no VAD stream".to_owned()))
         }
+    }
+
+    /// The bridge's error text without the layers' own prefixes ("Swift bridge error: ",
+    /// "transcription failed: ", …), so the pipeline's "transcription failed: …" reads once.
+    fn bridge_reason(e: &fluidaudio_rs::FluidAudioError) -> String {
+        let mut s = e.to_string();
+        for prefix in [
+            "Swift bridge error: ",
+            "transcription failed: ",
+            "VAD process samples failed: ",
+        ] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                s = rest.to_owned();
+            }
+        }
+        s
     }
 
     impl SpeechEngine for FluidAudioEngine {
@@ -155,7 +171,7 @@ mod mac {
                     padded.resize(VAD_CHUNK, 0.0);
                     stream.process_chunk(&padded)
                 }
-                .map_err(|e| EngineError::Vad(e.to_string()))?;
+                .map_err(|e| EngineError::Vad(bridge_reason(&e)))?;
                 frames.push(VadFrame {
                     probability: frame.probability,
                     is_speech: frame.is_voice_active,
@@ -168,7 +184,7 @@ mod mac {
             let r = self
                 .fluid
                 .transcribe_samples(samples)
-                .map_err(|e| EngineError::Transcribe(e.to_string()))?;
+                .map_err(|e| EngineError::Transcribe(bridge_reason(&e)))?;
             let confidence = r
                 .confidence
                 .is_finite()

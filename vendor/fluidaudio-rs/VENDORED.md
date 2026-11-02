@@ -47,6 +47,12 @@ and a `[lints.clippy]` table keep `cargo fmt --all` and `./ci.sh`'s clippy off i
    dependencies, and `./ci.sh` runs it with `-D warnings`).
 
 Everything else (ASR, diarization, TTS, Qwen3, examples, tests, `AGENTS.md`) is as shipped.
+3. **Real error text.** Upstream printed the Swift error to stdout and returned -1, so Rust only
+   saw "Transcription failed". `FluidAudioBridgeInternal.lastError` (locked) is set in the
+   `catch` of `fluidaudio_transcribe_file` / `_transcribe_samples` / `_vad_process_file` /
+   `_vad_process_samples` (the `print` stays); new export `fluidaudio_last_error` (strdup'd,
+   freed with `fluidaudio_free_string`); `src/ffi/bridge.rs` `last_error()` appends it:
+   `transcription failed: <swift error>`. The VAD stream functions have no bridge object and are unchanged.
 
 ## Why no FluidAudio version bump
 

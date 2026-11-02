@@ -251,6 +251,8 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast|--media] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>]\n\n\
+         \n\
+         Log: <data dir>/oats.log (also on stderr; the last 2 MB are kept; RUST_LOG sets the level)\n\n\
          --listen       start listening as soon as the speech engine is ready\n\
          --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
          \x20              paced in real time; listening stops when the file ends\n\
@@ -279,9 +281,68 @@ fn chrono_now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+/// The log file keeps at most this much (the tail) across launches.
+const LOG_KEEP_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Log lines go to stderr and, appended, to `<data dir>/oats.log` so a launch from Finder
+/// leaves a trace. A file that cannot be opened is skipped.
+struct Tee {
+    file: Option<std::fs::File>,
+}
+
+impl std::io::Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write_all(buf);
+        if let Some(f) = &mut self.file {
+            let _ = f.write_all(buf);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(f) = &mut self.file {
+            let _ = f.flush();
+        }
+        Ok(())
+    }
+}
+
+/// Open the log file for appending, first cutting it down to its last [`LOG_KEEP_BYTES`].
+fn open_log_file() -> Option<std::fs::File> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let dir = oats_core::paths::secure_data_dir().ok()?;
+    let path = dir.join("oats.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_KEEP_BYTES) {
+        let mut tail = Vec::new();
+        let mut f = std::fs::File::open(&path).ok()?;
+        f.seek(SeekFrom::End(-(LOG_KEEP_BYTES as i64))).ok()?;
+        f.read_to_end(&mut tail).ok()?;
+        // start at a line boundary
+        let from = tail.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let mut out = std::fs::File::create(&path).ok()?;
+        out.write_all(&tail[from..]).ok()?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path).ok()
+}
+
 fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    let plain = args.iter().any(|a| a == "-h" || a == "--help")
+        || args.first().map(String::as_str) == Some("--selftest");
+    if !plain {
+        logger.target(env_logger::Target::Pipe(Box::new(Tee {
+            file: open_log_file(),
+        })));
+    }
+    logger.init();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         return usage();
     }
