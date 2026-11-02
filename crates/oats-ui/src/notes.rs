@@ -40,6 +40,12 @@ pub enum NotesAction {
     Summarise(i64),
     /// A note's decision / action item was clicked: the transcript at the segment it was said.
     ShowSegment(i64),
+    /// An action item's checkbox: mark it complete (`done`) or open again.
+    SetActionItemDone {
+        episode_id: i64,
+        text: String,
+        done: bool,
+    },
     /// "Move to…" on a note: the text typed in its field (resolved by the app: the tree
     /// first, the model when that is ambiguous or new).
     MoveText {
@@ -423,7 +429,8 @@ impl EditDraft {
     }
 
     /// [`Self::to_content`], keeping the filing and provenance (`node_id`, `at_ms`,
-    /// `segment_id`) of every decision / action item whose text is unchanged from `old`.
+    /// `segment_id`) of every decision / action item, and an action item's completion
+    /// (`done_at`), whose text is unchanged from `old`.
     pub fn to_content_keeping(&self, old: &Episode) -> EpisodeContent {
         let mut c = self.to_content();
         for d in &mut c.decisions {
@@ -438,6 +445,7 @@ impl EditDraft {
                 a.node_id = o.node_id;
                 a.at_ms = o.at_ms;
                 a.segment_id = o.segment_id;
+                a.done_at = o.done_at;
             }
         }
         c
@@ -572,11 +580,17 @@ fn item_line(
     hl: &str,
     (segment, at): (Option<i64>, Option<i64>),
     filed: Option<i64>,
+    done: bool,
     nodes: &[Node],
     actions: &mut Vec<NotesAction>,
 ) {
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = ui.available_width();
+    let (color, strikethrough) = if done {
+        (t.text_tertiary, egui::Stroke::new(1.0, t.text_tertiary))
+    } else {
+        (t.text, egui::Stroke::NONE)
+    };
     for (span, bold) in bold_spans(text) {
         let font = if bold {
             crate::theme::font_medium(ui.ctx(), 12.5)
@@ -590,7 +604,8 @@ fn item_line(
             hl,
             egui::TextFormat {
                 font_id: font,
-                color: t.text,
+                color,
+                strikethrough,
                 ..Default::default()
             },
         );
@@ -1161,6 +1176,7 @@ pub(crate) fn episode_card(
                                         hl,
                                         (d.segment_id, d.at_ms),
                                         d.node_id.filter(|n| Some(*n) != e.node_id),
+                                        false,
                                         nodes,
                                         actions,
                                     );
@@ -1177,7 +1193,14 @@ pub(crate) fn episode_card(
                             for a in &e.action_items {
                                 ui.horizontal_top(|ui| {
                                     ui.add_space(6.0);
-                                    ui.label(RichText::new("☐").color(t.text_secondary).size(12.5));
+                                    let mut done = a.done_at.is_some();
+                                    if action_checkbox(ui, &mut done) {
+                                        actions.push(NotesAction::SetActionItemDone {
+                                            episode_id: e.id,
+                                            text: a.text.clone(),
+                                            done,
+                                        });
+                                    }
                                     let mut text = a.text.clone();
                                     if let Some(o) = &a.owner {
                                         text.push_str(&format!(" — **{o}**"));
@@ -1192,6 +1215,7 @@ pub(crate) fn episode_card(
                                         hl,
                                         (a.segment_id, a.at_ms),
                                         a.node_id.filter(|n| Some(*n) != e.node_id),
+                                        a.done_at.is_some(),
                                         nodes,
                                         actions,
                                     );
@@ -1707,12 +1731,16 @@ pub struct NextStep {
     pub episode_id: i64,
     pub episode_title: String,
     pub started_at: i64,
+    /// When the user ticked it complete (`None` = open).
+    pub done_at: Option<i64>,
 }
 
 /// A project page's next steps: the action items of its own `episodes` (low-signal notes
 /// left out) and, inline among them, the action items filed under the project from notes
-/// homed elsewhere (`filed`, [`oats_core::Store::items_filed_under`]); one list, newest note
-/// first, each item once (by note and text), each tagged with its source note.
+/// homed elsewhere (`filed`, [`oats_core::Store::items_filed_under`]); one list, each item
+/// once (by note and text), each tagged with its source note. The open items come first,
+/// newest note first (a note's items in their order), then the completed ones, most recently
+/// completed first.
 pub fn collect_next_steps(episodes: &[Episode], filed: &[(Episode, NoteItem)]) -> Vec<NextStep> {
     let step = |e: &Episode, a: &ActionItem| NextStep {
         text: a.text.clone(),
@@ -1721,6 +1749,7 @@ pub fn collect_next_steps(episodes: &[Episode], filed: &[(Episode, NoteItem)]) -
         episode_id: e.id,
         episode_title: e.title.clone(),
         started_at: e.started_at,
+        done_at: a.done_at,
     };
     let mut steps: Vec<NextStep> = episodes
         .iter()
@@ -1740,11 +1769,36 @@ pub fn collect_next_steps(episodes: &[Episode], filed: &[(Episode, NoteItem)]) -
     // stable: a note's items keep their order
     steps.sort_by_key(|s| {
         (
+            s.done_at.is_some(),
+            std::cmp::Reverse(s.done_at),
             std::cmp::Reverse(s.started_at),
             std::cmp::Reverse(s.episode_id),
         )
     });
     steps
+}
+
+/// How many of `steps` ([`collect_next_steps`] order: open, then completed) the page shows,
+/// and whether the "Show all N" / "Show fewer" link is drawn. Collapsed: the open items up to
+/// [`NEXT_STEPS_CAP`]; completed items only behind the link, which shows whenever something
+/// is hidden that way (more open items than the cap, or anything completed).
+pub fn next_steps_shown(steps: &[NextStep], show_all: bool) -> (usize, bool) {
+    let open = steps.iter().filter(|s| s.done_at.is_none()).count();
+    let link = open > NEXT_STEPS_CAP || open < steps.len();
+    let shown = if show_all {
+        steps.len()
+    } else {
+        open.min(NEXT_STEPS_CAP)
+    };
+    (shown, link)
+}
+
+/// An action item's checkbox (the todos' look). True when the user toggled it.
+fn action_checkbox(ui: &mut egui::Ui, done: &mut bool) -> bool {
+    let was = *done;
+    ui.checkbox(done, "")
+        .on_hover_text(if was { "Mark not done" } else { "Mark done" })
+        .changed()
 }
 
 /// A text link (accent colour, pointing hand).
@@ -1776,15 +1830,23 @@ fn next_steps(
         ui.add_space(8.0);
         return;
     }
-    let shown = if state.show_all_steps {
-        steps.len()
-    } else {
-        steps.len().min(NEXT_STEPS_CAP)
-    };
+    let (shown, show_link) = next_steps_shown(&steps, state.show_all_steps);
     for s in &steps[..shown] {
         ui.horizontal_wrapped(|ui| {
-            ui.add_space(14.0);
-            ui.label(RichText::new("☐").color(t.text_secondary).size(12.5));
+            ui.add_space(10.0);
+            let mut done = s.done_at.is_some();
+            if action_checkbox(ui, &mut done) {
+                actions.push(NotesAction::SetActionItemDone {
+                    episode_id: s.episode_id,
+                    text: s.text.clone(),
+                    done,
+                });
+            }
+            let (color, strikethrough) = if s.done_at.is_some() {
+                (t.text_tertiary, egui::Stroke::new(1.0, t.text_tertiary))
+            } else {
+                (t.text, egui::Stroke::NONE)
+            };
             let mut text = s.text.clone();
             if let Some(o) = &s.owner {
                 text.push_str(&format!(" — **{o}**"));
@@ -1803,7 +1865,8 @@ fn next_steps(
                         } else {
                             t.font(12.5)
                         },
-                        color: t.text,
+                        color,
+                        strikethrough,
                         ..Default::default()
                     },
                 );
@@ -1833,7 +1896,7 @@ fn next_steps(
         });
         ui.add_space(2.0);
     }
-    if steps.len() > NEXT_STEPS_CAP {
+    if show_link {
         ui.horizontal(|ui| {
             ui.add_space(14.0);
             let label = if state.show_all_steps {
@@ -2148,6 +2211,11 @@ mod tests {
         };
         let mut d = EditDraft::from_episode(&old);
         d.action_items.push_str("\nDo y | Ana");
+        let mut old_done = old.clone();
+        old_done.action_items[0].done_at = Some(99);
+        let c = d.to_content_keeping(&old_done);
+        assert_eq!(c.action_items[0].done_at, Some(99), "completion kept");
+        assert_eq!(c.action_items[1].done_at, None);
         let c = d.to_content_keeping(&old);
         assert_eq!(c.decisions[0].segment_id, Some(3));
         assert_eq!(c.action_items[0].node_id, Some(7));
@@ -2171,6 +2239,65 @@ mod tests {
         // a note both homed here and cross-filed lists its item once
         let both = collect_next_steps(std::slice::from_ref(&old), &filed);
         assert_eq!(both.len(), 1);
+    }
+
+    #[test]
+    fn completed_next_steps_go_last_newest_completion_first_behind_show_all() {
+        let ep = |id: i64, started_at: i64, items: &[(&str, Option<i64>)]| Episode {
+            id,
+            started_at,
+            title: format!("n{id}"),
+            action_items: items
+                .iter()
+                .map(|(text, done_at)| ActionItem {
+                    text: (*text).into(),
+                    done_at: *done_at,
+                    ..Default::default()
+                })
+                .collect(),
+            ended_at: started_at,
+            summary: String::new(),
+            node_id: None,
+            decisions: vec![],
+            topics: vec![],
+            low_signal: false,
+            model: String::new(),
+            cost_usd: None,
+            revision: 1,
+            created_at: 0,
+            last_revised_at: 0,
+            user_edited_at: None,
+            kind: "conversation".into(),
+        };
+        let eps = vec![
+            ep(1, 100, &[("old a", Some(5)), ("old b", None)]),
+            ep(
+                2,
+                200,
+                &[("new a", None), ("new b", Some(9)), ("new c", None)],
+            ),
+        ];
+        let steps = collect_next_steps(&eps, &[]);
+        let texts: Vec<&str> = steps.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["new a", "new c", "old b", "new b", "old a"]);
+        // collapsed: the open ones only, and the link because two are completed
+        assert_eq!(next_steps_shown(&steps, false), (3, true));
+        assert_eq!(next_steps_shown(&steps, true), (5, true));
+        // nothing completed, under the cap: no link
+        let open = vec![ep(3, 1, &[("x", None), ("y", None)])];
+        let steps = collect_next_steps(&open, &[]);
+        assert_eq!(next_steps_shown(&steps, false), (2, false));
+        // every item completed: nothing shown collapsed, only the link
+        let done = vec![ep(4, 1, &[("x", Some(1))])];
+        let steps = collect_next_steps(&done, &[]);
+        assert_eq!(next_steps_shown(&steps, false), (0, true));
+        // more open items than the cap
+        let many: Vec<(String, Option<i64>)> = (0..NEXT_STEPS_CAP + 2)
+            .map(|i| (format!("s{i}"), None))
+            .collect();
+        let refs: Vec<(&str, Option<i64>)> = many.iter().map(|(t, d)| (t.as_str(), *d)).collect();
+        let steps = collect_next_steps(&[ep(5, 1, &refs)], &[]);
+        assert_eq!(next_steps_shown(&steps, false), (NEXT_STEPS_CAP, true));
     }
 
     #[test]

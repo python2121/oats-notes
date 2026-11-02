@@ -2507,6 +2507,21 @@ impl OatsApp {
                     self.notes_state.pending_focus = Some(id);
                 }
                 NotesAction::ShowSegment(seg) => self.jump_to_segment(Some(seg)),
+                NotesAction::SetActionItemDone {
+                    episode_id,
+                    text,
+                    done,
+                } => {
+                    let now = chrono::Local::now().timestamp_millis();
+                    match self
+                        .store
+                        .set_action_item_done(episode_id, &text, done, now)
+                    {
+                        Ok(true) => self.reload(),
+                        Ok(false) => {}
+                        Err(e) => self.store_error(e),
+                    }
+                }
                 NotesAction::MoveText { episode, text } => {
                     self.submit_move(MoveTarget::Episode(episode), text)
                 }

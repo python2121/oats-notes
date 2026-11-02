@@ -55,9 +55,15 @@ the Work view offscreen.
 
 **Project landing page** (`node_view` for `kind == project`): header, then "Next steps" — the
 action items of the project's episodes (newest note first, low-signal notes skipped, capped at
-`NEXT_STEPS_CAP` = 12 with "Show all N"), each with owner/due and a "from <note> · <date>"
+`NEXT_STEPS_CAP` = 12 with "Show all N"), each with a checkbox, owner/due and a "from <note> · <date>"
 link (`NotesAction::GoToNote` → `pending_focus` + flash, staying on the page; a collapsed
-target is opened first); "No next steps yet" when empty. Then "Notes": every note NEWEST FIRST
+target is opened first); "No next steps yet" when empty. The checkbox
+(`NotesAction::SetActionItemDone` → `Store::set_action_item_done`: `done_at` in the item's
+JSON, not a hand edit, so `user_edited_at` stays) completes an item like a todo: completed
+items go after the open ones (newest completion first), struck through in `t.text_tertiary`,
+and only behind "Show all N" (N = open + completed), which shows whenever more than the cap
+are open OR anything is completed (`notes::next_steps_shown`); unticking reopens. A note
+card's action items carry the same checkbox and strike-through. Then "Notes": every note NEWEST FIRST
 (the rest of the app is newest first), one collapsed 24 pt row each (triangle, date, time range,
 title, topic chips); a click toggles the full `episode_card` inline (`NotesState::open_notes`,
 not persisted; "Expand all · Collapse all"). Topics and the transcript toggle follow.
@@ -71,7 +77,7 @@ note's own page (its home node, or Conversations when unfiled) with the note foc
 note card each decision / action item with a `segment_id` is a link ("Show in transcript at
 2:31 pm", `timefmt`) → `NotesAction::ShowSegment` → `jump_to_segment`; an item filed under
 another project than its note carries a "→ Commerce project" chip (opens that project). So:
-Commerce page → dev-call note → transcript line. Editing a note keeps the filing / source of
+Commerce page → dev-call note → transcript line. Editing a note keeps the filing / source / completion of
 items whose text is unchanged (`EditDraft::to_content_keeping`).
 
 **Move to… on notes**: a note card's title and a project page's note row have a context menu
@@ -485,7 +491,9 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   the note's own home → `None`; items never create nodes) and `at` → `interpret::resolve_at`
   (the first non-echo segment of the chunk in that local minute, else the nearest within
   10 min → `at_ms` = its start, `segment_id`). Stored in the episode JSON: action items
-  `{text, owner?, due?, node_id?, at_ms?, segment_id?}`; decisions a plain string when bare
+  `{text, owner?, due?, node_id?, at_ms?, segment_id?, done_at?}` (`done_at` = ticked
+  complete, unix ms; a revision — `apply_interpretation` with a prior, so also Rewrite /
+  Summarise — carries it to the item with the same trimmed text, as does the edit form); decisions a plain string when bare
   (older rows, still read) else `{text, node_id?, at_ms?, segment_id?}` (`oats_core::Decision`).
   A revision's prior shows each item's `(project: …) (at: HH:MM)`. `merge_nodes` refiles items
   to the survivor, `delete_node` back to their note's home. **Series rule** (prompt): a

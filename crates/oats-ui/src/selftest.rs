@@ -470,7 +470,7 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
                 decisions: vec!["Ship CSV first, Excel a week later".into()],
                 action_items: vec![
                     ActionItem { text: "Add an ISO 8601 date option to the exporter".into(), owner: Some("Sam".into()), due: Some("Friday".into()), ..Default::default() },
-                    ActionItem { text: "Share sample files with finance".into(), owner: None, due: None, ..Default::default() },
+                    ActionItem { text: "Share sample files with finance".into(), owner: None, due: None, done_at: Some(now), ..Default::default() },
                 ],
                 topics: vec!["export rewrite".into(), "finance".into()],
                 low_signal: false,
@@ -537,7 +537,7 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
                     },
                 ],
                 action_items: vec![
-                    ActionItem { text: "Add a progress bar to long exports".into(), owner: Some("Sam".into()), due: Some("this week".into()), node_id: Some(project.id), at_ms: Some(said_at), segment_id: Some(said.id) },
+                    ActionItem { text: "Add a progress bar to long exports".into(), owner: Some("Sam".into()), due: Some("this week".into()), node_id: Some(project.id), at_ms: Some(said_at), segment_id: Some(said.id), done_at: None },
                     ActionItem { text: "Move the release calendar to Tuesdays".into(), owner: Some("Priya".into()), due: None, ..Default::default() },
                 ],
                 topics: vec!["release train".into()],

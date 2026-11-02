@@ -1031,6 +1031,13 @@ fn apply_interpretation_in_tx(
                     node_id: resolve_item_node(tree, a.project.as_deref(), node_id),
                     at_ms,
                     segment_id,
+                    // a revision keeps the user's tick on an item it still proposes
+                    done_at: prior.and_then(|p| {
+                        p.action_items
+                            .iter()
+                            .find(|o| o.text.trim() == a.text.trim())
+                            .and_then(|o| o.done_at)
+                    }),
                 }
             })
             .collect(),
@@ -2008,6 +2015,59 @@ mod tests {
         assert!(req.user_prompt.contains("Previous interpretation"));
         assert!(req.user_prompt.contains("Old title"));
         assert!(req.user_prompt.contains("do x (owner: Sam)"));
+    }
+
+    #[test]
+    fn a_revision_keeps_the_completion_of_unchanged_action_items() {
+        let (s, tree, chunk) = seeded();
+        let v = |items: serde_json::Value| {
+            parse_interpretation(&json!({
+                "title": "Sync", "summary": "x", "low_signal": false, "node_id": null,
+                "new_project": null, "new_topic": null, "decisions": [],
+                "action_items": items, "topics": [], "events": []
+            }))
+            .unwrap()
+        };
+        let first = apply_interpretation(
+            &s,
+            &tree,
+            &chunk,
+            &v(json!([{"text": "write the tests"}, {"text": "book a room"}])),
+            None,
+            "sonnet",
+            None,
+            None,
+            3,
+            1_000,
+        )
+        .unwrap();
+        let id = first.episode.id;
+        assert!(
+            s.set_action_item_done(id, "write the tests", true, 2_000)
+                .unwrap()
+        );
+        let prior = s.episode(id).unwrap().unwrap();
+        let revised = apply_interpretation(
+            &s,
+            &tree,
+            &chunk,
+            &v(json!([{"text": " write the tests "}, {"text": "book a bigger room"}])),
+            Some(&prior),
+            "sonnet",
+            None,
+            None,
+            3,
+            3_000,
+        )
+        .unwrap();
+        assert_eq!(revised.episode.id, id);
+        let done: Vec<Option<i64>> = revised
+            .episode
+            .action_items
+            .iter()
+            .map(|a| a.done_at)
+            .collect();
+        assert_eq!(done, vec![Some(2_000), None]);
     }
 
     #[test]

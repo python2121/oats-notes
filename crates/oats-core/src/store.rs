@@ -179,7 +179,8 @@ pub struct Node {
 /// belongs and where it was said (all optional, absent in older rows): `node_id` = the
 /// project / topic it concerns when that is not the note's home (`None` = the note's home),
 /// `at_ms` = the moment it was said (from the `[HH:MM]` the model cited) and `segment_id` =
-/// the transcript segment at that moment.
+/// the transcript segment at that moment; `done_at` = when the user ticked it complete
+/// (unix ms; `None` = open).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActionItem {
     pub text: String,
@@ -193,6 +194,8 @@ pub struct ActionItem {
     pub at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_at: Option<i64>,
 }
 
 /// A decision inside an episode, with the same filing and provenance as an [`ActionItem`].
@@ -2102,6 +2105,50 @@ impl Store {
         })
     }
 
+    /// Mark the action item(s) of episode `id` whose trimmed text is `text` complete
+    /// (`done_at = now`) or open again. Not a hand edit: `user_edited_at` is left alone, so
+    /// the brain may still revise the note (a revision keeps `done_at` for unchanged text).
+    /// Returns whether anything changed.
+    pub fn set_action_item_done(
+        &self,
+        id: i64,
+        text: &str,
+        done: bool,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        use rusqlite::OptionalExtension;
+        let text = text.trim();
+        self.with_savepoint(|s| {
+            let json: Option<String> = s
+                .conn
+                .query_row(
+                    "SELECT action_items_json FROM episodes WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(json) = json else {
+                return Ok(false);
+            };
+            let mut items: Vec<ActionItem> = serde_json::from_str(&json)?;
+            let mut changed = false;
+            for a in items.iter_mut().filter(|a| a.text.trim() == text) {
+                let want = if done { a.done_at.or(Some(now)) } else { None };
+                if a.done_at != want {
+                    a.done_at = want;
+                    changed = true;
+                }
+            }
+            if changed {
+                s.conn.execute(
+                    "UPDATE episodes SET action_items_json = ?2 WHERE id = ?1",
+                    rusqlite::params![id, serde_json::to_string(&items)?],
+                )?;
+            }
+            Ok(changed)
+        })
+    }
+
     pub fn set_episode_low_signal(&self, id: i64, low_signal: bool) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE episodes SET low_signal = ?2 WHERE id = ?1",
@@ -3795,6 +3842,58 @@ mod tests {
         assert_eq!(t.source, Origin::User);
         s.init_locked()?;
         assert_eq!(s.todos(TodoFilter::All)?.len(), 3);
+        Ok(())
+    }
+
+    /// Ticking an action item stamps `done_at` in the JSON (not a hand edit), unticking clears
+    /// it, and a node merge that refiles the item keeps it.
+    #[test]
+    fn action_items_can_be_marked_done_and_refiling_keeps_it() -> R {
+        let s = Store::open_in_memory()?;
+        let work = s.categories()?[0].id;
+        let a = s.add_node(Some(work), NodeKind::Project, "A", "", Origin::Auto)?;
+        let b = s.add_node(Some(work), NodeKind::Project, "B", "", Origin::Auto)?;
+        let content = EpisodeContent {
+            title: "Sync".into(),
+            node_id: Some(work),
+            action_items: vec![
+                ActionItem {
+                    text: "ship it".into(),
+                    node_id: Some(a.id),
+                    ..Default::default()
+                },
+                ActionItem {
+                    text: "other".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let e = s.insert_episode(0, 10, &content, 1)?;
+        assert!(s.set_action_item_done(e.id, " ship it ", true, 500)?);
+        // already done: nothing changes, the first completion time stays
+        assert!(!s.set_action_item_done(e.id, "ship it", true, 900)?);
+        assert!(!s.set_action_item_done(e.id, "missing", true, 900)?);
+        assert!(!s.set_action_item_done(9999, "ship it", true, 900)?);
+        let got = s
+            .episode(e.id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        assert_eq!(got.action_items[0].done_at, Some(500));
+        assert_eq!(got.action_items[1].done_at, None);
+        assert_eq!(got.user_edited_at, None, "completion is not a hand edit");
+        s.merge_nodes(a.id, b.id)?;
+        let got = s
+            .episode(e.id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        assert_eq!(
+            (got.action_items[0].node_id, got.action_items[0].done_at),
+            (Some(b.id), Some(500))
+        );
+        assert!(s.set_action_item_done(e.id, "ship it", false, 1000)?);
+        let got = s
+            .episode(e.id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        assert_eq!(got.action_items[0].done_at, None);
         Ok(())
     }
 
