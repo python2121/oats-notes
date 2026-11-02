@@ -579,7 +579,7 @@ fn todo_row(
     ui.horizontal(|ui| {
         ui.add_space(MARGIN - 4.0);
         let mut done = td.done();
-        if ui.checkbox(&mut done, "").changed() {
+        if crate::widgets::check_box(ui, &mut done, &t.font(13.0)).changed() {
             actions.push(CalendarAction::Todo(TodoAction::SetDone(td.id, done)));
         }
         let when = td.due.map(|d| clock(d, &Local)).unwrap_or_default();

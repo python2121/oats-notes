@@ -1192,6 +1192,7 @@ pub(crate) fn episode_card(
                             );
                             for a in &e.action_items {
                                 ui.horizontal_top(|ui| {
+                                    ui.set_min_height(ui.spacing().interact_size.y);
                                     ui.add_space(6.0);
                                     let mut done = a.done_at.is_some();
                                     if action_checkbox(ui, &mut done) {
@@ -1793,10 +1794,11 @@ pub fn next_steps_shown(steps: &[NextStep], show_all: bool) -> (usize, bool) {
     (shown, link)
 }
 
-/// An action item's checkbox (the todos' look). True when the user toggled it.
+/// An action item's checkbox (the todos' look), centred on the first line of its 12.5-pt
+/// text. True when the user toggled it.
 fn action_checkbox(ui: &mut egui::Ui, done: &mut bool) -> bool {
     let was = *done;
-    ui.checkbox(done, "")
+    crate::widgets::check_box(ui, done, &egui::FontId::proportional(12.5))
         .on_hover_text(if was { "Mark not done" } else { "Mark done" })
         .changed()
 }
@@ -1832,7 +1834,9 @@ fn next_steps(
     }
     let (shown, show_link) = next_steps_shown(&steps, state.show_all_steps);
     for s in &steps[..shown] {
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal_top(|ui| {
+            // The row pitch egui's own checkbox gave; the box is centred on the text anyway.
+            ui.set_min_height(ui.spacing().interact_size.y);
             ui.add_space(10.0);
             let mut done = s.done_at.is_some();
             if action_checkbox(ui, &mut done) {
@@ -1875,6 +1879,7 @@ fn next_steps(
             let resp = ui
                 .add(
                     egui::Label::new(job)
+                        .wrap()
                         .sense(Sense::click())
                         .selectable(false),
                 )

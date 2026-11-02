@@ -30,6 +30,7 @@ pub mod todos;
 pub mod topic;
 pub mod transcript;
 pub mod undo;
+pub mod widgets;
 
 pub use app::{
     AppOptions, AppPrefs, AudioRequest, AudioStarter, Chime, Command, Lanes, MenuEntry,

@@ -31,6 +31,8 @@ pub const MAX_REMINDERS: usize = 3;
 pub const WIDTH: f32 = 340.0;
 /// Inset from the window's edge (right) and from the top of the content (below the bars).
 pub const INSET: f32 = 12.0;
+/// The column the × takes at a card's right edge (its glyph is ~7 pt wide).
+const CLOSE_W: f32 = 12.0;
 
 /// A confirmation on screen.
 #[derive(Clone, Debug, PartialEq)]
@@ -178,19 +180,37 @@ fn card_frame(t: &Tokens, shadow: egui::epaint::Shadow, light: bool) -> egui::Fr
         .inner_margin(if light {
             egui::Margin::symmetric(12, 8)
         } else {
-            egui::Margin::same(12)
+            // The title's line box has ~3 pt of leading above the capitals, the button row
+            // none below: 10 / 13 makes the visible gaps (border → title capitals, Done →
+            // border) equal.
+            egui::Margin {
+                left: 12,
+                right: 12,
+                top: 10,
+                bottom: 13,
+            }
         })
 }
 
-/// A frameless "×"; `true` when clicked.
-fn close_button(ui: &mut egui::Ui, t: &Tokens, tip: &str) -> bool {
-    ui.add(
-        egui::Button::new(RichText::new("×").size(15.0).color(t.text_secondary))
-            .frame(false)
-            .min_size(vec2(18.0, 18.0)),
-    )
-    .on_hover_text(tip)
-    .clicked()
+/// The × in a card's top-right corner, its ink centred on the capitals of the first line of
+/// text set in `line` that starts at the row's top (the card's title / message).
+fn close_button(ui: &mut egui::Ui, t: &Tokens, tip: &str, line: &egui::FontId) -> bool {
+    let top = ui.cursor().top();
+    let (slot, _) = ui.allocate_exact_size(vec2(CLOSE_W, 18.0), Sense::hover());
+    let center = pos2(slot.center().x, top + crate::widgets::cap_center(ui, line));
+    let hit = egui::Rect::from_center_size(center, vec2(18.0, 18.0));
+    let resp = ui
+        .interact(hit, ui.id().with("close"), Sense::click())
+        .on_hover_text(tip);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "×"));
+    crate::widgets::paint_glyph_centered(
+        ui,
+        center,
+        "×",
+        &egui::FontId::proportional(15.0),
+        t.text_secondary,
+    );
+    resp.clicked()
 }
 
 /// A confirmation; returns whether the pointer is over it.
@@ -204,25 +224,34 @@ fn confirmation_card(
     let resp = card_frame(t, shadow, true).show(ui, |ui| {
         ui.set_width(WIDTH - 24.0);
         ui.horizontal_top(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            let font = egui::FontId::proportional(12.5);
+            // The icon is centred on the first line's capitals (the × too), so a one-line
+            // message is centred and a wrapped one keeps both on its first line.
+            let top = ui.cursor().top();
+            let (slot, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            let r = egui::Rect::from_center_size(
+                pos2(slot.center().x, top + crate::widgets::cap_center(ui, &font)),
+                vec2(16.0, 16.0),
+            );
             let col = if c.error { t.danger } else { t.text };
             if c.error {
-                ui.painter().text(
-                    r.center(),
-                    Align2::CENTER_CENTER,
-                    "!",
-                    egui::FontId::proportional(14.0),
-                    t.danger,
-                );
+                crate::widgets::paint_glyph_centered(ui, r.center(), "!", &font, t.danger);
             } else {
                 check_glyph(ui, r, t.accent);
             }
-            let w = ui.available_width() - 24.0;
-            ui.add_sized(
-                [w, 16.0],
-                egui::Label::new(RichText::new(&c.text).color(col).size(12.5)).wrap(),
+            let w = ui.available_width() - CLOSE_W - ui.spacing().item_spacing.x;
+            ui.allocate_ui_with_layout(
+                vec2(w, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(w);
+                    ui.add(
+                        egui::Label::new(RichText::new(&c.text).color(col).font(font.clone()))
+                            .wrap(),
+                    );
+                },
             );
-            if close_button(ui, t, "Dismiss") {
+            if close_button(ui, t, "Dismiss", &font) {
                 dismissed.push(c.id);
             }
         });
@@ -238,6 +267,7 @@ fn reminder_card(
     actions: &mut Vec<ToastAction>,
 ) {
     let now = Local::now();
+    let title = crate::theme::font_medium(ui.ctx(), 13.5);
     card_frame(t, shadow, false).show(ui, |ui| {
         ui.set_width(WIDTH - 24.0);
         ui.horizontal_top(|ui| {
@@ -247,12 +277,8 @@ fn reminder_card(
             ui.vertical(|ui| {
                 ui.set_width(WIDTH - 24.0 - 18.0 - 2.0 - 6.0 * 2.0 - 20.0);
                 ui.add(
-                    egui::Label::new(
-                        RichText::new(&todo.text)
-                            .font(crate::theme::font_medium(ui.ctx(), 13.5))
-                            .color(t.text),
-                    )
-                    .wrap(),
+                    egui::Label::new(RichText::new(&todo.text).font(title.clone()).color(t.text))
+                        .wrap(),
                 );
                 let when = match todo.due {
                     Some(d) => format!("Due {}", absolute(d, &now)),
@@ -260,9 +286,11 @@ fn reminder_card(
                 };
                 ui.label(RichText::new(when).color(t.text_secondary).size(11.5));
             });
-            if close_button(ui, t, "Done — mark complete") {
-                actions.push(ToastAction::Done(todo.id));
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if close_button(ui, t, "Done — mark complete", &title) {
+                    actions.push(ToastAction::Done(todo.id));
+                }
+            });
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {

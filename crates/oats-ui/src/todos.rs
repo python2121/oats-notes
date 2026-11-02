@@ -393,8 +393,7 @@ fn todo_row(
     ui.horizontal_top(|ui| {
         ui.add_space(12.0);
         let mut done = todo.done();
-        if ui
-            .checkbox(&mut done, "")
+        if crate::widgets::check_box(ui, &mut done, &t.font(13.0))
             .on_hover_text(if todo.done() {
                 "Mark not done"
             } else {
@@ -458,6 +457,22 @@ fn todo_row(
                     open_due_editor(state, todo);
                 }
             }
+            let editing_due = state
+                .editing_due
+                .as_ref()
+                .is_some_and(|(id, _)| *id == todo.id);
+            let node = todo.node_id.filter(|n| nodes.iter().any(|x| x.id == *n));
+            // The line under the text only when something goes on it: an empty one would
+            // still take a whole row (an undated todo of your own looked double-spaced).
+            let has_meta = todo.completed_at.is_some()
+                || editing_due
+                || todo.due.is_some()
+                || (!todo.done() && snooze_label(todo, now).is_some())
+                || node.is_some()
+                || todo.source != Origin::User;
+            if !has_meta {
+                return;
+            }
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if let Some(at) = todo.completed_at {
@@ -466,11 +481,7 @@ fn todo_row(
                             .color(t.text_disabled)
                             .size(11.0),
                     );
-                } else if state
-                    .editing_due
-                    .as_ref()
-                    .is_some_and(|(id, _)| *id == todo.id)
-                {
+                } else if editing_due {
                     due_editor(ui, t, state, todo, actions);
                 } else if let Some(due) = todo.due {
                     let (label, overdue) = due_label(due, now);
@@ -494,7 +505,7 @@ fn todo_row(
                 {
                     ui.label(RichText::new(s).color(t.text_tertiary).size(11.0));
                 }
-                if let Some(n) = todo.node_id.filter(|n| nodes.iter().any(|x| x.id == *n)) {
+                if let Some(n) = node {
                     chip(ui, t, &node_path(nodes, n), true);
                 }
                 if todo.source != Origin::User {
