@@ -349,7 +349,8 @@ fn has_children(nodes: &[Node], id: i64) -> bool {
     nodes.iter().any(|n| n.parent_id == Some(id) && !n.archived)
 }
 
-/// What the sidebar shows in pure white: where today's notes went.
+/// What the sidebar shows in pure white (where today's notes went) and in the accent colour
+/// (where the most recent note went).
 #[derive(Default)]
 pub struct TodayMarks {
     /// Local midnight (ms): a note that started at or after it is "today's".
@@ -358,6 +359,64 @@ pub struct TodayMarks {
     pub nodes: HashSet<i64>,
     /// An unfiled, non-media note started today (the Conversations row).
     pub conversations: bool,
+    /// The most recent note (`Store::latest_note`) when it has a sidebar row: it and the
+    /// rows above it are drawn in the accent colour.
+    pub latest: Option<i64>,
+    /// The nodes on the path to `latest`.
+    pub latest_nodes: HashSet<i64>,
+    /// The most recent note is unfiled (the Conversations row is the accent one).
+    pub latest_conversations: bool,
+}
+
+/// How a row is drawn: plain, pure white (today's) or accent (the most recent note).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mark {
+    Plain,
+    Today,
+    Latest,
+}
+
+impl TodayMarks {
+    pub fn node_mark(&self, id: i64) -> Mark {
+        if self.latest_nodes.contains(&id) {
+            Mark::Latest
+        } else if self.nodes.contains(&id) {
+            Mark::Today
+        } else {
+            Mark::Plain
+        }
+    }
+
+    fn episode_mark(&self, ep: &SidebarEpisode) -> Mark {
+        if self.latest == Some(ep.id) {
+            Mark::Latest
+        } else if ep.started_at >= self.start {
+            Mark::Today
+        } else {
+            Mark::Plain
+        }
+    }
+
+    pub fn conversations_mark(&self) -> Mark {
+        if self.latest_conversations {
+            Mark::Latest
+        } else if self.conversations {
+            Mark::Today
+        } else {
+            Mark::Plain
+        }
+    }
+}
+
+/// `id` and every ancestor of it into `out` (stopping at a node already there).
+fn ancestors_into(nodes: &[Node], id: i64, out: &mut HashSet<i64>) {
+    let mut cur = Some(id);
+    while let Some(id) = cur {
+        if !out.insert(id) {
+            break;
+        }
+        cur = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent_id);
+    }
 }
 
 /// The nodes that hold a note from today, plus every ancestor of those. Pure.
@@ -369,24 +428,29 @@ pub fn today_nodes(
     let mut out = HashSet::new();
     for (project, eps) in episodes {
         for ep in eps.iter().filter(|e| e.started_at >= today_start) {
-            let mut cur = Some(ep.node_id.unwrap_or(*project));
-            while let Some(id) = cur {
-                if !out.insert(id) {
-                    break;
-                }
-                cur = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent_id);
-            }
+            ancestors_into(nodes, ep.node_id.unwrap_or(*project), &mut out);
             // the project row itself (the list's key) even when the note sits on a topic
-            let mut cur = Some(*project);
-            while let Some(id) = cur {
-                if !out.insert(id) {
-                    break;
-                }
-                cur = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent_id);
-            }
+            ancestors_into(nodes, *project, &mut out);
         }
     }
     out
+}
+
+/// The path to the most recent note: the note's node, its project and their ancestors, when
+/// the note has a sidebar row (`None` when it has none — unfiled, or not listed). Pure.
+pub fn latest_nodes(
+    nodes: &[Node],
+    episodes: &HashMap<i64, Vec<SidebarEpisode>>,
+    latest: Option<i64>,
+) -> Option<HashSet<i64>> {
+    let id = latest?;
+    let (project, ep) = episodes
+        .iter()
+        .find_map(|(p, eps)| eps.iter().find(|e| e.id == id).map(|e| (*p, e)))?;
+    let mut out = HashSet::new();
+    ancestors_into(nodes, ep.node_id.unwrap_or(project), &mut out);
+    ancestors_into(nodes, project, &mut out);
+    Some(out)
 }
 
 pub fn sidebar_panel(
@@ -428,7 +492,11 @@ pub fn sidebar_panel(
             view == v,
             0,
             None,
-            v == View::Notes && today.conversations,
+            if v == View::Notes {
+                today.conversations_mark()
+            } else {
+                Mark::Plain
+            },
         );
         reveal(ui, state, &SidebarRow::View(v), &resp, view == v);
         if resp.clicked() {
@@ -522,7 +590,7 @@ pub fn sidebar_panel(
                     selected,
                     depth,
                     disclosure,
-                    today.nodes.contains(&n.id),
+                    today.node_mark(n.id),
                 );
                 let kind = match n.kind {
                     NodeKind::Category => "Category",
@@ -597,7 +665,7 @@ pub fn sidebar_panel(
                             ep,
                             focus_episode == Some(ep.id),
                             depth + 1,
-                            today.start,
+                            today.episode_mark(ep),
                         );
                         let row = SidebarRow::Episode {
                             episode: ep.id,
@@ -740,21 +808,24 @@ fn episode_row(
     ep: &SidebarEpisode,
     selected: bool,
     depth: usize,
-    today_start: i64,
+    mark: Mark,
 ) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::click_and_drag());
     let date = crate::notes::short_date(ep.started_at);
-    let is_today = ep.started_at >= today_start;
     let resp = resp.on_hover_text(format!(
         "{} · {date}{}",
         ep.title,
-        if is_today { " · today" } else { "" }
+        match mark {
+            Mark::Latest => " · most recent",
+            Mark::Today => " · today",
+            Mark::Plain => "",
+        }
     ));
-    let (title_col, date_col) = if is_today {
-        (egui::Color32::WHITE, egui::Color32::WHITE)
-    } else {
-        (t.text_secondary, t.text_tertiary)
+    let (title_col, date_col) = match mark {
+        Mark::Latest => (t.accent, t.accent),
+        Mark::Today => (egui::Color32::WHITE, egui::Color32::WHITE),
+        Mark::Plain => (t.text_secondary, t.text_tertiary),
     };
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(
@@ -825,7 +896,7 @@ fn hover_row(
     selected: bool,
     depth: usize,
     disclosure: Option<bool>,
-    white: bool,
+    mark: Mark,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::click());
     if !ui.is_rect_visible(rect) {
@@ -863,12 +934,11 @@ fn hover_row(
         p.add(egui::Shape::convex_polygon(tri.to_vec(), col, Stroke::NONE));
     }
     let size = if depth > 0 { 12.0 } else { 12.5 };
-    let color = if white {
-        egui::Color32::WHITE
-    } else if depth > 0 {
-        t.text_secondary
-    } else {
-        t.text
+    let color = match mark {
+        Mark::Latest => t.accent,
+        Mark::Today => egui::Color32::WHITE,
+        Mark::Plain if depth > 0 => t.text_secondary,
+        Mark::Plain => t.text,
     };
     let galley = p.layout_no_wrap(label.to_owned(), t.font(size), color);
     let clip = Rect::from_min_max(
@@ -1018,6 +1088,59 @@ mod tests {
         let got = today_nodes(&nodes, &eps, 1_000);
         assert_eq!(got, HashSet::from([1, 2, 3]));
         assert!(today_nodes(&nodes, &eps, 2_000).is_empty());
+    }
+
+    #[test]
+    fn the_latest_note_marks_its_path_in_the_accent_over_the_white_of_today() {
+        let nodes = vec![
+            node(1, None, "Work", 0, false),
+            node(2, Some(1), "Proj", 0, false),
+            node(3, Some(2), "Topic", 0, false),
+            node(4, None, "Admin", 1, false),
+            node(5, Some(4), "Other", 0, false),
+        ];
+        let ep = |id, node_id, started_at| SidebarEpisode {
+            id,
+            title: "t".into(),
+            started_at,
+            node_id,
+            is_media: false,
+            convertible: false,
+        };
+        let mut eps = HashMap::new();
+        eps.insert(2, vec![ep(10, Some(3), 1_000)]);
+        eps.insert(5, vec![ep(11, Some(5), 1_200)]);
+        assert_eq!(
+            latest_nodes(&nodes, &eps, Some(11)),
+            Some(HashSet::from([4, 5]))
+        );
+        assert_eq!(
+            latest_nodes(&nodes, &eps, Some(10)),
+            Some(HashSet::from([1, 2, 3]))
+        );
+        assert_eq!(latest_nodes(&nodes, &eps, Some(99)), None, "no sidebar row");
+        assert_eq!(latest_nodes(&nodes, &eps, None), None);
+        let marks = TodayMarks {
+            start: 1_000,
+            nodes: today_nodes(&nodes, &eps, 1_000),
+            conversations: true,
+            latest: Some(11),
+            latest_nodes: latest_nodes(&nodes, &eps, Some(11)).unwrap_or_default(),
+            latest_conversations: false,
+        };
+        assert_eq!(marks.node_mark(5), Mark::Latest);
+        assert_eq!(marks.node_mark(4), Mark::Latest);
+        assert_eq!(marks.node_mark(2), Mark::Today);
+        assert_eq!(marks.node_mark(99), Mark::Plain);
+        assert_eq!(marks.episode_mark(&ep(11, Some(5), 1_200)), Mark::Latest);
+        assert_eq!(marks.episode_mark(&ep(10, Some(3), 1_000)), Mark::Today);
+        assert_eq!(marks.episode_mark(&ep(12, Some(3), 10)), Mark::Plain);
+        assert_eq!(marks.conversations_mark(), Mark::Today);
+        let unfiled = TodayMarks {
+            latest_conversations: true,
+            ..Default::default()
+        };
+        assert_eq!(unfiled.conversations_mark(), Mark::Latest);
     }
 
     #[test]

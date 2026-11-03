@@ -99,7 +99,7 @@ card; parent = the note's category, else Work, else the first category; created
 **Sidebar notes layer**: a project's row has a triangle (closed by default, persisted as
 `AppPrefs::sidebar_episodes_open`) listing its last `SIDEBAR_EPISODES` = 5 non-low-signal notes
 (newest first, 22 pt rows: truncated title, "29 Oct" at the right), then its topics (the
-triangle now folds both). **Where today's notes went**: a note that started today (local day) draws its title and date in pure white (hover text adds " · today"), and so do the project, topic and category rows above it and the Conversations row when an unfiled non-media note started today (`sidebar::today_nodes` once per frame from `sidebar_episodes`; `Store::unfiled_episodes_since`, reloaded with `reload_sidebar_episodes`); it rolls over at local midnight with the existing midnight repaint. Clicking one sets `OatsApp::focus_episode` (a UI mode, not a `View`):
+triangle now folds both). **Where today's notes went**: a note that started today (local day) draws its title and date in pure white (hover text adds " · today"), and so do the project, topic and category rows above it and the Conversations row when an unfiled non-media note started today (`sidebar::today_nodes` once per frame from `sidebar_episodes`; `Store::unfiled_episodes_since`, reloaded with `reload_sidebar_episodes`); it rolls over at local midnight with the existing midnight repaint. **The most recent note** (`Store::latest_note`: the newest non-low-signal conversation note, any day) is drawn in the ACCENT colour instead, and so is the path above it (`sidebar::latest_nodes`; `TodayMarks::latest` / `latest_nodes`, hover text " · most recent"); when it is unfiled the Conversations row is the accent one (`latest_conversations`). `sidebar::Mark { Plain, Today, Latest }` is the row colour (`hover_row` / `episode_row`). Clicking one sets `OatsApp::focus_episode` (a UI mode, not a `View`):
 `notes::episode_view` shows that note's card under a breadcrumb "Work › Commerce project ›
 29 Oct" (node names are links). Escape, the project's sidebar row, any other navigation, or a
 breadcrumb link returns to the project page. `--selftest out.png --project [--expanded]
@@ -448,7 +448,12 @@ hotword; hotwords are unchanged.
   segments append only while the range ends at the newest row (`has_later == false`), and
   stick-to-bottom is off while `has_later`. A jump to a row not loaded replaces the range with
   `PAGE_ROWS / 2` rows either side of it, then pages outward both ways until the tail is
-  reached and live appends resume. Shortcuts: ⌘1 Transcripts, ⌘3 Conversations, ⌘4 Calendar,
+  reached and live appends resume. **Jump to now**: a pill in the Transcripts header next to
+  "Show media" (disabled while the newest row is loaded AND the viewport is at the end:
+  `TranscriptPages::at_end`); `Command::JumpToNow` reloads the newest page when `has_later`
+  (`reset_pages`), drops a pending focus and sets `TranscriptPages::jump_to_end`, which the next
+  layout turns into the scroll offset of the end in one frame (stored + `request_discard`, no
+  animation, no page load on the way; the stick-to-bottom then holds it). Shortcuts: ⌘1 Transcripts, ⌘3 Conversations, ⌘4 Calendar,
   ⌘5 Todos (⌘2 is unused).
 - **Jump to the transcript**: clicking a calendar chip / day-panel row / a dictated todo's text
   resolves its source (`source_segment_id`; an interpreted event: the first segment of its

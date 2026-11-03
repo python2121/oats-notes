@@ -69,6 +69,9 @@ pub struct TranscriptPages {
     /// The viewport was at the end of the content at the last layout (egui keeps it there by
     /// itself, so there is nothing to correct).
     at_end: bool,
+    /// "Jump to now": the next layout puts the viewport at the end of the content (and the
+    /// stick-to-bottom keeps it there).
+    pub jump_to_end: bool,
 }
 
 impl TranscriptPages {
@@ -95,6 +98,11 @@ impl TranscriptPages {
     pub fn append(&mut self, newer: Vec<TranscriptRow>, has_later: bool) {
         self.has_later = has_later;
         self.rows.extend(newer);
+    }
+
+    /// The viewport showed the end of the content at the last layout.
+    pub fn at_end(&self) -> bool {
+        self.at_end
     }
 
     pub fn contains_row(&self, id: i64) -> bool {
@@ -271,8 +279,9 @@ pub fn transcript_list(
     // the first layout of a new range has not stuck to the bottom yet (egui needs one pass to
     // know the content size): looking at the edges then would load a page nobody needs
     let settled = pages.anchor.is_some();
-    let emit = !was_armed && !jumping && settled;
-    if was_armed || !settled {
+    let jump_end = std::mem::take(&mut pages.jump_to_end);
+    let emit = !was_armed && !jumping && settled && !jump_end;
+    if was_armed || !settled || jump_end {
         ui.ctx().request_repaint();
     }
     let mut correction = 0.0_f32;
@@ -346,6 +355,17 @@ pub fn transcript_list(
             ui.add_space(8.0);
         });
     pages.at_end = out.state.offset.y + out.inner_rect.height() >= out.content_size.y - 2.0;
+    if jump_end && !pages.at_end {
+        // "Jump to now": straight to the end (no animation, so no page loads on the way)
+        let mut state = out.state;
+        state.offset.y = (out.content_size.y - out.inner_rect.height()).max(0.0);
+        state.store(ui.ctx(), out.id);
+        pages.at_end = true;
+        pages.anchor = None;
+        ui.ctx()
+            .request_discard("jump to the newest transcript row");
+        return actions;
+    }
     if was_armed {
         pages.armed = false;
         if correction.abs() > 0.5 && !at_end_before {

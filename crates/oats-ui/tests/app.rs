@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use oats_brain::{Brain, BrainConfig, BrainHandle, ClaudeCli};
 use oats_core::{AudioChunk, NullEngine, Pipeline, PipelineStatus, SpeechEngine, Store, View};
 use oats_status::{StatusAction, StatusItem, StatusState};
@@ -1751,6 +1751,71 @@ fn scrolling_toward_the_top_loads_the_previous_page_without_a_jump() {
         checked,
         "the row to follow was found on both sides of the load"
     );
+}
+
+#[test]
+fn jump_to_now_after_a_jump_into_the_past_reloads_the_newest_page_at_its_end() {
+    let dir = TempDir::new("jump-now");
+    let ids = seed_rows(&dir.db(), 600);
+    {
+        let s = Store::open(&dir.db()).unwrap();
+        let sid = s.begin_session(0, "old").unwrap();
+        let at = now_ms() - 60_000 - 600 * 300_000 + 100 * 300_000 + 1_000;
+        s.insert_segment(sid, at, at + 3_000, "zebra crossing budget", None)
+            .unwrap();
+    }
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().set_page_rows(100);
+    rig.harness.run_steps(3);
+    // at the newest rows the pill is there but disabled
+    assert!(
+        rig.harness
+            .get_by_label("Jump to now")
+            .accesskit_node()
+            .is_disabled()
+    );
+    rig.app().run(Command::Search);
+    rig.harness.run_steps(2);
+    rig.harness.event(egui::Event::Text("zebra".to_owned()));
+    rig.harness.run_steps(3);
+    rig.until_label("the hit", "zebra crossing budget");
+    rig.harness.get_by_label_contains("zebra crossing").click();
+    rig.harness.run_steps(6);
+    assert!(rig.app().transcript_has_later(), "the tail is not loaded");
+    let pill = rig.harness.get_by_label("Jump to now");
+    assert!(!pill.accesskit_node().is_disabled());
+    pill.click();
+    rig.harness.run_steps(6);
+    assert!(
+        !rig.app().transcript_has_later(),
+        "the newest page is loaded"
+    );
+    assert_eq!(rig.app().loaded_rows().2, Some(ids[599]));
+    assert!(
+        rig.app().transcript_at_end(),
+        "and the viewport is at its end"
+    );
+    assert!(
+        rig.harness
+            .get_by_label("Jump to now")
+            .accesskit_node()
+            .is_disabled()
+    );
+    // scrolling up re-enables it; a click returns to the end without a reload
+    rig.harness.hover_at(egui::pos2(600.0, 400.0));
+    rig.harness.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, 600.0),
+        modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+    });
+    rig.harness.run_steps(4);
+    assert!(!rig.app().transcript_at_end());
+    let (n, ..) = rig.app().loaded_rows();
+    rig.harness.get_by_label("Jump to now").click();
+    rig.harness.run_steps(4);
+    assert!(rig.app().transcript_at_end());
+    assert_eq!(rig.app().loaded_rows().0, n, "no page was loaded");
 }
 
 #[test]

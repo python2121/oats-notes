@@ -239,6 +239,8 @@ pub enum Command {
     ToggleOnCall,
     /// The Transcripts view's "Show media" (a pref).
     ToggleShowMedia,
+    /// Transcripts: scroll to the newest line (reloading the newest page after a jump).
+    JumpToNow,
     NewCategory,
     /// Open the Preferences window (your name, for now).
     Preferences,
@@ -573,6 +575,14 @@ pub fn app_rows(store: &Store) -> Result<Vec<AppRow>, oats_core::StoreError> {
 }
 
 /// The app.
+/// The most recent note, as the sidebar marks it.
+#[derive(Clone, Copy, Debug)]
+struct LatestNote {
+    id: i64,
+    /// No project / topic holds it: the Conversations row is its place.
+    unfiled: bool,
+}
+
 pub struct OatsApp {
     pipeline: PipelineHandle,
     audio: AudioStarter,
@@ -663,6 +673,9 @@ pub struct OatsApp {
     sidebar_episodes: HashMap<i64, Vec<SidebarEpisode>>,
     /// Unfiled notes that started today (the Conversations row turns white).
     unfiled_today: i64,
+    /// The most recent note (`Store::latest_note`): its id and whether it is unfiled (the
+    /// sidebar draws its path, or the Conversations row, in the accent colour).
+    latest_note: Option<LatestNote>,
     /// The single-note view: this note of the viewed node, instead of the node's page.
     focus_episode: Option<i64>,
     /// The Preferences window, when open.
@@ -783,6 +796,7 @@ impl OatsApp {
             },
             sidebar_episodes: HashMap::new(),
             unfiled_today: 0,
+            latest_note: None,
             focus_episode: None,
             prefs_window: None,
             search: None,
@@ -1278,6 +1292,16 @@ impl OatsApp {
                 self.prefs.show_media = !self.prefs.show_media;
                 self.reset_pages();
             }
+            Command::JumpToNow => {
+                if self.prefs.view != View::Transcripts {
+                    self.set_view(View::Transcripts);
+                }
+                if self.pages.has_later {
+                    self.reset_pages();
+                }
+                self.transcript_focus.pending = None;
+                self.pages.jump_to_end = true;
+            }
             Command::NewCategory => {
                 self.prefs.sidebar_visible = true;
                 self.sidebar.renaming = None;
@@ -1582,6 +1606,17 @@ impl OatsApp {
             .store
             .unfiled_episodes_since(self.today_start)
             .unwrap_or(0);
+        self.latest_note = self.store.latest_note().ok().flatten().map(|e| {
+            let filed = e.node_id.is_some_and(|n| {
+                self.nodes
+                    .iter()
+                    .any(|x| x.id == n && x.kind != oats_core::NodeKind::Category)
+            });
+            LatestNote {
+                id: e.id,
+                unfiled: !filed,
+            }
+        });
         let mut map = HashMap::new();
         let projects: Vec<i64> = self
             .nodes
@@ -1967,6 +2002,11 @@ impl OatsApp {
     /// Whether newer rows than the loaded ones exist (after a jump; tests).
     pub fn transcript_has_later(&self) -> bool {
         self.pages.has_later
+    }
+
+    /// Whether the Transcripts viewport showed the end of its content at the last layout (tests).
+    pub fn transcript_at_end(&self) -> bool {
+        self.pages.at_end()
     }
 
     /// Rows per page (tests use a small one so a few hundred rows make several pages).
@@ -3939,6 +3979,9 @@ impl eframe::App for OatsApp {
                         .inner_margin(egui::Margin::symmetric(6, 6)),
                 )
                 .show(ui, |ui| {
+                    let latest = self.latest_note.filter(|l| !l.unfiled).map(|l| l.id);
+                    let latest_nodes =
+                        crate::sidebar::latest_nodes(&self.nodes, &self.sidebar_episodes, latest);
                     let marks = crate::sidebar::TodayMarks {
                         start: self.today_start,
                         nodes: crate::sidebar::today_nodes(
@@ -3947,6 +3990,9 @@ impl eframe::App for OatsApp {
                             self.today_start,
                         ),
                         conversations: self.unfiled_today > 0,
+                        latest: latest.filter(|_| latest_nodes.is_some()),
+                        latest_nodes: latest_nodes.unwrap_or_default(),
+                        latest_conversations: self.latest_note.is_some_and(|l| l.unfiled),
                     };
                     sidebar_actions.extend(sidebar_panel(
                         ui,
@@ -4175,6 +4221,19 @@ impl eframe::App for OatsApp {
                                     .layout(egui::Layout::right_to_left(egui::Align::Center)),
                             );
                             head_ui.add_space(12.0);
+                            let at_now = !self.pages.has_later && self.pages.at_end();
+                            if pill(&mut head_ui, &t, "Jump to now", false, !at_now)
+                                .on_hover_text(if at_now {
+                                    "Showing the newest lines"
+                                } else {
+                                    "Scroll to the newest line, where transcription is \
+                                     happening now"
+                                })
+                                .clicked()
+                            {
+                                cmds.push(Command::JumpToNow);
+                            }
+                            head_ui.add_space(8.0);
                             let on = self.prefs.show_media;
                             if pill(&mut head_ui, &t, "Show media", on, true)
                                 .on_hover_text(if on {

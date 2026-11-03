@@ -2377,6 +2377,21 @@ impl Store {
         )
     }
 
+    /// The newest conversation note that is not low-signal (the one the sidebar marks as the
+    /// most recent), whatever it is filed under.
+    pub fn latest_note(&self) -> Result<Option<Episode>, StoreError> {
+        Ok(self
+            .query_episodes(
+                &format!(
+                    "SELECT {EPISODE_COLUMNS} FROM episodes
+                     WHERE kind != 'media' AND low_signal = 0
+                     ORDER BY started_at DESC, id DESC LIMIT 1"
+                ),
+                &[],
+            )?
+            .pop())
+    }
+
     /// How many unfiled, non-media episodes started at or after `ts` (the same filter as
     /// [`Store::episodes_unfiled`]).
     pub fn unfiled_episodes_since(&self, ts: i64) -> Result<i64, StoreError> {
@@ -4690,6 +4705,24 @@ mod tests {
         // idempotent: a second open changes nothing
         s.init_locked()?;
         assert_eq!(s.events_from(i64::MIN, 20)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn the_latest_note_skips_low_signal_and_media() -> Result<(), StoreError> {
+        let s = Store::open_in_memory()?;
+        assert!(s.latest_note()?.is_none());
+        let c = |title: &str, low: bool| EpisodeContent {
+            title: title.into(),
+            low_signal: low,
+            ..Default::default()
+        };
+        s.insert_episode(1_000, 2_000, &c("old", false), 3_000)?;
+        let newest = s.insert_episode(10_000, 11_000, &c("newest", false), 12_000)?;
+        s.insert_episode(20_000, 21_000, &c("fragments", true), 22_000)?;
+        let media = s.insert_episode(30_000, 31_000, &c("video", false), 32_000)?;
+        s.set_episode_kind(media.id, "media")?;
+        assert_eq!(s.latest_note()?.map(|e| e.id), Some(newest.id));
         Ok(())
     }
 
