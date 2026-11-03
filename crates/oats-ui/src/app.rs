@@ -3615,7 +3615,15 @@ impl OatsApp {
                 }
             },
         };
-        let project = node.and_then(|n| crate::notes::project_of(&self.nodes, n).map(|p| p.id));
+        // only a note the sidebar lists (one of the project's recent, non-low-signal notes)
+        // has a row to select; the rest open inline on the page
+        let project = node
+            .and_then(|n| crate::notes::project_of(&self.nodes, n).map(|p| p.id))
+            .filter(|p| {
+                self.sidebar_episodes
+                    .get(p)
+                    .is_some_and(|list| list.iter().any(|e| e.id == id))
+            });
         match project {
             Some(p) => {
                 // the sidebar row exists only while the project's layer is open and every

@@ -2906,3 +2906,60 @@ fn the_arrow_keys_walk_the_sidebar_and_leave_text_fields_alone() {
     press(&mut rig, egui::Key::ArrowUp);
     assert_eq!(rig.app().prefs().view, View::Todos);
 }
+
+#[test]
+fn a_next_step_of_a_note_without_a_sidebar_row_opens_inline() {
+    use oats_core::{ActionItem, EpisodeContent};
+    let dir = TempDir::new("inline-fallback");
+    let (_work, commerce, _lease) = seed_projects(&dir.db());
+    let s = Store::open(&dir.db()).unwrap();
+    let t = now_ms() - 36_000_000;
+    // seven notes: the oldest falls off the sidebar's five recent rows
+    let mut oldest = None;
+    for i in 0..7 {
+        let at = t + i * 1_800_000;
+        let items = if i == 0 {
+            vec![ActionItem {
+                text: "Ancient task".into(),
+                ..Default::default()
+            }]
+        } else {
+            Vec::new()
+        };
+        let id = s
+            .insert_episode(
+                at,
+                at + 60_000,
+                &EpisodeContent {
+                    title: format!("Note {i}"),
+                    summary: format!("- detail {i}"),
+                    node_id: Some(commerce),
+                    action_items: items,
+                    model: "m".into(),
+                    ..Default::default()
+                },
+                at + 120_000,
+            )
+            .unwrap();
+        if i == 0 {
+            oldest = Some(id.id);
+        }
+    }
+    let oldest = oldest.unwrap();
+    drop(s);
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(3);
+    assert!(!rig.shows("detail 0"), "notes start collapsed");
+    rig.harness.get_by_label_contains("Ancient task").click();
+    rig.harness.run_steps(4);
+    assert_eq!(rig.app().prefs().view, View::Node(commerce));
+    assert_eq!(
+        rig.app().focus_episode(),
+        None,
+        "no sidebar row: stays on the page"
+    );
+    assert!(!rig.app().sidebar_layer_open(commerce));
+    assert!(rig.app().open_notes().contains(&oldest));
+    assert!(rig.shows("detail 0"));
+}

@@ -58,8 +58,9 @@ action items of the project's episodes (newest note first, low-signal notes skip
 `NEXT_STEPS_CAP` = 12 with "Show all N"), each with a checkbox, owner/due and a "from <note> · <date>"
 link (`NotesAction::GoToNote` → `OatsApp::open_note_page`: the note's OWN single-note view
 under its project, exactly as clicking its sidebar row — the project's layer is opened, its
-ancestors expanded, the row selected and scrolled into view; a note with no project — unfiled
-or under a bare category — is focused and flashed on its page via `pending_focus` instead);
+ancestors expanded, the row selected and scrolled into view; a note with no sidebar row — unfiled,
+under a bare category, low-signal, or older than the project's five listed notes — is opened
+inline and flashed on the page via `pending_focus` instead);
 "No next steps yet" when empty. The checkbox
 (`NotesAction::SetActionItemDone` → `Store::set_action_item_done`: `done_at` in the item's
 JSON, not a hand edit, so `user_edited_at` stays) completes an item like a todo: completed
