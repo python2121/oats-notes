@@ -2,8 +2,9 @@
 //! pipeline writes segments, the brain writes interpretations, the UI reads). Times are Unix
 //! milliseconds (UTC); the UI formats them in local time.
 //!
-//! Schema version 8 (`meta.schema_version`; v1 to v7 databases are migrated on open; v8 added
-//! the per-app classes (`producer_overrides`, `producers_seen`, `segments.media_app`) and v7
+//! Schema version 9 (`meta.schema_version`; v1 to v8 databases are migrated on open; v9
+//! removed the auto-created **Media** category — media notes carry no node — see
+//! `store_media.rs`; v8 added the per-app classes (`producer_overrides`, `producers_seen`, `segments.media_app`) and v7
 //! the media columns and `media_plays`, see `store_media.rs`; v5 added
 //! `episodes.user_edited_at`, the time the user last edited a note by hand; v6 re-keyed
 //! interpretation events without the episode id, see [`interpretation_event_key`]):
@@ -348,7 +349,7 @@ pub struct Episode {
 }
 
 impl Episode {
-    /// A media episode (YouTube, music, a media-class app), filed under Media.
+    /// A media episode (YouTube, music, a media-class app): no node, shown in the Media view.
     pub fn is_media(&self) -> bool {
         self.kind == EPISODE_MEDIA
     }
@@ -581,7 +582,7 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// At most this many tags in a search's Tags section.
 pub const TAG_LIMIT: usize = 40;
@@ -1126,6 +1127,12 @@ impl Store {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
+            Some(8) => {
+                // v8 → v9 removes the Media category, `migrate_media_category` below
+                log::info!("migrating the database from schema 8 to {SCHEMA_VERSION}");
+                conn.execute_batch(SCHEMA)?;
+                conn.execute_batch(SCHEMA_REST)?;
+            }
             Some(5) => {
                 // v5 → v6 is the event re-key + orphan cleanup, `migrate_event_keys` below
                 log::info!("migrating the database from schema 5 to {SCHEMA_VERSION}");
@@ -1146,6 +1153,10 @@ impl Store {
         Self::ensure_media_schema(conn)?;
         if from_version.is_some_and(|v| v < 6) {
             Self::migrate_event_keys(conn)?;
+        }
+        // once, at the v9 bump: a category the user names "Media" later is just a category
+        if from_version.is_some_and(|v| v < 9) {
+            self.migrate_media_category()?;
         }
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -4715,6 +4726,5 @@ mod tests {
 #[path = "store_media.rs"]
 mod media;
 pub use media::{
-    EPISODE_CONVERSATION, EPISODE_MEDIA, MEDIA_CATEGORY, MEDIA_COLLAPSE_MS, MediaEntry, Relabel,
-    collapse_plays,
+    EPISODE_CONVERSATION, EPISODE_MEDIA, MEDIA_COLLAPSE_MS, MediaEntry, Relabel, collapse_plays,
 };

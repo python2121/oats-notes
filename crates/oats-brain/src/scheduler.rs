@@ -1457,16 +1457,13 @@ impl Worker {
             return;
         }
         let more = batch.len() >= self.cfg.categorise_batch;
-        // media (YouTube, music) is filed under the Media category without a call
+        // media (YouTube, music) is categorised without a call and filed nowhere: the Media
+        // view shows it
         let (media, batch): (Vec<TranscriptRow>, Vec<TranscriptRow>) =
             batch.into_iter().partition(episodes::is_media_row);
         if !media.is_empty() {
-            let filed = self.store.media_category().and_then(|node| {
-                let filed: Vec<(i64, Option<i64>)> =
-                    media.iter().map(|r| (r.id, Some(node.id))).collect();
-                self.store.apply_categorisation(&filed)
-            });
-            match filed {
+            let filed: Vec<(i64, Option<i64>)> = media.iter().map(|r| (r.id, None)).collect();
+            match self.store.apply_categorisation(&filed) {
                 Ok(()) => self.out.send(BrainEvent::Changed(Vec::new())),
                 Err(e) => self
                     .out
@@ -1847,7 +1844,7 @@ impl Worker {
                 prior = Some(p);
             }
         }
-        // media is filed under Media by its title / URL without a model call (continuing the
+        // media becomes a media note by its title / URL without a model call (continuing the
         // same media's episode); "Summarise" on its note runs one on demand
         if let Some(media) = interpret::media_of(&self.store, chunk) {
             interpret::file_media_without_call(&self.store, chunk, &media, prior.as_ref(), now)

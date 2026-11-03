@@ -600,6 +600,9 @@ pub struct OatsApp {
     media_plays_day: Option<chrono::NaiveDate>,
     /// The Media view: the loaded part of the watch history.
     media_pages: MediaPages,
+    /// The media notes of the Media view's loaded rows, by play id (a row with one gets a
+    /// disclosure triangle and opens the note's card inline).
+    media_notes: HashMap<i64, Episode>,
     /// The Media view row to scroll to and flash (a search hit), by play id.
     media_focus: TranscriptFocus,
     /// The Media view's thumbnails (opt-in: `AppPrefs::fetch_thumbnails`).
@@ -743,6 +746,7 @@ impl OatsApp {
             media_plays: Vec::new(),
             media_plays_day: None,
             media_pages: MediaPages::default(),
+            media_notes: HashMap::new(),
             media_focus: TranscriptFocus::default(),
             thumbs: Thumbs::default(),
             opened_url: None,
@@ -1128,13 +1132,13 @@ impl OatsApp {
         }
     }
 
-    /// "Mark as media" on a conversation from an app classed Media: filed under Media, and
-    /// re-interpreted by the media rules (no todos, no events).
+    /// "Mark as media" on a conversation from an app classed Media: a media note (no node,
+    /// the Media view), re-interpreted by the media rules (no todos, no events).
     pub fn mark_episode_as_media(&mut self, id: i64) {
         match self.store.mark_episode_as_media(id) {
             Ok(true) => {
                 self.brain_send(BrainCommand::Reinterpret(id));
-                self.last_command = Some("Marked as media: filed under Media".to_owned());
+                self.last_command = Some("Marked as media: it is in the Media view now".to_owned());
                 self.reload();
             }
             Ok(false) => self.warning = Some("Already a media note".to_owned()),
@@ -1427,6 +1431,20 @@ impl OatsApp {
     /// Show an episode's note: its node's view (Conversations when it has none), scrolled to its card,
     /// which flashes. The card consumes `pending_focus` when it is laid out.
     fn jump_to_episode(&mut self, id: i64, node: Option<i64>) {
+        // a media note lives in the Media view (it has no node)
+        if node.is_none()
+            && self
+                .store
+                .episode(id)
+                .ok()
+                .flatten()
+                .is_some_and(|e| e.is_media())
+        {
+            if !self.open_media_note(id) {
+                self.warning = Some("That media note has no play in the history".to_owned());
+            }
+            return;
+        }
         self.topic = None;
         self.focus_episode = None;
         self.notes_state.pending_focus = Some(id);
@@ -1763,6 +1781,54 @@ impl OatsApp {
         let (plays, more) = self.fetch_media(None, n);
         self.media_pages.clear();
         self.media_pages.append(plays, more);
+        self.reload_media_notes();
+    }
+
+    /// The media note of every loaded Media view row (the first of its plays that has one).
+    fn reload_media_notes(&mut self) {
+        let mut found = HashMap::new();
+        for e in &self.media_pages.entries {
+            for id in &e.ids {
+                match self.store.episode_of_play(*id) {
+                    Ok(Some(ep)) => {
+                        found.insert(*id, ep);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        log::warn!("media notes: {err}");
+                        break;
+                    }
+                }
+            }
+        }
+        self.media_notes = found;
+    }
+
+    /// Open a media note in the Media view: its row (paged back until loaded) scrolled to and
+    /// flashed, its card open. `false`: none of its plays is in the history.
+    pub fn open_media_note(&mut self, id: i64) -> bool {
+        let plays = match self.store.plays_of_episode(id) {
+            Ok(p) => p,
+            Err(e) => {
+                self.store_error(e);
+                return false;
+            }
+        };
+        let Some(play) = plays.last().copied() else {
+            return false;
+        };
+        self.show_media_play(play);
+        if self.media_pages.row_of(play).is_none() {
+            return false;
+        }
+        self.notes_state.open_notes.insert(id);
+        true
+    }
+
+    /// The Media view's media notes, by play id (tests).
+    pub fn media_notes(&self) -> &HashMap<i64, Episode> {
+        &self.media_notes
     }
 
     /// The Media view's next (older) page.
@@ -1773,6 +1839,7 @@ impl OatsApp {
         let before = self.media_pages.oldest;
         let (plays, more) = self.fetch_media(before, MEDIA_PAGE);
         self.media_pages.append(plays, more);
+        self.reload_media_notes();
     }
 
     /// A search hit on a play: the Media view, paged back until its row is loaded, scrolled
@@ -1955,8 +2022,11 @@ impl OatsApp {
             Ok(c) => self.changes = c,
             Err(e) => self.store_error(e),
         }
-        // the Calendar's media list reloads with the rest
+        // the Calendar's media list reloads with the rest, and the Media view's notes
         self.media_plays_day = None;
+        if self.prefs.view == View::Media {
+            self.reload_media_notes();
+        }
         if let Ok(runs) = self.store.runs(1) {
             self.brain_status.last_run = runs.into_iter().next();
         }
@@ -2791,7 +2861,7 @@ impl OatsApp {
 
     /// "Move to…" on a project / topic: the typed name resolved in the tree (no model call);
     /// a project goes under a category or project, a topic under a project or topic, never
-    /// into its own subtree or under Media. `true` when it moved.
+    /// into its own subtree. `true` when it moved.
     fn reparent_node(&mut self, id: i64, text: &str) -> bool {
         use oats_core::NodeKind;
         let Some(node) = self.nodes.iter().find(|n| n.id == id).cloned() else {
@@ -2817,11 +2887,8 @@ impl OatsApp {
                 return false;
             }
         };
-        let media = self.nodes.iter().any(|n| {
-            n.id == parent && n.parent_id.is_none() && n.name == oats_core::store::MEDIA_CATEGORY
-        });
         let below = self.store.subtree_ids(id).unwrap_or_default();
-        if below.contains(&parent) || media {
+        if below.contains(&parent) {
             self.warning = Some("It can't go there".to_owned());
             return false;
         }
@@ -3304,8 +3371,8 @@ impl OatsApp {
                     egui::RichText::new(if fixed_policy.is_some() {
                         "Set by OATS_MEDIA_POLICY."
                     } else {
-                        "Never taken for your conversation. Transcribe (default): filed under \
-                         Media without a model call (“Summarise” runs one), hidden from \
+                        "Never taken for your conversation. Transcribe (default): a media note \
+                         in the Media view without a model call (“Summarise” runs one), hidden from \
                          Transcripts unless “Show media”. Log only: “Watched: …” in the \
                          Calendar, no transcript. Ignore: nothing kept. Music is logged, never \
                          transcribed."
@@ -3536,7 +3603,7 @@ fn apps_table(
     ui.label(
         egui::RichText::new(
             "Meeting: transcribed as the other side of a call. Media: follows the policy above, \
-             filed under Media. Ignore: nothing kept. Changes apply within 5 s. In a call on \
+             its notes in the Media view. Ignore: nothing kept. Changes apply within 5 s. In a call on \
              a media app, turn on “On a call” (⇧⌘C).",
         )
         .color(t.text_tertiary)
@@ -4041,13 +4108,21 @@ impl eframe::App for OatsApp {
                             }
                         }
                         View::Media => {
-                            media_actions = media_view(
+                            self.notes_state.brain = self.brain_status.clone();
+                            let (media, notes) = media_view(
                                 &mut list_ui,
                                 &self.media_pages,
                                 &mut self.media_focus,
                                 &mut self.thumbs,
                                 self.prefs.fetch_thumbnails,
+                                crate::media::MediaNotes {
+                                    by_play: &self.media_notes,
+                                    state: &mut self.notes_state,
+                                    nodes: &self.nodes,
+                                },
                             );
+                            media_actions = media;
+                            notes_actions = notes;
                         }
                         View::Todos => {
                             todo_actions = todos_view(

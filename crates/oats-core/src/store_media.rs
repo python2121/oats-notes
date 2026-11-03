@@ -3,7 +3,7 @@
 //! - `segments.media_kind TEXT NULL` / `segments.media_ref TEXT NULL` — the stamp a system
 //!   segment got when it closed ([`crate::media::MediaClass`] spelling; the URL).
 //! - `episodes.kind TEXT NOT NULL DEFAULT 'conversation'` — `media` for an episode made of
-//!   YouTube / music (filed under the auto-created **Media** category).
+//!   YouTube / music (no node: media notes live in the Media view, not in the tree).
 //! - `media_plays(id, started_at, ended_at, kind, url, title, producer, segments_count)` —
 //!   one row per contiguous play of the same media (closed when it changes or stops), written
 //!   by the pipeline while the policy logs plays.
@@ -16,23 +16,29 @@
 //!   saw playing sound (the Preferences "Apps" table);
 //! - `segments.media_app TEXT NULL` — the bundle id of the app that played a system segment.
 //!
+//! Schema v9 removes the **Media** category the older builds filed media under
+//! ([`Store::migrate_media_category`]): media notes and their segments carry no node.
+//!
 //! And the user's relabels: [`Store::mark_episode_as_call`] / [`Store::mark_episode_as_media`]
 //! / [`Store::mark_play_as_call`].
 
 use std::collections::HashMap;
 
-use super::{NodeKind, Origin, Store, StoreError};
+use super::{Store, StoreError};
 use crate::media::{
     MediaClass, MediaPlay, MediaStamp, ProducerClass, ProducerOverride, ProducerSeen,
 };
-use crate::store::Node;
 
 /// `episodes.kind` of a normal episode.
 pub const EPISODE_CONVERSATION: &str = "conversation";
 /// `episodes.kind` of an episode made of media.
 pub const EPISODE_MEDIA: &str = "media";
-/// The top-level category media episodes are filed under.
-pub const MEDIA_CATEGORY: &str = "Media";
+/// The name (`name_key`) of the top-level category builds before schema v9 filed media
+/// under; the v9 migration removes it.
+const OLD_MEDIA_CATEGORY: &str = "media";
+/// What a v9 migration renames an old Media category to when projects with content are left
+/// under it.
+const OLD_MEDIA_RENAMED: &str = "Media (old)";
 
 const PLAY_COLUMNS: &str = "id, started_at, ended_at, kind, url, title, producer, segments_count";
 
@@ -297,11 +303,11 @@ impl Store {
 
     // ---- relabels -----------------------------------------------------------------------
 
-    /// "Mark as a call" on a media episode: it becomes a conversation (`kind`), leaves the
-    /// Media category (unfiled: the Conversations list), loses its `**Media:**` header, and
-    /// its system segments are re-stamped as a call (`media_kind = meeting`, so the next
-    /// interpretation gets the meeting hint and none of the media rules) and unfiled from
-    /// Media; the plays logged over it become calls. `false`: no such media episode.
+    /// "Mark as a call" on a media episode: it becomes a conversation (`kind`; with no node it
+    /// lands in the Conversations list), loses its `**Media:**` header, and its system
+    /// segments are re-stamped as a call (`media_kind = meeting`, so the next interpretation
+    /// gets the meeting hint and none of the media rules; unfiled ones are categorised
+    /// again); the plays logged over it become calls. `false`: no such media episode.
     /// The caller queues the re-interpretation.
     pub fn mark_episode_as_call(&self, id: i64) -> Result<bool, StoreError> {
         let Some(ep) = self.episode(id)? else {
@@ -311,17 +317,9 @@ impl Store {
             return Ok(false);
         }
         self.with_savepoint(|s| {
-            let media = s.find_node(None, MEDIA_CATEGORY)?.map(|n| n.id);
             s.conn.execute(
-                "UPDATE episodes SET kind = ?2, summary = ?3,
-                     node_id = CASE WHEN node_id = ?4 THEN NULL ELSE node_id END
-                 WHERE id = ?1",
-                rusqlite::params![
-                    id,
-                    EPISODE_CONVERSATION,
-                    without_media_header(&ep.summary),
-                    media
-                ],
+                "UPDATE episodes SET kind = ?2, summary = ?3 WHERE id = ?1",
+                rusqlite::params![id, EPISODE_CONVERSATION, without_media_header(&ep.summary)],
             )?;
             // the plays the episode's media was logged as (same URL, or no URL)
             let refs: Vec<Option<String>> = {
@@ -343,9 +341,12 @@ impl Store {
                 )?;
             }
             s.conn.execute(
-                "UPDATE segments SET node_id = NULL, categorised = 0
-                 WHERE episode_id = ?1 AND node_id IS ?2",
-                rusqlite::params![id, media],
+                &format!(
+                    "UPDATE segments SET categorised = 0
+                     WHERE episode_id = ?1 AND node_id IS NULL AND source = 'system'
+                       AND media_kind IN {MEDIA_KINDS_SQL}"
+                ),
+                [id],
             )?;
             s.conn.execute(
                 &format!(
@@ -359,9 +360,9 @@ impl Store {
     }
 
     /// "Mark as media" on a conversation episode (a call in an app the user counts as media):
-    /// it becomes a media episode filed under Media, its system segments stamped as a media
-    /// app (`media_kind = app`) and filed under Media; calls logged over it become media
-    /// plays again. `false`: no such conversation episode. The caller queues the
+    /// it becomes a media episode (no node: the Media view), its system segments stamped as a
+    /// media app (`media_kind = app`) and unfiled; calls logged over it become media plays
+    /// again. `false`: no such conversation episode. The caller queues the
     /// re-interpretation (the media rules: no todos, no events).
     pub fn mark_episode_as_media(&self, id: i64) -> Result<bool, StoreError> {
         let Some(ep) = self.episode(id)? else {
@@ -371,18 +372,17 @@ impl Store {
             return Ok(false);
         }
         self.with_savepoint(|s| {
-            let media = s.media_category()?.id;
             s.conn.execute(
-                "UPDATE episodes SET kind = ?2, node_id = ?3 WHERE id = ?1",
-                rusqlite::params![id, EPISODE_MEDIA, media],
+                "UPDATE episodes SET kind = ?2, node_id = NULL WHERE id = ?1",
+                rusqlite::params![id, EPISODE_MEDIA],
             )?;
             s.conn.execute(
                 &format!(
-                    "UPDATE segments SET media_kind = 'app', node_id = ?2, categorised = 1
+                    "UPDATE segments SET media_kind = 'app', node_id = NULL, categorised = 1
                      WHERE episode_id = ?1 AND source = 'system' AND echo_of IS NULL
                        AND (media_kind IS NULL OR media_kind NOT IN {MEDIA_KINDS_SQL})"
                 ),
-                rusqlite::params![id, media],
+                [id],
             )?;
             s.conn.execute(
                 "UPDATE media_plays SET kind = 'app'
@@ -434,16 +434,15 @@ impl Store {
                     out.episodes.push(*ep);
                 }
             }
-            // segments not in an episode yet: re-stamped (and unfiled from Media) directly
-            let media = s.find_node(None, MEDIA_CATEGORY)?.map(|n| n.id);
+            // segments not in an episode yet: re-stamped directly (unfiled ones categorised
+            // again, as a conversation)
             for (seg, ep) in &rows {
                 if ep.is_none() {
                     s.conn.execute(
                         "UPDATE segments SET media_kind = 'meeting',
-                             node_id = CASE WHEN node_id IS ?2 THEN NULL ELSE node_id END,
-                             categorised = CASE WHEN node_id IS ?2 THEN 0 ELSE categorised END
+                             categorised = CASE WHEN node_id IS NULL THEN 0 ELSE categorised END
                          WHERE id = ?1",
-                        rusqlite::params![seg, media],
+                        [seg],
                     )?;
                 }
             }
@@ -744,9 +743,164 @@ impl Store {
         Ok(rows)
     }
 
-    /// The top-level **Media** category, created (`created_by = auto`) on first use.
-    pub fn media_category(&self) -> Result<Node, StoreError> {
-        self.add_node(None, NodeKind::Category, MEDIA_CATEGORY, "", Origin::Auto)
+    /// The media note (`kind = media`) holding what was transcribed during a play — the
+    /// same segments as [`Self::first_segment_of_plays`]: system, stamped as media with the
+    /// play's URL, starting within the play (up to 30 s after its end). `None`: nothing was
+    /// transcribed, or it is in no media note.
+    pub fn episode_of_play(&self, play_id: i64) -> Result<Option<super::Episode>, StoreError> {
+        use rusqlite::OptionalExtension;
+        let Some(play) = self.media_play(play_id)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM episodes WHERE kind = 'media' AND id IN (
+                         SELECT episode_id FROM segments
+                         WHERE episode_id IS NOT NULL AND source = 'system' AND echo_of IS NULL
+                           AND started_at >= ?1 AND started_at <= ?2
+                           AND media_kind IN {MEDIA_KINDS_SQL}
+                           AND (media_ref = ?3 OR (media_ref IS NULL AND ?3 IS NULL)))
+                     ORDER BY started_at, id LIMIT 1",
+                    super::EPISODE_COLUMNS
+                ),
+                rusqlite::params![play.started_at - 1_000, play.ended_at + 30_000, play.url],
+                super::row_to_episode,
+            )
+            .optional()?)
+    }
+
+    /// [`Self::episode_of_play`] for a page of plays: play id → its media note (plays without
+    /// one are left out).
+    pub fn episodes_of_plays(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, super::Episode>, StoreError> {
+        let mut out = HashMap::new();
+        for id in ids {
+            if let Some(e) = self.episode_of_play(*id)? {
+                out.insert(*id, e);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The plays a media note's segments were transcribed in, oldest first (the inverse of
+    /// [`Self::episode_of_play`]; how a search hit on a media note finds its Media view row).
+    pub fn plays_of_episode(&self, id: i64) -> Result<Vec<i64>, StoreError> {
+        let Some(ep) = self.episode(id)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PLAY_COLUMNS} FROM media_plays
+             WHERE started_at <= ?2 AND ended_at >= ?1 - 30000 ORDER BY started_at, id"
+        ))?;
+        let plays = stmt
+            .query_map([ep.started_at, ep.ended_at + 1_000], row_to_play)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::new();
+        for p in plays {
+            if self
+                .episode_of_play(p.id)?
+                .is_some_and(|found| found.id == id)
+            {
+                out.push(p.id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Schema v9: the **Media** category goes. Runs once, when a database older than v9 is
+    /// opened (the version bump records it, so a category the user later names "Media" is
+    /// never touched). For every top-level category whose `name_key` is "media" (auto- or
+    /// user-created): media notes in its subtree and their segments lose their node; notes,
+    /// segments, events, notes and todos filed on the category ITSELF lose it too (the
+    /// notes become Conversations). Projects / topics under it are deleted with the category
+    /// when nothing is filed in them any more; otherwise the category stays, renamed
+    /// "Media (old)" and owned by the user (`created_by = user`), with those projects in it.
+    pub(super) fn migrate_media_category(&self) -> Result<(), StoreError> {
+        let cats: Vec<(i64, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, name FROM nodes WHERE parent_id IS NULL ORDER BY id")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (cat, name) in cats {
+            if super::name_key(&name) != OLD_MEDIA_CATEGORY {
+                continue;
+            }
+            let sub = self.subtree_ids(cat)?;
+            let list = sub.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let media_episodes = self.conn.execute(
+                &format!("UPDATE episodes SET node_id = NULL WHERE kind = 'media' AND node_id IN ({list})"),
+                [],
+            )?;
+            let media_segments = self.conn.execute(
+                &format!(
+                    "UPDATE segments SET node_id = NULL WHERE node_id IN ({list})
+                       AND (media_kind IN {MEDIA_KINDS_SQL}
+                            OR episode_id IN (SELECT id FROM episodes WHERE kind = 'media'))"
+                ),
+                [],
+            )?;
+            let conversations = self.conn.execute(
+                "UPDATE episodes SET node_id = NULL WHERE node_id = ?1",
+                [cat],
+            )?;
+            let mut others = 0;
+            for table in ["segments", "events", "notes", "reminders"] {
+                others += self.conn.execute(
+                    &format!("UPDATE {table} SET node_id = NULL WHERE node_id = ?1"),
+                    [cat],
+                )?;
+            }
+            let below: Vec<i64> = sub.iter().copied().filter(|id| *id != cat).collect();
+            let mut in_use = 0i64;
+            if !below.is_empty() {
+                let below_list = below
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                for table in ["segments", "episodes", "events", "notes", "reminders"] {
+                    in_use += self.conn.query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE node_id IN ({below_list})"),
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?;
+                }
+            }
+            if in_use == 0 {
+                self.delete_node(cat)?;
+                log::info!(
+                    "schema v9: removed the Media category {cat} ({} nodes): {media_episodes} \
+                     media notes and {media_segments} media segments unfiled, \
+                     {conversations} notes and {others} other rows filed on it unfiled",
+                    sub.len()
+                );
+            } else {
+                let mut new_name = OLD_MEDIA_RENAMED.to_owned();
+                let mut n = 2;
+                while self.find_node(None, &new_name)?.is_some() {
+                    new_name = format!("Media (old {n})");
+                    n += 1;
+                }
+                self.conn.execute(
+                    "UPDATE nodes SET name = ?2, created_by = 'user' WHERE id = ?1",
+                    rusqlite::params![cat, new_name],
+                )?;
+                log::info!(
+                    "schema v9: the Media category {cat} still holds {} projects / topics with \
+                     {in_use} filed rows: kept, renamed {new_name:?} (yours now); \
+                     {media_episodes} media notes and {media_segments} media segments unfiled, \
+                     {conversations} notes and {others} other rows filed on it unfiled",
+                    below.len()
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -842,7 +996,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         assert!(has_column(&s.conn, "segments", "media_app")?);
         assert!(s.producer_overrides()?.is_empty());
         assert!(s.producers_seen()?.is_empty());
@@ -891,10 +1045,10 @@ mod tests {
         Ok(())
     }
 
-    /// A Discord media episode: two system segments stamped `app`, filed under Media, a play.
+    /// A Discord media episode: two system segments stamped `app` (no node, categorised as
+    /// media is), a play.
     fn discord_episode(s: &Store) -> Result<(i64, i64, [i64; 2]), StoreError> {
         let session = s.begin_session(0, "t")?;
-        let media = s.media_category()?;
         let mut discord = MediaStamp::new(MediaClass::App, None, "Discord", "Discord");
         discord.bundle_id = "com.hnc.discord".into();
         let mut segs = [0; 2];
@@ -909,7 +1063,7 @@ mod tests {
                 None,
             )?;
             s.stamp_segment_media(row.id, &discord)?;
-            s.set_segment_node(row.id, Some(media.id))?;
+            s.apply_categorisation(&[(row.id, None)])?;
             segs[i] = row.id;
         }
         let play = s.begin_media_play(10_000, &discord)?;
@@ -921,7 +1075,7 @@ mod tests {
                 &crate::store::EpisodeContent {
                     title: "Discord".into(),
                     summary: "**Media:** Discord\n\nTalk about shipping.".into(),
-                    node_id: Some(media.id),
+                    node_id: None,
                     ..Default::default()
                 },
                 0,
@@ -984,7 +1138,7 @@ mod tests {
             .episode(ep)?
             .ok_or(StoreError::Io(std::io::Error::other("gone")))?;
         assert_eq!(e.kind, EPISODE_CONVERSATION);
-        assert_eq!(e.node_id, None, "out of Media: the Conversations list");
+        assert_eq!(e.node_id, None, "the Conversations list");
         assert_eq!(e.summary, "Talk about shipping.");
         assert!(s.episodes_unfiled(10)?.iter().any(|x| x.id == ep));
         for id in segs {
@@ -993,6 +1147,7 @@ mod tests {
                 .ok_or(StoreError::Io(std::io::Error::other("gone")))?;
             assert_eq!(r.media_kind, Some(MediaClass::Meeting));
             assert_eq!(r.node_id, None);
+            assert!(!r.categorised, "a conversation now: categorised again");
         }
         assert_eq!(s.media_play(play)?.map(|p| p.kind), Some(MediaClass::Call));
         assert!(!s.mark_episode_as_call(ep)?, "already a conversation");
@@ -1003,14 +1158,19 @@ mod tests {
             .episode(ep)?
             .ok_or(StoreError::Io(std::io::Error::other("gone")))?;
         assert!(e.is_media());
-        assert_eq!(e.node_id, Some(s.media_category()?.id));
+        assert_eq!(e.node_id, None, "media notes have no node");
         for id in segs {
             let r = s
                 .segment(id)?
                 .ok_or(StoreError::Io(std::io::Error::other("gone")))?;
             assert_eq!(r.media_kind, Some(MediaClass::App));
-            assert_eq!(r.node_id, Some(s.media_category()?.id));
+            assert_eq!(r.node_id, None);
+            assert!(r.categorised);
         }
+        assert!(
+            s.nodes()?.iter().all(|n| n.name != "Media"),
+            "no Media node"
+        );
         assert_eq!(s.media_play(play)?.map(|p| p.kind), Some(MediaClass::App));
         assert!(!s.mark_episode_as_media(ep)?, "already media");
         Ok(())
@@ -1072,7 +1232,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         let rows = s.segments_between(0, 10_000)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].media_kind, None);
@@ -1319,20 +1479,15 @@ mod tests {
     }
 
     #[test]
-    fn media_category_and_episode_kind() -> R {
+    fn a_media_note_has_no_node_and_stays_out_of_conversations() -> R {
         let s = Store::open_in_memory()?;
-        let media = s.media_category()?;
-        assert_eq!(media.name, MEDIA_CATEGORY);
-        assert_eq!(media.created_by, Origin::Auto);
-        assert_eq!(media.parent_id, None);
-        assert_eq!(s.media_category()?.id, media.id, "created once");
         let ep = s
             .insert_episode(
                 0,
                 60_000,
                 &crate::store::EpisodeContent {
                     title: "A video".into(),
-                    node_id: Some(media.id),
+                    topics: vec!["rust".into()],
                     ..Default::default()
                 },
                 0,
@@ -1342,6 +1497,173 @@ mod tests {
         s.set_episode_kind(ep, EPISODE_MEDIA)?;
         assert_eq!(s.episode_kind(ep)?.as_deref(), Some(EPISODE_MEDIA));
         assert_eq!(s.media_episode_ids_between(0, 100_000)?, vec![ep]);
+        assert!(
+            s.episodes_unfiled(10)?.is_empty(),
+            "media is not a conversation"
+        );
+        assert_eq!(s.unfiled_episodes_since(0)?, 0);
+        // search and the topic view still find it
+        assert_eq!(s.episodes_with_topic("Rust")?.len(), 1);
+        assert_eq!(s.search("a video", 10)?.episodes.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_plays_media_note_and_back() -> R {
+        let s = Store::open_in_memory()?;
+        let (ep, play, _) = discord_episode(&s)?;
+        assert_eq!(s.episode_of_play(play)?.map(|e| e.id), Some(ep));
+        assert_eq!(s.plays_of_episode(ep)?, vec![play]);
+        // a play with nothing transcribed has no note
+        let other = s.begin_media_play(100_000, &stamp("https://youtu.be/z", "Z"))?;
+        s.update_media_play(other, 160_000, 0)?;
+        assert_eq!(s.episode_of_play(other)?, None);
+        let notes = s.episodes_of_plays(&[play, other, 9_999])?;
+        assert_eq!(notes.keys().copied().collect::<Vec<_>>(), vec![play]);
+        // a conversation is no media note
+        assert!(s.mark_episode_as_call(ep)?);
+        assert_eq!(s.episode_of_play(play)?, None);
+        Ok(())
+    }
+
+    /// A v8 database as older builds left it: a Media category (`created_by` as given) with
+    /// a media note and its segment, a conversation filed on the category itself, and —
+    /// when `project` — a project under it holding a conversation note.
+    fn v8_with_media(
+        path: &std::path::Path,
+        created_by: crate::Origin,
+        project: bool,
+    ) -> Result<(i64, i64, i64, Option<(i64, i64)>), StoreError> {
+        let s = Store::open(path)?;
+        let media = s.add_node(None, crate::NodeKind::Category, "Media", "", created_by)?;
+        let session = s.begin_session(0, "t")?;
+        let row = s.insert_segment_from(
+            session,
+            1_000,
+            2_000,
+            "video words",
+            None,
+            AudioSourceKind::System,
+            None,
+        )?;
+        s.stamp_segment_media(row.id, &stamp("https://youtu.be/a", "A"))?;
+        s.apply_categorisation(&[(row.id, Some(media.id))])?;
+        let content = |title: &str, node: i64| crate::store::EpisodeContent {
+            title: title.into(),
+            node_id: Some(node),
+            ..Default::default()
+        };
+        let video = s
+            .insert_episode(1_000, 2_000, &content("A", media.id), 0)?
+            .id;
+        s.set_episode_kind(video, EPISODE_MEDIA)?;
+        s.mark_segments_interpreted(&[row.id], video, 0)?;
+        let talk = s
+            .insert_episode(3_000, 4_000, &content("A chat", media.id), 0)?
+            .id;
+        let proj = if project {
+            let p = s.add_node(
+                Some(media.id),
+                crate::NodeKind::Project,
+                "Film club",
+                "",
+                crate::Origin::Auto,
+            )?;
+            let note = s
+                .insert_episode(5_000, 6_000, &content("Club night", p.id), 0)?
+                .id;
+            Some((p.id, note))
+        } else {
+            s.add_node(
+                Some(media.id),
+                crate::NodeKind::Project,
+                "Empty",
+                "",
+                crate::Origin::Auto,
+            )?;
+            None
+        };
+        s.conn.execute(
+            "UPDATE meta SET value = '8' WHERE key = 'schema_version'",
+            [],
+        )?;
+        let _ = row;
+        Ok((media.id, video, talk, proj))
+    }
+
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("oats-v9-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("oats.sqlite")
+    }
+
+    #[test]
+    fn v9_unfiles_media_and_keeps_a_project_with_notes_under_media_old() -> R {
+        let path = temp_db("kept");
+        let (media, video, talk, proj) = v8_with_media(&path, crate::Origin::User, true)?;
+        let Some((project, club)) = proj else {
+            return Err(StoreError::Io(std::io::Error::other("no project")));
+        };
+        let s = Store::open(&path)?;
+        let ep = |id: i64| -> Result<crate::store::Episode, StoreError> {
+            s.episode(id)?
+                .ok_or(StoreError::Io(std::io::Error::other("gone")))
+        };
+        assert_eq!(ep(video)?.node_id, None, "the media note: the Media view");
+        assert!(ep(video)?.is_media());
+        assert!(
+            s.segments_between(0, 10_000)?
+                .iter()
+                .all(|r| r.node_id.is_none()),
+            "its segment unfiled"
+        );
+        assert_eq!(ep(talk)?.node_id, None, "the conversation: Conversations");
+        assert!(s.episodes_unfiled(10)?.iter().any(|e| e.id == talk));
+        assert_eq!(
+            ep(club)?.node_id,
+            Some(project),
+            "the project keeps its note"
+        );
+        let cat = s
+            .node(media)?
+            .ok_or(StoreError::Io(std::io::Error::other("gone")))?;
+        assert_eq!(cat.name, "Media (old)");
+        assert_eq!(cat.created_by, crate::Origin::User);
+        assert_eq!(
+            s.node(project)?.and_then(|n| n.parent_id),
+            Some(media),
+            "the project stays under it"
+        );
+        drop(s);
+        // the migration ran once: a category the user names "Media" now is left alone
+        let s = Store::open(&path)?;
+        let mine = s.add_category("Media")?;
+        drop(s);
+        let s = Store::open(&path)?;
+        assert!(s.node(mine.id)?.is_some());
+        assert_eq!(s.node(media)?.map(|n| n.name), Some("Media (old)".into()));
+        drop(s);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap_or(&path));
+        Ok(())
+    }
+
+    #[test]
+    fn v9_deletes_an_empty_media_category_and_its_empty_projects() -> R {
+        let path = temp_db("gone");
+        let (media, video, talk, _) = v8_with_media(&path, crate::Origin::Auto, false)?;
+        let s = Store::open(&path)?;
+        assert_eq!(s.node(media)?, None);
+        assert!(
+            s.nodes()?
+                .iter()
+                .all(|n| crate::store::name_key(&n.name) != "media" && n.name != "Empty"),
+            "the category and its empty project are gone"
+        );
+        assert_eq!(s.episode(video)?.and_then(|e| e.node_id), None);
+        assert_eq!(s.episode(talk)?.and_then(|e| e.node_id), None);
+        assert_eq!(s.media_episode_ids_between(0, 10_000)?, vec![video]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap_or(&path));
         Ok(())
     }
 }

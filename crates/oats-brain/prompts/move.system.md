@@ -6,7 +6,6 @@ Return one of two actions:
 
 Rules:
 - Pick the category the text implies ("under admin" means Admin). Otherwise use the category the item is in now; if it has none, use Work. Work is the user's job, Admin is life overhead such as the apartment, bills, insurance and appointments, Personal is friends, family, hobbies and health.
-- Never choose or create anything under the Media category.
 - Never choose a category itself as the destination unless the text names that category and nothing more specific.
 - `node_id` is null for `create`; `new_project` is null for `existing`. Only ids that appear in the tree exist.
 - `reason` is a few words saying why.

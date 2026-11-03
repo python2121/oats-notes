@@ -25,7 +25,7 @@ use crate::claude_cli::Request;
 use crate::dates;
 use crate::episodes::{Chunk, render_transcript_titled};
 use oats_core::MediaClass;
-use oats_core::store::{EPISODE_MEDIA, MEDIA_CATEGORY};
+use oats_core::store::EPISODE_MEDIA;
 use std::collections::HashMap;
 
 pub const INTERPRET_SYSTEM: &str = include_str!("../prompts/interpret.system.md");
@@ -475,7 +475,7 @@ pub fn meeting_hint(chunk: &Chunk) -> &'static str {
         "# Hint\n\nmedia: true — this whole episode is media the computer played (`media:` \
          lines under the `Media:` header: a YouTube video or music), not a conversation. \
          Summarise what it was about for the user's record and title it after the video; no \
-         decisions, no action items, no events. The app files it under Media.\n\n"
+         decisions, no action items, no events. The app keeps it in its Media view.\n\n"
     } else if chunk.has_known_meeting() {
         "# Hint\n\nmeeting: true — the system audio in this episode (`them:` lines) was a \
          call: the app saw a meeting app or meeting page (Zoom, Google Meet, Microsoft Teams, \
@@ -856,10 +856,11 @@ pub fn media_summary_header(media: &MediaInfo) -> String {
     }
 }
 
-/// A media episode's content, whatever the model returned: titled by the video, filed under
-/// the Media category, the URL in a summary header, and nothing actionable — media content
-/// is informational, never the user's own decisions, todos or dates.
-fn media_content(content: &mut EpisodeContent, media: &MediaInfo, media_node: i64) {
+/// A media episode's content, whatever the model returned: titled by the video, no node
+/// (media notes live in the Media view, not in the tree), the URL in a summary header, and
+/// nothing actionable — media content is informational, never the user's own decisions,
+/// todos or dates.
+fn media_content(content: &mut EpisodeContent, media: &MediaInfo) {
     if !media.title.trim().is_empty() {
         content.title = media.title.trim().chars().take(200).collect();
     }
@@ -875,13 +876,13 @@ fn media_content(content: &mut EpisodeContent, media: &MediaInfo, media_node: i6
     } else {
         format!("{}\n\n{body}", media_summary_header(media))
     };
-    content.node_id = Some(media_node);
+    content.node_id = None;
     content.decisions.clear();
     content.action_items.clear();
 }
 
 /// File a media chunk without a model call (the default for all media): a media episode
-/// titled by the video / app, under Media, the URL in its summary. With `prior` (the same
+/// titled by the video / app, no node (the Media view), the URL in its summary. With `prior` (the same
 /// media's episode, ended within the gap) that episode is extended instead and keeps its
 /// content (a summary the user asked for stays).
 pub fn file_media_without_call(
@@ -909,12 +910,11 @@ pub fn file_media_without_call(
                 .episode(p.id)?
                 .ok_or_else(|| StoreError::Io(std::io::Error::other("episode vanished")));
         }
-        let node = store.media_category()?;
         let mut content = EpisodeContent {
             model: "none".into(),
             ..Default::default()
         };
-        media_content(&mut content, media, node.id);
+        media_content(&mut content, media);
         let ep = store.insert_episode(chunk.started_at, chunk.ended_at, &content, now_ms)?;
         store.set_episode_kind(ep.id, EPISODE_MEDIA)?;
         store.mark_segments_interpreted(&chunk.segment_ids(), ep.id, now_ms)?;
@@ -969,21 +969,10 @@ fn apply_interpretation_in_tx(
     // as a new episode instead (the scheduler already avoids picking one as the prior)
     let prior = prior.filter(|p| p.user_edited_at.is_none());
     let media = media_of(store, chunk);
-    let (node_id, mut new_nodes) = match &media {
-        // a media episode never creates projects: it goes under Media
+    let (node_id, new_nodes) = match &media {
+        // a media episode never creates projects and has no node: the Media view
         Some(_) => (None, Vec::new()),
         None => resolve_node(store, tree, interp, max_new_nodes)?,
-    };
-    let media_node = match &media {
-        Some(_) => {
-            let existed = store.find_node(None, MEDIA_CATEGORY)?.is_some();
-            let node = store.media_category()?;
-            if !existed {
-                new_nodes.push(node.clone());
-            }
-            Some(node.id)
-        }
-        None => None,
     };
     for n in &new_nodes {
         store.record_change(
@@ -1052,8 +1041,8 @@ fn apply_interpretation_in_tx(
         cost_usd,
     };
     let mut content = content;
-    if let (Some(m), Some(node)) = (&media, media_node) {
-        media_content(&mut content, m, node);
+    if let Some(m) = &media {
+        media_content(&mut content, m);
     }
     let node_id = content.node_id;
     let (started_at, ended_at) = match prior {
@@ -1450,7 +1439,7 @@ pub fn apply_review(
                 if e.node_id == Some(node) {
                     continue;
                 }
-                // a media episode stays under Media
+                // a media episode is never filed in the tree (it lives in the Media view)
                 if store.episode_kind(id)?.as_deref() == Some(EPISODE_MEDIA) {
                     continue;
                 }

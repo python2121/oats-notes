@@ -1810,12 +1810,12 @@ fn a_search_hit_from_far_back_loads_a_window_around_it_and_paging_forward_reache
 
 // ---- per-app classes, On a call, Mark as a call / media, Show media ------------------------------
 
-/// A Discord media note: two system segments stamped as a media app, filed under Media.
+/// A Discord media note: two system segments stamped as a media app; no node (the Media
+/// view).
 fn seed_discord_episode(db: &Path) -> i64 {
     use oats_core::{AudioSourceKind, EpisodeContent, MediaClass, MediaStamp};
     let s = Store::open(db).unwrap();
     let sid = s.begin_session(now_ms() - 600_000, "seed").unwrap();
-    let media = s.media_category().unwrap();
     let mut discord = MediaStamp::new(MediaClass::App, None, "Discord", "Discord");
     discord.bundle_id = "com.hnc.discord".into();
     let t = now_ms() - 300_000;
@@ -1840,7 +1840,7 @@ fn seed_discord_episode(db: &Path) -> i64 {
             )
             .unwrap();
         s.stamp_segment_media(row.id, &discord).unwrap();
-        s.set_segment_node(row.id, Some(media.id)).unwrap();
+        s.apply_categorisation(&[(row.id, None)]).unwrap();
         ids.push(row.id);
     }
     let ep = s
@@ -1850,7 +1850,7 @@ fn seed_discord_episode(db: &Path) -> i64 {
             &EpisodeContent {
                 title: "Discord".into(),
                 summary: "**Media:** Discord".into(),
-                node_id: Some(media.id),
+                node_id: None,
                 model: "none".into(),
                 ..Default::default()
             },
@@ -2112,7 +2112,7 @@ fn mark_as_a_call_moves_a_media_note_to_conversations_and_reinterprets_it_as_a_m
     });
     assert!(
         rig.app().listed_episodes().iter().all(|e| e.id != ep),
-        "a media note is filed under Media, not in Conversations"
+        "a media note is in the Media view, not in Conversations"
     );
     rig.app().mark_episode_as_call(ep);
     let s = Store::open(&dir.db()).unwrap();
@@ -2136,7 +2136,7 @@ fn mark_as_a_call_moves_a_media_note_to_conversations_and_reinterprets_it_as_a_m
 }
 
 #[test]
-fn mark_as_media_files_a_media_app_call_under_media() {
+fn mark_as_media_makes_a_media_app_call_a_media_note_with_no_node() {
     let dir = TempDir::new("mark-media");
     let ep = seed_discord_episode(&dir.db());
     let s = Store::open(&dir.db()).unwrap();
@@ -2149,7 +2149,7 @@ fn mark_as_media_files_a_media_app_call_under_media() {
     rig.harness.run_steps(2);
     let e = s.episode(ep).unwrap().unwrap();
     assert!(e.is_media());
-    assert_eq!(e.node_id, Some(s.media_category().unwrap().id));
+    assert_eq!(e.node_id, None);
     assert!(rig.app().listed_episodes().iter().all(|e| e.id != ep));
 }
 
@@ -3011,4 +3011,44 @@ fn a_next_step_of_a_note_without_a_sidebar_row_opens_inline() {
     assert!(!rig.app().sidebar_layer_open(commerce));
     assert!(rig.app().open_notes().contains(&oldest));
     assert!(rig.shows("detail 0"));
+}
+
+#[test]
+fn a_media_note_opens_under_its_play_in_the_media_view() {
+    use oats_core::{MediaClass, MediaStamp};
+    let dir = TempDir::new("media-note");
+    let ep = seed_discord_episode(&dir.db());
+    let s = Store::open(&dir.db()).unwrap();
+    let e = s.episode(ep).unwrap().unwrap();
+    let play = s
+        .begin_media_play(
+            e.started_at,
+            &MediaStamp::new(MediaClass::App, None, "Discord", "Discord"),
+        )
+        .unwrap();
+    s.update_media_play(play, e.ended_at, 2).unwrap();
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowMediaView);
+    rig.harness.run_steps(3);
+    assert_eq!(
+        rig.app().media_notes().get(&play).map(|n| n.id),
+        Some(ep),
+        "the play's media note"
+    );
+    assert!(!rig.shows("Re-interpret"), "closed by default");
+    // a click on the row opens the card inline, with its actions
+    rig.harness.get_by_label("Discord (note)").click();
+    rig.harness.run_steps(3);
+    assert!(rig.app().open_notes().contains(&ep));
+    assert!(rig.shows("Re-interpret"));
+    rig.harness.get_by_label("Discord (note)").click();
+    rig.harness.run_steps(3);
+    assert!(!rig.app().open_notes().contains(&ep));
+    // a jump to the note (search, topic) lands here, open
+    rig.app().run(Command::ShowNotes);
+    rig.harness.run_steps(2);
+    assert!(rig.app().open_media_note(ep));
+    rig.harness.run_steps(3);
+    assert_eq!(rig.app().prefs().view, View::Media);
+    assert!(rig.shows("Re-interpret"));
 }

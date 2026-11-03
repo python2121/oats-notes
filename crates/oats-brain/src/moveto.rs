@@ -4,7 +4,7 @@
 //! new target goes to a haiku request (`prompts/move.*.md`, [`move_request`]) whose answer is
 //! either an existing node or ONE new project, executed by [`execute_move`].
 
-use oats_core::store::{MEDIA_CATEGORY, name_key};
+use oats_core::store::name_key;
 use oats_core::{Node, NodeKind, Origin, Store, StoreError};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -263,7 +263,7 @@ pub struct Moved {
 }
 
 /// Apply the model's decision in one transaction. A node id that does not exist, a parent
-/// that is missing / under Media, or an empty name is an `Err` (nothing written). A new
+/// that is missing, or an empty name is an `Err` (nothing written). A new
 /// project is the user's own (`created_by = user`) and recorded as a `node_create` change.
 pub fn execute_move(
     store: &Store,
@@ -302,16 +302,6 @@ pub fn execute_move(
                 let Some(parent) = all.iter().find(|n| n.id == np.parent_id && !n.archived) else {
                     return Ok(Err(format!("no such parent {}", np.parent_id)));
                 };
-                let mut root = parent;
-                for _ in 0..16 {
-                    match root.parent_id.and_then(|p| all.iter().find(|n| n.id == p)) {
-                        Some(p) => root = p,
-                        None => break,
-                    }
-                }
-                if root.name == MEDIA_CATEGORY {
-                    return Ok(Err("projects are not made under Media".to_owned()));
-                }
                 let existed = s.find_node(Some(parent.id), &name)?.is_some();
                 let desc: String = np.description.chars().take(MAX_DESC_CHARS).collect();
                 let node = s.add_node(

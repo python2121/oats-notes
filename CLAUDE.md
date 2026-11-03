@@ -92,7 +92,7 @@ items whose text is unchanged (`EditDraft::to_content_keeping`).
 
 **Move to… on notes**: a note card's title and a project page's note row have a context menu
 with "Move to ▸" (every node by full path) and "New project…" (an inline name field in the
-card; parent = the note's category unless Media, else Work, else the first category; created
+card; parent = the note's category, else Work, else the first category; created
 `created_by = user` + a `node_create` change), both via `Store::move_episode` (an
 `episode_move` change, undoable like `episode_node`).
 
@@ -328,7 +328,17 @@ Firefox" / "Spotify" / "Spotify · Firefox", "2:05–2:41 pm · 36 min", the URL
 transcribed segments: `Store::first_segment_of_plays` → the usual jump), Delete
 (`Store::delete_media_plays` + a WAL checkpoint). Paged by `Store::media_history_page(before,
 limit)` 200 plays at a time; the next (older) page loads when the bottom "Loading older…" marker
-comes within 1.5 viewports. Empty: "Nothing watched yet." `--selftest out.png --media`.
+comes within 1.5 viewports. Empty: "Nothing watched yet." **Media notes live here** (they have
+no node, there is no Media category): a row whose plays were transcribed into a media note
+(`Store::episode_of_play` — the play's media-stamped system segments' `kind = media` episode;
+`episodes_of_plays` batch, `plays_of_episode` the inverse; `OatsApp::media_notes`, reloaded with
+the pages and on every data change while the view is open) gets a disclosure triangle in the
+left margin; a click on the row toggles the note's `episode_card` inline under it
+(`NotesState::open_notes`; AccessKit label "<title> (note)"), whose actions (Summarise,
+Re-interpret, Mark as a call, Edit, Delete) go through `apply_notes` as on a node page. A jump
+to a media note (search, Topic view: `jump_to_episode`) opens it here (`OatsApp::open_media_note`:
+its last play's row paged in, flashed, card open). `--selftest out.png --media` (seeds a
+transcribed video with its note and renders it open).
 
 **Thumbnails are opt-in (privacy rule)**: the app makes no network calls of its own except the
 model download and the `claude` CLI. Preferences "Fetch video thumbnails (contacts YouTube's
@@ -577,7 +587,7 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   and schema `{action: existing|create, node_id, new_project{name,parent_id,description},
   reason}` (the prompt gets the tree, the item's title/summary or text, its current path). The
   scheduler executes it in one savepoint (`moveto::execute_move`): an unknown node / parent,
-  a Media parent or an empty name is a warning and nothing changes; a new project is
+  or an empty name is a warning and nothing changes; a new project is
   `created_by = user` with a `node_create` change; the result is a `BrainEvent::Command`
   confirmation ("Moved to …" / "Created Admin › X and moved the note") so the usual toast and
   ding show. Kinds in `Queued` / `Settled`: `move` (episode id) and `move_segment`. Tier-0
@@ -591,7 +601,7 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   `MoveDraft::sidebar` — and "Mark as a call" / "Mark as media" when they apply); project /
   topic rows have "Rename…" and "Move to…" (re-parent: an inline field resolved by
   `resolve_local` only, NO model call — ambiguous / unknown names are a warning; a project goes
-  under a category or project, a topic anywhere below; never into its own subtree or Media;
+  under a category or project, a topic anywhere below; never into its own subtree;
   a `node_move` change, undoable). Tree rows carry AccessKit labels "Category: …" / "Project:
   …" / "Topic: …".
 - Drag-to-merge (`oats-ui::merge`): a note card's title, a project-page note row and a sidebar
@@ -740,7 +750,8 @@ nested transaction (`Store::with_savepoint`; outermost `BEGIN IMMEDIATE`, inner 
 `SAVEPOINT`, rolled back on error or panic). `episodes.id` is `AUTOINCREMENT` (an older table
 is rebuilt in place on open, same schema version), so a reset or merged episode's id is never
 handed to a later episode that would adopt its events.
-Schema version 5 (`meta.schema_version`; v5 added `episodes.user_edited_at`; a v1 file is migrated on open — `categories` become
+Schema version 9 (`meta.schema_version`; v9 removed the Media category — see "Media on the
+system lane" —, v7/v8 added the media tables, v6 re-keyed events; v5 added `episodes.user_edited_at`; a v1 file is migrated on open — `categories` become
 the root `nodes` with the same ids, `segments` is rebuilt — a v2 file gets two columns
 in place, `segments.source TEXT NOT NULL DEFAULT 'mic'` and `segments.echo_of INTEGER NULL`,
 and a v3 file's `reminders` table is rebuilt as the todos, same ids, by
@@ -896,13 +907,13 @@ from a video creates nothing), and what was watched is recorded.
   call" pill in the control bar (enabled while listening with system audio), Listen → "On a
   Call" (⇧⌘C, `Command::ToggleOnCall`), status strip "· on a call".
 - Retroactive relabels (`store_media.rs`): `Store::mark_episode_as_call` (media episode →
-  `kind = conversation`, out of Media (node NULL → Conversations), `**Media:**` header dropped,
-  its system segments re-stamped `media_kind = meeting` and unfiled from Media, overlapping
+  `kind = conversation` (node NULL → Conversations), `**Media:**` header dropped, its system
+  segments re-stamped `media_kind = meeting` (unfiled ones `categorised = 0` again), overlapping
   plays → `kind = call`), then the UI sends `BrainCommand::Reinterpret` (the stamps now make
   it a conversation chunk with the meeting hint; no media rules). `mark_episode_as_media` (the
   inverse, offered on a conversation whose `segments.media_app` is classed Media:
-  `Store::episode_media_apps` + `ProducerOverrides::effective_class`) → `kind = media`, under
-  Media, segments `media_kind = app`, calls → `app`, Reinterpret. `mark_play_as_call` (a
+  `Store::episode_media_apps` + `ProducerOverrides::effective_class`) → `kind = media`, node
+  NULL, segments `media_kind = app`, calls → `app`, Reinterpret. `mark_play_as_call` (a
   Calendar play) → `kind = call` ("Call via Discord 10:12–10:40"), transcribed segments of
   the play re-stamped and their episodes converted; under Log only nothing was kept and the
   confirmation says "No transcript was kept for this (policy: log only)". UI: right-click on a
@@ -946,7 +957,18 @@ from a video creates nothing), and what was watched is recorded.
   `Episode::is_media`), `media_plays(id, started_at, ended_at, kind, url, title, producer,
   segments_count)` (kind also 'app' and 'call'); `stamp_segment_media`, `set_segment_media`,
   `begin_media_play` / `update_media_play` / `media_plays_between`, `episode_kind` /
-  `set_episode_kind`, `media_category()` (top-level **Media**, `created_by = auto`, on first use).
+  `set_episode_kind`, `episode_of_play` / `episodes_of_plays` / `plays_of_episode`.
+- **No Media category (schema v9)**: media notes (`kind = media`) and media segments carry
+  `node_id = NULL`; the Media VIEW is their home, the sidebar tree never shows them, and
+  `episodes_unfiled` (Conversations) keeps excluding them. `Store::migrate_media_category`
+  (run once from `init_locked` when a file older than v9 is opened; the version bump records
+  it, so a category the user names "Media" later is just a category): for every top-level
+  category whose `name_key` is "media" (auto or user-created), media notes and media segments
+  in its subtree → node NULL; notes / segments / events / notes / todos filed on the category
+  itself → NULL (its conversations land in Conversations); then the category and its subtree
+  are deleted when no project / topic under it still holds anything, else it is renamed
+  "Media (old)" (`created_by = user`) with those projects kept. Counts are logged at info.
+  A v8 binary refuses a v9 file (`SchemaTooNew`).
 - Brain: `episodes::cut` never mixes media with conversation (nor two videos); media segments
   render as `[HH:MM] media: …` under `Media: <title> <url>` (titles from `media_plays`); the
   interpret prompt says media is informational (no decisions/actions/todos/reminders/events,
@@ -955,17 +977,19 @@ from a video creates nothing), and what was watched is recorded.
   continuing the same media's episode within the gap; title from the play, else the URL / app);
   `BrainCommand::Summarise(id)` ("Summarise" on a media note) runs one interpretation with the
   media prompt, revising the note in place (`run_in_place`, shared with `Rewrite`). `apply_interpretation` enforces the media rules
-  for media chunks: title = the video, node = Media, summary header `**Media:** [title](url)`,
+  for media chunks: title = the video, node NULL, summary header `**Media:** [title](url)`,
   no decisions/action items/events/new projects, `episodes.kind = media`; the review
-  never merges media with conversation nor re-files a media episode; categorisation files
-  media segments under Media without a call; hotwords stay mic-only (`can_command`).
+  never merges media with conversation nor files a media episode in the tree; categorisation
+  marks media segments categorised with node NULL, without a call; hotwords stay mic-only (`can_command`).
 - UI: Preferences "Media: Ignore / Log only / Transcribe" and the "Apps" table (`app_rows`:
   fixed rows for `oats_media::KNOWN_APPS` (locked call apps, then Slack / Discord tagged "web + app":
   their web pages take the desktop bundle's class, so a browser-only user can still change it)
   ∪ producers seen ∪ overrides, deduped by bundle id (a seen row replaces the fixed one);
   order locked, Slack/Discord, rest alphabetical; class dropdown "Auto (Media)" / Meeting / Media / Ignore, locked
-  rows "Meeting 🔒" greyed, "transcribe anyway" for Media rows only while the policy is Ignore /
-  Log only; `OatsApp::set_app_class`); the status strip shows "▶ <title>" while media plays;
+  rows "Meeting 🔒" greyed, "transcribe anyway" for Media rows while the policy is Ignore /
+  Log only, and always for music apps (music is never transcribed otherwise);
+  `OatsApp::set_app_class`); the status strip shows "▶ <title>" while media plays (not for an
+  idle web player / an ignored app);
   the Calendar day panel lists "Watched: <title>" / "Listened: …" / "Call via …" 10:12–10:40
   (`Store::media_plays_between_latest`: a media — URL, for `music` URL + title — is listed on
   the day of its LAST play only, once; calls and URL-less plays are never scrubbed; index
@@ -984,5 +1008,5 @@ from a video creates nothing), and what was watched is recorded.
 Commands block — add:
 OATS_MEDIA_POLICY=ignore|log|transcribe …  # media on system audio (default transcribe; Preferences sets meta.media_policy)
 cargo run -p oats-notes -- --selftest out.png --prefs   # Preferences over seeded apps (the Apps table)
-cargo run -p oats-notes -- --selftest out.png --media   # the Media view (seeded plays over two days, thumbnails off)
+cargo run -p oats-notes -- --selftest out.png --media   # the Media view (seeded plays over two days, thumbnails off; a transcribed video's media note open under its row)
 OATS_MEDIA=off …                            # no media detection (no producer polling, no Firefox reads)

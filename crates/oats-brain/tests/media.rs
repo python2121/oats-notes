@@ -1,6 +1,6 @@
 //! Media on the system lane in the brain: `media:` lines and their `Media:` header in the
-//! prompt, media episodes titled by the video and filed under an auto-created Media category
-//! with nothing actionable, and a video saying "hey computer" commanding nothing.
+//! prompt, media episodes titled by the video with no node (the Media view; no Media category)
+//! and nothing actionable, and a video saying "hey computer" commanding nothing.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -9,10 +9,8 @@ use chrono::Local;
 use oats_brain::episodes::{Chunk, EpisodeRule, cut};
 use oats_brain::interpret::{self, Interpretation};
 use oats_brain::{Brain, BrainCommand, BrainConfig, BrainEvent, BrainHandle, ClaudeCli, hotword};
-use oats_core::store::{EPISODE_MEDIA, MEDIA_CATEGORY};
-use oats_core::{
-    AudioSourceKind, MediaClass, MediaStamp, NodeKind, Origin, Store, TodoFilter, TranscriptRow,
-};
+use oats_core::store::{EPISODE_MEDIA, name_key};
+use oats_core::{AudioSourceKind, MediaClass, MediaStamp, Store, TodoFilter, TranscriptRow};
 
 const URL: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
 const TITLE: &str = "How to plan a launch";
@@ -118,7 +116,7 @@ fn the_prompt_renders_media_lines_under_a_titled_header_with_the_media_hint() {
 }
 
 #[test]
-fn a_media_episode_is_titled_by_the_video_filed_under_media_and_carries_nothing_actionable() {
+fn a_media_episode_is_titled_by_the_video_has_no_node_and_carries_nothing_actionable() {
     let s = Store::open_in_memory().unwrap();
     let work = s.categories().unwrap()[0].id;
     let row = store_video(&s, now_ms() - 3_600_000);
@@ -128,7 +126,6 @@ fn a_media_episode_is_titled_by_the_video_filed_under_media_and_carries_nothing_
         segments: vec![row],
     };
     let tree = s.nodes().unwrap();
-    assert!(s.find_node(None, MEDIA_CATEGORY).unwrap().is_none());
     let applied = interpret::apply_interpretation(
         &s,
         &tree,
@@ -148,10 +145,14 @@ fn a_media_episode_is_titled_by_the_video_filed_under_media_and_carries_nothing_
         s.episode_kind(ep.id).unwrap().as_deref(),
         Some(EPISODE_MEDIA)
     );
-    let media = s.find_node(None, MEDIA_CATEGORY).unwrap().unwrap();
-    assert_eq!(media.kind, NodeKind::Category);
-    assert_eq!(media.created_by, Origin::Auto);
-    assert_eq!(ep.node_id, Some(media.id));
+    assert_eq!(ep.node_id, None, "media notes live in the Media view");
+    assert!(
+        s.nodes()
+            .unwrap()
+            .iter()
+            .all(|n| name_key(&n.name) != "media"),
+        "no Media category"
+    );
     assert!(
         ep.summary
             .starts_with(&format!("**Media:** [{TITLE}]({URL})\n\n- plan a launch")),
@@ -165,7 +166,7 @@ fn a_media_episode_is_titled_by_the_video_filed_under_media_and_carries_nothing_
     assert!(s.todos(TodoFilter::Open).unwrap().is_empty());
     // no "Product launch" project
     assert!(s.find_node(Some(work), "Product launch").unwrap().is_none());
-    assert_eq!(applied.new_nodes.len(), 1, "only the Media category");
+    assert!(applied.new_nodes.is_empty(), "media creates no nodes");
 }
 
 #[test]
@@ -369,9 +370,13 @@ fn the_brain_files_a_video_as_media_and_runs_no_command_from_it() {
         s.episode_kind(ep.id).unwrap().as_deref(),
         Some(EPISODE_MEDIA)
     );
-    assert_eq!(
-        ep.node_id,
-        s.find_node(None, MEDIA_CATEGORY).unwrap().map(|n| n.id)
+    assert_eq!(ep.node_id, None);
+    assert!(
+        s.segments_between(0, i64::MAX)
+            .unwrap()
+            .iter()
+            .all(|r| r.node_id.is_none()),
+        "media segments are filed nowhere"
     );
     assert!(ep.action_items.is_empty() && ep.decisions.is_empty());
     assert!(s.events_from(i64::MIN, 100).unwrap().is_empty());

@@ -77,7 +77,7 @@ pub enum ProducerClass {
     Auto,
     /// Always a call: transcribed as the other side (`them:`), the meeting hint.
     Meeting,
-    /// Always media: follows the media policy (log only by default), filed under Media.
+    /// Always media: follows the media policy; its notes live in the Media view.
     Media,
     /// Neither transcribed nor logged.
     Ignore,
@@ -151,7 +151,7 @@ pub enum MediaPolicy {
     /// Not transcribed, but each play is logged in `media_plays` (title, URL, start / end).
     LogOnly,
     /// Transcribed, segments stamped with the media, plays logged (the default: the brain
-    /// files media under Media without a model call; "Summarise" on a media note runs one).
+    /// makes media notes without a model call; "Summarise" on a media note runs one).
     #[default]
     Transcribe,
 }

@@ -707,7 +707,9 @@ fn episode_menu(
         ui.separator();
         if ui
             .button("Mark as media")
-            .on_hover_text("Not a conversation of yours: file it under Media (no todos, no events)")
+            .on_hover_text(
+                "Not a conversation of yours: make it a media note (no todos, no events)",
+            )
             .clicked()
         {
             actions.push(SidebarAction::MarkAsMedia(ep.id));

@@ -36,7 +36,7 @@ pub enum NotesAction {
     GoToNote(i64),
     /// "Mark as a call" on a media note: a conversation again, re-interpreted as a meeting.
     MarkAsCall(i64),
-    /// "Mark as media" on a call in an app classed Media: filed under Media.
+    /// "Mark as media" on a call in an app classed Media: a media note (the Media view).
     MarkAsMedia(i64),
     /// "Summarise" a media note (one model call with the media prompt).
     Summarise(i64),
@@ -1050,7 +1050,7 @@ pub(crate) fn episode_card(
                             && ui
                                 .button("Mark as media")
                                 .on_hover_text(
-                                    "Not a conversation of yours: file it under Media (no \
+                                    "Not a conversation of yours: make it a media note (no \
                                      todos, no events)",
                                 )
                                 .clicked()

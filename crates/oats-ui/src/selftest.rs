@@ -85,9 +85,10 @@ fn seed_apps(store: &Store) -> Result<(), oats_core::StoreError> {
 }
 
 /// Four plays over yesterday and today: two YouTube videos in Firefox (one watched in two
-/// sittings five minutes apart, which the view folds into one row), Spotify, a Discord stream.
-fn seed_media(store: &Store) -> Result<(), oats_core::StoreError> {
-    use oats_core::{MediaClass, MediaStamp};
+/// sittings five minutes apart, which the view folds into one row, and transcribed into a
+/// media note — returned, so the view can show it open), Spotify, a Discord stream.
+fn seed_media(store: &Store) -> Result<i64, oats_core::StoreError> {
+    use oats_core::{AudioSourceKind, EpisodeContent, MediaClass, MediaStamp};
     const H: i64 = 3_600_000;
     const M: i64 = 60_000;
     let today = midnight_ms(&Local::now());
@@ -146,7 +147,52 @@ fn seed_media(store: &Store) -> Result<(), oats_core::StoreError> {
         )?;
         store.update_media_play(id, to, segments)?;
     }
-    Ok(())
+    // the Rust video was transcribed (no node: the Media view is its home) and summarised
+    let url = "https://www.youtube.com/watch?v=rQ3xV2b7Lk0";
+    let title = "Rust 2026: what's new in the compiler";
+    let stamp = MediaStamp::new(MediaClass::YouTube, Some(url.into()), title, "Firefox");
+    let session = store.begin_session(today + 8 * H + 30 * M, "selftest")?;
+    let mut segs = Vec::new();
+    for (i, text) in [
+        "the new trait solver is now on by default for every crate",
+        "and incremental builds got about twenty percent faster on large workspaces",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = today + 8 * H + 31 * M + i as i64 * M;
+        let row = store.insert_segment_from(
+            session,
+            at,
+            at + 20_000,
+            text,
+            None,
+            AudioSourceKind::System,
+            None,
+        )?;
+        store.stamp_segment_media(row.id, &stamp)?;
+        store.apply_categorisation(&[(row.id, None)])?;
+        segs.push(row.id);
+    }
+    store.end_session(session, today + 8 * H + 52 * M)?;
+    let note = store.insert_episode(
+        today + 8 * H + 31 * M,
+        today + 8 * H + 33 * M,
+        &EpisodeContent {
+            title: title.into(),
+            summary: format!(
+                "**Media:** [{title}]({url})\n\n- The next-generation trait solver is on by \
+                 default.\n- Incremental builds are about 20 % faster on large workspaces."
+            ),
+            topics: vec!["Rust".into(), "compilers".into()],
+            model: "sonnet".into(),
+            ..Default::default()
+        },
+        today + 9 * H,
+    )?;
+    store.set_episode_kind(note.id, oats_core::store::EPISODE_MEDIA)?;
+    store.mark_segments_interpreted(&segs, note.id, today + 9 * H)?;
+    Ok(note.id)
 }
 
 /// Notes tagged around a commerce project, so a multi-word search ("commerce cod delay")
@@ -201,9 +247,11 @@ pub fn run_with(
     if options.prefs {
         seed_apps(&store).map_err(|e| format!("seeding the apps: {e}"))?;
     }
-    if options.media {
-        seed_media(&store).map_err(|e| format!("seeding the plays: {e}"))?;
-    }
+    let media_note = if options.media {
+        Some(seed_media(&store).map_err(|e| format!("seeding the plays: {e}"))?)
+    } else {
+        None
+    };
     if options.search.is_some() {
         seed_tags(&store).map_err(|e| format!("seeding the tags: {e}"))?;
     }
@@ -279,7 +327,14 @@ pub fn run_with(
     } else if options.calendar {
         harness.state_mut().run(Command::ShowCalendar);
     } else if options.media {
-        harness.state_mut().run(Command::ShowMediaView);
+        let app = harness.state_mut();
+        app.run(Command::ShowMediaView);
+        // the transcribed video's note, open under its row
+        if let Some(note) = media_note
+            && !app.open_media_note(note)
+        {
+            return Err("the seeded media note has no row".to_owned());
+        }
     } else if options.todos || options.toast {
         harness.state_mut().run(Command::ShowTodos);
     }
