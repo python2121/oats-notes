@@ -20,7 +20,7 @@ oats-brain = { workspace = true }
 oats-media = { workspace = true }
 oats-status = { workspace = true }
 egui = { workspace = true }
-eframe = { workspace = true, features = ["wgpu", "persistence"] }
+eframe = { workspace = true, features = ["wgpu", "persistence", "links"] }
 craft-ui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
