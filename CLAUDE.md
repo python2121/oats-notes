@@ -1041,7 +1041,9 @@ from a video creates nothing), and what was watched is recorded.
   the Calendar day panel lists "Watched: <title>" / "Listened: …" / "Call via …" 10:12–10:40
   (`Store::media_plays_between_latest`: a media — URL, for `music` URL + title — is listed on
   the day of its LAST play only, once; calls and URL-less plays are never scrubbed; index
-  `media_plays_url`) (click opens the URL); consecutive MUSIC plays of one producer and service
+  `media_plays_url`) (each row is an `egui::Hyperlink` to the play's URL — hover shows it, ⌘-click
+  opens a new tab; right-click adds "Open in browser" / "Copy link" before "Mark as a call" /
+  "Delete"); consecutive MUSIC plays of one producer and service
   ≤ 10 min apart fold into one row (`calendar::fold_plays`, `PlayFold`): "Listened: Spotify"
   "10:00–10:48 pm · 14 tracks" (distinct titles; one track: "Listened: <Track — Artist>"), a
   click opens the last track's URL, right-click "Mark as a call" / "Delete" act on every play

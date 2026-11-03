@@ -9,7 +9,8 @@
 //!
 //! Events and todos come from the brain's interpretation (significant dates) or from voice
 //! commands; the source is shown so the user can audit. Under them the panel lists what the
-//! computer played that day ("Watched: <title> 10:12–10:40", from `media_plays`); a click
+//! computer played that day ("Watched: <title> 10:12–10:40", from `media_plays`, each a
+//! hyperlink to its URL with "Open in browser" / "Copy link" in the context menu); a click
 //! opens the video in the browser, and the right-click "Mark as a call" relabels a play that
 //! was really a call ("Call via Discord 10:12–10:40").
 
@@ -594,20 +595,15 @@ fn media_section(
         crate::widgets::inset_wrapped(ui, MARGIN, MARGIN, |ui| {
             let when = fold.when();
             let text = RichText::new(fold.label()).size(12.5);
+            // a real hyperlink to the source (underline on hover, hand cursor, ⌘-click for a
+            // new tab, the URL as the tooltip); a play without a URL is plain text
             let resp = match &p.url {
-                Some(url) => {
-                    let link = ui
-                        .add(
-                            egui::Label::new(text.color(t.accent))
-                                .sense(Sense::click())
-                                .wrap(),
-                        )
-                        .on_hover_text(url.as_str());
-                    if link.clicked() {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                    }
-                    link
-                }
+                Some(url) => ui
+                    .add(egui::Hyperlink::from_label_and_url(
+                        text.color(t.accent),
+                        url.clone(),
+                    ))
+                    .on_hover_text(url.as_str()),
                 None => ui.add(
                     egui::Label::new(text.color(t.text))
                         .sense(Sense::click())
@@ -615,6 +611,17 @@ fn media_section(
                 ),
             };
             resp.context_menu(|ui| {
+                if let Some(url) = &p.url {
+                    if ui.button("Open in browser").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        ui.close();
+                    }
+                    if ui.button("Copy link").clicked() {
+                        ui.ctx().copy_text(url.clone());
+                        ui.close();
+                    }
+                    ui.separator();
+                }
                 if p.kind.is_media() {
                     if ui
                         .button("Mark as a call")
