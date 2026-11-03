@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>OatsNotes</string>
+	<key>CFBundleDisplayName</key>
+	<string>OatsNotes</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>OatsNotes transcribes what it hears on this Mac, on device.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>OatsNotes transcribes the other side of calls and what the Mac plays, on device.</string>
+</dict>
+</plist>
