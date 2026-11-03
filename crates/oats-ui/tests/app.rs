@@ -451,11 +451,11 @@ fn brain_events_update_readiness_spend_and_the_notes() {
         interpret_enabled(app) == Some(true)
     });
     rig.harness.run_steps(2);
-    assert!(rig.shows("usage 0.00 today"));
+    assert!(rig.shows("usage $0.00 today"));
     assert!(rig.shows("no brain run yet"));
 
     rig.app().run(Command::InterpretNow);
-    rig.until_label("the spend", "usage 0.25 today");
+    rig.until_label("the spend", "usage $0.25 today");
     // the Changed event reloaded the episodes: the new one is listed
     rig.until_label("the new episode", "Weather chat");
     rig.until_label("the last run line", "last run: interpret");
@@ -2407,7 +2407,7 @@ fn interpret_now_greys_out_with_a_spinner_label_until_the_brain_settles() {
     assert!(rig.harness.query_by_label("Review now").is_some());
     // a second trigger does nothing (one run only)
     rig.app().run(Command::InterpretNow);
-    rig.until_label("the spend", "usage 0.25 today");
+    rig.until_label("the spend", "usage $0.25 today");
     rig.until("the button to come back", |app| {
         interpret_enabled(app) == Some(true)
     });

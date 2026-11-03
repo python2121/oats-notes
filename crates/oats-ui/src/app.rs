@@ -3488,7 +3488,7 @@ impl OatsApp {
                 }
                 (None, None) => {
                     format!(
-                        " · brain usage {:.2} today",
+                        " · brain usage ${:.2} today",
                         self.brain_status.spend_today_usd
                     )
                 }

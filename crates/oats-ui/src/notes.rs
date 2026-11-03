@@ -994,7 +994,7 @@ fn brain_strip(
     });
     inset_wrapped(ui, 8.0, 8.0, |ui| {
         ui.label(
-            RichText::new(format!("usage {:.2} today", status.spend_today_usd))
+            RichText::new(format!("usage ${:.2} today", status.spend_today_usd))
                 .color(t.text_tertiary)
                 .size(11.0),
         );
