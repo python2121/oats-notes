@@ -1387,6 +1387,11 @@ impl OatsApp {
         self.focus_episode
     }
 
+    /// Whether a project's sidebar layer (its recent notes) is open.
+    pub fn sidebar_layer_open(&self, project: i64) -> bool {
+        self.sidebar.episodes_open.contains(&project)
+    }
+
     /// Notes expanded on the project page.
     pub fn open_notes(&self) -> &std::collections::HashSet<i64> {
         &self.notes_state.open_notes
@@ -2635,22 +2640,7 @@ impl OatsApp {
                     self.focus_episode = None;
                     self.set_view(View::Node(id));
                 }
-                NotesAction::GoToNote(id) => {
-                    self.focus_episode = None;
-                    self.topic = None;
-                    // a note homed elsewhere (an item filed here from it): its own page
-                    if !self.episodes.iter().any(|e| e.id == id) {
-                        match self.store.episode(id) {
-                            Ok(Some(e)) => self.set_view(match e.node_id {
-                                Some(n) if self.nodes.iter().any(|x| x.id == n) => View::Node(n),
-                                _ => View::Notes,
-                            }),
-                            Ok(None) => {}
-                            Err(e) => self.store_error(e),
-                        }
-                    }
-                    self.notes_state.pending_focus = Some(id);
-                }
+                NotesAction::GoToNote(id) => self.open_note_page(id),
                 NotesAction::ShowSegment(seg) => self.jump_to_segment(Some(seg)),
                 NotesAction::SetActionItemDone {
                     episode_id,
@@ -3604,6 +3594,64 @@ impl OatsApp {
     /// Open a project's sidebar layer (its recent notes), as the triangle does.
     pub fn open_project_layer(&mut self, id: i64) {
         self.sidebar.episodes_open.insert(id);
+    }
+
+    /// Jump to a note as the sidebar does: the single-note view under its project, with the
+    /// project's layer open and its category expanded so the note's row is the selected one
+    /// in the sidebar. An unfiled note (or one under a bare category) has no sidebar row: it is
+    /// focused and flashed on its page instead.
+    fn open_note_page(&mut self, id: i64) {
+        self.topic = None;
+        self.focus_episode = None;
+        self.notes_state.editing = None;
+        let node = match self.episodes.iter().find(|e| e.id == id) {
+            Some(e) => e.node_id,
+            None => match self.store.episode(id) {
+                Ok(Some(e)) => e.node_id,
+                Ok(None) => return,
+                Err(e) => {
+                    self.store_error(e);
+                    return;
+                }
+            },
+        };
+        let project = node.and_then(|n| crate::notes::project_of(&self.nodes, n).map(|p| p.id));
+        match project {
+            Some(p) => {
+                // the sidebar row exists only while the project's layer is open and every
+                // ancestor is expanded
+                self.sidebar.episodes_open.insert(p);
+                let mut cur = self
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == p)
+                    .and_then(|n| n.parent_id);
+                while let Some(a) = cur {
+                    self.sidebar.collapsed.remove(&a);
+                    cur = self
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == a)
+                        .and_then(|n| n.parent_id);
+                }
+                let mut open: Vec<i64> = self.sidebar.episodes_open.iter().copied().collect();
+                open.sort_unstable();
+                self.prefs.sidebar_episodes_open = open;
+                self.sidebar.reveal_selected = Some(crate::sidebar::SidebarRow::Episode {
+                    episode: id,
+                    project: p,
+                });
+                self.set_view(View::Node(p));
+                self.focus_episode = Some(id);
+            }
+            None => {
+                self.set_view(match node {
+                    Some(n) if self.nodes.iter().any(|x| x.id == n) => View::Node(n),
+                    _ => View::Notes,
+                });
+                self.notes_state.pending_focus = Some(id);
+            }
+        }
     }
 
     /// Selftest only: open a project's sidebar layer.

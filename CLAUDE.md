@@ -56,8 +56,11 @@ the Work view offscreen.
 **Project landing page** (`node_view` for `kind == project`): header, then "Next steps" — the
 action items of the project's episodes (newest note first, low-signal notes skipped, capped at
 `NEXT_STEPS_CAP` = 12 with "Show all N"), each with a checkbox, owner/due and a "from <note> · <date>"
-link (`NotesAction::GoToNote` → `pending_focus` + flash, staying on the page; a collapsed
-target is opened first); "No next steps yet" when empty. The checkbox
+link (`NotesAction::GoToNote` → `OatsApp::open_note_page`: the note's OWN single-note view
+under its project, exactly as clicking its sidebar row — the project's layer is opened, its
+ancestors expanded, the row selected and scrolled into view; a note with no project — unfiled
+or under a bare category — is focused and flashed on its page via `pending_focus` instead);
+"No next steps yet" when empty. The checkbox
 (`NotesAction::SetActionItemDone` → `Store::set_action_item_done`: `done_at` in the item's
 JSON, not a hand edit, so `user_edited_at` stays) completes an item like a todo: completed
 items go after the open ones (newest completion first), struck through in `t.text_tertiary`,
@@ -77,8 +80,9 @@ yet"); the Notes are the same collapsed rows (`project_notes`) of the whole subt
 **Cross-filed items and the click chain**: "Next steps" also lists, INLINE in the same list
 (sorted newest note first, deduped by note + text), the action items filed under this project
 from notes homed elsewhere (`Store::items_filed_under(node)`, loaded into
-`OatsApp::filed_items` for a Node view). A row's click (`GoToNote`) on such an item opens the
-note's own page (its home node, or Conversations when unfiled) with the note focused. Inside a
+`OatsApp::filed_items` for a Node view). A row's click (`GoToNote`) on such an item jumps to the
+note itself (`open_note_page`: the single-note view under its home project, selected in the
+sidebar; Conversations with the card flashed when unfiled). Inside a
 note card each decision / action item with a `segment_id` is a link ("Show in transcript at
 2:31 pm", `timefmt`) → `NotesAction::ShowSegment` → `jump_to_segment`; an item filed under
 another project than its note carries a "→ Commerce project" chip (opens that project). So:

@@ -1263,16 +1263,23 @@ fn the_project_page_lists_next_steps_over_collapsed_notes_and_links_back_to_them
     assert!(rig.shows("pricing detail alpha"));
     assert!(rig.app().open_notes().contains(&pricing));
     assert!(!rig.shows("launch detail beta"));
-    // collapse all, then a next step's source link lands on the expanded note
+    // collapse all, then a next step's source link jumps to the note itself: the single-note
+    // view, selected in the sidebar (the project's layer opened for it)
     rig.harness.get_by_label("Collapse all").click();
     rig.harness.run_steps(3);
     assert!(!rig.shows("pricing detail alpha"));
+    assert!(!rig.app().sidebar_layer_open(commerce));
     rig.harness
         .get_by_label_contains("Book the launch room")
         .click();
     rig.harness.run_steps(4);
-    assert_eq!(rig.app().pending_focus(), None, "focus consumed");
-    assert!(rig.app().open_notes().contains(&launch));
+    assert_eq!(rig.app().pending_focus(), None);
+    assert_eq!(rig.app().focus_episode(), Some(launch));
+    assert_eq!(rig.app().prefs().view, View::Node(commerce));
+    assert!(
+        rig.app().sidebar_layer_open(commerce),
+        "the sidebar row is shown"
+    );
     assert!(rig.shows("launch detail beta"));
     assert!(!rig.shows("pricing detail alpha"));
 }
@@ -1353,14 +1360,15 @@ fn an_item_filed_elsewhere_shows_inline_and_its_click_chain_reaches_the_transcri
         !rig.shows("Note: Dev call notes"),
         "the note itself lives elsewhere"
     );
-    // its source: the dev call's page, the note opened and focused
+    // its source: the dev call's note itself (single-note view, selected in the sidebar)
     rig.harness
         .get_by_label_contains("Add a checkout spinner")
         .click();
     rig.harness.run_steps(4);
     assert_eq!(rig.app().prefs().view, View::Node(devcall));
-    assert_eq!(rig.app().pending_focus(), None, "focus consumed");
-    assert!(rig.app().open_notes().contains(&note));
+    assert_eq!(rig.app().pending_focus(), None);
+    assert_eq!(rig.app().focus_episode(), Some(note));
+    assert!(rig.app().sidebar_layer_open(devcall));
     assert!(rig.shows("devcall detail gamma"));
     // inside the note the item links to the transcript at the line it was said
     rig.harness
