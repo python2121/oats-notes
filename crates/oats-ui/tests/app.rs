@@ -2300,6 +2300,55 @@ fn toggling_24_hour_time_in_preferences_rerenders_transcript_times() {
     assert!(!rig.shows(&twelve) || twelve.starts_with(&twenty_four));
 }
 
+#[test]
+fn deleting_a_note_from_its_edit_view_asks_first_and_keeps_the_transcript() {
+    let dir = TempDir::new("edit-delete");
+    let (commerce, pricing, launch) = seed_project_notes(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(2);
+    rig.harness.get_by_label("Note: Pricing sync").click();
+    rig.harness.run_steps(2);
+    rig.harness.get_all_by_label("Edit").last().unwrap().click();
+    rig.harness.run_steps(2);
+    // Delete asks; Cancel leaves everything
+    rig.harness.get_by_label("Delete").click();
+    rig.harness.run_steps(2);
+    assert!(
+        rig.shows("The transcript stays; the note will not be re-created. Undo not available.")
+    );
+    rig.harness
+        .get_all_by_label("Cancel")
+        .last()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(2);
+    let s = Store::open(&dir.db()).unwrap();
+    assert!(s.episode(pricing).unwrap().is_some());
+    assert!(rig.shows("Save"), "still editing");
+    // confirm: the note goes, its segments stay interpreted
+    let segs = s.segments_of_episode(pricing).unwrap();
+    let uninterpreted = s.uninterpreted_count().unwrap();
+    rig.harness.get_by_label("Delete").click();
+    rig.harness.run_steps(2);
+    rig.harness
+        .get_all_by_label("Delete")
+        .last()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(3);
+    assert!(s.episode(pricing).unwrap().is_none());
+    assert!(s.episode(launch).unwrap().is_some());
+    for seg in segs {
+        let r = s.segment(seg.id).unwrap().unwrap();
+        assert_eq!(r.episode_id, None);
+    }
+    assert_eq!(s.uninterpreted_count().unwrap(), uninterpreted);
+    assert_eq!(rig.app().focus_episode(), None);
+    assert!(!rig.shows("Save"), "edit closed");
+    assert!(!rig.shows("Note: Pricing sync"));
+}
+
 // ---- move while editing, the sidebar note menu, drag-to-merge -------------------------------
 
 fn lease_id(db: &Path) -> i64 {

@@ -2508,6 +2508,55 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a note for good (the user's "Delete" in the edit view): its segments stay in the
+    /// transcript, detached from it, and keep `interpreted_at` so the brain never turns them
+    /// into a new note; the interpretation events it produced go (hotword / user events and
+    /// any todos of those hotword events stay); an `episode_delete` change records the
+    /// episode (not undoable). Returns the title, `None` when there is no such note.
+    pub fn delete_episode(&self, id: i64, now: i64) -> Result<Option<String>, StoreError> {
+        let Some(e) = self.episode(id)? else {
+            return Ok(None);
+        };
+        let tx = Savepoint::begin(&self.conn)?;
+        tx.execute(
+            "UPDATE segments SET episode_id = NULL,
+                    interpreted_at = COALESCE(interpreted_at, ?2)
+             WHERE episode_id = ?1",
+            [id, now],
+        )?;
+        tx.execute(
+            "DELETE FROM reminders WHERE event_id IN
+               (SELECT id FROM events WHERE source = 'interpretation' AND source_episode_id = ?1)",
+            [id],
+        )?;
+        tx.execute(
+            "DELETE FROM events WHERE source = 'interpretation' AND source_episode_id = ?1",
+            [id],
+        )?;
+        tx.execute("DELETE FROM episodes WHERE id = ?1", [id])?;
+        self.record_change(
+            None,
+            "episode_delete",
+            &format!("Deleted note “{}”", e.title),
+            &serde_json::json!({
+                "id": e.id,
+                "title": e.title,
+                "summary": e.summary,
+                "decisions": e.decisions,
+                "action_items": e.action_items,
+                "topics": e.topics,
+                "started_at": e.started_at,
+                "ended_at": e.ended_at,
+                "node_id": e.node_id,
+                "by": "user",
+            }),
+            &serde_json::Value::Null,
+            now,
+        )?;
+        tx.commit()?;
+        Ok(Some(e.title))
+    }
+
     /// After a reset: re-point the interpretation events whose episode no longer exists and
     /// whose source segment is one of `segment_ids` to `episode_id`, so the new
     /// interpretation owns them (and can drop the ones it no longer proposes). Hotword and
@@ -3742,6 +3791,53 @@ mod tests {
         assert_eq!(s.categories()?.len(), 2);
         // positions keep growing after a delete
         assert_eq!(s.add_category("Next")?.position, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn delete_episode_keeps_segments_uninterpreted_free_and_records_a_change() -> R {
+        let s = Store::open_in_memory()?;
+        let sid = s.begin_session(0, "e")?;
+        let a = s.insert_segment(sid, 1_000, 2_000, "a", None)?;
+        let content = EpisodeContent {
+            title: "Standup".into(),
+            ..Default::default()
+        };
+        let ep = s.insert_episode(1_000, 2_000, &content, 5_000)?;
+        s.mark_segments_interpreted(&[a.id], ep.id, 5_000)?;
+        let ev = |title: &str, source, key: &str| NewEvent {
+            when_start: 10_000,
+            when_end: None,
+            all_day: true,
+            title: title.into(),
+            details: String::new(),
+            node_id: None,
+            source: Some(source),
+            source_segment_id: Some(a.id),
+            source_episode_id: Some(ep.id),
+            confidence: None,
+            dedupe_key: Some(key.into()),
+        };
+        let interp = s.upsert_event(&ev("Review", Origin::Interpretation, "ev:1:review"), 5_000)?;
+        let hot = s.upsert_event(&ev("Dentist", Origin::Hotword, "hotword:1:dentist"), 5_000)?;
+        assert_eq!(s.delete_episode(999, 6_000)?, None);
+        assert_eq!(s.delete_episode(ep.id, 6_000)?.as_deref(), Some("Standup"));
+        assert!(s.episode(ep.id)?.is_none());
+        assert_eq!(s.delete_episode(ep.id, 6_000)?, None);
+        // the segment stays, interpreted, with no episode
+        assert_eq!(s.segment(a.id)?.map(|r| r.episode_id), Some(None));
+        assert_eq!(s.uninterpreted_count()?, 0);
+        assert!(s.uninterpreted_segments(10)?.is_empty());
+        let left = s.events_from(0, 100)?;
+        let titles: Vec<_> = left.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, vec!["Dentist"], "{interp:?} {hot:?}");
+        let ch = s.changes(10)?;
+        let descs: Vec<_> = ch
+            .iter()
+            .filter(|c| c.kind == "episode_delete")
+            .map(|c| c.description.as_str())
+            .collect();
+        assert_eq!(descs, vec!["Deleted note “Standup”"]);
         Ok(())
     }
 

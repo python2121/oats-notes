@@ -115,6 +115,7 @@ The brain never rewrites such a note: `interpret_chunk` does not pick an edited 
 prior to revise (the new speech becomes its own episode), `apply_interpretation` ignores an
 edited prior, and the review never merges an edited episode away; node re-filing, low-signal
 marks and events still apply. "Re-interpret" on an edited note first asks "Replace your edits?".
+**Delete** (edit view, after "Move to…", danger text) opens a pop-up at the button (`NotesState::confirm_delete`, `notes::confirm_delete_popup`): "Delete “title”? The transcript stays; the note will not be re-created. Undo not available."; confirming sends `NotesAction::DeleteEpisode` → `Store::delete_episode` (one savepoint: segments detached but keep `interpreted_at`, so they are never re-interpreted into a new note; the note's interpretation events and their todos go, hotword / user events stay; an `episode_delete` change with the old note as `before`, `by: user`), then `checkpoint()`, a 4 s toast, and the view falls back to the project page. Not on the undo stack.
 
 ## The status item (`crates/oats-status/src/lib.rs`)
 

@@ -1347,11 +1347,11 @@ impl OatsApp {
         }
     }
 
-    fn apply_search(&mut self, actions: Vec<SearchAction>) {
+    fn apply_search(&mut self, ctx: &egui::Context, actions: Vec<SearchAction>) {
         for a in actions {
             match a {
                 SearchAction::Close => self.close_search(),
-                SearchAction::Notes(n) => self.apply_notes(vec![n]),
+                SearchAction::Notes(n) => self.apply_notes(ctx, vec![n]),
                 SearchAction::OpenEpisode(id) => {
                     let node = self
                         .search
@@ -1457,6 +1457,7 @@ impl OatsApp {
             self.prefs.view = view;
             self.focus_episode = None;
             self.notes_state.editing = None;
+            self.notes_state.confirm_delete = None;
             self.notes_state.show_transcript = false;
             self.notes_state.show_all_steps = false;
             self.reload_rows();
@@ -2622,7 +2623,7 @@ impl OatsApp {
         }
     }
 
-    fn apply_notes(&mut self, actions: Vec<NotesAction>) {
+    fn apply_notes(&mut self, ctx: &egui::Context, actions: Vec<NotesAction>) {
         for a in actions {
             match a {
                 NotesAction::InterpretNow => self.run(Command::InterpretNow),
@@ -2706,9 +2707,31 @@ impl OatsApp {
                         Err(e) => self.store_error(e),
                     }
                 }
+                NotesAction::DeleteEpisode(id) => self.delete_note(ctx, id),
                 NotesAction::OpenTopic(topic) => self.open_topic(topic),
                 NotesAction::MergeDrop { dragged, into, at } => self.ask_merge(dragged, into, at),
             }
+        }
+    }
+
+    /// A confirmed Delete in a note's edit view: the note and its interpretation events go, its
+    /// segments stay (still marked interpreted). Not on the undo stack.
+    fn delete_note(&mut self, ctx: &egui::Context, id: i64) {
+        let now = chrono::Local::now().timestamp_millis();
+        match self.store.delete_episode(id, now) {
+            Ok(title) => {
+                self.store.checkpoint();
+                self.notes_state.editing = None;
+                self.notes_state.move_draft = None;
+                if self.focus_episode == Some(id) {
+                    self.focus_episode = None;
+                }
+                self.reload();
+                if let Some(title) = title {
+                    self.brain_toast(ctx, format!("Deleted “{title}”"), false);
+                }
+            }
+            Err(e) => self.store_error(e),
         }
     }
 
@@ -3781,6 +3804,7 @@ impl eframe::App for OatsApp {
             && self.notes_state.editing.is_none()
             && self.notes_state.move_draft.is_none()
             && self.notes_state.confirm_merge.is_none()
+            && self.notes_state.confirm_delete.is_none()
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
         {
             // back from a single note to its project's page
@@ -3806,6 +3830,7 @@ impl eframe::App for OatsApp {
             if !ui.ctx().egui_wants_keyboard_input()
                 && self.prefs_window.is_none()
                 && self.notes_state.confirm_merge.is_none()
+                && self.notes_state.confirm_delete.is_none()
             {
                 sidebar_actions = crate::sidebar::key_nav(
                     ui.ctx(),
@@ -4110,14 +4135,19 @@ impl eframe::App for OatsApp {
         {
             self.merge_notes(&ctx, merge);
         }
+        if let Some(id) =
+            crate::notes::confirm_delete_popup(&ctx, &t, &mut self.notes_state.confirm_delete)
+        {
+            notes_actions.push(NotesAction::DeleteEpisode(id));
+        }
         self.apply_sidebar(sidebar_actions, &mut cmds);
         self.apply_transcript(&ctx, transcript_actions);
-        self.apply_notes(notes_actions);
+        self.apply_notes(&ctx, notes_actions);
         self.apply_calendar(calendar_actions);
         self.apply_todos(todo_actions);
         self.apply_media(&ctx, media_actions);
         self.apply_toasts(toast_actions);
-        self.apply_search(search_actions);
+        self.apply_search(&ctx, search_actions);
         self.apply_topic(topic_actions);
         for c in cmds {
             self.run(c);

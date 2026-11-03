@@ -22,6 +22,8 @@ pub enum NotesAction {
     ReviewNow,
     Reorganise,
     Reinterpret(i64),
+    /// Delete a note for good (confirmed in the edit view).
+    DeleteEpisode(i64),
     Undo(i64),
     /// Drill into a node (a project chip in a category's view).
     SelectNode(i64),
@@ -353,6 +355,8 @@ pub struct NotesState {
     pub move_draft: Option<crate::move_to::MoveDraft>,
     /// A note dropped on another, waiting for the user's Yes / No.
     pub confirm_merge: Option<crate::merge::MergeConfirm>,
+    /// A note whose Delete was clicked in the edit view: (episode id, title, popup anchor).
+    pub confirm_delete: Option<(i64, String, egui::Pos2)>,
 }
 
 /// The text fields of a note being edited. Decisions: one per line. Action items: one per
@@ -1265,7 +1269,8 @@ fn edit_card(
         .move_draft
         .as_ref()
         .is_some_and(|d| d.target == oats_brain::MoveTarget::Episode(e.id) && !d.sidebar);
-    let mut cancel = !moving && ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let mut cancel =
+        !moving && state.confirm_delete.is_none() && ui.input(|i| i.key_pressed(egui::Key::Escape));
     let mut open_move = false;
     let inner = ui
         .vertical(|ui| {
@@ -1343,6 +1348,13 @@ fn edit_card(
                         // still writes it
                         if small_button(ui, "Move to…", true) {
                             open_move = true;
+                        }
+                        let del = ui.add(egui::Button::new(
+                            RichText::new("Delete").size(11.5).color(t.danger),
+                        ));
+                        if del.clicked() {
+                            state.confirm_delete =
+                                Some((e.id, e.title.clone(), del.rect.left_bottom()));
                         }
                         ui.label(
                             RichText::new("⌘S saves · Esc cancels")
@@ -2637,4 +2649,50 @@ mod pending_tests {
         );
         assert_eq!(nothing_toast("summarise"), None);
     }
+}
+
+/// The confirmation pop-up for deleting a note from its edit view. Returns the episode id when
+/// confirmed; clears `confirm` on any answer (Escape and Cancel close it).
+pub fn confirm_delete_popup(
+    ctx: &egui::Context,
+    t: &Tokens,
+    confirm: &mut Option<(i64, String, egui::Pos2)>,
+) -> Option<i64> {
+    let (id, title, at) = confirm.as_ref()?.clone();
+    let mut out = None;
+    let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    egui::Area::new(egui::Id::new("delete-confirm"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(at)
+        .constrain(true)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(320.0);
+                ui.label(
+                    RichText::new(format!("Delete “{title}”?"))
+                        .size(12.0)
+                        .color(t.text),
+                );
+                ui.label(
+                    RichText::new(
+                        "The transcript stays; the note will not be re-created. \
+                         Undo not available.",
+                    )
+                    .size(11.0)
+                    .color(t.text_tertiary),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Delete").color(t.danger)).clicked() {
+                        out = Some(id);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        });
+    if out.is_some() || close {
+        *confirm = None;
+    }
+    out
 }
