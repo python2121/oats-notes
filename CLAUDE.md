@@ -347,6 +347,8 @@ grey out when empty, but carry NO accelerator (`UNDO_SHORTCUT` / `REDO_SHORTCUT`
 keep working. Instead `OatsApp::undo_keys` reads ⇧⌘Z then ⌘Z from egui's input every frame,
 native menu or not, only while `!egui_wants_keyboard_input()` (the ⌘S-in-edit-mode pattern).
 
+**Sidebar keyboard** (`sidebar::key_nav`, pure steps `navigable_rows` / `nav_decide`): ↓ / ↑ select the next / previous row in draw order (Views, then the visible tree with an open project's notes before its topics; no wrap; with the selection not in the list ↓ takes the first, ↑ the last) and navigate as a click would. → opens a collapsed node (or a project's note layer), else enters its first child; ← closes an open node, else selects the parent. The keys are consumed only while the sidebar is visible, no text field has focus (`egui_wants_keyboard_input`) and neither Preferences nor the merge confirmation is open; the new row is scrolled into view (`SidebarState::reveal_selected`).
+
 Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui::Window` anchored
 centre with one field, "Your name", saved on Enter / blur / close via `Store::set_user_name`
 (a blank name clears it). Stored in the database, `meta` key `user_name`

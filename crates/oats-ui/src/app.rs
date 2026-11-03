@@ -1378,6 +1378,11 @@ impl OatsApp {
     }
 
     /// The note shown alone (the single-note view), if any.
+    /// Whether the sidebar has this node folded (tests).
+    pub fn sidebar_collapsed(&self, id: i64) -> bool {
+        self.sidebar.collapsed.contains(&id)
+    }
+
     pub fn focus_episode(&self) -> Option<i64> {
         self.focus_episode
     }
@@ -3741,6 +3746,20 @@ impl eframe::App for OatsApp {
 
         let mut sidebar_actions = Vec::new();
         if self.prefs.sidebar_visible {
+            // ↑ ↓ ← → move through the sidebar unless a text field or a modal has the keys
+            if !ui.ctx().egui_wants_keyboard_input()
+                && self.prefs_window.is_none()
+                && self.notes_state.confirm_merge.is_none()
+            {
+                sidebar_actions = crate::sidebar::key_nav(
+                    ui.ctx(),
+                    &mut self.sidebar,
+                    &self.nodes,
+                    &self.sidebar_episodes,
+                    self.prefs.view,
+                    self.focus_episode,
+                );
+            }
             let resp = egui::Panel::left("sidebar")
                 .default_size(
                     self.prefs
@@ -3764,7 +3783,7 @@ impl eframe::App for OatsApp {
                         ),
                         conversations: self.unfiled_today > 0,
                     };
-                    sidebar_actions = sidebar_panel(
+                    sidebar_actions.extend(sidebar_panel(
                         ui,
                         &mut self.sidebar,
                         self.prefs.view,
@@ -3773,7 +3792,7 @@ impl eframe::App for OatsApp {
                         self.focus_episode,
                         &mut self.notes_state.move_draft,
                         &marks,
-                    );
+                    ));
                 });
             let w = resp.response.rect.width();
             if (w - self.prefs.sidebar_width).abs() > 0.5 {

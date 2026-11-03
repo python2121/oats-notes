@@ -2854,3 +2854,47 @@ fn the_master_switch_turns_both_lanes_on() {
     rig.app().run(Command::ToggleListening);
     assert!(!rig.app().is_listening());
 }
+
+#[test]
+fn the_arrow_keys_walk_the_sidebar_and_leave_text_fields_alone() {
+    let dir = TempDir::new("sidebar-keys");
+    let (work, _commerce, _lease) = seed_projects(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    let press = |rig: &mut Rig, key: egui::Key| {
+        rig.harness.key_press(key);
+        rig.harness.run_steps(3);
+    };
+    assert_eq!(rig.app().prefs().view, View::Transcripts);
+    press(&mut rig, egui::Key::ArrowDown);
+    press(&mut rig, egui::Key::ArrowDown);
+    assert_eq!(rig.app().prefs().view, View::Calendar);
+    // Todos, Media, then the first category
+    for _ in 0..3 {
+        press(&mut rig, egui::Key::ArrowDown);
+    }
+    assert_eq!(rig.app().prefs().view, View::Node(work));
+    assert!(!rig.app().sidebar_collapsed(work));
+    // ← closes Work, → opens it again
+    press(&mut rig, egui::Key::ArrowLeft);
+    assert!(rig.app().sidebar_collapsed(work));
+    assert_eq!(rig.app().prefs().view, View::Node(work));
+    press(&mut rig, egui::Key::ArrowRight);
+    assert!(!rig.app().sidebar_collapsed(work));
+    // ↑ goes back up to Media
+    press(&mut rig, egui::Key::ArrowUp);
+    assert_eq!(rig.app().prefs().view, View::Media);
+
+    // arrows inside the add-todo field do not move the selection
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    use egui::accesskit::Role;
+    rig.harness
+        .get_all_by_role(Role::TextInput)
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(1);
+    press(&mut rig, egui::Key::ArrowDown);
+    press(&mut rig, egui::Key::ArrowUp);
+    assert_eq!(rig.app().prefs().view, View::Todos);
+}

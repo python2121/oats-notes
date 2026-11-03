@@ -31,6 +31,9 @@ pub struct SidebarState {
     /// Projects whose layer (recent notes, then topics) is open; closed by default. The app
     /// mirrors this into `AppPrefs::sidebar_episodes_open` when it changes.
     pub episodes_open: HashSet<i64>,
+    /// A row a key press just selected: the panel scrolls it into view once it is drawn
+    /// selected, then clears this.
+    pub reveal_selected: Option<SidebarRow>,
 }
 
 /// One note listed under a project.
@@ -104,6 +107,242 @@ pub fn visible_rows<'a>(nodes: &'a [Node], collapsed: &HashSet<i64>) -> Vec<(&'a
     let mut out = Vec::new();
     walk(nodes, None, 0, collapsed, &mut out);
     out
+}
+
+/// A row the keyboard can land on, in draw order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SidebarRow {
+    View(View),
+    Node(i64),
+    /// A note listed under a project.
+    Episode {
+        episode: i64,
+        project: i64,
+    },
+}
+
+/// The arrow keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavKey {
+    Down,
+    Up,
+    Left,
+    Right,
+}
+
+/// What an arrow key does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NavOutcome {
+    Nothing,
+    /// Select (and navigate to) a row.
+    Select(SidebarRow),
+    /// Expand a collapsed category / topic.
+    Expand(i64),
+    /// Collapse an open category / topic.
+    Collapse(i64),
+    /// Open a project's note layer.
+    OpenLayer(i64),
+    /// Close a project's note layer.
+    CloseLayer(i64),
+}
+
+/// The navigable rows in exactly the order `sidebar_panel` draws them: the Views, then the
+/// visible tree, with an open project's notes between it and its topics.
+pub fn navigable_rows(
+    nodes: &[Node],
+    collapsed: &HashSet<i64>,
+    episodes_open: &HashSet<i64>,
+    episodes: &HashMap<i64, Vec<SidebarEpisode>>,
+) -> Vec<SidebarRow> {
+    let mut out: Vec<SidebarRow> = VIEW_ROWS
+        .iter()
+        .map(|(_, v)| SidebarRow::View(*v))
+        .collect();
+    // a project folds with its notes layer, not with `collapsed`
+    let mut folded = collapsed.clone();
+    for n in nodes {
+        if n.kind == NodeKind::Project && !episodes_open.contains(&n.id) {
+            folded.insert(n.id);
+        }
+    }
+    for (n, _) in visible_rows(nodes, &folded) {
+        out.push(SidebarRow::Node(n.id));
+        if n.kind == NodeKind::Project && episodes_open.contains(&n.id) {
+            for ep in episodes.get(&n.id).into_iter().flatten() {
+                out.push(SidebarRow::Episode {
+                    episode: ep.id,
+                    project: n.id,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The index of the row drawn selected, if it is in the list.
+pub fn current_row(rows: &[SidebarRow], view: View, focus_episode: Option<i64>) -> Option<usize> {
+    if let Some(ep) = focus_episode {
+        return rows
+            .iter()
+            .position(|r| matches!(r, SidebarRow::Episode { episode, .. } if *episode == ep));
+    }
+    let want = match view {
+        View::Node(id) => SidebarRow::Node(id),
+        v => SidebarRow::View(v),
+    };
+    rows.iter().position(|r| *r == want)
+}
+
+/// ↓: the next row (the first when nothing is selected); no wrap.
+pub fn next_row(rows: &[SidebarRow], cur: Option<usize>) -> Option<SidebarRow> {
+    let i = cur.map_or(0, |i| i + 1);
+    rows.get(i).cloned()
+}
+
+/// ↑: the previous row (the last when nothing is selected); no wrap.
+pub fn prev_row(rows: &[SidebarRow], cur: Option<usize>) -> Option<SidebarRow> {
+    match cur {
+        None => rows.last().cloned(),
+        Some(0) => None,
+        Some(i) => rows.get(i - 1).cloned(),
+    }
+}
+
+/// ←: the parent row of the current one.
+pub fn parent_row(nodes: &[Node], row: &SidebarRow) -> Option<SidebarRow> {
+    match row {
+        SidebarRow::View(_) => None,
+        SidebarRow::Episode { project, .. } => Some(SidebarRow::Node(*project)),
+        SidebarRow::Node(id) => nodes
+            .iter()
+            .find(|n| n.id == *id)
+            .and_then(|n| n.parent_id)
+            .map(SidebarRow::Node),
+    }
+}
+
+/// What one arrow key does, given the rows and the fold state.
+pub fn nav_decide(
+    key: NavKey,
+    rows: &[SidebarRow],
+    cur: Option<usize>,
+    nodes: &[Node],
+    collapsed: &HashSet<i64>,
+    episodes_open: &HashSet<i64>,
+    episodes: &HashMap<i64, Vec<SidebarEpisode>>,
+) -> NavOutcome {
+    let select = |r: Option<SidebarRow>| r.map_or(NavOutcome::Nothing, NavOutcome::Select);
+    match key {
+        NavKey::Down => return select(next_row(rows, cur)),
+        NavKey::Up => return select(prev_row(rows, cur)),
+        _ => {}
+    }
+    let Some(i) = cur else {
+        return NavOutcome::Nothing;
+    };
+    let SidebarRow::Node(id) = rows[i] else {
+        // a note row or a Views row: only ← (to the project) does anything
+        return if key == NavKey::Left {
+            select(parent_row(nodes, &rows[i]))
+        } else {
+            NavOutcome::Nothing
+        };
+    };
+    let is_project = nodes
+        .iter()
+        .any(|n| n.id == id && n.kind == NodeKind::Project);
+    let has_content = has_children(nodes, id) || episodes.get(&id).is_some_and(|e| !e.is_empty());
+    // `Some(open)` for a row with a disclosure triangle
+    let open = if !has_content {
+        None
+    } else if is_project {
+        Some(episodes_open.contains(&id))
+    } else {
+        Some(!collapsed.contains(&id))
+    };
+    match (key, open) {
+        (NavKey::Right, Some(false)) if is_project => NavOutcome::OpenLayer(id),
+        (NavKey::Right, Some(false)) => NavOutcome::Expand(id),
+        (NavKey::Right, Some(true)) => select(rows.get(i + 1).cloned().filter(|r| match r {
+            SidebarRow::Episode { project, .. } => *project == id,
+            SidebarRow::Node(n) => nodes.iter().any(|x| x.id == *n && x.parent_id == Some(id)),
+            SidebarRow::View(_) => false,
+        })),
+        (NavKey::Left, Some(true)) if is_project => NavOutcome::CloseLayer(id),
+        (NavKey::Left, Some(true)) => NavOutcome::Collapse(id),
+        (NavKey::Left, _) => select(parent_row(nodes, &rows[i])),
+        _ => NavOutcome::Nothing,
+    }
+}
+
+/// Read ↑ ↓ ← → for the sidebar and apply the result: fold changes happen here, navigation
+/// is returned as the actions a click would give. Call only when the sidebar is visible, no
+/// text field has focus and no modal is open.
+pub fn key_nav(
+    ctx: &egui::Context,
+    state: &mut SidebarState,
+    nodes: &[Node],
+    episodes: &HashMap<i64, Vec<SidebarEpisode>>,
+    view: View,
+    focus_episode: Option<i64>,
+) -> Vec<SidebarAction> {
+    let key = ctx.input_mut(|i| {
+        let none = egui::Modifiers::NONE;
+        [
+            (Key::ArrowDown, NavKey::Down),
+            (Key::ArrowUp, NavKey::Up),
+            (Key::ArrowLeft, NavKey::Left),
+            (Key::ArrowRight, NavKey::Right),
+        ]
+        .into_iter()
+        .find(|(k, _)| i.consume_key(none, *k))
+        .map(|(_, n)| n)
+    });
+    let Some(key) = key else {
+        return Vec::new();
+    };
+    let rows = navigable_rows(nodes, &state.collapsed, &state.episodes_open, episodes);
+    let cur = current_row(&rows, view, focus_episode);
+    let outcome = nav_decide(
+        key,
+        &rows,
+        cur,
+        nodes,
+        &state.collapsed,
+        &state.episodes_open,
+        episodes,
+    );
+    let mut actions = Vec::new();
+    match outcome {
+        NavOutcome::Nothing => {}
+        NavOutcome::Select(row) => {
+            actions.push(match &row {
+                SidebarRow::View(v) => SidebarAction::Select(*v),
+                SidebarRow::Node(id) => SidebarAction::Select(View::Node(*id)),
+                SidebarRow::Episode { episode, project } => {
+                    SidebarAction::SelectEpisode(*episode, *project)
+                }
+            });
+            state.reveal_selected = Some(row);
+        }
+        NavOutcome::Expand(id) => {
+            state.collapsed.remove(&id);
+        }
+        NavOutcome::Collapse(id) => {
+            state.collapsed.insert(id);
+        }
+        NavOutcome::OpenLayer(id) => {
+            state.episodes_open.insert(id);
+            actions.push(SidebarAction::EpisodesToggled);
+        }
+        NavOutcome::CloseLayer(id) => {
+            state.episodes_open.remove(&id);
+            actions.push(SidebarAction::EpisodesToggled);
+        }
+    }
+    // the key was an input event, but the result is applied after this frame's draw
+    ctx.request_repaint();
+    actions
 }
 
 fn has_children(nodes: &[Node], id: i64) -> bool {
@@ -182,7 +421,7 @@ pub fn sidebar_panel(
         });
     });
     for (label, v) in VIEW_ROWS {
-        if hover_row(
+        let resp = hover_row(
             ui,
             &t,
             label,
@@ -190,9 +429,9 @@ pub fn sidebar_panel(
             0,
             None,
             v == View::Notes && today.conversations,
-        )
-        .clicked()
-        {
+        );
+        reveal(ui, state, &SidebarRow::View(v), &resp, view == v);
+        if resp.clicked() {
             actions.push(SidebarAction::Select(v));
         }
     }
@@ -290,6 +529,7 @@ pub fn sidebar_panel(
                     NodeKind::Project => "Project",
                     NodeKind::Topic => "Topic",
                 };
+                reveal(ui, state, &SidebarRow::Node(n.id), &resp, selected);
                 resp.widget_info(|| {
                     egui::WidgetInfo::labeled(
                         egui::WidgetType::Button,
@@ -359,6 +599,11 @@ pub fn sidebar_panel(
                             depth + 1,
                             today.start,
                         );
+                        let row = SidebarRow::Episode {
+                            episode: ep.id,
+                            project: n.id,
+                        };
+                        reveal(ui, state, &row, &r, focus_episode == Some(ep.id));
                         if r.clicked() {
                             actions.push(SidebarAction::SelectEpisode(ep.id, n.id));
                         }
@@ -414,6 +659,20 @@ pub fn sidebar_panel(
             }
         });
     actions
+}
+
+/// Scroll a row into view when a key just selected it and it is now drawn selected.
+fn reveal(
+    ui: &egui::Ui,
+    state: &mut SidebarState,
+    row: &SidebarRow,
+    resp: &egui::Response,
+    selected: bool,
+) {
+    if selected && state.reveal_selected.as_ref() == Some(row) {
+        ui.scroll_to_rect(resp.rect, None);
+        state.reveal_selected = None;
+    }
 }
 
 /// A note row's context menu, as on the card's title: "Move to…" (the field opens under the
@@ -815,5 +1074,162 @@ mod tests {
         assert!(has_children(&nodes, 1));
         assert!(!has_children(&nodes, 13));
         assert!(!has_children(&nodes, 12));
+    }
+
+    fn ep(id: i64) -> SidebarEpisode {
+        SidebarEpisode {
+            id,
+            title: "t".into(),
+            started_at: 0,
+            node_id: Some(10),
+            is_media: false,
+            convertible: false,
+        }
+    }
+
+    /// Work(1) > Exporter(10, project) > CSV(11, topic); Admin(2).
+    fn tree() -> Vec<Node> {
+        let mut csv = node(11, Some(10), "CSV", 0, false);
+        csv.kind = NodeKind::Topic;
+        vec![
+            node(1, None, "Work", 0, false),
+            node(10, Some(1), "Exporter", 0, false),
+            csv,
+            node(2, None, "Admin", 1, false),
+        ]
+    }
+
+    fn eps() -> HashMap<i64, Vec<SidebarEpisode>> {
+        [(10, vec![ep(100), ep(101)])].into_iter().collect()
+    }
+
+    fn views() -> Vec<SidebarRow> {
+        VIEW_ROWS
+            .iter()
+            .map(|(_, v)| SidebarRow::View(*v))
+            .collect()
+    }
+
+    #[test]
+    fn navigable_rows_follow_the_draw_order() {
+        let nodes = tree();
+        let none = HashSet::new();
+        // project closed: its topics and notes are hidden
+        let mut want = views();
+        want.extend([1, 10, 2].map(SidebarRow::Node));
+        assert_eq!(navigable_rows(&nodes, &none, &none, &eps()), want);
+        // open: notes sit between the project and its topics
+        let open: HashSet<i64> = [10].into_iter().collect();
+        let mut want = views();
+        want.extend([
+            SidebarRow::Node(1),
+            SidebarRow::Node(10),
+            SidebarRow::Episode {
+                episode: 100,
+                project: 10,
+            },
+            SidebarRow::Episode {
+                episode: 101,
+                project: 10,
+            },
+            SidebarRow::Node(11),
+            SidebarRow::Node(2),
+        ]);
+        assert_eq!(navigable_rows(&nodes, &none, &open, &eps()), want);
+        // a collapsed category hides its whole subtree
+        let collapsed: HashSet<i64> = [1].into_iter().collect();
+        let mut want = views();
+        want.extend([1, 2].map(SidebarRow::Node));
+        assert_eq!(navigable_rows(&nodes, &collapsed, &open, &eps()), want);
+    }
+
+    #[test]
+    fn up_and_down_step_without_wrapping_and_start_from_the_ends() {
+        let rows = views();
+        assert_eq!(next_row(&rows, None), Some(rows[0].clone()));
+        assert_eq!(prev_row(&rows, None), Some(rows[4].clone()));
+        assert_eq!(next_row(&rows, Some(1)), Some(rows[2].clone()));
+        assert_eq!(prev_row(&rows, Some(1)), Some(rows[0].clone()));
+        assert_eq!(prev_row(&rows, Some(0)), None);
+        assert_eq!(next_row(&rows, Some(4)), None);
+        let cur = current_row(&rows, View::Calendar, None);
+        assert_eq!(cur, Some(2));
+        assert_eq!(current_row(&rows, View::Node(1), None), None);
+        assert_eq!(current_row(&rows, View::Calendar, Some(5)), None);
+    }
+
+    #[test]
+    fn left_and_right_open_close_and_walk_the_tree() {
+        let nodes = tree();
+        let eps = eps();
+        let decide = |key, collapsed: &[i64], open: &[i64], at: SidebarRow| {
+            let collapsed: HashSet<i64> = collapsed.iter().copied().collect();
+            let open: HashSet<i64> = open.iter().copied().collect();
+            let rows = navigable_rows(&nodes, &collapsed, &open, &eps);
+            let cur = rows.iter().position(|r| *r == at);
+            nav_decide(key, &rows, cur, &nodes, &collapsed, &open, &eps)
+        };
+        let n = SidebarRow::Node;
+        // → opens a collapsed category, then enters it
+        assert_eq!(
+            decide(NavKey::Right, &[1], &[], n(1)),
+            NavOutcome::Expand(1)
+        );
+        assert_eq!(
+            decide(NavKey::Right, &[], &[], n(1)),
+            NavOutcome::Select(n(10))
+        );
+        // → on a project opens its layer, then enters the first note
+        assert_eq!(
+            decide(NavKey::Right, &[], &[], n(10)),
+            NavOutcome::OpenLayer(10)
+        );
+        assert_eq!(
+            decide(NavKey::Right, &[], &[10], n(10)),
+            NavOutcome::Select(SidebarRow::Episode {
+                episode: 100,
+                project: 10
+            })
+        );
+        // → on a leaf or a note does nothing
+        assert_eq!(
+            decide(NavKey::Right, &[], &[10], n(11)),
+            NavOutcome::Nothing
+        );
+        assert_eq!(decide(NavKey::Right, &[], &[], n(2)), NavOutcome::Nothing);
+        // ← closes an open row, else goes to the parent
+        assert_eq!(
+            decide(NavKey::Left, &[], &[], n(1)),
+            NavOutcome::Collapse(1)
+        );
+        assert_eq!(decide(NavKey::Left, &[1], &[], n(1)), NavOutcome::Nothing);
+        assert_eq!(
+            decide(NavKey::Left, &[], &[10], n(10)),
+            NavOutcome::CloseLayer(10)
+        );
+        assert_eq!(
+            decide(NavKey::Left, &[], &[], n(10)),
+            NavOutcome::Select(n(1))
+        );
+        assert_eq!(
+            decide(NavKey::Left, &[], &[10], n(11)),
+            NavOutcome::Select(n(10))
+        );
+        assert_eq!(
+            decide(
+                NavKey::Left,
+                &[],
+                &[10],
+                SidebarRow::Episode {
+                    episode: 101,
+                    project: 10
+                }
+            ),
+            NavOutcome::Select(n(10))
+        );
+        assert_eq!(
+            decide(NavKey::Left, &[], &[], SidebarRow::View(View::Todos)),
+            NavOutcome::Nothing
+        );
     }
 }
