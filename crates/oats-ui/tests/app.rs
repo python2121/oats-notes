@@ -688,7 +688,7 @@ fn a_topic_chip_lists_its_notes_and_a_row_jumps_to_the_card() {
         .unwrap();
     }
     {
-        // an unfiled conversation carries the chip the project's note no longer shows here
+        // a second note with the tag (All notes lists both: the chip shows twice)
         let s = Store::open(&dir.db()).unwrap();
         let t = now_ms() - 7_200_000;
         s.insert_episode(
@@ -709,7 +709,11 @@ fn a_topic_chip_lists_its_notes_and_a_row_jumps_to_the_card() {
     rig.app().run(Command::ShowNotes);
     rig.harness.run_steps(3);
     assert!(!rig.app().topic_open());
-    rig.harness.get_by_label("Q4 roadmap").click();
+    rig.harness
+        .query_all_by_label("Q4 roadmap")
+        .next()
+        .unwrap()
+        .click();
     rig.harness.run_steps(3);
     assert!(rig.app().topic_open());
     assert!(rig.shows("Tagged “Q4 roadmap”"));
@@ -735,7 +739,11 @@ fn a_topic_chip_lists_its_notes_and_a_row_jumps_to_the_card() {
     // Escape closes the topic view back to the previous view
     rig.app().run(Command::ShowNotes);
     rig.harness.run_steps(2);
-    rig.harness.get_by_label("Q4 roadmap").click();
+    rig.harness
+        .query_all_by_label("Q4 roadmap")
+        .next()
+        .unwrap()
+        .click();
     rig.harness.run_steps(2);
     assert!(rig.app().topic_open());
     rig.harness.key_press(egui::Key::Escape);
@@ -744,10 +752,112 @@ fn a_topic_chip_lists_its_notes_and_a_row_jumps_to_the_card() {
 }
 
 #[test]
-fn conversations_lists_only_unfiled_episodes() {
+fn all_notes_lists_filed_and_unfiled_notes_as_rows_with_their_filing_chip() {
     use oats_core::EpisodeContent;
-    let dir = TempDir::new("conversations");
-    let (work, _commerce, _lease) = seed_projects(&dir.db());
+    let dir = TempDir::new("all-notes");
+    let (_work, commerce, _lease) = seed_projects(&dir.db());
+    {
+        let s = Store::open(&dir.db()).unwrap();
+        let t = now_ms() - 3_600_000;
+        for (title, low) in [("Bare chat", false), ("Television noise", true)] {
+            s.insert_episode(
+                t,
+                t + 60_000,
+                &EpisodeContent {
+                    title: title.into(),
+                    summary: "- hello there".into(),
+                    low_signal: low,
+                    model: "m".into(),
+                    ..Default::default()
+                },
+                t + 120_000,
+            )
+            .unwrap();
+        }
+    }
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowNotes);
+    rig.harness.run_steps(3);
+    // filed and unfiled notes, each a collapsed row
+    assert!(rig.shows("Note: Checkout flow decisions"));
+    assert!(rig.shows("Note: Lease renewal terms"));
+    assert!(rig.shows("Note: Bare chat"));
+    assert!(!rig.shows("something concrete"), "rows are collapsed");
+    // the filing chips: the project's name, or "Unfiled"
+    rig.harness.get_by_label("Commerce project");
+    rig.harness.get_by_label("Apartment lease");
+    rig.harness.get_by_label("Unfiled");
+    // the low-signal note hides behind the header link
+    assert!(!rig.shows("Note: Television noise"));
+    rig.harness.get_by_label("Show 1 low-signal").click();
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Note: Television noise"));
+    assert!(rig.shows("Hide low-signal"));
+    // a row opens its card inline
+    rig.harness
+        .get_by_label("Note: Checkout flow decisions")
+        .click();
+    rig.harness.run_steps(3);
+    assert!(rig.shows("something concrete"), "the card is open");
+    // the chip opens the project
+    rig.harness.get_by_label("Commerce project").click();
+    rig.harness.run_steps(3);
+    assert_eq!(rig.app().prefs().view, View::Node(commerce));
+    // back on All notes, the low-signal toggle was reset
+    rig.app().run(Command::ShowNotes);
+    rig.harness.run_steps(3);
+    assert!(!rig.shows("Note: Television noise"));
+}
+
+#[test]
+fn a_jump_to_a_hidden_low_signal_note_reveals_and_opens_it_in_all_notes() {
+    use oats_core::EpisodeContent;
+    let dir = TempDir::new("all-notes-jump");
+    let (_work, commerce, _lease) = seed_projects(&dir.db());
+    {
+        let s = Store::open(&dir.db()).unwrap();
+        let t = now_ms() - 3_600_000;
+        for (title, summary, node, low) in [
+            ("Pricing sync", "- numbers", Some(commerce), false),
+            ("Murmurs about pricing", "- the hidden detail", None, true),
+        ] {
+            s.insert_episode(
+                t,
+                t + 60_000,
+                &EpisodeContent {
+                    title: title.into(),
+                    summary: summary.into(),
+                    node_id: node,
+                    low_signal: low,
+                    topics: vec!["pricing".into()],
+                    model: "m".into(),
+                    ..Default::default()
+                },
+                t + 120_000,
+            )
+            .unwrap();
+        }
+    }
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowNotes);
+    rig.harness.run_steps(3);
+    assert!(!rig.shows("Note: Murmurs about pricing"), "hidden");
+    rig.harness.get_by_label("pricing").click();
+    rig.harness.run_steps(3);
+    assert!(rig.app().topic_open());
+    rig.harness.get_by_label("Murmurs about pricing").click();
+    rig.harness.run_steps(4);
+    assert!(!rig.app().topic_open());
+    assert_eq!(rig.app().prefs().view, View::Notes);
+    assert_eq!(rig.app().pending_focus(), None, "the card took the focus");
+    assert!(rig.shows("Note: Murmurs about pricing"), "revealed");
+    assert!(rig.shows("the hidden detail"), "and opened");
+}
+
+#[test]
+fn all_notes_says_so_when_only_low_signal_notes_exist() {
+    use oats_core::EpisodeContent;
+    let dir = TempDir::new("all-notes-low");
     {
         let s = Store::open(&dir.db()).unwrap();
         let t = now_ms() - 3_600_000;
@@ -755,9 +865,8 @@ fn conversations_lists_only_unfiled_episodes() {
             t,
             t + 60_000,
             &EpisodeContent {
-                title: "Bare category chat".into(),
-                summary: "- hello".into(),
-                node_id: Some(work),
+                title: "Fragments".into(),
+                low_signal: true,
                 model: "m".into(),
                 ..Default::default()
             },
@@ -768,32 +877,20 @@ fn conversations_lists_only_unfiled_episodes() {
     let mut rig = build(&dir.db(), None, None);
     rig.app().run(Command::ShowNotes);
     rig.harness.run_steps(3);
-    assert!(rig.shows("Bare category chat"));
-    assert!(
-        !rig.shows("Checkout flow decisions"),
-        "filed under a project"
-    );
-    assert!(!rig.shows("Lease renewal terms"));
-    let titles: Vec<_> = rig
-        .app()
-        .listed_episodes()
-        .iter()
-        .map(|e| e.title.clone())
-        .collect();
-    assert_eq!(titles, ["Bare category chat"]);
+    assert!(rig.shows("1 low-signal note hidden"));
+    assert!(!rig.shows("Note: Fragments"));
+    rig.harness.get_by_label("Show 1 low-signal").click();
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Note: Fragments"));
 }
 
 #[test]
-fn conversations_says_so_when_everything_is_filed() {
-    let dir = TempDir::new("conversations-empty");
-    seed_projects(&dir.db());
+fn all_notes_says_so_when_there_are_no_notes() {
+    let dir = TempDir::new("all-notes-empty");
     let mut rig = build(&dir.db(), None, None);
     rig.app().run(Command::ShowNotes);
     rig.harness.run_steps(3);
-    assert!(
-        rig.app().listed_episodes().is_empty(),
-        "the empty state shows"
-    );
+    assert!(rig.app().listed_episodes().is_empty());
 }
 
 // ---- todos, reminder pop-ups, the calendar's jump to the transcript ----------------------------
@@ -1653,7 +1750,7 @@ fn the_sidebar_has_no_today_and_says_transcripts() {
     rig.harness.get_by_label("View").click();
     rig.harness.run_steps(3);
     assert!(rig.shows("Transcripts"));
-    assert!(rig.shows("Conversations"));
+    assert!(rig.shows("All notes"));
     assert!(!rig.shows("Today"));
     assert!(!rig.shows("All Transcripts"));
     assert_eq!(rig.app().prefs().view, View::Transcripts);
@@ -2177,7 +2274,7 @@ fn mark_as_a_call_moves_a_media_note_to_conversations_and_reinterprets_it_as_a_m
     });
     assert!(
         rig.app().listed_episodes().iter().all(|e| e.id != ep),
-        "a media note is in the Media view, not in Conversations"
+        "a media note is in the Media view, not in All notes"
     );
     rig.app().mark_episode_as_call(ep);
     let s = Store::open(&dir.db()).unwrap();
@@ -2186,7 +2283,7 @@ fn mark_as_a_call_moves_a_media_note_to_conversations_and_reinterprets_it_as_a_m
         assert!(!e.is_media());
         assert_eq!(e.node_id, None);
     }
-    // the re-interpretation lands in Conversations
+    // the re-interpretation lands in All notes
     rig.until_label("the re-interpreted note", "Release planning");
     let listed = rig.app().listed_episodes().to_vec();
     let note = listed

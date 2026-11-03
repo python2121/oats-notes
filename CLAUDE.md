@@ -36,7 +36,7 @@ crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mi
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
-crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / Conversations / Calendar (month grid) / Todos / Media views, node view (notes + projects), reminder + confirmation pop-ups, drag-to-merge (merge.rs)
+crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / All notes / Calendar (month grid) / Todos / Media views, node view (notes + projects), reminder + confirmation pop-ups, drag-to-merge (merge.rs)
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
 vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
 vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream and a voice-processing input stream (macOS); NOT a workspace member
@@ -49,7 +49,7 @@ path as the header, its child projects (topics, under a project) as clickable ro
 count and last activity, the notes (`Store::episodes_under`, newest first, as collapsed rows — see the project landing page below) of
 the subtree, and "Show transcript (N segments)" — the raw segments filed under the subtree,
 collapsed by default (`NotesState::show_transcript`, reset on every view change). Transcripts
-(`View::Transcripts`, ⌘1; there is no Today view — old prefs saying `Today` / `All` load as it) stays a transcript view, paged by day (below); Conversations (`View::Notes`, name kept for the saved pref; ⌘3) shows only UNFILED episodes (`Store::episodes_unfiled`: no node or a top-level category, i.e. not under a project or topic; low-signal included); filed ones live on the project pages. The app menus are File, Edit, Listen, View, Brain (the one formerly titled "Notes" is now "Brain"). The sidebar shows a muted
+(`View::Transcripts`, ⌘1; there is no Today view — old prefs saying `Today` / `All` load as it) stays a transcript view, paged by day (below). **All notes** (`View::Notes`, name kept for the saved pref; once "Conversations"; ⌘3, `Command::ShowNotes`; `notes::notes_view`) lists EVERY conversation note, filed or not (`Store::conversations(300)`: `kind != 'media'`, newest first — media notes never, they live in the Media view), under the brain strip: a "Notes · Expand all · Collapse all · Show N low-signal" header line, then day headings (`day_of` / `day_heading`) over the same collapsed 24 pt rows as the project page (`note_row` via the shared `note_list`; a click toggles the card inline, `NotesState::open_notes`). Each row carries a filing chip before its topic chips (`ListOpts::filing`, `notes::filing_of`): the PROJECT's name (a topic maps to its project, `project_of`; hover = the note's full path; click → `NotesAction::SelectNode(project)`), or "Unfiled" in the tertiary colour (no node or a bare category; not clickable); both are AccessKit buttons. Low-signal notes are hidden unless `NotesState::show_low_signal` (reset on every view change in `set_view`; the header's "Show N low-signal" / "Hide low-signal", absent when N = 0); a day whose notes are all hidden draws no heading; when every loaded note is low-signal the view reads "N low-signal notes hidden" + the toggle; with no notes at all "No notes yet. Notes appear here as the brain interprets what it hears." Row marks (`NotesState::marks: RowMarks { today_start, latest }`, set by the app every frame; on the project page too): a note that started today draws its date and time range in pure white, the most recent note (`Store::latest_note`) its title, date and time range in the accent; the row's hover text adds " · today" / " · most recent". The time-range column has a fixed minimum width so titles line up. The app menus are File, Edit, Listen, View, Brain (the one formerly titled "Notes" is now "Brain"). The sidebar shows a muted
 "No projects yet" row under a category without projects. `--selftest out.png --work` renders
 the Work view offscreen.
 
@@ -83,7 +83,7 @@ yet"); the Notes are the same collapsed rows (`project_notes`) of the whole subt
 from notes homed elsewhere (`Store::items_filed_under(node)`, loaded into
 `OatsApp::filed_items` for a Node view). A row's click (`GoToNote`) on such an item jumps to the
 note itself (`open_note_page`: the single-note view under its home project, selected in the
-sidebar; Conversations with the card flashed when unfiled). Inside a
+sidebar; All notes with the row opened and the card flashed when unfiled). Inside a
 note card each decision / action item with a `segment_id` is a link ("Show in transcript at
 2:31 pm", `timefmt`) → `NotesAction::ShowSegment` → `jump_to_segment`; an item filed under
 another project than its note carries a "→ Commerce project" chip (opens that project). So:
@@ -99,7 +99,7 @@ card; parent = the note's category, else Work, else the first category; created
 **Sidebar notes layer**: a project's row has a triangle (closed by default, persisted as
 `AppPrefs::sidebar_episodes_open`) listing its last `SIDEBAR_EPISODES` = 5 non-low-signal notes
 (newest first, 22 pt rows: truncated title, "29 Oct" at the right), then its topics (the
-triangle now folds both). **Where today's notes went**: a note that started today (local day) draws its title and date in pure white (hover text adds " · today"), and so do the project, topic and category rows above it and the Conversations row when an unfiled non-media note started today (`sidebar::today_nodes` once per frame from `sidebar_episodes`; `Store::unfiled_episodes_since`, reloaded with `reload_sidebar_episodes`); it rolls over at local midnight with the existing midnight repaint. **The most recent note** (`Store::latest_note`: the newest non-low-signal conversation note, any day) is drawn in the ACCENT colour instead, and so is the path above it (`sidebar::latest_nodes`; `TodayMarks::latest` / `latest_nodes`, hover text " · most recent"); when it is unfiled the Conversations row is the accent one (`latest_conversations`). `sidebar::Mark { Plain, Today, Latest }` is the row colour (`hover_row` / `episode_row`). Clicking one sets `OatsApp::focus_episode` (a UI mode, not a `View`):
+triangle now folds both). **Where today's notes went**: a note that started today (local day) draws its title and date in pure white (hover text adds " · today"), and so do the project, topic and category rows above it and the All notes row (the only sidebar home of unfiled notes) when an unfiled non-media note started today (`sidebar::today_nodes` once per frame from `sidebar_episodes`; `Store::unfiled_episodes_since`, reloaded with `reload_sidebar_episodes`); it rolls over at local midnight with the existing midnight repaint. **The most recent note** (`Store::latest_note`: the newest non-low-signal conversation note, any day) is drawn in the ACCENT colour instead, and so is the path above it (`sidebar::latest_nodes`; `TodayMarks::latest` / `latest_nodes`, hover text " · most recent"); when it is unfiled the All notes row is the accent one (`latest_conversations`). `sidebar::Mark { Plain, Today, Latest }` is the row colour (`hover_row` / `episode_row`). Clicking one sets `OatsApp::focus_episode` (a UI mode, not a `View`):
 `notes::episode_view` shows that note's card under a breadcrumb "Work › Commerce project ›
 29 Oct" (node names are links). Escape, the project's sidebar row, any other navigation, or a
 breadcrumb link returns to the project page. `--selftest out.png --project [--expanded]
@@ -297,10 +297,10 @@ command, else EMPTY (the data-directory path is no longer shown).
 
 Search (View → "Find…", ⌘F; `Command::Search`, `oats-ui/src/search.rs`): a 36 pt bar under the
 control bar (focused at once, match counts, × icon) and a results view that replaces the current
-view while open: Conversations (episode cards, matches marked), Calendar (events), Transcript (lines),
+view while open: Notes (episode cards, matches marked), Calendar (events), Transcript (lines),
 from `Store::search(query, 200)` (case-insensitive substring, echoes excluded, re-run only when
 the text or the data changes). Esc (also from the field) or × closes it and the previous view is
-back; ⌘F again re-selects the field. Clicking a note opens its node view (Conversations if unfiled), an
+back; ⌘F again re-selects the field. Clicking a note opens its node view (All notes if unfiled), an
 event opens Calendar, a line opens Transcripts around that segment, scrolled to the row and flashed
 (same jump as the calendar and todos, see below).
 `--selftest out.png --search TEXT` renders it.
@@ -453,7 +453,7 @@ hotword; hotwords are unchanged.
   `TranscriptPages::at_end`); `Command::JumpToNow` reloads the newest page when `has_later`
   (`reset_pages`), drops a pending focus and sets `TranscriptPages::jump_to_end`, which the next
   layout turns into the scroll offset of the end in one frame (stored + `request_discard`, no
-  animation, no page load on the way; the stick-to-bottom then holds it). Shortcuts: ⌘1 Transcripts, ⌘3 Conversations, ⌘4 Calendar,
+  animation, no page load on the way; the stick-to-bottom then holds it). Shortcuts: ⌘1 Transcripts, ⌘3 All notes, ⌘4 Calendar,
   ⌘5 Todos (⌘2 is unused).
 - **Jump to the transcript**: clicking a calendar chip / day-panel row / a dictated todo's text
   resolves its source (`source_segment_id`; an interpreted event: the first segment of its
@@ -660,7 +660,7 @@ offline or rate limited (`CliError::unavailable_reason`), the brain marks itself
 successful call; the first real call after a probe is the probe for login and rate limits),
 keeps every new segment and voice command waiting, and reports
 `BrainEvent::Backlog { waiting_segments, waiting_commands }`. The status strip then reads
-"claude unavailable (not logged in) — N segments waiting" (also in the Conversations strip). When it
+"claude unavailable (not logged in) — N segments waiting" (also in the All notes strip). When it
 is back, the backlog is worked oldest-first: queued hotword commands first (an interpret run
 that finds hotword segments in the backlog hands them to tier 0 and comes back after them),
 then the rolling interpretation in chronological chunks within the budget, each chunk shown
@@ -701,7 +701,7 @@ OATS_INPUT_DEVICE="Scarlett 2i2" …         # microphone by name (default: the 
 OATS_SYSTEM_DEDUP=auto|always|never …      # the mic-echo rule (auto: only while the output is speakers)
 OATS_ECHO_AUDIO=auto|always|never …        # the audio-level echo pre-check (auto: while the echo rule is on; never = transcribe every mic segment)
 scripts/perf.sh [rest|idle|speech|stress]    # CPU/memory/energy profile per scenario (release build); see docs/performance-2026-10-28.md
-cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar|--todos|--toast]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events / todos (--toast: a due reminder + a confirmation) — how the shell is verified without a window
+cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar|--todos|--toast]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events / todos (--notes: All notes with filed, unfiled, today's and a hidden low-signal note) (--toast: a due reminder + a confirmation) — how the shell is verified without a window
 cargo run -p oats-notes -- --listen      # start listening as soon as the engine is ready (doesn't change the remembered pref)
 OATS_NO_NATIVE_MENU=1 …                   # in-window egui menu bar instead of the macOS menu bar
 OATS_NO_STATUS_ITEM=1 …                   # no menu bar extra (closing the window then quits)
@@ -739,7 +739,9 @@ Topic chips on episode cards are clickable (`NotesAction::OpenTopic`): `OatsApp:
 a `TopicState` shown over the current view like the search results (header "Tagged “…”" + count + ×;
 Escape closes; never touches the saved `prefs.view`). One concise row per episode (date, time range,
 title, node path); clicking a row calls `jump_to_episode`: it sets `NotesState::pending_focus`
-(`OatsApp::pending_focus()`) and switches to the episode's node view (Conversations without a node). The card
+(`OatsApp::pending_focus()`) and switches to the episode's node view (All notes without a node). The list first opens a
+collapsed target row and, in All notes, turns `show_low_signal` on for a hidden low-signal target
+(`notes::prepare_focus`, the same path on the project page); the card
 that matches (`notes::focus_card`, run for every laid-out `episode_card`) consumes it with
 `ui.scroll_to_rect` and flashes an accent fill for 1.5 s (`NotesState::flash`, repaints only while it
 fades). Search-result clicks on a note use the same path.
@@ -917,7 +919,7 @@ from a video creates nothing), and what was watched is recorded.
   call" pill in the control bar (enabled while listening with system audio), Listen → "On a
   Call" (⇧⌘C, `Command::ToggleOnCall`), status strip "· on a call".
 - Retroactive relabels (`store_media.rs`): `Store::mark_episode_as_call` (media episode →
-  `kind = conversation` (node NULL → Conversations), `**Media:**` header dropped, its system
+  `kind = conversation` (node NULL → All notes, "Unfiled"), `**Media:**` header dropped, its system
   segments re-stamped `media_kind = meeting` (unfiled ones `categorised = 0` again), overlapping
   plays → `kind = call`), then the UI sends `BrainCommand::Reinterpret` (the stamps now make
   it a conversation chunk with the meeting hint; no media rules). `mark_episode_as_media` (the
@@ -928,7 +930,7 @@ from a video creates nothing), and what was watched is recorded.
   the play re-stamped and their episodes converted; under Log only nothing was kept and the
   confirmation says "No transcript was kept for this (policy: log only)". UI: right-click on a
   media note's title ("Mark as a call", "Summarise"), on a convertible conversation ("Mark as
-  media"), on a Calendar play row ("Mark as a call"). Conversations (`episodes_unfiled`)
+  media"), on a Calendar play row ("Mark as a call"). All notes (`Store::conversations`)
   never lists media episodes.
 - `MediaWatcher` (thread "oats-media", in the binary): active only while system audio is
   captured (its guard is part of the capture guard; blocked, no timer, otherwise); producers
@@ -970,12 +972,12 @@ from a video creates nothing), and what was watched is recorded.
   `set_episode_kind`, `episode_of_play` / `episodes_of_plays` / `plays_of_episode`.
 - **No Media category (schema v9)**: media notes (`kind = media`) and media segments carry
   `node_id = NULL`; the Media VIEW is their home, the sidebar tree never shows them, and
-  `episodes_unfiled` (Conversations) keeps excluding them. `Store::migrate_media_category`
+  All notes (`Store::conversations`) keeps excluding them. `Store::migrate_media_category`
   (run once from `init_locked` when a file older than v9 is opened; the version bump records
   it, so a category the user names "Media" later is just a category): for every top-level
   category whose `name_key` is "media" (auto or user-created), media notes and media segments
   in its subtree → node NULL; notes / segments / events / notes / todos filed on the category
-  itself → NULL (its conversations land in Conversations); then the category and its subtree
+  itself → NULL (its conversations become "Unfiled" in All notes); then the category and its subtree
   are deleted when no project / topic under it still holds anything, else it is renamed
   "Media (old)" (`created_by = user`) with those projects kept. Counts are logged at info.
   A v8 binary refuses a v9 file (`SchemaTooNew`).

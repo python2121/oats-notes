@@ -2361,6 +2361,18 @@ impl Store {
         )
     }
 
+    /// Every conversation note (filed or not, low-signal included; media notes left out),
+    /// newest first (at most `limit`): the All notes view.
+    pub fn conversations(&self, limit: i64) -> Result<Vec<Episode>, StoreError> {
+        self.query_episodes(
+            &format!(
+                "SELECT {EPISODE_COLUMNS} FROM episodes WHERE kind != 'media'
+                 ORDER BY started_at DESC, id DESC LIMIT ?1"
+            ),
+            &[limit],
+        )
+    }
+
     /// Unfiled episodes, newest first (at most `limit`): no node, or a top-level category —
     /// anything not under a project or topic. Low-signal ones are included.
     pub fn episodes_unfiled(&self, limit: i64) -> Result<Vec<Episode>, StoreError> {
@@ -4723,6 +4735,34 @@ mod tests {
         let media = s.insert_episode(30_000, 31_000, &c("video", false), 32_000)?;
         s.set_episode_kind(media.id, "media")?;
         assert_eq!(s.latest_note()?.map(|e| e.id), Some(newest.id));
+        Ok(())
+    }
+
+    #[test]
+    fn conversations_lists_every_non_media_note_newest_first() -> Result<(), StoreError> {
+        let s = Store::open_in_memory()?;
+        let work = s.categories()?.remove(0);
+        let p = s.add_node(Some(work.id), NodeKind::Project, "Export", "", Origin::User)?;
+        let c = |title: &str, node: Option<i64>, low: bool| EpisodeContent {
+            title: title.into(),
+            node_id: node,
+            low_signal: low,
+            ..Default::default()
+        };
+        let unfiled = s.insert_episode(1_000, 2_000, &c("unfiled", None, false), 3_000)?;
+        let filed = s.insert_episode(5_000, 6_000, &c("filed", Some(p.id), false), 7_000)?;
+        let low = s.insert_episode(8_000, 9_000, &c("fragments", None, true), 9_500)?;
+        let tie = s.insert_episode(8_000, 9_000, &c("tie", Some(work.id), false), 9_500)?;
+        let media = s.insert_episode(30_000, 31_000, &c("video", None, false), 32_000)?;
+        s.set_episode_kind(media.id, "media")?;
+        let ids: Vec<i64> = s.conversations(10)?.into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            [tie.id, low.id, filed.id, unfiled.id],
+            "media left out"
+        );
+        let ids: Vec<i64> = s.conversations(2)?.into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, [tie.id, low.id], "limit applies");
         Ok(())
     }
 

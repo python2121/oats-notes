@@ -24,8 +24,9 @@ pub struct SelftestOptions {
     /// Show the app in the Listening state with a fake input level (no audio is opened) and the
     /// Transcripts view, so the pill, the meter and both day headings are in the capture.
     pub listening: bool,
-    /// Show the Conversations view (unfiled seeded episodes and a
-    /// change-log line) instead of the transcript.
+    /// Show the All notes view (every seeded conversation note as a collapsed row with its
+    /// project / "Unfiled" chip, today's in white, the latest in the accent, the low-signal
+    /// one behind "Show 1 low-signal", and a change-log line) instead of the transcript.
     pub notes: bool,
     /// With `notes`: the brain mid-work (a review running, an interpret queued): greyed
     /// buttons with spinners.
@@ -502,7 +503,7 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
             },
             now,
         )?;
-        // an unfiled conversation (the Conversations view lists only these)
+        // an unfiled conversation (All notes: an "Unfiled" chip)
         store.insert_episode(
             yesterday + 11 * H,
             yesterday + 11 * H + 9 * M,
@@ -606,7 +607,7 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
             now,
         )?;
         store.mark_segments_interpreted(&[said.id], dev.id, now)?;
-        // an unfiled conversation from today: the Conversations row turns white
+        // an unfiled conversation from today: the All notes row turns white
         store.insert_episode(
             today + 8 * H,
             today + 8 * H + 6 * M,

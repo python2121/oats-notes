@@ -451,7 +451,7 @@ pub fn build_menu_model(s: &MenuState) -> Vec<MenuSection> {
                     Command::ShowTranscripts,
                     s.view == View::Transcripts,
                 ),
-                check("Conversations", Command::ShowNotes, s.view == View::Notes),
+                check("All notes", Command::ShowNotes, s.view == View::Notes),
                 check("Calendar", Command::ShowCalendar, s.view == View::Calendar),
                 check("Todos", Command::ShowTodos, s.view == View::Todos),
                 check("Media", Command::ShowMediaView, s.view == View::Media),
@@ -579,7 +579,7 @@ pub fn app_rows(store: &Store) -> Result<Vec<AppRow>, oats_core::StoreError> {
 #[derive(Clone, Copy, Debug)]
 struct LatestNote {
     id: i64,
-    /// No project / topic holds it: the Conversations row is its place.
+    /// No project / topic holds it: the All notes row is its sidebar place.
     unfiled: bool,
 }
 
@@ -671,10 +671,10 @@ pub struct OatsApp {
     sidebar: SidebarState,
     /// The notes listed under each project in the sidebar (newest first).
     sidebar_episodes: HashMap<i64, Vec<SidebarEpisode>>,
-    /// Unfiled notes that started today (the Conversations row turns white).
+    /// Unfiled notes that started today (the All notes row turns white).
     unfiled_today: i64,
     /// The most recent note (`Store::latest_note`): its id and whether it is unfiled (the
-    /// sidebar draws its path, or the Conversations row, in the accent colour).
+    /// sidebar draws its path, or the All notes row, in the accent colour).
     latest_note: Option<LatestNote>,
     /// The single-note view: this note of the viewed node, instead of the node's page.
     focus_episode: Option<i64>,
@@ -1132,7 +1132,7 @@ impl OatsApp {
     }
 
     /// "Mark as a call" on a media note: a conversation again (out of Media, into the
-    /// Conversations list), its segments stamped as a call, and a re-interpretation queued
+    /// All notes list), its segments stamped as a call, and a re-interpretation queued
     /// (the meeting hint, none of the media rules).
     pub fn mark_episode_as_call(&mut self, id: i64) {
         match self.store.mark_episode_as_call(id) {
@@ -1452,7 +1452,7 @@ impl OatsApp {
         self.topic = None;
     }
 
-    /// Show an episode's note: its node's view (Conversations when it has none), scrolled to its card,
+    /// Show an episode's note: its node's view (All notes when it has none), scrolled to its card,
     /// which flashes. The card consumes `pending_focus` when it is laid out.
     fn jump_to_episode(&mut self, id: i64, node: Option<i64>) {
         // a media note lives in the Media view (it has no node)
@@ -1502,6 +1502,7 @@ impl OatsApp {
             self.notes_state.confirm_delete = None;
             self.notes_state.show_transcript = false;
             self.notes_state.show_all_steps = false;
+            self.notes_state.show_low_signal = false;
             self.reload_rows();
             self.reload_brain_data();
         }
@@ -2023,8 +2024,8 @@ impl OatsApp {
     fn reload_brain_data(&mut self) {
         let episodes = match self.prefs.view {
             View::Node(id) => self.store.episodes_under(id, 300),
-            // the Conversations view lists only what no project or topic has taken in
-            View::Notes => self.store.episodes_unfiled(300),
+            // All notes: every conversation note, filed or not (media notes live in Media)
+            View::Notes => self.store.conversations(300),
             _ => self.store.episodes(300),
         };
         match episodes {
@@ -4052,6 +4053,11 @@ impl eframe::App for OatsApp {
                 );
                 list_ui.painter().rect_filled(list_rect, 0.0, t.canvas);
                 list_ui.set_clip_rect(list_rect);
+                // the note rows' marks: today's in white, the most recent note in the accent
+                self.notes_state.marks = crate::notes::RowMarks {
+                    today_start: self.today_start,
+                    latest: self.latest_note.map(|l| l.id),
+                };
                 if self.search.is_some() {
                     // the search bar (chrome, like the control bar) and its results replace
                     // the view underneath

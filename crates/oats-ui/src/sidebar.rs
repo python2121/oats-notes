@@ -1,4 +1,4 @@
-//! The left sidebar: the "Views" group (Transcripts, Conversations, Calendar, Todos, Media) and the tree
+//! The left sidebar: the "Views" group (Transcripts, All notes, Calendar, Todos, Media) and the tree
 //! group — the store's categories as 22 pt hover rows, with the projects the brain created
 //! under them and topics under those, collapsible per node (a disclosure triangle on rows with
 //! children, indented SwiftInvert-style); a "+" header icon that reveals an inline field to add
@@ -357,14 +357,15 @@ pub struct TodayMarks {
     pub start: i64,
     /// Nodes holding (or, for ancestors, containing) a note from today.
     pub nodes: HashSet<i64>,
-    /// An unfiled, non-media note started today (the Conversations row).
+    /// An unfiled, non-media note started today (the All notes row: the only sidebar home of
+    /// unfiled notes).
     pub conversations: bool,
     /// The most recent note (`Store::latest_note`) when it has a sidebar row: it and the
     /// rows above it are drawn in the accent colour.
     pub latest: Option<i64>,
     /// The nodes on the path to `latest`.
     pub latest_nodes: HashSet<i64>,
-    /// The most recent note is unfiled (the Conversations row is the accent one).
+    /// The most recent note is unfiled (the All notes row is the accent one).
     pub latest_conversations: bool,
 }
 
@@ -877,11 +878,11 @@ fn group_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {
     );
 }
 
-/// The "Views" group, in order. `View::Notes` is the Conversations view (the variant keeps its
-/// name so saved prefs still load).
+/// The "Views" group, in order. `View::Notes` is the All notes view (once "Conversations"; the
+/// variant keeps its name so saved prefs still load).
 pub const VIEW_ROWS: [(&str, View); 5] = [
     ("Transcripts", View::Transcripts),
-    ("Conversations", View::Notes),
+    ("All notes", View::Notes),
     ("Calendar", View::Calendar),
     ("Todos", View::Todos),
     ("Media", View::Media),
@@ -1144,13 +1145,14 @@ mod tests {
     }
 
     #[test]
-    fn the_views_group_says_conversations() {
+    fn the_views_group_says_all_notes() {
         let labels: Vec<_> = super::VIEW_ROWS.iter().map(|r| r.0).collect();
-        assert!(labels.contains(&"Conversations"));
+        assert!(labels.contains(&"All notes"));
+        assert!(!labels.contains(&"Conversations"));
         assert!(!labels.contains(&"Notes"));
         assert_eq!(
             labels,
-            ["Transcripts", "Conversations", "Calendar", "Todos", "Media"],
+            ["Transcripts", "All notes", "Calendar", "Todos", "Media"],
             "no Today, no All transcripts"
         );
     }

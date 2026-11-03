@@ -1,5 +1,7 @@
-//! The Conversations view (`View::Notes`, name kept for the saved pref): the brain's unfiled
-//! episodes (not under a project or topic; those live on the project pages), newest first — title, time range, the
+//! The All notes view (`View::Notes`, name kept for the saved pref; once "Conversations"):
+//! every conversation note, newest first under day headings as collapsed rows (date, time
+//! range, title, a chip naming its project or "Unfiled", topic chips; low-signal notes behind
+//! "Show N low-signal"), a click opening the full card — title, time range, the
 //! node chip (category › project › topic), the summary (a small markdown subset: headings,
 //! bullets, **bold**), decisions, action items as a checklist-looking list, topics, a
 //! "Re-interpret" button — with the brain's control strip (Interpret now / Review now /
@@ -15,7 +17,7 @@ use oats_core::{
 use crate::theme::Tokens;
 use crate::transcript::{TranscriptAction, clock, day_heading, day_of, transcript_rows};
 
-/// What the user did in the Conversations view this frame.
+/// What the user did in a notes view (All notes, a node page, a note card) this frame.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NotesAction {
     InterpretNow,
@@ -325,6 +327,45 @@ impl BrainStatus {
     }
 }
 
+/// What a note row marks, mirroring the sidebar: notes that started at or after
+/// `today_start` (local midnight) are today's, `latest` (`Store::latest_note`) is the most
+/// recent note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowMarks {
+    pub today_start: i64,
+    pub latest: Option<i64>,
+}
+
+impl Default for RowMarks {
+    fn default() -> Self {
+        RowMarks {
+            today_start: i64::MAX,
+            latest: None,
+        }
+    }
+}
+
+/// How a note row is drawn: plain, today's (date and time in white) or the most recent
+/// (title, date and time in the accent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowMark {
+    Plain,
+    Today,
+    Latest,
+}
+
+impl RowMarks {
+    pub fn of(&self, e: &Episode) -> RowMark {
+        if self.latest == Some(e.id) {
+            RowMark::Latest
+        } else if e.started_at >= self.today_start {
+            RowMark::Today
+        } else {
+            RowMark::Plain
+        }
+    }
+}
+
 /// Per-frame UI state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NotesState {
@@ -346,6 +387,11 @@ pub struct NotesState {
     pub open_notes: std::collections::HashSet<i64>,
     /// The project page lists every next step, not just the first [`NEXT_STEPS_CAP`].
     pub show_all_steps: bool,
+    /// All notes lists the low-signal notes too (off by default, reset on every view change).
+    pub show_low_signal: bool,
+    /// Today's start and the most recent note, for the note rows' marks (set by the app
+    /// every frame).
+    pub marks: RowMarks,
     /// The card flashing right now and the egui time the flash started.
     pub flash: Option<(i64, f64)>,
     /// Conversation notes heard (partly) from an app classed Media — "Mark as media" is
@@ -1469,7 +1515,9 @@ fn focus_card(ui: &mut egui::Ui, t: &Tokens, state: &mut NotesState, id: i64, re
         .request_repaint_after(std::time::Duration::from_millis(33));
 }
 
-/// The view. `episodes` newest first.
+/// All notes (`View::Notes`): `episodes` = every conversation note, newest first
+/// (`Store::conversations`), under day headings as collapsed rows with a filing chip; the
+/// low-signal ones only behind "Show N low-signal".
 pub fn notes_view(
     ui: &mut egui::Ui,
     state: &mut NotesState,
@@ -1490,39 +1538,44 @@ pub fn notes_view(
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "No unfiled conversations. Everything is filed under a project.",
+            "No notes yet. Notes appear here as the brain interprets what it hears.",
             t.font(12.5),
             t.text_tertiary,
         );
         return actions;
     }
-    let this_year = chrono::Datelike::year(&Local::now());
+    let opts = ListOpts {
+        days: true,
+        filing: true,
+        hide_low_signal: true,
+    };
+    prepare_focus(state, episodes, opts);
+    let low_signal = episodes.iter().filter(|e| e.low_signal).count();
+    if low_signal == episodes.len() && !state.show_low_signal {
+        let rect = ui.available_rect_before_wrap();
+        ui.add_space((rect.height() / 2.0 - 20.0).max(0.0));
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{low_signal} low-signal note{} hidden",
+                    if low_signal == 1 { "" } else { "s" }
+                ))
+                .color(t.text_tertiary)
+                .size(12.5),
+            );
+            low_signal_toggle(ui, &t, state, low_signal);
+        });
+        return actions;
+    }
     egui::ScrollArea::vertical()
         .id_salt("notes-scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.add_space(8.0);
+            notes_header(ui, &t, state, episodes, opts, low_signal);
             ui.add_space(6.0);
-            let mut last_day = None;
-            for e in episodes {
-                let day = day_of(e.started_at, &Local);
-                if last_day != Some(day) {
-                    last_day = Some(day);
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        ui.label(
-                            RichText::new(
-                                day.map(|d| day_heading(d, this_year))
-                                    .unwrap_or_else(|| "Unknown date".to_owned()),
-                            )
-                            .font(crate::theme::font_medium(ui.ctx(), 13.5))
-                            .color(t.text),
-                        );
-                    });
-                    ui.add_space(4.0);
-                }
-                episode_card(ui, &t, state, e, nodes, &mut actions, "", None);
-            }
+            note_list(ui, &t, state, episodes, nodes, &mut actions, opts);
             ui.add_space(8.0);
         });
     actions
@@ -2003,22 +2056,45 @@ fn open_note(state: &mut NotesState, e: &Episode) {
     }
 }
 
-/// The project page's "Notes": every note newest first, one dense row each (disclosure
-/// triangle, date, time range, title, topic chips); a click opens the full card inline.
-fn project_notes(
-    ui: &mut egui::Ui,
-    t: &Tokens,
-    state: &mut NotesState,
-    episodes: &[Episode],
-    nodes: &[Node],
-    actions: &mut Vec<NotesAction>,
-) {
-    // a jump to a collapsed note opens it before it is laid out
+/// How a list of collapsed note rows is drawn ([`note_list`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct ListOpts {
+    /// Day headings where the local day changes (All notes).
+    days: bool,
+    /// Each row carries the chip naming where it is filed (All notes).
+    filing: bool,
+    /// Low-signal notes are listed only while [`NotesState::show_low_signal`] is on.
+    hide_low_signal: bool,
+}
+
+/// Run before a note list is laid out: a jump to a collapsed note opens it (and reveals it
+/// when it is a hidden low-signal note), so `focus_card` finds its card.
+fn prepare_focus(state: &mut NotesState, episodes: &[Episode], opts: ListOpts) {
     if let Some(f) = state.pending_focus
         && let Some(e) = episodes.iter().find(|e| e.id == f)
     {
         open_note(state, e);
+        if opts.hide_low_signal && e.low_signal {
+            state.show_low_signal = true;
+        }
     }
+}
+
+/// Whether a row is listed under `opts`.
+fn listed(state: &NotesState, e: &Episode, opts: ListOpts) -> bool {
+    !(opts.hide_low_signal && e.low_signal && !state.show_low_signal)
+}
+
+/// The "Notes" header line: the label, "Expand all · Collapse all" over the listed notes, and
+/// (All notes) the low-signal toggle when `low_signal` > 0.
+fn notes_header(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    state: &mut NotesState,
+    episodes: &[Episode],
+    opts: ListOpts,
+    low_signal: usize,
+) {
     ui.horizontal(|ui| {
         ui.add_space(14.0);
         ui.label(
@@ -2030,7 +2106,9 @@ fn project_notes(
             ui.add_space(6.0);
             if link(ui, t, "Expand all", 11.0).clicked() {
                 for e in episodes {
-                    open_note(state, e);
+                    if listed(state, e, opts) {
+                        open_note(state, e);
+                    }
                 }
             }
             ui.label(RichText::new("·").color(t.text_tertiary).size(11.0));
@@ -2038,7 +2116,99 @@ fn project_notes(
                 state.open_notes.clear();
             }
         }
+        if opts.hide_low_signal && low_signal > 0 {
+            ui.label(RichText::new("·").color(t.text_tertiary).size(11.0));
+            low_signal_toggle(ui, t, state, low_signal);
+        }
     });
+}
+
+/// "Show N low-signal" / "Hide low-signal".
+fn low_signal_toggle(ui: &mut egui::Ui, t: &Tokens, state: &mut NotesState, n: usize) {
+    let label = if state.show_low_signal {
+        "Hide low-signal".to_owned()
+    } else {
+        format!("Show {n} low-signal")
+    };
+    if link(ui, t, &label, 11.0).clicked() {
+        state.show_low_signal = !state.show_low_signal;
+    }
+}
+
+/// The collapsed note rows shared by the project page and All notes: one [`note_row`] each,
+/// a click toggling the full card inline (`NotesState::open_notes`).
+fn note_list(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    state: &mut NotesState,
+    episodes: &[Episode],
+    nodes: &[Node],
+    actions: &mut Vec<NotesAction>,
+    opts: ListOpts,
+) {
+    let this_year = chrono::Datelike::year(&Local::now());
+    let mut last_day = None;
+    for e in episodes {
+        if !listed(state, e, opts) {
+            continue;
+        }
+        if opts.days {
+            let day = day_of(e.started_at, &Local);
+            if last_day != Some(day) {
+                if last_day.is_some() {
+                    ui.add_space(6.0);
+                }
+                last_day = Some(day);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(
+                        RichText::new(
+                            day.map(|d| day_heading(d, this_year))
+                                .unwrap_or_else(|| "Unknown date".to_owned()),
+                        )
+                        .font(crate::theme::font_medium(ui.ctx(), 13.5))
+                        .color(t.text),
+                    );
+                });
+                ui.add_space(2.0);
+            }
+        }
+        // "Move to…" from a closed row: its field lives in the open card
+        if state
+            .move_draft
+            .as_ref()
+            .is_some_and(|d| d.target == oats_brain::MoveTarget::Episode(e.id) && !d.sidebar)
+        {
+            state.open_notes.insert(e.id);
+        }
+        let open = state.open_notes.contains(&e.id);
+        let filing = opts.filing.then_some(nodes);
+        if note_row(ui, t, e, state, open, filing, actions) {
+            if open {
+                state.open_notes.remove(&e.id);
+            } else {
+                open_note(state, e);
+            }
+        }
+        if open {
+            episode_card(ui, t, state, e, nodes, actions, "", None);
+        }
+    }
+}
+
+/// The project page's "Notes": every note newest first, one dense row each (disclosure
+/// triangle, date, time range, title, topic chips); a click opens the full card inline.
+fn project_notes(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    state: &mut NotesState,
+    episodes: &[Episode],
+    nodes: &[Node],
+    actions: &mut Vec<NotesAction>,
+) {
+    let opts = ListOpts::default();
+    prepare_focus(state, episodes, opts);
+    notes_header(ui, t, state, episodes, opts, 0);
     if episodes.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(14.0);
@@ -2050,37 +2220,91 @@ fn project_notes(
         });
     }
     ui.add_space(2.0);
-    for e in episodes {
-        // "Move to…" from a closed row: its field lives in the open card
-        if state
-            .move_draft
-            .as_ref()
-            .is_some_and(|d| d.target == oats_brain::MoveTarget::Episode(e.id) && !d.sidebar)
-        {
-            state.open_notes.insert(e.id);
-        }
-        let open = state.open_notes.contains(&e.id);
-        if note_row(ui, t, e, state, open, actions) {
-            if open {
-                state.open_notes.remove(&e.id);
-            } else {
-                open_note(state, e);
-            }
-        }
-        if open {
-            episode_card(ui, t, state, e, nodes, actions, "", None);
-        }
-    }
+    note_list(ui, t, state, episodes, nodes, actions, opts);
     ui.add_space(8.0);
 }
 
-/// One collapsed-note row (24 pt). `true` when the row (not a chip) was clicked.
+/// Where a note is filed, for its All notes chip: the project (a topic maps to its project)
+/// with the note's full path, or `None` when it has no node or only a bare category.
+pub fn filing_of<'a>(nodes: &'a [Node], e: &Episode) -> Option<(&'a Node, String)> {
+    let node = e.node_id?;
+    let p = project_of(nodes, node)?;
+    Some((p, node_path(nodes, node)))
+}
+
+/// The filing chip of a note: its label, the project it opens (`None`: "Unfiled", not
+/// clickable) and its hover text.
+fn filing_chip_label(nodes: &[Node], e: &Episode) -> (String, Option<i64>, String) {
+    match filing_of(nodes, e) {
+        Some((p, path)) => {
+            let mut name: String = p.name.chars().take(28).collect();
+            if p.name.chars().count() > 28 {
+                name.push('…');
+            }
+            (name, Some(p.id), path)
+        }
+        None => {
+            let hover = match e.node_id.and_then(|n| nodes.iter().find(|x| x.id == n)) {
+                Some(c) => format!("In {}, not under a project", c.name),
+                None => "Not filed under a project".to_owned(),
+            };
+            ("Unfiled".to_owned(), None, hover)
+        }
+    }
+}
+
+/// The chip naming where a note is filed: outlined, the project's name (clickable) or
+/// "Unfiled" in the tertiary colour (not clickable).
+fn filing_chip(ui: &mut egui::Ui, t: &Tokens, label: &str, clickable: bool) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), t.font(10.5), t.text_secondary);
+    let size = vec2(galley.size().x + 12.0, 16.0);
+    let sense = if clickable {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    if ui.is_rect_visible(rect) {
+        let col = if !clickable {
+            t.text_tertiary
+        } else if resp.hovered() {
+            t.text
+        } else {
+            t.text_secondary
+        };
+        if clickable && resp.hovered() {
+            ui.painter().rect_filled(rect, 8.0, t.hover);
+        }
+        ui.painter().rect_stroke(
+            rect.shrink(0.5),
+            8.0,
+            egui::Stroke::new(1.0, t.button_border),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, col);
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, clickable, label));
+    if clickable {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// One collapsed-note row (24 pt). `true` when the row (not a chip) was clicked. With
+/// `filing` (All notes) a chip naming the note's project (or "Unfiled") comes before the topic
+/// chips. Today's notes draw their date and time range in pure white, the most recent note
+/// ([`NotesState::marks`]) its title, date and time range in the accent colour.
 fn note_row(
     ui: &mut egui::Ui,
     t: &Tokens,
     e: &Episode,
     state: &mut NotesState,
     open: bool,
+    filing: Option<&[Node]>,
     actions: &mut Vec<NotesAction>,
 ) -> bool {
     let (rect, resp) =
@@ -2090,13 +2314,30 @@ fn note_row(
     });
     crate::merge::drag_source(ui, t, &resp, e.id, &e.title);
     merge_drop(ui, t, rect.shrink2(vec2(6.0, 0.0)), e.id, actions);
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mark = state.marks.of(e);
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!(
+            "{} · {}{}",
+            e.title,
+            short_date(e.started_at),
+            match mark {
+                RowMark::Latest => " · most recent",
+                RowMark::Today => " · today",
+                RowMark::Plain => "",
+            }
+        ));
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Note: {}", e.title))
     });
     if !ui.is_rect_visible(rect) {
         return resp.clicked();
     }
+    let (when_col, latest) = match mark {
+        RowMark::Latest => (t.accent, true),
+        RowMark::Today => (egui::Color32::WHITE, false),
+        RowMark::Plain => (t.text_tertiary, false),
+    };
     let p = ui.painter();
     if resp.hovered() {
         p.rect_filled(rect.shrink2(vec2(6.0, 1.0)), 4.0, t.hover);
@@ -2122,35 +2363,36 @@ fn note_row(
         egui::Stroke::NONE,
     ));
     let mut x = rect.left() + 30.0;
-    let date = p.layout_no_wrap(short_date(e.started_at), t.mono(10.5), t.text_tertiary);
+    let date = p.layout_no_wrap(short_date(e.started_at), t.mono(10.5), when_col);
     let w = date.size().x;
-    p.galley(
-        egui::pos2(x, cy - date.size().y / 2.0),
-        date,
-        t.text_tertiary,
-    );
+    p.galley(egui::pos2(x, cy - date.size().y / 2.0), date, when_col);
     x += 46.0_f32.max(w + 6.0);
     let range = crate::timefmt::range(e.started_at, e.ended_at, &Local);
-    let range = p.layout_no_wrap(range, t.mono(10.5), t.text_tertiary);
-    let w = range.size().x;
-    p.galley(
-        egui::pos2(x, cy - range.size().y / 2.0),
-        range,
-        t.text_tertiary,
-    );
+    let range = p.layout_no_wrap(range, t.mono(10.5), when_col);
+    // the widest 12-hour range ("11:00–11:09 am"), so the titles line up
+    let col = p
+        .layout_no_wrap("00:00–00:00 am".to_owned(), t.mono(10.5), when_col)
+        .size()
+        .x;
+    let w = range.size().x.max(col);
+    p.galley(egui::pos2(x, cy - range.size().y / 2.0), range, when_col);
     x += w + 10.0;
-    // chips from the right edge, as many as fit in a third of the row
-    let topics: Vec<&String> = e.topics.iter().take(3).collect();
-    let budget = (rect.width() / 3.0).max(60.0);
-    let mut chips_w = 0.0_f32;
-    let mut fit = 0;
-    for tp in &topics {
-        let w = p
-            .layout_no_wrap((*tp).clone(), t.font(10.5), t.text_secondary)
+    // chips from the right edge, as many as fit in a third of the row (the filing chip
+    // always: it comes first)
+    let chip_w = |text: &str| {
+        p.layout_no_wrap(text.to_owned(), t.font(10.5), t.text_secondary)
             .size()
             .x
             + 12.0
-            + 4.0;
+            + 4.0
+    };
+    let filing = filing.map(|nodes| filing_chip_label(nodes, e));
+    let topics: Vec<&String> = e.topics.iter().take(3).collect();
+    let budget = (rect.width() / 3.0).max(60.0);
+    let mut chips_w = filing.as_ref().map_or(0.0, |(l, _, _)| chip_w(l));
+    let mut fit = 0;
+    for tp in &topics {
+        let w = chip_w(tp);
         if chips_w + w > budget {
             break;
         }
@@ -2158,7 +2400,9 @@ fn note_row(
         fit += 1;
     }
     let chips_left = rect.right() - 14.0 - chips_w;
-    let title_col = if e.low_signal {
+    let title_col = if latest {
+        t.accent
+    } else if e.low_signal {
         t.text_tertiary
     } else {
         t.text
@@ -2174,7 +2418,7 @@ fn note_row(
     );
     p.with_clip_rect(clip)
         .galley(egui::pos2(x, cy - title.size().y / 2.0), title, title_col);
-    if fit > 0 {
+    if fit > 0 || filing.is_some() {
         let chips_rect = Rect::from_min_max(
             egui::pos2(chips_left, rect.top()),
             egui::pos2(rect.right() - 14.0, rect.bottom()),
@@ -2185,6 +2429,14 @@ fn note_row(
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         cui.spacing_mut().item_spacing.x = 4.0;
+        if let Some((label, project, hover)) = &filing {
+            let r = filing_chip(&mut cui, t, label, project.is_some()).on_hover_text(hover);
+            if let Some(id) = project
+                && r.clicked()
+            {
+                actions.push(NotesAction::SelectNode(*id));
+            }
+        }
         for tp in topics.into_iter().take(fit) {
             if topic_chip(&mut cui, t, tp)
                 .on_hover_text(format!("Show everything tagged “{tp}”"))
