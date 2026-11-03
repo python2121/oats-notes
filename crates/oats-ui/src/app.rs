@@ -3200,30 +3200,6 @@ impl OatsApp {
         }
     }
 
-    /// " · ▶ <title>" while YouTube or music plays on the system lane (what the pipeline
-    /// stamps), else nothing.
-    fn media_label(&self) -> String {
-        if !self.is_listening() || !self.system_on || self.on_call {
-            return String::new();
-        }
-        match self.pipeline.media_feed().current() {
-            // an idle web player / an ignored app: nothing plays
-            Some(m) if m.is_media() && m.policy != Some(oats_core::MediaPolicy::Ignore) => {
-                let title = if m.title.trim().is_empty() {
-                    m.producer.clone()
-                } else {
-                    m.title.clone()
-                };
-                let mut short: String = title.chars().take(40).collect();
-                if title.chars().count() > 40 {
-                    short.push('…');
-                }
-                format!(" · ▶ {short}")
-            }
-            _ => String::new(),
-        }
-    }
-
     /// "listening · mic + system", "listening · mic", "idle", …
     pub fn state_label(&self) -> String {
         match self.status {
@@ -3266,7 +3242,10 @@ impl OatsApp {
             cmds.push(Command::ToggleMic);
         }
         ui.add_space(6.0);
-        let tip = if lanes.system {
+        let tip = if lanes.system && self.system_no_signal && listening {
+            "Capturing system audio, but nothing has come through for 30 s — check the \
+             System Audio Recording permission — click to turn off"
+        } else if lanes.system {
             "Capturing system audio (what the computer plays: the other side of a call) — click to turn off"
         } else {
             "Capture system audio (what the computer plays: the other side of a call)"
@@ -3481,7 +3460,8 @@ impl OatsApp {
 
     /// The status strip's left text ("engine · on a call · 617 segments today · brain usage …");
     /// listening / idle and the lanes are NOT repeated here (the control bar's pills show them),
-    /// only loading… / failed.
+    /// only loading… / failed. No "system audio: no signal" and no "▶ <media>" line either: the
+    /// no-signal state is the System audio pill's tooltip, what plays is the Media view's.
     pub fn status_text(&self) -> String {
         let engine = if self.engine_name.is_empty() {
             "engine"
@@ -3514,11 +3494,6 @@ impl OatsApp {
                 }
             },
         };
-        let no_signal = if self.system_no_signal && self.is_listening() {
-            " · system audio: no signal"
-        } else {
-            ""
-        };
         let on_call = if self.on_call && self.is_listening() {
             " · on a call"
         } else {
@@ -3533,8 +3508,7 @@ impl OatsApp {
             PipelineStatus::Idle | PipelineStatus::Listening => String::new(),
         };
         format!(
-            "{engine}{state}{no_signal}{on_call}{} · {n} segment{} today{brain}",
-            self.media_label(),
+            "{engine}{state}{on_call} · {n} segment{} today{brain}",
             if n == 1 { "" } else { "s" }
         )
     }
