@@ -19,7 +19,7 @@ use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use egui::{Align2, Rect, RichText, Sense, Stroke, pos2, vec2};
 use oats_core::{Event, MediaClass, MediaPlay, Node, Todo};
 
-use crate::notes::{chip, node_path};
+use crate::notes::{chip, chip_max, node_path};
 use crate::theme::Tokens;
 use crate::todos::{TodoAction, source_label, todo_menu};
 use crate::transcript::{clock, day_heading};
@@ -121,8 +121,31 @@ pub fn items_by_day<'a, Tz: TimeZone>(
 /// Grid metrics.
 const MARGIN: f32 = 14.0;
 const CELL_H: f32 = 78.0;
+/// The shortest a grid row gets (the day number and one chip).
+const MIN_CELL_H: f32 = 40.0;
+/// What the day panel under the grid keeps of the view before the grid stops shrinking.
+const DAY_PANEL_MIN: f32 = 110.0;
+/// The header, the weekday names and the gaps above and below the grid.
+const GRID_CHROME_H: f32 = 8.0 + 24.0 + 6.0 + 18.0 + 12.0;
 const CHIP_H: f32 = 15.0;
 const MAX_CHIPS: usize = 3;
+/// The cell's top band (the day number) above its chips.
+const CHIPS_TOP: f32 = 18.0;
+
+/// The grid's row height in a view `view_h` tall with `weeks` rows: [`CELL_H`], less when
+/// that would leave the day panel under [`DAY_PANEL_MIN`], never under [`MIN_CELL_H`].
+pub fn cell_height(view_h: f32, weeks: usize) -> f32 {
+    let weeks = weeks.max(1) as f32;
+    ((view_h - GRID_CHROME_H - DAY_PANEL_MIN) / weeks).clamp(MIN_CELL_H, CELL_H)
+}
+
+/// How many chips fit in a cell `cell_h` tall (at most [`MAX_CHIPS`]).
+pub fn chips_fitting(cell_h: f32) -> usize {
+    let room = cell_h - 2.0 - CHIPS_TOP - 2.0;
+    ((room + 2.0) / (CHIP_H + 2.0))
+        .floor()
+        .clamp(0.0, MAX_CHIPS as f32) as usize
+}
 
 pub fn calendar_view(
     ui: &mut egui::Ui,
@@ -139,6 +162,10 @@ pub fn calendar_view(
     let month = state.month.unwrap_or_else(|| month_of(today));
     let selected = state.selected.unwrap_or(today);
     let grid_items = items_by_day(events, todos, &Local, true);
+    let days = grid_days(month);
+    // the grid shrinks (down to MIN_CELL_H a row) so the day panel under it keeps
+    // DAY_PANEL_MIN of the view; past that the whole view scrolls
+    let cell_h = cell_height(ui.available_height(), days.len() / 7);
     egui::ScrollArea::vertical()
         .id_salt("calendar-scroll")
         .auto_shrink([false, false])
@@ -167,14 +194,13 @@ pub fn calendar_view(
                     t.text_tertiary,
                 );
             }
-            let days = grid_days(month);
             for week in days.chunks(7) {
                 let (row, _) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), CELL_H), Sense::hover());
+                    ui.allocate_exact_size(vec2(ui.available_width(), cell_h), Sense::hover());
                 for (i, day) in week.iter().enumerate() {
                     let cell = Rect::from_min_size(
                         pos2(row.left() + MARGIN + cell_w * i as f32, row.top()),
-                        vec2(cell_w, CELL_H),
+                        vec2(cell_w, cell_h),
                     );
                     let items = grid_items.get(day).map(Vec::as_slice).unwrap_or(&[]);
                     day_cell(
@@ -324,21 +350,22 @@ fn day_cell(
         t.font(11.0),
         num_col,
     );
-    if items.len() > MAX_CHIPS {
+    let fit = chips_fitting(cell.height());
+    if items.len() > fit {
         p.text(
             pos2(inner.right() - 5.0, inner.top() + 3.0),
             Align2::RIGHT_TOP,
-            format!("+{}", items.len() - MAX_CHIPS),
+            format!("+{}", items.len() - fit),
             t.font(10.5),
             t.text_tertiary,
         );
     }
     let dim = if look.in_month { 1.0 } else { 0.55 };
-    for (i, item) in items.iter().take(MAX_CHIPS).enumerate() {
+    for (i, item) in items.iter().take(fit).enumerate() {
         let r = Rect::from_min_size(
             pos2(
                 inner.left() + 3.0,
-                inner.top() + 18.0 + i as f32 * (CHIP_H + 2.0),
+                inner.top() + CHIPS_TOP + i as f32 * (CHIP_H + 2.0),
             ),
             vec2(inner.width() - 6.0, CHIP_H),
         );
@@ -563,8 +590,8 @@ fn media_section(
         let Some(p) = fold.last() else {
             continue;
         };
-        ui.horizontal(|ui| {
-            ui.add_space(MARGIN);
+        // the label wraps, its time after it (or on the next line)
+        crate::widgets::inset_wrapped(ui, MARGIN, MARGIN, |ui| {
             let when = fold.when();
             let text = RichText::new(fold.label()).size(12.5);
             let resp = match &p.url {
@@ -573,7 +600,7 @@ fn media_section(
                         .add(
                             egui::Label::new(text.color(t.accent))
                                 .sense(Sense::click())
-                                .truncate(),
+                                .wrap(),
                         )
                         .on_hover_text(url.as_str());
                     if link.clicked() {
@@ -584,7 +611,7 @@ fn media_section(
                 None => ui.add(
                     egui::Label::new(text.color(t.text))
                         .sense(Sense::click())
-                        .truncate(),
+                        .wrap(),
                 ),
             };
             resp.context_menu(|ui| {
@@ -604,9 +631,26 @@ fn media_section(
                     ui.close();
                 }
             });
-            ui.label(RichText::new(when).color(t.text_tertiary).size(11.5));
+            ui.add(
+                egui::Label::new(RichText::new(when).color(t.text_tertiary).size(11.5)).truncate(),
+            );
         });
     }
+}
+
+/// The rest of a day-panel row after its dot / checkbox and time: a wrapping area (14 pt
+/// short of the right edge) whose text wraps and whose chips follow it or take the next line.
+fn trailing_wrapped(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let w = (ui.available_width() - MARGIN).max(40.0);
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        vec2(w, h),
+        egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+        |ui| {
+            ui.set_max_width(w);
+            add(ui);
+        },
+    );
 }
 
 fn event_row(
@@ -630,38 +674,41 @@ fn event_row(
                 .font(t.mono(10.5))
                 .color(t.text_tertiary),
         );
-        let resp = ui
-            .add(
-                egui::Label::new(RichText::new(&e.title).color(t.text).size(13.0))
-                    .truncate()
-                    .sense(Sense::click()),
-            )
-            .on_hover_text("Show in transcript");
-        if resp.clicked() {
-            actions.push(CalendarAction::ShowEvent(e.id));
-        }
-        resp.context_menu(|ui| {
-            if ui.button("Show in Transcript").clicked() {
+        // the title wraps in the rest of the row, the chips flow after it
+        trailing_wrapped(ui, |ui| {
+            let resp = ui
+                .add(
+                    egui::Label::new(RichText::new(&e.title).color(t.text).size(13.0))
+                        .wrap()
+                        .sense(Sense::click()),
+                )
+                .on_hover_text("Show in transcript");
+            if resp.clicked() {
                 actions.push(CalendarAction::ShowEvent(e.id));
-                ui.close();
             }
-            ui.separator();
-            if ui.button("Delete Event").clicked() {
-                actions.push(CalendarAction::DeleteEvent(e.id));
-                ui.close();
+            resp.context_menu(|ui| {
+                if ui.button("Show in Transcript").clicked() {
+                    actions.push(CalendarAction::ShowEvent(e.id));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Delete Event").clicked() {
+                    actions.push(CalendarAction::DeleteEvent(e.id));
+                    ui.close();
+                }
+            });
+            if let Some(n) = e.node_id.filter(|n| nodes.iter().any(|x| x.id == *n)) {
+                let w = ui.available_width();
+                chip_max(ui, t, &node_path(nodes, n), true, w);
+            }
+            chip(ui, t, source_label(e.source), false);
+            if let Some(c) = e.confidence.filter(|c| *c < 0.7) {
+                chip(ui, t, &format!("{:.0}% sure", c * 100.0), false);
             }
         });
-        if let Some(n) = e.node_id.filter(|n| nodes.iter().any(|x| x.id == *n)) {
-            chip(ui, t, &node_path(nodes, n), true);
-        }
-        chip(ui, t, source_label(e.source), false);
-        if let Some(c) = e.confidence.filter(|c| *c < 0.7) {
-            chip(ui, t, &format!("{:.0}% sure", c * 100.0), false);
-        }
     });
     if !e.details.is_empty() {
-        ui.horizontal(|ui| {
-            ui.add_space(MARGIN + 14.0);
+        crate::widgets::inset_wrapped(ui, MARGIN + 14.0, MARGIN, |ui| {
             ui.add(
                 egui::Label::new(RichText::new(&e.details).color(t.text_secondary).size(11.5))
                     .wrap(),
@@ -696,31 +743,49 @@ fn todo_row(
         } else {
             text.color(t.text)
         };
-        let mut resp = ui.add(egui::Label::new(text).truncate().sense(Sense::click()));
-        if td.source_segment_id.is_some() {
-            resp = resp.on_hover_text("Show in transcript");
-            if resp.clicked() {
-                actions.push(CalendarAction::Todo(TodoAction::Show(td.id)));
+        trailing_wrapped(ui, |ui| {
+            let mut resp = ui.add(egui::Label::new(text).wrap().sense(Sense::click()));
+            if td.source_segment_id.is_some() {
+                resp = resp.on_hover_text("Show in transcript");
+                if resp.clicked() {
+                    actions.push(CalendarAction::Todo(TodoAction::Show(td.id)));
+                }
             }
-        }
-        resp.context_menu(|ui| {
-            let mut out = Vec::new();
-            todo_menu(ui, td, false, &mut out);
-            actions.extend(out.into_iter().map(CalendarAction::Todo));
+            resp.context_menu(|ui| {
+                let mut out = Vec::new();
+                todo_menu(ui, td, false, &mut out);
+                actions.extend(out.into_iter().map(CalendarAction::Todo));
+            });
+            if td.snoozed_until.is_some() && !td.done() {
+                chip(ui, t, "snoozed", false);
+            }
+            if let Some(n) = td.node_id.filter(|n| nodes.iter().any(|x| x.id == *n)) {
+                let w = ui.available_width();
+                chip_max(ui, t, &node_path(nodes, n), true, w);
+            }
+            chip(ui, t, source_label(td.source), false);
         });
-        if td.snoozed_until.is_some() && !td.done() {
-            chip(ui, t, "snoozed", false);
-        }
-        if let Some(n) = td.node_id.filter(|n| nodes.iter().any(|x| x.id == *n)) {
-            chip(ui, t, &node_path(nodes, n), true);
-        }
-        chip(ui, t, source_label(td.source), false);
     });
     ui.add_space(2.0);
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_grid_shrinks_so_the_day_panel_keeps_room_in_a_short_window() {
+        // a tall view: the full cell height and three chips
+        assert_eq!(cell_height(900.0, 6), CELL_H);
+        assert_eq!(chips_fitting(CELL_H), 3);
+        // the 520 pt window's ~440 pt list: shorter rows, the day panel keeps its minimum
+        let h = cell_height(443.0, 5);
+        assert!((MIN_CELL_H..CELL_H).contains(&h));
+        assert!(443.0 - GRID_CHROME_H - 5.0 * h >= DAY_PANEL_MIN - 0.01);
+        assert!(chips_fitting(h) >= 1);
+        // never under the minimum (then the view scrolls)
+        assert_eq!(cell_height(200.0, 6), MIN_CELL_H);
+        assert_eq!(chips_fitting(MIN_CELL_H), 1);
+    }
+
     use super::*;
     use chrono::FixedOffset;
     use oats_core::Origin;

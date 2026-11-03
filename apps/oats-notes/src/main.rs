@@ -38,7 +38,7 @@
 //! `OATS_BRAIN_TIER0_PER_HOUR`, `OATS_CLAUDE_PASS_PROXY`, `OATS_HOTWORDS` (see
 //! `oats_brain::BrainConfig::from_env`).
 //!
-//! `--selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast|--media] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>]` renders the whole window offscreen to a PNG (seeded
+//! `--selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast|--media] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>] [--size WxH]` renders the whole window offscreen to a PNG (seeded
 //! demo content, the null engine, a throwaway database) — the shell verified without a window.
 
 use std::any::Any;
@@ -250,7 +250,7 @@ fn status_item(ctx: &egui::Context) -> Option<Box<dyn oats_status::StatusItem>> 
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast|--media] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>]\n\n\
+        "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast|--media] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>] [--size WxH]\n\n\
          \n\
          Log: <data dir>/oats.log (also on stderr; the last 2 MB are kept; RUST_LOG sets the level)\n\n\
          --listen       start listening as soon as the speech engine is ready\n\
@@ -574,6 +574,13 @@ fn selftest_cli(args: &[String]) -> ExitCode {
             "--no-sidebar" => options.no_sidebar = true,
             "--prefs" => options.prefs = true,
             "--media" => options.media = true,
+            "--size" => match args.next().and_then(|v| {
+                let (w, h) = v.split_once('x')?;
+                Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?])
+            }) {
+                Some(size) => options.size = Some(size),
+                None => return usage(),
+            },
             f if !f.starts_with("--") && out.is_none() => out = Some(f.into()),
             _ => return usage(),
         }

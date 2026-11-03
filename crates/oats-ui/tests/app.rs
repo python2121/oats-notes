@@ -3273,3 +3273,235 @@ fn a_media_note_opens_under_its_play_in_the_media_view() {
     assert_eq!(rig.app().prefs().view, View::Media);
     assert!(rig.shows("Re-interpret"));
 }
+
+/// Every node of the AccessKit tree whose rect reaches into the window must lie inside it
+/// horizontally (a row that runs off the right edge, or content laid out wider than its
+/// panel), and a node that starts inside the window must not end below it unless it sits in
+/// a scroll area (a pop-up or a fixed bar cut off at the bottom). Returns the offenders.
+fn out_of_window(harness: &Harness<'_, OatsApp>, window: egui::Rect) -> Vec<String> {
+    fn walk(
+        node: egui_kittest::Node<'_>,
+        window: egui::Rect,
+        in_scroll: bool,
+        out: &mut Vec<String>,
+    ) {
+        let ak = node.accesskit_node();
+        // a scroll area's content sits next to its scroll bar (when it has one)
+        let scroll = in_scroll
+            || node
+                .children()
+                .any(|c| c.accesskit_node().role() == egui::accesskit::Role::ScrollBar);
+        if ak.bounding_box().is_some() {
+            let r = node.rect();
+            let reaches_in = r.max.y > window.min.y + 1.0 && r.min.y < window.max.y - 1.0;
+            let wide = r.min.x < window.min.x - 1.0 || r.max.x > window.max.x + 1.0;
+            let low = !scroll && (r.min.y < window.min.y - 1.0 || r.max.y > window.max.y + 1.0);
+            if reaches_in && r.width() > 0.0 && (wide || low) {
+                out.push(format!(
+                    "{:?} {:?} {:?}",
+                    ak.role(),
+                    ak.label().or_else(|| ak.value()).unwrap_or_default(),
+                    r
+                ));
+            }
+        }
+        for c in node.children() {
+            walk(c, window, scroll, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(harness.root(), window, false, &mut out);
+    // widgets drawn over one another (a title under its card's buttons, a chip over a title):
+    // two labelled nodes that overlap without one containing the other
+    // (compared within one layer: an area, a window or a scroll area's content — a pop-up over
+    // the app, or rows scrolled under a fixed header, are not overlaps)
+    let mut leaves = Vec::new();
+    fn leaves_of(
+        node: egui_kittest::Node<'_>,
+        depth: usize,
+        layer: usize,
+        next: &mut usize,
+        out: &mut Vec<(usize, String, egui::Rect, bool)>,
+    ) {
+        use egui::accesskit::Role;
+        let ak = node.accesskit_node();
+        let mut layer = layer;
+        let scrolls = node
+            .children()
+            .any(|c| c.accesskit_node().role() == Role::ScrollBar);
+        if depth == 1 || scrolls || ak.role() == Role::Window {
+            *next += 1;
+            layer = *next;
+        }
+        if !matches!(
+            ak.role(),
+            Role::TextRun | Role::GenericContainer | Role::ScrollBar | Role::Unknown | Role::Window
+        ) && ak.bounding_box().is_some()
+        {
+            let label = ak.label().or_else(|| ak.value()).unwrap_or_else(|| {
+                node.children()
+                    .filter_map(|c| c.accesskit_node().value())
+                    .collect::<Vec<_>>()
+                    .join("")
+            });
+            let text = ak.role() == Role::Label;
+            out.push((
+                layer,
+                format!("{:?} {label:?}", ak.role()),
+                node.rect(),
+                text,
+            ));
+        }
+        for c in node.children() {
+            leaves_of(c, depth + 1, layer, next, out);
+        }
+    }
+    leaves_of(harness.root(), 0, 0, &mut 0, &mut leaves);
+    for (i, (la, a, ra, ta)) in leaves.iter().enumerate() {
+        for (lb, b, rb, tb) in &leaves[i + 1..] {
+            let x = ra.intersect(*rb);
+            if la == lb
+                && x.width() > 2.0
+                && x.height() > 2.0
+                // a row (a button) may hold its chips; a text label holds nothing
+                && (*ta || !ra.expand(1.0).contains_rect(*rb))
+                && (*tb || !rb.expand(1.0).contains_rect(*ra))
+                && window.intersects(x)
+            {
+                out.push(format!("{a} {ra:?} overlaps {b} {rb:?}"));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn every_view_fits_a_constrained_window() {
+    use oats_ui::selftest::SelftestOptions;
+    // the window's minimum is 800×520; with the default sidebar the content column is then
+    // ~440 pt wide only at 660×520 (the sidebar at its narrowest is the same squeeze)
+    let size = [660.0_f32, 520.0];
+    let base = SelftestOptions {
+        size: Some(size),
+        ..Default::default()
+    };
+    let views: Vec<(&str, SelftestOptions)> = vec![
+        (
+            "work",
+            SelftestOptions {
+                work: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "project expanded",
+            SelftestOptions {
+                project: true,
+                expanded: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "development team call",
+            SelftestOptions {
+                project: true,
+                project_name: Some("Development team call".into()),
+                ..base.clone()
+            },
+        ),
+        (
+            "all notes",
+            SelftestOptions {
+                notes: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "all notes busy",
+            SelftestOptions {
+                notes: true,
+                busy: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "calendar",
+            SelftestOptions {
+                calendar: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "todos",
+            SelftestOptions {
+                todos: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "toast",
+            SelftestOptions {
+                toast: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "media",
+            SelftestOptions {
+                media: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "transcripts",
+            SelftestOptions {
+                listening: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "search",
+            SelftestOptions {
+                search: Some("commerce cod delay".into()),
+                ..base.clone()
+            },
+        ),
+        (
+            "topic",
+            SelftestOptions {
+                topic: Some("Q4 roadmap".into()),
+                ..base.clone()
+            },
+        ),
+        (
+            "preferences",
+            SelftestOptions {
+                prefs: true,
+                ..base.clone()
+            },
+        ),
+    ];
+    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+    let mut failures = Vec::new();
+    for (name, options) in views {
+        let dir = TempDir::new("fit");
+        let store = Store::open(&dir.db()).unwrap();
+        let pipeline = Pipeline {
+            engine: Box::new(|| Ok(Box::new(NullEngine) as Box<dyn SpeechEngine>)),
+            store_path: dir.db(),
+            segmenter: Default::default(),
+            wake: Box::new(|| {}),
+        }
+        .spawn();
+        let audio: AudioStarter = Box::new(|_, _| Ok(StartedAudio::mic(Box::new(()))));
+        let harness = oats_ui::selftest::harness(store, pipeline, audio, &options, false).unwrap();
+        for bad in out_of_window(&harness, window) {
+            failures.push(format!("{name}: {bad}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "nodes outside the 660×520 window:\n{}",
+        failures.join("\n")
+    );
+}

@@ -11,7 +11,7 @@ use egui::text::{CCursor, CCursorRange, LayoutJob};
 use egui::{Align2, Id, RichText, Sense, TextFormat, pos2, vec2};
 use oats_core::{Event, MediaPlay, Node, SearchResults, TranscriptRow};
 
-use crate::notes::{NotesAction, NotesState, chip, episode_card, node_path};
+use crate::notes::{NotesAction, NotesState, chip_max, episode_card, node_path};
 use crate::sidebar::{HeaderIcon, header_icon};
 use crate::theme::Tokens;
 use crate::transcript::{clock, day_heading, day_of, source_label, source_tag};
@@ -167,29 +167,6 @@ pub fn search_bar(ui: &mut egui::Ui, state: &mut SearchState) -> (bool, bool) {
     let mut close = false;
     ui.horizontal_centered(|ui| {
         ui.add_space(12.0);
-        let w = (ui.available_width() - count_w - 24.0 - 12.0 - 8.0 - 8.0).max(120.0);
-        if state.select_all {
-            state.select_all = false;
-            let mut te = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-            te.cursor.set_char_range(Some(CCursorRange::two(
-                CCursor::new(0),
-                CCursor::new(state.query.chars().count()),
-            )));
-            te.store(ui.ctx(), id);
-        }
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut state.query)
-                .id(id)
-                .hint_text("Search transcripts and notes")
-                .desired_width(w),
-        );
-        if state.focus {
-            state.focus = false;
-            resp.request_focus();
-        }
-        changed = resp.changed();
-        ui.add_space(8.0);
-        ui.label(RichText::new(count).size(11.5).color(t.text_secondary));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             if header_icon(ui, HeaderIcon::Close)
@@ -198,6 +175,39 @@ pub fn search_bar(ui: &mut egui::Ui, state: &mut SearchState) -> (bool, bool) {
             {
                 close = true;
             }
+            ui.add_space(4.0);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // the field takes what the count leaves, at least half the bar; a count longer than
+                // the rest is cut with …
+                let w = (ui.available_width() - count_w - 8.0 - ui.spacing().item_spacing.x)
+                    .max(ui.available_width() / 2.0)
+                    .max(80.0);
+                if state.select_all {
+                    state.select_all = false;
+                    let mut te = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+                    te.cursor.set_char_range(Some(CCursorRange::two(
+                        CCursor::new(0),
+                        CCursor::new(state.query.chars().count()),
+                    )));
+                    te.store(ui.ctx(), id);
+                }
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut state.query)
+                        .id(id)
+                        .hint_text("Search transcripts and notes")
+                        .desired_width(w),
+                );
+                if state.focus {
+                    state.focus = false;
+                    resp.request_focus();
+                }
+                changed = resp.changed();
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(RichText::new(count).size(11.5).color(t.text_secondary))
+                        .truncate(),
+                );
+            });
         });
     });
     (changed, close)
@@ -342,15 +352,17 @@ fn event_hit(
         );
         ui.add_space(4.0);
         ui.vertical(|ui| {
-            ui.set_width((ui.available_width() - 12.0).max(60.0));
+            ui.set_width((ui.available_width() - 14.0).max(60.0));
             marked_label(ui, t, &e.title, hl, 13.0, t.text);
             if !e.details.is_empty() {
                 marked_label(ui, t, &e.details, hl, 11.5, t.text_secondary);
             }
+            // under the text (after it, it ran off a narrow row)
+            if let Some(n) = e.node_id {
+                let w = ui.available_width();
+                chip_max(ui, t, &node_path(nodes, n), true, w);
+            }
         });
-        if let Some(n) = e.node_id {
-            chip(ui, t, &node_path(nodes, n), true);
-        }
     })
     .clicked()
 }

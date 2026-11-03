@@ -29,10 +29,17 @@ pub const MAX_CONFIRMATIONS: usize = 3;
 pub const MAX_REMINDERS: usize = 3;
 /// Card width.
 pub const WIDTH: f32 = 340.0;
+/// The narrowest a card gets (in a content column narrower than `WIDTH` + 2 × `INSET`).
+pub const MIN_WIDTH: f32 = 240.0;
 /// Inset from the window's edge (right) and from the top of the content (below the bars).
 pub const INSET: f32 = 12.0;
 /// The column the × takes at a card's right edge (its glyph is ~7 pt wide).
 const CLOSE_W: f32 = 12.0;
+
+/// The cards' width in a content column `content_w` wide.
+pub fn card_width(content_w: f32) -> f32 {
+    (content_w - 2.0 * INSET).clamp(MIN_WIDTH, WIDTH)
+}
 
 /// A confirmation on screen.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,11 +111,12 @@ pub fn reminder_order(due: &[Todo]) -> Vec<&Todo> {
     v
 }
 
-/// Draw the stack, top right, `top` points below the window's top (the content area's
-/// top). Schedules the repaint for the next confirmation deadline.
+/// Draw the stack at the top right of `content` (the content column, below the bars):
+/// [`WIDTH`] wide, narrower when the column is (never under [`MIN_WIDTH`]), [`INSET`] from
+/// its edges. Schedules the repaint for the next confirmation deadline.
 pub fn toasts(
     ctx: &egui::Context,
-    top: f32,
+    content: egui::Rect,
     due: &[Todo],
     state: &mut ToastState,
 ) -> Vec<ToastAction> {
@@ -123,15 +131,21 @@ pub fn toasts(
     let t = Tokens::get(ctx);
     let shadow = ctx.global_style().visuals.popup_shadow;
     let mut dismissed = Vec::new();
+    let width = card_width(content.width());
+    let right = ctx.content_rect().right() - content.right().min(ctx.content_rect().right());
     egui::Area::new(egui::Id::new("oats-toasts"))
         .order(Order::Foreground)
-        .anchor(Align2::RIGHT_TOP, vec2(-INSET, top + INSET))
+        .anchor(
+            Align2::RIGHT_TOP,
+            vec2(-INSET - right, content.top().max(0.0) + INSET),
+        )
+        .constrain(true)
         .interactable(true)
         .show(ctx, |ui| {
-            ui.set_width(WIDTH);
+            ui.set_width(width);
             ui.spacing_mut().item_spacing.y = 8.0;
             for c in &mut state.confirmations {
-                let hovered = confirmation_card(ui, &t, shadow, c, &mut dismissed);
+                let hovered = confirmation_card(ui, &t, shadow, width, c, &mut dismissed);
                 if hovered {
                     // hovering holds it open; re-checked when the pointer leaves
                     c.expires = c.expires.max(now + 1.5);
@@ -139,7 +153,7 @@ pub fn toasts(
             }
             let order = reminder_order(due);
             for todo in order.iter().take(MAX_REMINDERS) {
-                reminder_card(ui, &t, shadow, todo, &mut actions);
+                reminder_card(ui, &t, shadow, width, todo, &mut actions);
             }
             if order.len() > MAX_REMINDERS {
                 let more = order.len() - MAX_REMINDERS;
@@ -218,11 +232,12 @@ fn confirmation_card(
     ui: &mut egui::Ui,
     t: &Tokens,
     shadow: egui::epaint::Shadow,
+    width: f32,
     c: &Confirmation,
     dismissed: &mut Vec<u64>,
 ) -> bool {
     let resp = card_frame(t, shadow, true).show(ui, |ui| {
-        ui.set_width(WIDTH - 24.0);
+        ui.set_width(width - 24.0);
         ui.horizontal_top(|ui| {
             let font = egui::FontId::proportional(12.5);
             // The icon is centred on the first line's capitals (the × too), so a one-line
@@ -263,19 +278,20 @@ fn reminder_card(
     ui: &mut egui::Ui,
     t: &Tokens,
     shadow: egui::epaint::Shadow,
+    width: f32,
     todo: &Todo,
     actions: &mut Vec<ToastAction>,
 ) {
     let now = Local::now();
     let title = crate::theme::font_medium(ui.ctx(), 13.5);
     card_frame(t, shadow, false).show(ui, |ui| {
-        ui.set_width(WIDTH - 24.0);
+        ui.set_width(width - 24.0);
         ui.horizontal_top(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
             bell_glyph(ui, r, t.accent);
             ui.add_space(2.0);
             ui.vertical(|ui| {
-                ui.set_width(WIDTH - 24.0 - 18.0 - 2.0 - 6.0 * 2.0 - 20.0);
+                ui.set_width(width - 24.0 - 18.0 - 2.0 - 6.0 * 2.0 - 20.0);
                 ui.add(
                     egui::Label::new(RichText::new(&todo.text).font(title.clone()).color(t.text))
                         .wrap(),
@@ -370,6 +386,13 @@ fn check_glyph(ui: &egui::Ui, r: egui::Rect, col: Color32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cards_shrink_in_a_narrow_column() {
+        assert_eq!(card_width(800.0), WIDTH);
+        assert_eq!(card_width(300.0), 300.0 - 2.0 * INSET);
+        assert_eq!(card_width(100.0), MIN_WIDTH);
+    }
+
     use super::*;
     use oats_core::Origin;
 

@@ -7,10 +7,10 @@ use chrono::Local;
 use egui::{Align2, RichText, Sense, pos2, vec2};
 use oats_core::{Episode, Node};
 
-use crate::notes::{chip, node_path};
+use crate::notes::{chip_max, node_path};
 use crate::sidebar::{HeaderIcon, header_icon};
 use crate::theme::Tokens;
-use crate::transcript::{at, clock};
+use crate::transcript::at;
 
 /// Height of the header bar.
 pub const BAR_H: f32 = 36.0;
@@ -35,19 +35,10 @@ pub enum TopicAction {
 pub fn topic_header(ui: &mut egui::Ui, state: &TopicState) -> bool {
     let t = Tokens::get(ui.ctx());
     let mut close = false;
+    let n = state.episodes.len();
+    let count = format!("{n} note{}", if n == 1 { "" } else { "s" });
     ui.horizontal_centered(|ui| {
         ui.add_space(14.0);
-        ui.label(
-            RichText::new(format!("Tagged “{}”", state.topic))
-                .font(crate::theme::font_medium(ui.ctx(), 13.5))
-                .color(t.text),
-        );
-        let n = state.episodes.len();
-        ui.label(
-            RichText::new(format!("{n} note{}", if n == 1 { "" } else { "s" }))
-                .size(11.5)
-                .color(t.text_secondary),
-        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             if header_icon(ui, HeaderIcon::Close)
@@ -56,6 +47,25 @@ pub fn topic_header(ui: &mut egui::Ui, state: &TopicState) -> bool {
             {
                 close = true;
             }
+            ui.add_space(8.0);
+            // the title cut with … so the count after it stays in view
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let count_w = ui
+                    .painter()
+                    .layout_no_wrap(count.clone(), t.font(11.5), t.text_secondary)
+                    .size()
+                    .x;
+                let title_w = ui.available_width() - count_w - ui.spacing().item_spacing.x;
+                let title = crate::widgets::truncated_galley(
+                    ui,
+                    format!("Tagged “{}”", state.topic),
+                    crate::theme::font_medium(ui.ctx(), 13.5),
+                    t.text,
+                    title_w,
+                );
+                ui.add(egui::Label::new(title).selectable(false));
+                ui.label(RichText::new(count).size(11.5).color(t.text_secondary));
+            });
         });
     });
     close
@@ -107,30 +117,35 @@ pub fn topic_list(ui: &mut egui::Ui, state: &TopicState, nodes: &[Node]) -> Vec<
                             ))
                             .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     );
-                    cell.label(RichText::new(date).size(11.5).color(t.text_secondary));
-                    cell.label(
-                        RichText::new(format!(
-                            "{}–{}",
-                            clock(e.started_at, &Local),
-                            clock(e.ended_at, &Local)
-                        ))
-                        .font(t.mono(10.5))
-                        .color(t.text_tertiary),
-                    );
-                    cell.add(
-                        egui::Label::new(
-                            RichText::new(&e.title)
-                                .font(crate::theme::font_medium(ui.ctx(), 13.0))
-                                .color(t.text),
-                        )
-                        .selectable(false)
-                        .truncate(),
-                    );
-                    if let Some(n) = e.node_id {
-                        cell.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            chip(ui, &t, &node_path(nodes, n), true)
+                    // right to left: the node chip (at most 40 % of the row, cut with …),
+                    // then date and time from the left, the title clipped between them
+                    cell.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(n) = e.node_id {
+                            let max = (ui.available_width() * 0.4).max(60.0);
+                            chip_max(ui, &t, &node_path(nodes, n), true, max);
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(date).size(11.5).color(t.text_secondary));
+                            ui.label(
+                                RichText::new(crate::timefmt::range(
+                                    e.started_at,
+                                    e.ended_at,
+                                    &Local,
+                                ))
+                                .font(t.mono(10.5))
+                                .color(t.text_tertiary),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&e.title)
+                                        .font(crate::theme::font_medium(ui.ctx(), 13.0))
+                                        .color(t.text),
+                                )
+                                .selectable(false)
+                                .truncate(),
+                            );
                         });
-                    }
+                    });
                 }
                 if resp
                     .on_hover_cursor(egui::CursorIcon::PointingHand)

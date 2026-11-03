@@ -3298,22 +3298,8 @@ impl OatsApp {
         ui.add_space(6.0);
         level_meter(ui, t, if listening { self.level } else { None });
         ui.add_space(6.0);
-        match &self.status {
-            PipelineStatus::Loading(line) => {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(line).color(t.text_secondary).size(11.5))
-                        .truncate(),
-                );
-            }
-            PipelineStatus::Failed(msg) => {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(msg).color(t.danger).size(11.5))
-                        .truncate(),
-                );
-            }
-            _ => {}
-        }
-        // Find, at the far right
+        // Find at the far right; the engine's loading / failure line in what is left, cut
+        // with … (it never pushes the icon out)
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(12.0);
             let icon = if self.search.is_some() {
@@ -3327,12 +3313,31 @@ impl OatsApp {
             {
                 cmds.push(Command::Search);
             }
+            ui.add_space(6.0);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let line = match &self.status {
+                    PipelineStatus::Loading(line) => Some((line, t.text_secondary)),
+                    PipelineStatus::Failed(msg) => Some((msg, t.danger)),
+                    _ => None,
+                };
+                if let Some((text, col)) = line {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text).color(col).size(11.5))
+                            .truncate(),
+                    );
+                }
+            });
         });
         cmds
     }
 
     /// The Preferences window: "Your name", saved on Enter or when the field loses focus.
     fn preferences_window(&mut self, ctx: &egui::Context, t: &Tokens) {
+        let menu = if self.has_native_menu() {
+            0.0
+        } else {
+            t.menu_bar_h
+        };
         let Some(win) = &mut self.prefs_window else {
             return;
         };
@@ -3352,13 +3357,30 @@ impl OatsApp {
         let policy_before = oats_core::MediaPolicy::effective(stored_policy.as_deref());
         let mut policy = policy_before;
         let mut app_changes: Vec<(String, oats_core::ProducerClass, bool)> = Vec::new();
+        // Inside the window, below the in-window menu bar, 12 pt clear of every edge: as wide
+        // as fits up to 560 pt, as tall as fits (egui caps the height at the constrain rect;
+        // the body scrolls when it is taller).
+        let screen = ctx.content_rect();
+        let bounds = Rect::from_min_max(pos2(screen.left(), screen.top() + menu), screen.max)
+            .shrink(PREFS_INSET);
+        let margin = ctx.global_style().spacing.window_margin;
+        let chrome_w = margin.sum().x + 2.0;
+        let width = (bounds.width() - chrome_w).clamp(200.0, PREFS_WIDTH);
         egui::Window::new("Preferences")
             .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .anchor(egui::Align2::CENTER_CENTER, bounds.center() - screen.center())
+            .constrain_to(bounds)
             .collapsible(false)
             .resizable(false)
-            .fixed_size(vec2(560.0, 0.0))
+            .min_width(width)
+            .max_width(width)
+            .default_width(width)
+            .default_height(f32::INFINITY)
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("prefs-body")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
                 ui.label(egui::RichText::new("Your name").color(t.text_secondary));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut win.name)
@@ -3424,6 +3446,7 @@ impl OatsApp {
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new("Apps").color(t.text_secondary));
                 apps_table(ui, t, &win.apps, policy, &mut app_changes);
+                    });
             });
         if policy != policy_before {
             match self
@@ -3511,36 +3534,86 @@ impl OatsApp {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, t.inset);
         let left = self.status_text();
-        let left_galley = p.layout_no_wrap(left, t.mono(9.5), t.text_tertiary);
-        let left_w = left_galley.size().x;
-        p.galley(
-            pos2(
-                rect.left() + 8.0,
-                rect.center().y - left_galley.size().y / 2.0,
-            ),
-            left_galley,
-            t.text_tertiary,
-        );
         let (right, col) = match (&self.warning, &self.last_command) {
             (Some(w), _) => (w.as_str(), t.danger.gamma_multiply(0.9)),
             (None, Some(c)) => (c.as_str(), t.accent.gamma_multiply(0.9)),
             (None, None) => ("", t.text_tertiary),
         };
-        // the right text never runs over the left
-        let room = rect.width() - left_w - 32.0;
-        if room > 40.0 && !right.is_empty() {
-            let galley = p.layout(right.to_owned(), t.mono(9.5), col, f32::INFINITY);
-            let clip = Rect::from_min_max(pos2(rect.right() - 8.0 - room, rect.top()), rect.max);
-            p.with_clip_rect(clip).galley(
-                pos2(
-                    rect.right() - 8.0 - galley.size().x.min(room),
-                    rect.center().y - galley.size().y / 2.0,
-                ),
-                galley,
-                col,
+        let font = t.mono(9.5);
+        let full_w = |text: &str| {
+            p.layout_no_wrap(text.to_owned(), font.clone(), col)
+                .size()
+                .x
+        };
+        let (left_w, right_w) = status_widths(
+            rect.width() - 2.0 * STATUS_INSET,
+            full_w(&left),
+            if right.is_empty() { 0.0 } else { full_w(right) },
+        );
+        let left_galley = crate::widgets::truncated_galley(
+            ui,
+            left.clone(),
+            font.clone(),
+            t.text_tertiary,
+            left_w,
+        );
+        let left_cut = left_galley.elided;
+        let left_rect = Rect::from_min_size(
+            pos2(
+                rect.left() + STATUS_INSET,
+                rect.center().y - left_galley.size().y / 2.0,
+            ),
+            left_galley.size(),
+        );
+        p.galley(left_rect.min, left_galley, t.text_tertiary);
+        let mut cut = Vec::new();
+        if left_cut {
+            cut.push((left_rect, left));
+        }
+        if right_w > 0.0 {
+            let galley = crate::widgets::truncated_galley(ui, right, font, col, right_w);
+            let at = pos2(
+                rect.right() - STATUS_INSET - galley.size().x,
+                rect.center().y - galley.size().y / 2.0,
             );
+            if galley.elided {
+                cut.push((Rect::from_min_size(at, galley.size()), right.to_owned()));
+            }
+            p.galley(at, galley, col);
+        }
+        // a cut text reads in full on hover
+        for (i, (r, text)) in cut.into_iter().enumerate() {
+            ui.interact(r, egui::Id::new(("status-strip", i)), Sense::hover())
+                .on_hover_text(text);
         }
     }
+}
+
+/// The Preferences window's widest content and its distance from the window's edges.
+const PREFS_WIDTH: f32 = 560.0;
+const PREFS_INSET: f32 = 12.0;
+
+/// The status strip's side insets.
+const STATUS_INSET: f32 = 8.0;
+/// The gap kept between the strip's left and right texts.
+const STATUS_GAP: f32 = 16.0;
+
+/// The widths the status strip gives its left text (engine · state · …) and its right text
+/// (the warning or the last voice command) out of `room`, given their full widths: both in
+/// full when they fit; else the right text keeps its full width up to half the strip (more
+/// when the left text is short) and the left one is cut before it, then the right one too.
+/// `right` = 0: no right text, the left one has the whole strip.
+pub fn status_widths(room: f32, left: f32, right: f32) -> (f32, f32) {
+    let room = room.max(0.0);
+    if right <= 0.0 {
+        return (left.min(room), 0.0);
+    }
+    let text_room = (room - STATUS_GAP).max(0.0);
+    if left + right <= text_room {
+        return (left, right);
+    }
+    let right_w = right.min((text_room - left).max(text_room / 2.0));
+    (left.min(text_room - right_w), right_w)
 }
 
 /// The Preferences "Apps" table: each app seen playing sound, its class (Auto shows what it
@@ -3566,11 +3639,9 @@ fn apps_table(
         }
     };
     let anyway_shown = policy.skips_transcription();
-    egui::ScrollArea::vertical()
-        .id_salt("prefs-apps")
-        .max_height(220.0)
-        .min_scrolled_height(160.0)
-        .show(ui, |ui| {
+    // (no scroll area of its own: the whole Preferences body scrolls)
+    {
+        {
             egui::Grid::new("prefs-apps-grid")
                 .num_columns(3)
                 .spacing(vec2(12.0, 6.0))
@@ -3639,7 +3710,8 @@ fn apps_table(
                         ui.end_row();
                     }
                 });
-        });
+        }
+    }
     ui.add_space(2.0);
     ui.label(
         egui::RichText::new(
@@ -4017,7 +4089,7 @@ impl eframe::App for OatsApp {
         let mut calendar_actions = Vec::new();
         let mut todo_actions = Vec::new();
         let mut media_actions = Vec::new();
-        let mut list_top = 0.0;
+        let mut list_rect_seen = Rect::NOTHING;
         let mut search_actions = Vec::new();
         let mut topic_actions = Vec::new();
         egui::CentralPanel::default()
@@ -4032,7 +4104,7 @@ impl eframe::App for OatsApp {
                     pos2(full.left(), bar_rect.bottom() + 1.0),
                     pos2(full.right(), status_rect.top()),
                 );
-                list_top = list_rect.top();
+                list_rect_seen = list_rect;
 
                 let mut bar_ui = ui.new_child(
                     egui::UiBuilder::new()
@@ -4284,7 +4356,7 @@ impl eframe::App for OatsApp {
             });
 
         // the pop-ups: over every view, in the content area's upper right
-        let toast_actions = toasts(&ctx, list_top, &self.due_now, &mut self.toasts);
+        let toast_actions = toasts(&ctx, list_rect_seen, &self.due_now, &mut self.toasts);
         self.preferences_window(&ctx, &t);
         // a note dropped on another: the Yes / No before the (irreversible) merge
         if let Some(merge) =
@@ -4327,6 +4399,21 @@ impl eframe::App for OatsApp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_status_strip_cuts_the_left_text_before_the_right_one() {
+        use super::status_widths;
+        // both fit: both in full
+        assert_eq!(status_widths(400.0, 200.0, 100.0), (200.0, 100.0));
+        // no right text: the left one takes the strip, cut at its width
+        assert_eq!(status_widths(300.0, 500.0, 0.0), (300.0, 0.0));
+        // too long together: the right text keeps its width, the left one is cut
+        assert_eq!(status_widths(400.0, 350.0, 120.0), (264.0, 120.0));
+        // a right text over half the strip is cut to half, the left one to the rest
+        assert_eq!(status_widths(416.0, 350.0, 400.0), (200.0, 200.0));
+        // a short left text leaves the right one more than half
+        assert_eq!(status_widths(416.0, 100.0, 400.0), (100.0, 300.0));
+    }
+
     use super::*;
     use eframe::Storage as _;
 

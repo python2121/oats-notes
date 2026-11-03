@@ -1,5 +1,7 @@
 //! Small shared widgets whose job is alignment: a checkbox centred on the first line of the
-//! text beside it, and the cap-height centre that both use.
+//! text beside it, and the cap-height centre that both use; and the reflow helpers every view
+//! uses so a narrow window wraps or truncates instead of running off the right edge
+//! ([`inset_wrapped`], [`truncated_galley`]).
 
 use egui::{Color32, FontId, Rect, Response, Ui, UiBuilder, pos2, vec2};
 
@@ -60,6 +62,55 @@ pub fn check_box(ui: &mut Ui, checked: &mut bool, font: &FontId) -> Response {
     );
     child.spacing_mut().interact_size.y = side;
     child.add(egui::Checkbox::without_text(checked))
+}
+
+/// A wrapping row inset `left` and `right` points from `ui`'s edges: widgets flow left to
+/// right and wrap onto the next line at the same `left` inset (a hanging indent, unlike a
+/// bare `horizontal_wrapped` with a leading `add_space`, whose second line starts at the
+/// edge). A wrapping `Label` inside starts after the widget before it and continues on the
+/// line below; a widget that doesn't fit after it (a chip) moves to the next line. Never
+/// wider than `ui`.
+pub fn inset_wrapped<R>(
+    ui: &mut Ui,
+    left: f32,
+    right: f32,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let max = ui.max_rect();
+    let top = ui.cursor().top();
+    let rect = Rect::from_min_max(
+        pos2(max.left() + left, top),
+        pos2((max.right() - right).max(max.left() + left + 1.0), top),
+    );
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true)),
+        add,
+    )
+}
+
+/// `text` in `font` on one line, cut with "…" to at most `max_w` points.
+pub fn truncated_galley(
+    ui: &Ui,
+    text: impl Into<String>,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.into(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(1.0));
+    ui.painter().layout_job(job)
+}
+
+/// The width of a plain `egui::Button` with `text` at `size` points (its label plus the
+/// button padding), for laying out a row of buttons before drawing it.
+pub fn button_width(ui: &Ui, text: &str, size: f32) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), FontId::proportional(size), Color32::WHITE)
+        .size()
+        .x
+        + 2.0 * ui.spacing().button_padding.x
 }
 
 #[cfg(test)]

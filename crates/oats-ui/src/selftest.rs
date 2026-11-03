@@ -59,6 +59,8 @@ pub struct SelftestOptions {
     pub topic: Option<String>,
     /// Show the Media view over four seeded plays across two days (thumbnails off).
     pub media: bool,
+    /// Window size in points (default [`SIZE`]); `--size WxH` renders a narrow window.
+    pub size: Option<[f32; 2]>,
 }
 
 /// Apps seen playing sound, a couple of classes set, the policy at Log only.
@@ -244,6 +246,28 @@ pub fn run_with(
     audio: AudioStarter,
     options: SelftestOptions,
 ) -> Result<[u32; 2], String> {
+    let mut harness = harness(store, pipeline, audio, &options, true)?;
+    let image = harness.render()?;
+    let (w, h) = image.dimensions();
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    image
+        .save(out)
+        .map_err(|e| format!("{}: {e}", out.display()))?;
+    Ok([w, h])
+}
+
+/// Seed `store`, build the app at the options' size, open the view they ask for and let the
+/// layout settle: the harness [`run_with`] renders, and the layout tests walk. `wgpu`: with the
+/// wgpu renderer (needed to render a PNG; a layout check does without).
+pub fn harness(
+    store: Store,
+    pipeline: PipelineHandle,
+    audio: AudioStarter,
+    options: &SelftestOptions,
+    wgpu: bool,
+) -> Result<Harness<'static, OatsApp>, String> {
     seed(&store, options.toast).map_err(|e| format!("seeding the store: {e}"))?;
     if options.prefs {
         seed_apps(&store).map_err(|e| format!("seeding the apps: {e}"))?;
@@ -256,26 +280,31 @@ pub fn run_with(
     if options.search.is_some() {
         seed_tags(&store).map_err(|e| format!("seeding the tags: {e}"))?;
     }
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(SIZE[0], SIZE[1]))
-        .with_pixels_per_point(PIXELS_PER_POINT)
-        .wgpu()
-        .build_eframe(|cc| {
-            OatsApp::new(
-                cc,
-                AppOptions {
-                    native_menu: false,
-                    system_font: false,
-                    persist: false,
-                    start_listening: false,
-                },
-                pipeline,
-                audio,
-                store,
-                None,
-                None,
-            )
-        });
+    let mut builder = Harness::builder()
+        .with_size({
+            let [w, h] = options.size.unwrap_or(SIZE);
+            egui::vec2(w, h)
+        })
+        .with_pixels_per_point(PIXELS_PER_POINT);
+    if wgpu {
+        builder = builder.wgpu();
+    }
+    let mut harness = builder.build_eframe(|cc| {
+        OatsApp::new(
+            cc,
+            AppOptions {
+                native_menu: false,
+                system_font: false,
+                persist: false,
+                start_listening: false,
+            },
+            pipeline,
+            audio,
+            store,
+            None,
+            None,
+        )
+    });
     // let the engine report ready (the null engine loads at once)
     let deadline = Instant::now() + Duration::from_secs(20);
     while !matches!(
@@ -355,15 +384,7 @@ pub fn run_with(
     // settle: fonts, layout, the scroll area's stick-to-bottom, and the Transcripts view paging
     // in the earlier day (one page per frame while the list is shorter than the window)
     harness.run_steps(10);
-    let image = harness.render()?;
-    let (w, h) = image.dimensions();
-    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    image
-        .save(out)
-        .map_err(|e| format!("{}: {e}", out.display()))?;
-    Ok([w, h])
+    Ok(harness)
 }
 
 /// A session and eight segments: four yesterday afternoon, four this morning (two of them

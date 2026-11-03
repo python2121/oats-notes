@@ -77,7 +77,9 @@ pub fn move_field_in(
         let width = if sidebar {
             (ui.available_width() - if d.sent { 30.0 } else { 6.0 }).max(60.0)
         } else {
-            320.0
+            // 320 pt, less in a narrow card (room kept for the spinner and "Moving…")
+            let tail = if d.sent { 80.0 } else { 12.0 };
+            (ui.available_width() - tail).clamp(80.0, 320.0)
         };
         let r = ui.add_enabled(
             !d.sent,

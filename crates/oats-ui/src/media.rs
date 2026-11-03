@@ -34,6 +34,9 @@ pub const MEDIA_PAGE: usize = 200;
 pub const THUMB_SIZE: egui::Vec2 = egui::vec2(96.0, 54.0);
 const ROW_H: f32 = 72.0;
 const MARGIN: f32 = 14.0;
+/// From this list width up an open media note's card sits under the row's text column;
+/// narrower, it takes the row's whole width from the thumbnail's left edge.
+const MEDIA_CARD_UNDER_TEXT: f32 = 600.0;
 
 /// The loaded part of the history: rows (folded), and where the next page starts.
 #[derive(Clone, Debug, Default)]
@@ -290,8 +293,15 @@ pub fn media_view(
                         }
                     }
                     if open {
+                        // under the text column; in a narrow list from the thumbnail's left
+                        // edge (the card's fill starts 6 pt into its column)
+                        let indent = if ui.available_width() >= MEDIA_CARD_UNDER_TEXT {
+                            MARGIN + THUMB_SIZE.x - 12.0
+                        } else {
+                            MARGIN - 6.0
+                        };
                         ui.horizontal(|ui| {
-                            ui.add_space(MARGIN + THUMB_SIZE.x - 12.0);
+                            ui.add_space(indent);
                             ui.vertical(|ui| {
                                 crate::notes::episode_card(
                                     ui,

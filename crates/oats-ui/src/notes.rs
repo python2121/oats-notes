@@ -16,6 +16,7 @@ use oats_core::{
 
 use crate::theme::Tokens;
 use crate::transcript::{TranscriptAction, clock, day_heading, day_of, transcript_rows};
+use crate::widgets::inset_wrapped;
 
 /// What the user did in a notes view (All notes, a node page, a note card) this frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -680,7 +681,6 @@ fn item_line(
     actions: &mut Vec<NotesAction>,
 ) {
     let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = ui.available_width();
     let (color, strikethrough) = if done {
         (t.text_tertiary, egui::Stroke::new(1.0, t.text_tertiary))
     } else {
@@ -709,11 +709,13 @@ fn item_line(
         if let Some(n) = filed.and_then(|id| nodes.iter().find(|n| n.id == id)) {
             let r = ui
                 .add(
+                    // one piece: after the text's last line, or on the next one
                     egui::Label::new(
                         RichText::new(format!("→ {}", n.name))
                             .color(t.accent)
                             .size(11.0),
                     )
+                    .truncate()
                     .sense(Sense::click())
                     .selectable(false),
                 )
@@ -724,38 +726,44 @@ fn item_line(
             }
         }
     };
-    if filed.is_some() {
-        job.wrap.max_width = (ui.available_width() - 140.0).max(80.0);
-    }
-    let Some(seg) = segment else {
-        ui.add(egui::Label::new(job).wrap().selectable(false));
-        chip(ui, actions);
-        return;
-    };
-    let bg = ui.painter().add(egui::Shape::Noop);
-    let when = at
-        .map(|ms| crate::timefmt::clock(ms, &Local).trim().to_owned())
-        .map(|c| format!("Show in transcript at {c}"))
-        .unwrap_or_else(|| "Show in transcript".to_owned());
-    let resp = ui
-        .add(
-            egui::Label::new(job)
-                .wrap()
-                .sense(Sense::click())
-                .selectable(false),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(when);
-    if resp.hovered() {
-        ui.painter().set(
-            bg,
-            egui::Shape::rect_filled(resp.rect.expand2(vec2(4.0, 1.0)), 4.0, t.hover),
-        );
-    }
-    if resp.clicked() {
-        actions.push(NotesAction::ShowSegment(seg));
-    }
-    chip(ui, actions);
+    // the text wraps in the width left of the row, the chip flows after it
+    let w = ui.available_width().max(40.0);
+    ui.allocate_ui_with_layout(
+        vec2(w, 0.0),
+        egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+        |ui| {
+            ui.set_max_width(w);
+            let Some(seg) = segment else {
+                ui.add(egui::Label::new(job).wrap().selectable(false));
+                chip(ui, actions);
+                return;
+            };
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let when = at
+                .map(|ms| crate::timefmt::clock(ms, &Local).trim().to_owned())
+                .map(|c| format!("Show in transcript at {c}"))
+                .unwrap_or_else(|| "Show in transcript".to_owned());
+            let resp = ui
+                .add(
+                    egui::Label::new(job)
+                        .wrap()
+                        .sense(Sense::click())
+                        .selectable(false),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(when);
+            if resp.hovered() {
+                ui.painter().set(
+                    bg,
+                    egui::Shape::rect_filled(resp.rect.expand2(vec2(4.0, 1.0)), 4.0, t.hover),
+                );
+            }
+            if resp.clicked() {
+                actions.push(NotesAction::ShowSegment(seg));
+            }
+            chip(ui, actions);
+        },
+    );
 }
 
 /// "Move to…" on a note's context menu: opens the inline field.
@@ -817,14 +825,31 @@ fn summary_block(ui: &mut egui::Ui, t: &Tokens, summary: &str, hl: &str) {
 
 /// A small rounded chip.
 pub fn chip(ui: &mut egui::Ui, t: &Tokens, text: &str, accent: bool) -> egui::Response {
+    chip_max(ui, t, text, accent, f32::INFINITY)
+}
+
+/// [`chip`], never wider than `max_w` (the text cut with …, then the full text on hover).
+pub fn chip_max(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    text: &str,
+    accent: bool,
+    max_w: f32,
+) -> egui::Response {
     let font = t.font(10.5);
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
+    let galley = crate::widgets::truncated_galley(
+        ui,
+        text,
         font,
         if accent { t.accent } else { t.text_secondary },
+        max_w - 12.0,
     );
+    let elided = galley.elided;
     let size = vec2(galley.size().x + 12.0, 16.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::hover());
+    if elided {
+        resp = resp.on_hover_text(text);
+    }
     if ui.is_rect_visible(rect) {
         let fill = if accent {
             t.accent_alpha(0.18)
@@ -935,8 +960,9 @@ fn brain_strip(
     changes: &[Change],
     actions: &mut Vec<NotesAction>,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        ui.add_space(8.0);
+    // the buttons, then the status line after them or (narrow) on the line below at the same
+    // inset; a line longer than the whole row is cut with …
+    inset_wrapped(ui, 8.0, 8.0, |ui| {
         let up = status.available();
         for (kind, label, action) in [
             ("interpret", "Interpret now", NotesAction::InterpretNow),
@@ -966,8 +992,7 @@ fn brain_strip(
         };
         ui.add(egui::Label::new(RichText::new(line).color(t.text_secondary).size(11.0)).truncate());
     });
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
+    inset_wrapped(ui, 8.0, 8.0, |ui| {
         ui.label(
             RichText::new(format!("usage {:.2} today", status.spend_today_usd))
                 .color(t.text_tertiary)
@@ -993,36 +1018,42 @@ fn brain_strip(
     });
     if state.show_changes {
         for c in changes.iter().take(30) {
+            let undoable = !c.undone
+                && matches!(
+                    c.kind.as_str(),
+                    "node_rename"
+                        | "node_move"
+                        | "node_archive"
+                        | "node_description"
+                        | "episode_node"
+                        | "episode_low_signal"
+                );
             ui.horizontal(|ui| {
                 ui.add_space(16.0);
-                let col = if c.undone {
-                    t.text_disabled
-                } else {
-                    t.text_secondary
-                };
-                let when = clock(c.created_at, &Local);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("{when}  {}", c.description))
-                            .color(col)
-                            .size(11.0)
-                            .strikethrough_if(c.undone),
-                    )
-                    .truncate(),
-                );
-                let undoable = !c.undone
-                    && matches!(
-                        c.kind.as_str(),
-                        "node_rename"
-                            | "node_move"
-                            | "node_archive"
-                            | "node_description"
-                            | "episode_node"
-                            | "episode_low_signal"
-                    );
-                if undoable && small_button(ui, "Undo", true) {
-                    actions.push(NotesAction::Undo(c.id));
-                }
+                // Undo at the right edge, the description cut with … before it
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    if undoable && small_button(ui, "Undo", true) {
+                        actions.push(NotesAction::Undo(c.id));
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let col = if c.undone {
+                            t.text_disabled
+                        } else {
+                            t.text_secondary
+                        };
+                        let when = clock(c.created_at, &Local);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{when}  {}", c.description))
+                                    .color(col)
+                                    .size(11.0)
+                                    .strikethrough_if(c.undone),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
             });
         }
     }
@@ -1075,149 +1106,139 @@ pub(crate) fn episode_card(
     let inner = ui
         .vertical(|ui| {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            // The title and the buttons share the first row while the title keeps at least
+            // `CARD_TITLE_MIN` (it wraps in what the buttons leave); in a narrower card the
+            // buttons take their own row under it, right-aligned.
+            let buttons_w = card_buttons_width(ui, state, e);
+            let room = ui.available_width() - 12.0 - 8.0 - buttons_w - 12.0;
+            let stacked = room < CARD_TITLE_MIN;
+            let button_h = ui.spacing().interact_size.y;
+            ui.horizontal_top(|ui| {
                 ui.add_space(12.0);
-                let title_col = if e.low_signal {
-                    t.text_tertiary
+                let title_w = if stacked {
+                    ui.available_width() - 12.0
                 } else {
-                    t.text
+                    room
                 };
-                let title = if collapsed {
-                    format!("{} · {}", e.title, "low signal")
-                } else {
-                    e.title.clone()
-                };
-                let mut title_job = egui::text::LayoutJob::default();
-                crate::search::append_marked(
-                    &mut title_job,
-                    t,
-                    &title,
-                    hl,
-                    egui::TextFormat {
-                        font_id: crate::theme::font_medium(ui.ctx(), 13.5),
-                        color: title_col,
-                        ..Default::default()
+                let title_font = crate::theme::font_medium(ui.ctx(), 13.5);
+                let line_h = ui.fonts_mut(|f| f.row_height(&title_font));
+                ui.allocate_ui_with_layout(
+                    vec2(title_w.max(40.0), 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(title_w.max(40.0));
+                        if !stacked {
+                            // the first line centred on the buttons
+                            ui.add_space(((button_h - line_h) / 2.0).max(0.0));
+                        }
+                        let title_col = if e.low_signal {
+                            t.text_tertiary
+                        } else {
+                            t.text
+                        };
+                        let title = if collapsed {
+                            format!("{} · {}", e.title, "low signal")
+                        } else {
+                            e.title.clone()
+                        };
+                        let mut title_job = egui::text::LayoutJob::default();
+                        crate::search::append_marked(
+                            &mut title_job,
+                            t,
+                            &title,
+                            hl,
+                            egui::TextFormat {
+                                font_id: title_font.clone(),
+                                color: title_col,
+                                ..Default::default()
+                            },
+                        );
+                        // clickable for its context menu (Mark as a call / Mark as media / Summarise),
+                        // draggable onto another note to merge into it
+                        let mut resp = ui.add(
+                            egui::Label::new(title_job)
+                                .sense(Sense::click_and_drag())
+                                .wrap(),
+                        );
+                        crate::merge::drag_source(ui, t, &resp, e.id, &e.title);
+                        let convertible = state.media_convertible.contains(&e.id);
+                        if e.is_media() || convertible {
+                            resp = resp.on_hover_text(if e.is_media() {
+                                "Right-click: Mark as a call, Summarise"
+                            } else {
+                                "Right-click: Mark as media"
+                            });
+                        }
+                        resp.context_menu(|ui| {
+                            move_menu(ui, e, state);
+                            if e.is_media() || convertible {
+                                ui.separator();
+                            }
+                            {
+                                if e.is_media() {
+                                    if ui
+                                        .button("Mark as a call")
+                                        .on_hover_text(
+                                            "This was a conversation, not media: file it with your \
+                                 conversations and re-interpret it as a meeting",
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.push(NotesAction::MarkAsCall(e.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Summarise").clicked() {
+                                        actions.push(NotesAction::Summarise(e.id));
+                                        ui.close();
+                                    }
+                                } else if convertible
+                                    && ui
+                                        .button("Mark as media")
+                                        .on_hover_text(
+                                            "Not a conversation of yours: make it a media note (no \
+                                     todos, no events)",
+                                        )
+                                        .clicked()
+                                {
+                                    actions.push(NotesAction::MarkAsMedia(e.id));
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if let Some(open) = open {
+                            resp = resp
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("Show in the notes");
+                            if resp.clicked() {
+                                *open = Some(e.id);
+                            }
+                        }
+                        if e.low_signal && resp.clicked() {
+                            if let Some(i) = state.expanded.iter().position(|x| *x == e.id) {
+                                state.expanded.remove(i);
+                            } else {
+                                state.expanded.push(e.id);
+                            }
+                        }
                     },
                 );
-                // clickable for its context menu (Mark as a call / Mark as media / Summarise),
-                // draggable onto another note to merge into it
-                let mut resp = ui.add(
-                    egui::Label::new(title_job)
-                        .sense(Sense::click_and_drag())
-                        .truncate(),
-                );
-                crate::merge::drag_source(ui, t, &resp, e.id, &e.title);
-                let convertible = state.media_convertible.contains(&e.id);
-                if e.is_media() || convertible {
-                    resp = resp.on_hover_text(if e.is_media() {
-                        "Right-click: Mark as a call, Summarise"
-                    } else {
-                        "Right-click: Mark as media"
+                if !stacked {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        ui.add_space(12.0);
+                        card_buttons(ui, t, state, e, actions);
                     });
                 }
-                resp.context_menu(|ui| {
-                    move_menu(ui, e, state);
-                    if e.is_media() || convertible {
-                        ui.separator();
-                    }
-                    {
-                        if e.is_media() {
-                            if ui
-                                .button("Mark as a call")
-                                .on_hover_text(
-                                    "This was a conversation, not media: file it with your \
-                                 conversations and re-interpret it as a meeting",
-                                )
-                                .clicked()
-                            {
-                                actions.push(NotesAction::MarkAsCall(e.id));
-                                ui.close();
-                            }
-                            if ui.button("Summarise").clicked() {
-                                actions.push(NotesAction::Summarise(e.id));
-                                ui.close();
-                            }
-                        } else if convertible
-                            && ui
-                                .button("Mark as media")
-                                .on_hover_text(
-                                    "Not a conversation of yours: make it a media note (no \
-                                     todos, no events)",
-                                )
-                                .clicked()
-                        {
-                            actions.push(NotesAction::MarkAsMedia(e.id));
-                            ui.close();
-                        }
-                    }
-                });
-                if let Some(open) = open {
-                    resp = resp
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text("Show in the notes");
-                    if resp.clicked() {
-                        *open = Some(e.id);
-                    }
-                }
-                if e.low_signal && resp.clicked() {
-                    if let Some(i) = state.expanded.iter().position(|x| *x == e.id) {
-                        state.expanded.remove(i);
-                    } else {
-                        state.expanded.push(e.id);
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(12.0);
-                    if state.confirm_reinterpret == Some(e.id) {
-                        // right to left: No, Yes, then the question
-                        if small_button(ui, "No", true) {
-                            state.confirm_reinterpret = None;
-                        }
-                        if small_button(ui, "Yes", true) {
-                            state.confirm_reinterpret = None;
-                            actions.push(NotesAction::Reinterpret(e.id));
-                        }
-                        ui.label(
-                            RichText::new("Replace your edits?")
-                                .color(t.text_secondary)
-                                .size(11.5),
-                        );
-                    } else {
-                        if e.is_media()
-                            && brain_button(
-                                ui,
-                                t,
-                                &state.brain,
-                                "summarise",
-                                Some(e.id),
-                                "Summarise",
-                            )
-                        {
-                            actions.push(NotesAction::Summarise(e.id));
-                        }
-                        if brain_button(
-                            ui,
-                            t,
-                            &state.brain,
-                            "reinterpret",
-                            Some(e.id),
-                            "Re-interpret",
-                        ) {
-                            if e.user_edited_at.is_some() {
-                                state.confirm_reinterpret = Some(e.id);
-                            } else {
-                                actions.push(NotesAction::Reinterpret(e.id));
-                            }
-                        }
-                        if small_button(ui, "Edit", true) {
-                            state.editing = Some(EditDraft::from_episode(e));
-                        }
-                    }
-                });
             });
+            if stacked {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        card_buttons(ui, t, state, e, actions);
+                    });
+                });
+            }
             move_field(ui, t, e, state, actions);
-            ui.horizontal_wrapped(|ui| {
-                ui.add_space(12.0);
+            inset_wrapped(ui, 12.0, 12.0, |ui| {
                 ui.label(
                     RichText::new(crate::timefmt::range(e.started_at, e.ended_at, &Local))
                         .font(t.mono(10.5))
@@ -1340,6 +1361,100 @@ pub(crate) fn episode_card(
     focus_card(ui, t, state, e.id, rect);
     ui.add_space(6.0);
     rect
+}
+
+/// The narrowest a card's title gets beside its buttons before they move to their own row.
+const CARD_TITLE_MIN: f32 = 150.0;
+
+/// A card's buttons (Edit, Re-interpret, Summarise on a media note; or the "Replace your
+/// edits?" question), added right to left.
+fn card_buttons(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    state: &mut NotesState,
+    e: &Episode,
+    actions: &mut Vec<NotesAction>,
+) {
+    if state.confirm_reinterpret == Some(e.id) {
+        // right to left: No, Yes, then the question
+        if small_button(ui, "No", true) {
+            state.confirm_reinterpret = None;
+        }
+        if small_button(ui, "Yes", true) {
+            state.confirm_reinterpret = None;
+            actions.push(NotesAction::Reinterpret(e.id));
+        }
+        ui.label(
+            RichText::new("Replace your edits?")
+                .color(t.text_secondary)
+                .size(11.5),
+        );
+    } else {
+        if e.is_media() && brain_button(ui, t, &state.brain, "summarise", Some(e.id), "Summarise") {
+            actions.push(NotesAction::Summarise(e.id));
+        }
+        if brain_button(
+            ui,
+            t,
+            &state.brain,
+            "reinterpret",
+            Some(e.id),
+            "Re-interpret",
+        ) {
+            if e.user_edited_at.is_some() {
+                state.confirm_reinterpret = Some(e.id);
+            } else {
+                actions.push(NotesAction::Reinterpret(e.id));
+            }
+        }
+        if small_button(ui, "Edit", true) {
+            state.editing = Some(EditDraft::from_episode(e));
+        }
+    }
+}
+
+/// The width [`card_buttons`] takes, measured before it is drawn.
+fn card_buttons_width(ui: &egui::Ui, state: &NotesState, e: &Episode) -> f32 {
+    let gap = ui.spacing().item_spacing.x;
+    let brain = |kind: &str, id: Option<i64>, label: &str| {
+        if state.brain.busy(kind, id) {
+            ui.painter()
+                .layout_no_wrap(
+                    state.brain.busy_text(kind),
+                    egui::FontId::proportional(11.5),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+                + 30.0
+        } else {
+            crate::widgets::button_width(ui, label, 11.5)
+        }
+    };
+    let widths: Vec<f32> = if state.confirm_reinterpret == Some(e.id) {
+        vec![
+            crate::widgets::button_width(ui, "No", 11.5),
+            crate::widgets::button_width(ui, "Yes", 11.5),
+            ui.painter()
+                .layout_no_wrap(
+                    "Replace your edits?".to_owned(),
+                    egui::FontId::proportional(11.5),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x,
+        ]
+    } else {
+        let mut w = vec![
+            brain("reinterpret", Some(e.id), "Re-interpret"),
+            crate::widgets::button_width(ui, "Edit", 11.5),
+        ];
+        if e.is_media() {
+            w.push(brain("summarise", Some(e.id), "Summarise"));
+        }
+        w
+    };
+    widths.iter().sum::<f32>() + gap * (widths.len().saturating_sub(1)) as f32
 }
 
 /// The edit form of a card: title, summary (markdown source), decisions, action items,
@@ -1658,27 +1773,26 @@ pub fn node_view(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
+            // a long path or description wraps (at the list's 14 pt insets)
+            inset_wrapped(ui, 14.0, 14.0, |ui| {
                 ui.add(
                     egui::Label::new(
                         RichText::new(node_path(nodes, node.id))
                             .font(crate::theme::font_medium(ui.ctx(), 16.0))
                             .color(t.text),
                     )
-                    .truncate(),
+                    .wrap(),
                 );
             });
             if !node.description.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(14.0);
+                inset_wrapped(ui, 14.0, 14.0, |ui| {
                     ui.add(
                         egui::Label::new(
                             RichText::new(&node.description)
                                 .color(t.text_secondary)
                                 .size(11.5),
                         )
-                        .truncate(),
+                        .wrap(),
                     );
                 });
             }
@@ -1753,14 +1867,13 @@ fn children_section(
     {
         section_label(ui, t, title);
         if children.is_empty() {
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
+            inset_wrapped(ui, 14.0, 14.0, |ui| {
                 ui.label(RichText::new(empty).color(t.text_tertiary).size(12.0));
             });
         }
         for c in children {
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
+            // the name and its "N notes · last …" flow on; a long name wraps
+            inset_wrapped(ui, 14.0, 14.0, |ui| {
                 let resp = ui.add(
                     egui::Label::new(
                         RichText::new(&c.name)
@@ -1992,50 +2105,67 @@ fn next_steps(
                     },
                 );
             }
-            let bg = ui.painter().add(egui::Shape::Noop);
-            let resp = ui
-                .add(
-                    egui::Label::new(job)
-                        .wrap()
-                        .sense(Sense::click())
-                        .selectable(false),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(format!(
-                    "from {} · {}",
-                    s.episode_title,
-                    short_date(s.started_at)
-                ));
-            if resp.hovered() {
-                ui.painter().set(
-                    bg,
-                    egui::Shape::rect_filled(resp.rect.expand2(vec2(4.0, 1.0)), 4.0, t.hover),
-                );
-            }
-            if resp.clicked() {
-                actions.push(NotesAction::GoToNote(s.episode_id));
-            }
-            if chips
-                && let Some(p) = s
-                    .project_id
-                    .and_then(|id| nodes.iter().find(|n| n.id == id))
-            {
-                let r = ui
-                    .add(
-                        egui::Label::new(
-                            RichText::new(format!("→ {}", p.name))
-                                .color(t.accent)
-                                .size(11.0),
+            // the text wraps in what is left of the row (14 pt short of its right edge); the
+            // project chip follows its last line, or takes the next one when it doesn't fit
+            let w = (ui.available_width() - 14.0).max(40.0);
+            ui.allocate_ui_with_layout(
+                vec2(w, 0.0),
+                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                |ui| {
+                    ui.set_max_width(w);
+                    let bg = ui.painter().add(egui::Shape::Noop);
+                    let resp = ui
+                        .add(
+                            egui::Label::new(job)
+                                .wrap()
+                                .sense(Sense::click())
+                                .selectable(false),
                         )
-                        .sense(Sense::click())
-                        .selectable(false),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text(format!("Filed under {}", node_path(nodes, p.id)));
-                if r.clicked() {
-                    actions.push(NotesAction::SelectNode(p.id));
-                }
-            }
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(format!(
+                            "from {} · {}",
+                            s.episode_title,
+                            short_date(s.started_at)
+                        ));
+                    if resp.hovered() {
+                        ui.painter().set(
+                            bg,
+                            egui::Shape::rect_filled(
+                                resp.rect.expand2(vec2(4.0, 1.0)),
+                                4.0,
+                                t.hover,
+                            ),
+                        );
+                    }
+                    if resp.clicked() {
+                        actions.push(NotesAction::GoToNote(s.episode_id));
+                    }
+                    if chips
+                        && let Some(p) = s
+                            .project_id
+                            .and_then(|id| nodes.iter().find(|n| n.id == id))
+                    {
+                        let r = ui
+                            .add(
+                                // one piece: on the next line when it doesn't fit after
+                                // the text (cut with … only past the whole width)
+                                egui::Label::new(
+                                    RichText::new(format!("→ {}", p.name))
+                                        .color(t.accent)
+                                        .size(11.0),
+                                )
+                                .truncate()
+                                .sense(Sense::click())
+                                .selectable(false),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(format!("Filed under {}", node_path(nodes, p.id)));
+                        if r.clicked() {
+                            actions.push(NotesAction::SelectNode(p.id));
+                        }
+                    }
+                },
+            );
         });
         ui.add_space(2.0);
     }
@@ -2195,7 +2325,9 @@ fn note_list(
         }
         let open = state.open_notes.contains(&e.id);
         let filing = opts.filing.then_some(nodes);
-        if note_row(ui, t, e, state, open, filing, actions) {
+        // under day headings the date column only repeats the heading: a narrow list drops it
+        let show_date = !(opts.days && ui.available_width() < NOTE_ROW_NARROW);
+        if note_row(ui, t, e, state, open, filing, show_date, actions) {
             if open {
                 state.open_notes.remove(&e.id);
             } else {
@@ -2267,10 +2399,16 @@ fn filing_chip_label(nodes: &[Node], e: &Episode) -> (String, Option<i64>, Strin
 
 /// The chip naming where a note is filed: outlined, the project's name (clickable) or
 /// "Unfiled" in the tertiary colour (not clickable).
-fn filing_chip(ui: &mut egui::Ui, t: &Tokens, label: &str, clickable: bool) -> egui::Response {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), t.font(10.5), t.text_secondary);
+/// Never wider than `max_w` (the label cut with …).
+fn filing_chip(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    label: &str,
+    clickable: bool,
+    max_w: f32,
+) -> egui::Response {
+    let galley =
+        crate::widgets::truncated_galley(ui, label, t.font(10.5), t.text_secondary, max_w - 12.0);
     let size = vec2(galley.size().x + 12.0, 16.0);
     let sense = if clickable {
         Sense::click()
@@ -2306,10 +2444,20 @@ fn filing_chip(ui: &mut egui::Ui, t: &Tokens, label: &str, clickable: bool) -> e
     }
 }
 
+/// A collapsed note row's title keeps at least this much before chips are dropped.
+const NOTE_ROW_TITLE_MIN: f32 = 110.0;
+/// The narrowest a row's filing chip is cut to.
+const FILING_CHIP_MIN: f32 = 56.0;
+/// Below this row width a list under day headings drops the rows' (repeated) date column.
+const NOTE_ROW_NARROW: f32 = 520.0;
+
 /// One collapsed-note row (24 pt). `true` when the row (not a chip) was clicked. With
 /// `filing` (All notes) a chip naming the note's project (or "Unfiled") comes before the topic
 /// chips. Today's notes draw their date and time range in pure white, the most recent note
-/// ([`NotesState::marks`]) its title, date and time range in the accent colour.
+/// ([`NotesState::marks`]) its title, date and time range in the accent colour. Without
+/// `show_date` the row starts at the time range. The painted title is clipped before the
+/// chips, and the chips never take more than a third of the row.
+#[allow(clippy::too_many_arguments)]
 fn note_row(
     ui: &mut egui::Ui,
     t: &Tokens,
@@ -2317,6 +2465,7 @@ fn note_row(
     state: &mut NotesState,
     open: bool,
     filing: Option<&[Node]>,
+    show_date: bool,
     actions: &mut Vec<NotesAction>,
 ) -> bool {
     let (rect, resp) =
@@ -2375,10 +2524,12 @@ fn note_row(
         egui::Stroke::NONE,
     ));
     let mut x = rect.left() + 30.0;
-    let date = p.layout_no_wrap(short_date(e.started_at), t.mono(10.5), when_col);
-    let w = date.size().x;
-    p.galley(egui::pos2(x, cy - date.size().y / 2.0), date, when_col);
-    x += 46.0_f32.max(w + 6.0);
+    if show_date {
+        let date = p.layout_no_wrap(short_date(e.started_at), t.mono(10.5), when_col);
+        let w = date.size().x;
+        p.galley(egui::pos2(x, cy - date.size().y / 2.0), date, when_col);
+        x += 46.0_f32.max(w + 6.0);
+    }
     let range = crate::timefmt::range(e.started_at, e.ended_at, &Local);
     let range = p.layout_no_wrap(range, t.mono(10.5), when_col);
     // the widest 12-hour range ("11:00–11:09 am"), so the titles line up
@@ -2389,8 +2540,9 @@ fn note_row(
     let w = range.size().x.max(col);
     p.galley(egui::pos2(x, cy - range.size().y / 2.0), range, when_col);
     x += w + 10.0;
-    // chips from the right edge, as many as fit in a third of the row (the filing chip
-    // always: it comes first)
+    // chips from the right edge, as many as fit in a third of the row and leave the title
+    // `NOTE_ROW_TITLE_MIN` (the filing chip always: it comes first, cut with … when it is
+    // wider than that)
     let chip_w = |text: &str| {
         p.layout_no_wrap(text.to_owned(), t.font(10.5), t.text_secondary)
             .size()
@@ -2400,8 +2552,12 @@ fn note_row(
     };
     let filing = filing.map(|nodes| filing_chip_label(nodes, e));
     let topics: Vec<&String> = e.topics.iter().take(3).collect();
-    let budget = (rect.width() / 3.0).max(60.0);
-    let mut chips_w = filing.as_ref().map_or(0.0, |(l, _, _)| chip_w(l));
+    let room = rect.right() - 14.0 - 8.0 - x;
+    let budget = (rect.width() / 3.0).min(room - NOTE_ROW_TITLE_MIN).max(0.0);
+    let filing_w = filing
+        .as_ref()
+        .map_or(0.0, |(l, _, _)| chip_w(l).min(budget.max(FILING_CHIP_MIN)));
+    let mut chips_w = filing_w;
     let mut fit = 0;
     for tp in &topics {
         let w = chip_w(tp);
@@ -2442,7 +2598,8 @@ fn note_row(
         );
         cui.spacing_mut().item_spacing.x = 4.0;
         if let Some((label, project, hover)) = &filing {
-            let r = filing_chip(&mut cui, t, label, project.is_some()).on_hover_text(hover);
+            let r = filing_chip(&mut cui, t, label, project.is_some(), filing_w - 4.0)
+                .on_hover_text(hover);
             if let Some(id) = project
                 && r.clicked()
             {
@@ -2487,8 +2644,8 @@ pub fn episode_view(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.add_space(14.0);
+            // a long path wraps, every line at the list's inset
+            inset_wrapped(ui, 14.0, 14.0, |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for (id, name) in &chain {
                     if link(ui, &t, name, 12.5).clicked() {

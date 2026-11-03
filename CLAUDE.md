@@ -293,9 +293,31 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
 ## UI chrome and preferences
 
 Control bar (34 pt): Listen pill, "System audio" pill, level meter, and the engine loading /
-failure line only (the engine name is in the status strip, not repeated). Status strip (18 pt):
+failure line only (the engine name is in the status strip, not repeated; cut with … in what the
+search icon leaves, never pushing it out). Status strip (18 pt):
 left = engine · state · segment count · brain line; right = the warning, else the last voice
-command, else EMPTY (the data-directory path is no longer shown).
+command, else EMPTY (the data-directory path is no longer shown). Neither runs over the other
+(`app::status_widths`): both in full when they fit, else the right text keeps its width up to
+half the strip and the left one is cut with …, then the right one too; a cut text reads in full
+on hover.
+
+**Reflow in a narrow window** (the minimum is 800×520 with a 180–360 pt sidebar, so the content
+column can be 440 pt wide and ~440 pt tall): nothing may widen a scroll area's content past its
+viewport (egui grows a parent's max rect to fit an overflowing child, and every later row is
+then laid out too wide). Rows with variable text either wrap (`widgets::inset_wrapped`: a
+wrapping row with a hanging left inset and a right inset, or a wrapping child of the remaining
+width), give the text an explicit width, or truncate; trailing chips go into the same wrapping
+flow (after the last line, else on the next one; a chip is one piece: `Label::truncate`, or
+`notes::chip_max` cut with …). Card headers measure their buttons (`card_buttons_width`): the
+title wraps in what is left, or the buttons take their own right-aligned row when the title
+would get under `CARD_TITLE_MIN` (150 pt). Collapsed note rows keep the title ≥ 110 pt (chips
+dropped, the filing chip cut with …) and, under day headings below 520 pt, drop the repeated
+date. The open media note's card sits under the row's text column from 600 pt, else spans the
+row from the thumbnail. The calendar grid's rows shrink (78 → 40 pt, fewer chips, "+N") so the
+day panel keeps 110 pt. Toast cards are 340 pt, narrower in a narrow column (≥ 240). The search
+field takes what its count leaves (at least half the bar; the count is cut with …). The kittest
+`every_view_fits_a_constrained_window` builds each view at 660×520 (`oats_ui::selftest::harness`)
+and fails on any AccessKit node outside the window or two widgets drawn over each other.
 
 Search (View → "Find…", ⌘F; `Command::Search`, `oats-ui/src/search.rs`): a 36 pt bar under the
 control bar (focused at once, match counts, × icon) and a results view that replaces the current
@@ -373,8 +395,10 @@ native menu or not, only while `!egui_wants_keyboard_input()` (the ⌘S-in-edit-
 
 **Sidebar keyboard** (`sidebar::key_nav`, pure steps `navigable_rows` / `nav_decide`): ↓ / ↑ select the next / previous row in draw order (Views, then the visible tree with an open project's notes before its topics; no wrap; with the selection not in the list ↓ takes the first, ↑ the last) and navigate as a click would. → opens a collapsed node (or a project's note layer), else enters its first child; ← closes an open node, else selects the parent. The keys are consumed only while the sidebar is visible, no text field has focus (`egui_wants_keyboard_input`) and neither Preferences nor the merge confirmation is open; the new row is scrolled into view (`SidebarState::reveal_selected`).
 
-Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui::Window` anchored
-centre with one field, "Your name", saved on Enter / blur / close via `Store::set_user_name`
+Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui::Window` centred in
+the window below the in-window menu bar, 12 pt clear of every edge (`constrain_to`), up to
+560 pt wide (narrower when the window is), its whole body in a vertical `ScrollArea` (the Apps
+table has none of its own) so it is never taller than the window, with one field, "Your name", saved on Enter / blur / close via `Store::set_user_name`
 (a blank name clears it). Stored in the database, `meta` key `user_name`
 (`Store::user_name()` / `set_user_name()`). The brain re-reads it at the start of every job
 (`BrainConfig::user_name`, `Worker::refresh_user_name`), so no restart or plumbing is needed;
@@ -703,7 +727,7 @@ OATS_INPUT_DEVICE="Scarlett 2i2" …         # microphone by name (default: the 
 OATS_SYSTEM_DEDUP=auto|always|never …      # the mic-echo rule (auto: only while the output is speakers)
 OATS_ECHO_AUDIO=auto|always|never …        # the audio-level echo pre-check (auto: while the echo rule is on; never = transcribe every mic segment)
 scripts/perf.sh [rest|idle|speech|stress]    # CPU/memory/energy profile per scenario (release build); see docs/performance-2026-10-28.md
-cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar|--todos|--toast]   # whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events / todos (--notes: All notes with filed, unfiled, today's and a hidden low-signal note) (--toast: a due reminder + a confirmation) — how the shell is verified without a window
+cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar|--todos|--toast] [--size WxH]   # (--size in points, default 1100x720; 660x520 = the narrowest content column) whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events / todos (--notes: All notes with filed, unfiled, today's and a hidden low-signal note) (--toast: a due reminder + a confirmation) — how the shell is verified without a window
 cargo run -p oats-notes -- --listen      # start listening as soon as the engine is ready (doesn't change the remembered pref)
 OATS_NO_NATIVE_MENU=1 …                   # in-window egui menu bar instead of the macOS menu bar
 OATS_NO_STATUS_ITEM=1 …                   # no menu bar extra (closing the window then quits)
@@ -723,7 +747,14 @@ Build notes: `oats-engine-fluidaudio` → `fluidaudio-rs` (vendored, `vendor/flu
 its build.rs runs `swift build` of the FluidAudio Swift package (minutes the first time; needs
 Xcode; fetches FluidAudio from GitHub at the pinned tag). The binary needs the Swift
 runtime at run time: `apps/oats-notes/build.rs` adds `-rpath /usr/lib/swift` (without it dyld
-fails with "no LC_RPATH's found"). Microphone access: run from a terminal, macOS prompts for
+fails with "no LC_RPATH's found"). The same build.rs embeds `apps/oats-notes/Info.plist` into
+the binary's `__TEXT,__info_plist` section (`-sectcreate`): macOS reads it as the bare
+executable's bundle information, so the application menu is titled "OatsNotes"
+(`CFBundleName`; AppKit uses the process name otherwise, which is `oats-notes` — setting
+`NSProcessInfo.processName` from the menu code does NOT work, AppKit is already up), and the
+microphone / system-audio usage descriptions ride along for a future bundle. No bundle
+identifier is set on purpose: TCC keeps attributing the grants to the responsible app (the
+terminal). Microphone access: run from a terminal, macOS prompts for
 the terminal's mic permission; a bundled .app will need `NSMicrophoneUsageDescription`.
 System audio: "System Audio Recording Only", granted to the terminal app when run from one;
 a bundled .app needs `NSAudioCaptureUsageDescription` (see "Audio sources and lanes").

@@ -15,7 +15,7 @@ use chrono::{DateTime, Datelike, Local, TimeZone};
 use egui::{Key, RichText, Sense};
 use oats_core::{Node, Origin, Todo, when};
 
-use crate::notes::{chip, node_path};
+use crate::notes::{chip, chip_max, node_path};
 use crate::theme::Tokens;
 
 const MINUTE: i64 = 60_000;
@@ -284,8 +284,9 @@ pub fn todos_view(
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(14.0);
+        // the due field 40 % (140–270 pt), the text field the rest
         let width = (ui.available_width() - 14.0).min(680.0);
-        let due_width = 270.0_f32.min(width * 0.45);
+        let due_width = (width * 0.4).clamp(140.0, 270.0).min(width * 0.5);
         let bad = |on: bool, ui: &mut egui::Ui| {
             if on {
                 ui.visuals_mut().override_text_color = Some(t.danger);
@@ -473,7 +474,8 @@ fn todo_row(
             if !has_meta {
                 return;
             }
-            ui.horizontal(|ui| {
+            // due, snooze and chips flow on and wrap onto a second line in a narrow column
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if let Some(at) = todo.completed_at {
                     ui.label(
@@ -506,7 +508,8 @@ fn todo_row(
                     ui.label(RichText::new(s).color(t.text_tertiary).size(11.0));
                 }
                 if let Some(n) = node {
-                    chip(ui, t, &node_path(nodes, n), true);
+                    let w = ui.available_width();
+                    chip_max(ui, t, &node_path(nodes, n), true, w);
                 }
                 if todo.source != Origin::User {
                     chip(ui, t, source_label(todo.source), false);
