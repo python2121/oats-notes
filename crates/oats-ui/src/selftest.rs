@@ -548,6 +548,19 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
             now,
         )?;
         store.mark_segments_interpreted(&[said.id], dev.id, now)?;
+        // an unfiled conversation from today: the Conversations row turns white
+        store.insert_episode(
+            today + 8 * H,
+            today + 8 * H + 6 * M,
+            &EpisodeContent {
+                title: "Quick chat about lunch plans".into(),
+                summary: "- Lunch at noon.".into(),
+                node_id: None,
+                model: "claude-sonnet-4-5".into(),
+                ..Default::default()
+            },
+            now,
+        )?;
         store.upsert_event(
             &NewEvent {
                 when_start: today + 2 * 24 * H + 10 * H,

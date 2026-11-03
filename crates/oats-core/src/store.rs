@@ -2366,6 +2366,20 @@ impl Store {
         )
     }
 
+    /// How many unfiled, non-media episodes started at or after `ts` (the same filter as
+    /// [`Store::episodes_unfiled`]).
+    pub fn unfiled_episodes_since(&self, ts: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM episodes
+             WHERE kind != 'media' AND started_at >= ?1
+               AND (node_id IS NULL
+                OR node_id IN (SELECT id FROM nodes WHERE kind = 'category')
+                OR node_id NOT IN (SELECT id FROM nodes))",
+            [ts],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Episodes filed under a node or anything below it, newest first.
     pub fn episodes_under(&self, node_id: i64, limit: i64) -> Result<Vec<Episode>, StoreError> {
         self.query_episodes(
@@ -4569,6 +4583,26 @@ mod tests {
         // idempotent: a second open changes nothing
         s.init_locked()?;
         assert_eq!(s.events_from(i64::MIN, 20)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn unfiled_episodes_since_counts_recent_unfiled_only() -> Result<(), StoreError> {
+        let s = Store::open_in_memory()?;
+        let work = s.categories()?.remove(0);
+        let c = |title: &str, node: Option<i64>| EpisodeContent {
+            title: title.into(),
+            node_id: node,
+            ..Default::default()
+        };
+        s.insert_episode(1_000, 2_000, &c("old", None), 3_000)?;
+        s.insert_episode(10_000, 11_000, &c("new", None), 12_000)?;
+        s.insert_episode(10_000, 11_000, &c("in category", Some(work.id)), 12_000)?;
+        let p = s.add_node(Some(work.id), NodeKind::Project, "P", "", Origin::User)?;
+        s.insert_episode(10_000, 11_000, &c("filed", Some(p.id)), 12_000)?;
+        assert_eq!(s.unfiled_episodes_since(5_000)?, 2);
+        assert_eq!(s.unfiled_episodes_since(0)?, 3);
+        assert_eq!(s.unfiled_episodes_since(20_000)?, 0);
         Ok(())
     }
 

@@ -110,6 +110,46 @@ fn has_children(nodes: &[Node], id: i64) -> bool {
     nodes.iter().any(|n| n.parent_id == Some(id) && !n.archived)
 }
 
+/// What the sidebar shows in pure white: where today's notes went.
+#[derive(Default)]
+pub struct TodayMarks {
+    /// Local midnight (ms): a note that started at or after it is "today's".
+    pub start: i64,
+    /// Nodes holding (or, for ancestors, containing) a note from today.
+    pub nodes: HashSet<i64>,
+    /// An unfiled, non-media note started today (the Conversations row).
+    pub conversations: bool,
+}
+
+/// The nodes that hold a note from today, plus every ancestor of those. Pure.
+pub fn today_nodes(
+    nodes: &[Node],
+    episodes: &HashMap<i64, Vec<SidebarEpisode>>,
+    today_start: i64,
+) -> HashSet<i64> {
+    let mut out = HashSet::new();
+    for (project, eps) in episodes {
+        for ep in eps.iter().filter(|e| e.started_at >= today_start) {
+            let mut cur = Some(ep.node_id.unwrap_or(*project));
+            while let Some(id) = cur {
+                if !out.insert(id) {
+                    break;
+                }
+                cur = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent_id);
+            }
+            // the project row itself (the list's key) even when the note sits on a topic
+            let mut cur = Some(*project);
+            while let Some(id) = cur {
+                if !out.insert(id) {
+                    break;
+                }
+                cur = nodes.iter().find(|n| n.id == id).and_then(|n| n.parent_id);
+            }
+        }
+    }
+    out
+}
+
 pub fn sidebar_panel(
     ui: &mut egui::Ui,
     state: &mut SidebarState,
@@ -118,6 +158,7 @@ pub fn sidebar_panel(
     episodes: &HashMap<i64, Vec<SidebarEpisode>>,
     focus_episode: Option<i64>,
     move_draft: &mut Option<crate::move_to::MoveDraft>,
+    today: &TodayMarks,
 ) -> Vec<SidebarAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
@@ -141,7 +182,17 @@ pub fn sidebar_panel(
         });
     });
     for (label, v) in VIEW_ROWS {
-        if hover_row(ui, &t, label, view == v, 0, None).clicked() {
+        if hover_row(
+            ui,
+            &t,
+            label,
+            view == v,
+            0,
+            None,
+            v == View::Notes && today.conversations,
+        )
+        .clicked()
+        {
             actions.push(SidebarAction::Select(v));
         }
     }
@@ -225,7 +276,15 @@ pub fn sidebar_panel(
                     has_children(nodes, n.id).then_some(!state.collapsed.contains(&n.id))
                 };
                 let selected = view == View::Node(n.id) && focus_episode.is_none();
-                let resp = hover_row(ui, &t, &n.name, selected, depth, disclosure);
+                let resp = hover_row(
+                    ui,
+                    &t,
+                    &n.name,
+                    selected,
+                    depth,
+                    disclosure,
+                    today.nodes.contains(&n.id),
+                );
                 let kind = match n.kind {
                     NodeKind::Category => "Category",
                     NodeKind::Project => "Project",
@@ -292,7 +351,14 @@ pub fn sidebar_panel(
                 }
                 if is_project && state.episodes_open.contains(&n.id) {
                     for ep in project_eps {
-                        let r = episode_row(ui, &t, ep, focus_episode == Some(ep.id), depth + 1);
+                        let r = episode_row(
+                            ui,
+                            &t,
+                            ep,
+                            focus_episode == Some(ep.id),
+                            depth + 1,
+                            today.start,
+                        );
                         if r.clicked() {
                             actions.push(SidebarAction::SelectEpisode(ep.id, n.id));
                         }
@@ -413,11 +479,22 @@ fn episode_row(
     ep: &SidebarEpisode,
     selected: bool,
     depth: usize,
+    today_start: i64,
 ) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::click_and_drag());
     let date = crate::notes::short_date(ep.started_at);
-    let resp = resp.on_hover_text(format!("{} · {date}", ep.title));
+    let is_today = ep.started_at >= today_start;
+    let resp = resp.on_hover_text(format!(
+        "{} · {date}{}",
+        ep.title,
+        if is_today { " · today" } else { "" }
+    ));
+    let (title_col, date_col) = if is_today {
+        (egui::Color32::WHITE, egui::Color32::WHITE)
+    } else {
+        (t.text_secondary, t.text_tertiary)
+    };
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -436,14 +513,14 @@ fn episode_row(
         p.rect_filled(fill_rect, 4.0, t.hover);
     }
     let text_x = 12.0 + depth as f32 * 14.0 + 12.0;
-    let d = p.layout_no_wrap(date, t.font(10.5), t.text_tertiary);
+    let d = p.layout_no_wrap(date, t.font(10.5), date_col);
     let dw = d.size().x;
     p.galley(
         pos2(rect.right() - 8.0 - dw, rect.center().y - d.size().y / 2.0),
         d,
-        t.text_tertiary,
+        date_col,
     );
-    let galley = p.layout_no_wrap(ep.title.clone(), t.font(12.0), t.text_secondary);
+    let galley = p.layout_no_wrap(ep.title.clone(), t.font(12.0), title_col);
     let clip = Rect::from_min_max(
         pos2(rect.left() + text_x, rect.top()),
         pos2(rect.right() - 8.0 - dw - 6.0, rect.bottom()),
@@ -454,7 +531,7 @@ fn episode_row(
             rect.center().y - galley.size().y / 2.0,
         ),
         galley,
-        t.text_secondary,
+        title_col,
     );
     resp
 }
@@ -487,6 +564,7 @@ fn hover_row(
     selected: bool,
     depth: usize,
     disclosure: Option<bool>,
+    white: bool,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), t.row_h), Sense::click());
     if !ui.is_rect_visible(rect) {
@@ -524,7 +602,13 @@ fn hover_row(
         p.add(egui::Shape::convex_polygon(tri.to_vec(), col, Stroke::NONE));
     }
     let size = if depth > 0 { 12.0 } else { 12.5 };
-    let color = if depth > 0 { t.text_secondary } else { t.text };
+    let color = if white {
+        egui::Color32::WHITE
+    } else if depth > 0 {
+        t.text_secondary
+    } else {
+        t.text
+    };
     let galley = p.layout_no_wrap(label.to_owned(), t.font(size), color);
     let clip = Rect::from_min_max(
         pos2(rect.left() + text_x, rect.top()),
@@ -650,6 +734,31 @@ pub(crate) fn header_icon(ui: &mut egui::Ui, icon: HeaderIcon) -> egui::Response
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn today_marks_cover_the_topic_its_project_and_category_only_for_today() {
+        let nodes = vec![
+            node(1, None, "Work", 0, false),
+            node(2, Some(1), "Proj", 0, false),
+            node(3, Some(2), "Topic", 0, false),
+            node(4, None, "Admin", 1, false),
+            node(5, Some(4), "Other", 0, false),
+        ];
+        let ep = |node_id, started_at| SidebarEpisode {
+            id: 1,
+            title: "t".into(),
+            started_at,
+            node_id,
+            is_media: false,
+            convertible: false,
+        };
+        let mut eps = HashMap::new();
+        eps.insert(2, vec![ep(Some(3), 1_000)]);
+        eps.insert(5, vec![ep(Some(5), 400)]);
+        let got = today_nodes(&nodes, &eps, 1_000);
+        assert_eq!(got, HashSet::from([1, 2, 3]));
+        assert!(today_nodes(&nodes, &eps, 2_000).is_empty());
+    }
+
     #[test]
     fn the_views_group_says_conversations() {
         let labels: Vec<_> = super::VIEW_ROWS.iter().map(|r| r.0).collect();

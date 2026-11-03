@@ -658,6 +658,8 @@ pub struct OatsApp {
     sidebar: SidebarState,
     /// The notes listed under each project in the sidebar (newest first).
     sidebar_episodes: HashMap<i64, Vec<SidebarEpisode>>,
+    /// Unfiled notes that started today (the Conversations row turns white).
+    unfiled_today: i64,
     /// The single-note view: this note of the viewed node, instead of the node's page.
     focus_episode: Option<i64>,
     /// The Preferences window, when open.
@@ -776,6 +778,7 @@ impl OatsApp {
                 ..SidebarState::default()
             },
             sidebar_episodes: HashMap::new(),
+            unfiled_today: 0,
             focus_episode: None,
             prefs_window: None,
             search: None,
@@ -1546,6 +1549,10 @@ impl OatsApp {
 
     /// The last [`SIDEBAR_EPISODES`] notes (low-signal ones left out) of every project.
     fn reload_sidebar_episodes(&mut self) {
+        self.unfiled_today = self
+            .store
+            .unfiled_episodes_since(self.today_start)
+            .unwrap_or(0);
         let mut map = HashMap::new();
         let projects: Vec<i64> = self
             .nodes
@@ -2308,6 +2315,7 @@ impl OatsApp {
         // the day rolled over since the last look: "Today" means a different list now
         if local_midnight_ms() != self.today_start {
             self.reload_rows();
+            self.reload_sidebar_episodes();
         }
         for ev in self.pipeline.poll() {
             match ev {
@@ -3747,6 +3755,15 @@ impl eframe::App for OatsApp {
                         .inner_margin(egui::Margin::symmetric(6, 6)),
                 )
                 .show(ui, |ui| {
+                    let marks = crate::sidebar::TodayMarks {
+                        start: self.today_start,
+                        nodes: crate::sidebar::today_nodes(
+                            &self.nodes,
+                            &self.sidebar_episodes,
+                            self.today_start,
+                        ),
+                        conversations: self.unfiled_today > 0,
+                    };
                     sidebar_actions = sidebar_panel(
                         ui,
                         &mut self.sidebar,
@@ -3755,6 +3772,7 @@ impl eframe::App for OatsApp {
                         &self.sidebar_episodes,
                         self.focus_episode,
                         &mut self.notes_state.move_draft,
+                        &marks,
                     );
                 });
             let w = resp.response.rect.width();

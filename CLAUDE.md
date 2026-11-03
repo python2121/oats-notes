@@ -89,7 +89,7 @@ card; parent = the note's category unless Media, else Work, else the first categ
 **Sidebar notes layer**: a project's row has a triangle (closed by default, persisted as
 `AppPrefs::sidebar_episodes_open`) listing its last `SIDEBAR_EPISODES` = 5 non-low-signal notes
 (newest first, 22 pt rows: truncated title, "29 Oct" at the right), then its topics (the
-triangle now folds both). Clicking one sets `OatsApp::focus_episode` (a UI mode, not a `View`):
+triangle now folds both). **Where today's notes went**: a note that started today (local day) draws its title and date in pure white (hover text adds " · today"), and so do the project, topic and category rows above it and the Conversations row when an unfiled non-media note started today (`sidebar::today_nodes` once per frame from `sidebar_episodes`; `Store::unfiled_episodes_since`, reloaded with `reload_sidebar_episodes`); it rolls over at local midnight with the existing midnight repaint. Clicking one sets `OatsApp::focus_episode` (a UI mode, not a `View`):
 `notes::episode_view` shows that note's card under a breadcrumb "Work › Commerce project ›
 29 Oct" (node names are links). Escape, the project's sidebar row, any other navigation, or a
 breadcrumb link returns to the project page. `--selftest out.png --project [--expanded]
