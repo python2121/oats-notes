@@ -3479,7 +3479,9 @@ impl OatsApp {
         }
     }
 
-    /// The status strip's left text ("engine · listening · mic + system · on a call · …").
+    /// The status strip's left text ("engine · on a call · 617 segments today · brain usage …");
+    /// listening / idle and the lanes are NOT repeated here (the control bar's pills show them),
+    /// only loading… / failed.
     pub fn status_text(&self) -> String {
         let engine = if self.engine_name.is_empty() {
             "engine"
@@ -3522,9 +3524,16 @@ impl OatsApp {
         } else {
             ""
         };
+        // listening / idle and the open lanes are already on screen (the control bar's
+        // pills); only the states the pills cannot show are spelled out
+        let state = match self.status {
+            PipelineStatus::Loading(_) | PipelineStatus::Failed(_) => {
+                format!(" · {}", self.state_label())
+            }
+            PipelineStatus::Idle | PipelineStatus::Listening => String::new(),
+        };
         format!(
-            "{engine} · {}{no_signal}{on_call}{} · {n} segment{} today{brain}",
-            self.state_label(),
+            "{engine}{state}{no_signal}{on_call}{} · {n} segment{} today{brain}",
             self.media_label(),
             if n == 1 { "" } else { "s" }
         )

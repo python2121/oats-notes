@@ -282,8 +282,9 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   master switch (⌘L / "Start Listening", the status item's toggle, `--listen`, listening
   resumed at launch) opens that set, "Stop Listening" turns every lane off (the set is kept).
   The old `capture_system` pref is read once into `lanes.system` on load and no longer
-  written. A starter that opens nothing (system-only and the tap fails) returns `Err`. The status strip reads "listening · mic + system" /
-  "listening · mic" / "listening · system", plus "system audio: no signal" after the 30 s check; a system capture that
+  written. A starter that opens nothing (system-only and the tap fails) returns `Err`. The status item's tooltip reads "Listening · mic + system" /
+  "… · mic" / "… · system" (`state_label`; the status strip itself no longer repeats the
+  state or the lanes), and the strip adds "system audio: no signal" after the 30 s check; a system capture that
   fails to open shows "System audio: …" as the warning while the mic runs. Transcript rows from
   system audio carry a small "them" tag under the time; echoes never appear.
   `oats_ui::AudioStarter` = `Fn(Sender<AudioChunk>, AudioRequest { system }) ->
@@ -295,7 +296,9 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
 Control bar (34 pt): Listen pill, "System audio" pill, level meter, and the engine loading /
 failure line only (the engine name is in the status strip, not repeated; cut with … in what the
 search icon leaves, never pushing it out). Status strip (18 pt):
-left = engine · state · segment count · brain line; right = the warning, else the last voice
+left = engine · segment count · brain line (NOT the listening / idle state nor the open lanes —
+the control bar's pills show those; only "loading…" / "failed", "on a call", "system audio: no
+signal" and "▶ <media>" are spelled out; the engine name carries no chip); right = the warning, else the last voice
 command, else EMPTY (the data-directory path is no longer shown). Neither runs over the other
 (`app::status_widths`): both in full when they fit, else the right text keeps its width up to
 half the strip and the left one is cut with …, then the right one too; a cut text reads in full

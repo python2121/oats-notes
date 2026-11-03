@@ -71,6 +71,9 @@ mod mac {
         pub fn new() -> Result<Self, EngineError> {
             let fluid = FluidAudio::new().map_err(|e| EngineError::Load(e.to_string()))?;
             let chip = fluid.system_info().chip_name.trim().to_owned();
+            if !chip.is_empty() {
+                log::info!("FluidAudio engine on {chip}");
+            }
             Ok(Self {
                 vad_streams: [None, None],
                 fluid,
@@ -114,12 +117,9 @@ mod mac {
 
     impl SpeechEngine for FluidAudioEngine {
         fn name(&self) -> String {
-            let base = "Parakeet TDT v3 · CoreML (FluidAudio 0.14.8)";
-            if self.chip.is_empty() {
-                base.to_owned()
-            } else {
-                format!("{base} · {}", self.chip)
-            }
+            // the chip (`self.chip`, logged at load) is not part of the name: the status strip
+            // has no room for what the user already knows
+            "Parakeet TDT v3 · CoreML (FluidAudio 0.14.8)".to_owned()
         }
 
         fn load(&mut self, status: &mut dyn FnMut(String)) -> Result<(), EngineError> {
