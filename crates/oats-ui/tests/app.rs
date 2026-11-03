@@ -3119,6 +3119,65 @@ fn the_arrow_keys_walk_the_sidebar_and_leave_text_fields_alone() {
 }
 
 #[test]
+fn show_fewer_appears_where_show_all_sat_and_at_the_bottom() {
+    use oats_core::{ActionItem, EpisodeContent};
+    let dir = TempDir::new("show-fewer");
+    let (_work, commerce, _lease) = seed_projects(&dir.db());
+    let s = Store::open(&dir.db()).unwrap();
+    let t = now_ms() - 3_600_000;
+    // fifteen open items in one note: three more than the cap
+    let items: Vec<ActionItem> = (0..15)
+        .map(|i| ActionItem {
+            text: format!("Step number {i}"),
+            ..Default::default()
+        })
+        .collect();
+    s.insert_episode(
+        t,
+        t + 60_000,
+        &EpisodeContent {
+            title: "Planning".into(),
+            summary: "- plan".into(),
+            node_id: Some(commerce),
+            action_items: items,
+            model: "m".into(),
+            ..Default::default()
+        },
+        t + 120_000,
+    )
+    .unwrap();
+    drop(s);
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Step number 11"));
+    assert!(!rig.shows("Step number 12"), "capped at twelve");
+    assert!(
+        rig.harness
+            .query_all_by_label("Show fewer")
+            .next()
+            .is_none()
+    );
+    rig.harness.get_by_label("Show all 15").click();
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Step number 14"));
+    let fewer: Vec<_> = rig.harness.get_all_by_label("Show fewer").collect();
+    assert_eq!(fewer.len(), 2, "one where Show all sat, one at the bottom");
+    let (a, b) = (fewer[0].rect(), fewer[1].rect());
+    let twelfth = rig.harness.get_by_label_contains("Step number 12").rect();
+    assert!(a.top() < twelfth.top() && twelfth.top() < b.top());
+    // the upper one toggles back
+    rig.harness
+        .get_all_by_label("Show fewer")
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(3);
+    assert!(!rig.shows("Step number 12"));
+    assert!(rig.shows("Show all 15"));
+}
+
+#[test]
 fn a_next_step_of_a_note_without_a_sidebar_row_opens_inline() {
     use oats_core::{ActionItem, EpisodeContent};
     let dir = TempDir::new("inline-fallback");

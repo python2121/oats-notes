@@ -1943,7 +1943,14 @@ fn next_steps(
         return;
     }
     let (shown, show_link) = next_steps_shown(&steps, state.show_all_steps);
-    for s in &steps[..shown] {
+    // where "Show all" sat: expanded, a "Show fewer" is drawn there too, so the list can be
+    // toggled back without moving the pointer (and again at the bottom after a long scroll)
+    let collapsed = next_steps_shown(&steps, false).0;
+    for (i, s) in steps[..shown].iter().enumerate() {
+        if state.show_all_steps && show_link && i == collapsed && i > 0 {
+            next_steps_link(ui, t, state, steps.len());
+            ui.add_space(2.0);
+        }
         ui.horizontal_top(|ui| {
             // The row pitch egui's own checkbox gave; the box is centred on the text anyway.
             ui.set_min_height(ui.spacing().interact_size.y);
@@ -2033,19 +2040,24 @@ fn next_steps(
         ui.add_space(2.0);
     }
     if show_link {
-        ui.horizontal(|ui| {
-            ui.add_space(14.0);
-            let label = if state.show_all_steps {
-                "Show fewer".to_owned()
-            } else {
-                format!("Show all {}", steps.len())
-            };
-            if link(ui, t, &label, 11.5).clicked() {
-                state.show_all_steps = !state.show_all_steps;
-            }
-        });
+        next_steps_link(ui, t, state, steps.len());
     }
     ui.add_space(8.0);
+}
+
+/// The "Show all N" / "Show fewer" link of the next steps.
+fn next_steps_link(ui: &mut egui::Ui, t: &Tokens, state: &mut NotesState, total: usize) {
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        let label = if state.show_all_steps {
+            "Show fewer".to_owned()
+        } else {
+            format!("Show all {total}")
+        };
+        if link(ui, t, &label, 11.5).clicked() {
+            state.show_all_steps = !state.show_all_steps;
+        }
+    });
 }
 
 /// Mark a note open on the project page (a low-signal note also leaves its own collapse).

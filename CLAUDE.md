@@ -66,7 +66,9 @@ inline and flashed on the page via `pending_focus` instead);
 JSON, not a hand edit, so `user_edited_at` stays) completes an item like a todo: completed
 items go after the open ones (newest completion first), struck through in `t.text_tertiary`,
 and only behind "Show all N" (N = open + completed), which shows whenever more than the cap
-are open OR anything is completed (`notes::next_steps_shown`); unticking reopens. A note
+are open OR anything is completed (`notes::next_steps_shown`); unticking reopens. Expanded,
+"Show fewer" is drawn twice: where "Show all" sat (after the items the collapsed list shows,
+so it toggles back under the same pointer) and at the bottom of the full list. A note
 card's action items carry the same checkbox and strike-through. Then "Notes": every note NEWEST FIRST
 (the rest of the app is newest first), one collapsed 24 pt row each (triangle, date, time range,
 title, topic chips); a click toggles the full `episode_card` inline (`NotesState::open_notes`,
