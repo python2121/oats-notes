@@ -1373,7 +1373,7 @@ impl Session<'_> {
                 log::info!("media play {id} started ({})", stamp.class.as_str());
                 self.media.open = Some(OpenPlay {
                     id,
-                    key: stamp.play_key().to_string(),
+                    key: stamp.play_key(),
                     title: stamp.title.clone(),
                     started_ms: started,
                     last_signal_ms: at_ms,

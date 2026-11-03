@@ -288,10 +288,16 @@ impl MediaStamp {
         self.class.is_media()
     }
 
-    /// The policy that applies to this stamp: its own, else `global`. An app classed Ignore
-    /// is skipped whatever it is.
+    /// The policy that applies to this stamp: its own, else — for music, which is logged
+    /// and never transcribed whatever the global policy — [`MediaPolicy::LogOnly`], else
+    /// `global`. An app classed Ignore is skipped whatever it is; a music APP the user
+    /// transcribes anyway carries its own `Transcribe`.
     pub fn policy_under(&self, global: MediaPolicy) -> MediaPolicy {
-        self.policy.unwrap_or(global)
+        match self.policy {
+            Some(p) => p,
+            None if self.class == MediaClass::Music => MediaPolicy::LogOnly,
+            None => global,
+        }
     }
 
     /// The system lane is not transcribed while this plays (under `global`).
@@ -309,9 +315,14 @@ impl MediaStamp {
         }
     }
 
-    /// What identifies one play: the URL, else the title.
-    pub fn play_key(&self) -> &str {
-        self.url.as_deref().unwrap_or(&self.title)
+    /// What identifies one play: the URL, else the title; for music the URL AND the title
+    /// (a web player's page stays the playlist while the tracks change: one play per track).
+    pub fn play_key(&self) -> String {
+        match (&self.url, self.class) {
+            (Some(url), MediaClass::Music) => format!("{url}\n{}", self.title),
+            (Some(url), _) => url.clone(),
+            (None, _) => self.title.clone(),
+        }
     }
 }
 
@@ -327,6 +338,17 @@ pub struct MediaPlay {
     pub producer: String,
     /// System segments transcribed during the play (0 unless the policy transcribes).
     pub segments_count: i64,
+}
+
+impl MediaPlay {
+    /// `other` is the same media: the same URL (plays without one never are), and for music
+    /// the same title too (a web player's page is the playlist; the title is the track).
+    pub fn same_media(&self, other: &MediaPlay) -> bool {
+        self.url.is_some()
+            && self.url == other.url
+            && (self.kind != MediaClass::Music && other.kind != MediaClass::Music
+                || self.title == other.title)
+    }
 }
 
 /// The slot the media resolver writes and the pipeline reads: cheap to read on every system
@@ -437,6 +459,19 @@ mod tests {
         assert_eq!(s.as_call().class, MediaClass::Meeting);
         assert!(MediaClass::YouTube.is_media() && MediaClass::Music.is_media());
         assert!(!MediaClass::Meeting.is_media() && !MediaClass::Browser.is_media());
+        // music: logged, never transcribed, whatever the global policy
+        let mut music = MediaStamp::new(MediaClass::Music, None, "Spotify", "Spotify");
+        for global in MediaPolicy::ALL {
+            assert!(music.skips_transcription(global), "{global:?}");
+            assert!(music.policy_under(global).logs_plays(), "{global:?}");
+        }
+        // ... unless the music app is transcribed anyway (its own policy)
+        music.policy = Some(MediaPolicy::Transcribe);
+        assert!(!music.skips_transcription(MediaPolicy::Ignore));
+        // an idle / ignored stamp: neither
+        music.policy = Some(MediaPolicy::Ignore);
+        assert!(music.skips_transcription(MediaPolicy::Transcribe));
+        assert!(!music.policy_under(MediaPolicy::Transcribe).logs_plays());
         for p in MediaPolicy::ALL {
             assert_eq!(MediaPolicy::parse(p.as_str()), Some(p));
             assert_eq!(MediaPolicy::from_u8(p.to_u8()), p);
@@ -474,6 +509,20 @@ mod tests {
         assert_eq!(feed.version(), v, "an equal value is no change");
         assert_eq!(reader.get(), Some(&stamp));
         assert_eq!(stamp.play_key(), "https://www.youtube.com/watch?v=a");
+        let track = |t: &str| {
+            MediaStamp::new(
+                MediaClass::Music,
+                Some("https://open.spotify.com/playlist/p".into()),
+                t,
+                "Firefox",
+            )
+        };
+        assert_ne!(
+            track("A — X").play_key(),
+            track("B — Y").play_key(),
+            "a track is its own play"
+        );
+        assert_eq!(track("A — X").play_key(), track("A — X").play_key());
         feed.set(None);
         assert!(reader.get().is_none());
     }

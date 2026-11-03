@@ -30,8 +30,10 @@ pub enum CalendarAction {
     /// Show where the event was said in the transcript.
     ShowEvent(i64),
     Todo(TodoAction),
-    /// "Mark as a call" on a media play (`media_plays.id`).
-    MarkPlayAsCall(i64),
+    /// "Mark as a call" on media plays (`media_plays.id`; every play of a folded row).
+    MarkPlaysAsCall(Vec<i64>),
+    /// Delete media plays (every play of a folded row).
+    DeletePlays(Vec<i64>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -445,8 +447,100 @@ pub fn play_label(p: &MediaPlay) -> String {
     }
 }
 
-/// "Watched: <title> 10:12–10:40" / "Listened: …" / "Call via …" per play of the day; a
-/// click opens the URL; right-click "Mark as a call".
+/// Consecutive music plays of one producer this far apart (or closer) are one row.
+pub const MUSIC_FOLD_GAP_MS: i64 = 10 * 60_000;
+
+/// One row of the day panel's media section: a play, or consecutive music plays of the same
+/// producer and service (a listening session, track after track) folded together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayFold {
+    /// Oldest first.
+    pub plays: Vec<MediaPlay>,
+}
+
+impl PlayFold {
+    pub fn ids(&self) -> Vec<i64> {
+        self.plays.iter().map(|p| p.id).collect()
+    }
+
+    pub fn started_at(&self) -> i64 {
+        self.plays.iter().map(|p| p.started_at).min().unwrap_or(0)
+    }
+
+    pub fn ended_at(&self) -> i64 {
+        self.plays.iter().map(|p| p.ended_at).max().unwrap_or(0)
+    }
+
+    /// The newest play: its URL is what a click opens.
+    pub fn last(&self) -> Option<&MediaPlay> {
+        self.plays.last()
+    }
+
+    /// The distinct tracks (titles) played.
+    pub fn tracks(&self) -> usize {
+        let mut titles: Vec<&str> = self.plays.iter().map(|p| p.title.trim()).collect();
+        titles.sort_unstable();
+        titles.dedup();
+        titles.len()
+    }
+
+    /// "Listened: Spotify" for several tracks, else the play's own label.
+    pub fn label(&self) -> String {
+        match self.plays.as_slice() {
+            [p] => play_label(p),
+            [first, ..] if self.tracks() == 1 => play_label(first),
+            [first, ..] => format!("Listened: {}", service_of(first)),
+            [] => String::new(),
+        }
+    }
+
+    /// "10:00–10:48 pm" plus " · 14 tracks" for several tracks.
+    pub fn when(&self) -> String {
+        let range = crate::timefmt::range(self.started_at(), self.ended_at(), &Local);
+        match self.tracks() {
+            n if n > 1 => format!("{range} · {n} tracks"),
+            _ => range,
+        }
+    }
+}
+
+/// The music service a play came from ("Spotify" for a web-player tab in Firefox), else its
+/// app.
+fn service_of(p: &MediaPlay) -> String {
+    match p.url.as_deref() {
+        Some(url) => crate::media::music_service(url).to_owned(),
+        None if !p.producer.trim().is_empty() => p.producer.trim().to_owned(),
+        None => "Music".to_owned(),
+    }
+}
+
+/// Fold the day's plays (oldest first): consecutive MUSIC plays of the same producer and
+/// service at most [`MUSIC_FOLD_GAP_MS`] apart become one row; everything else stays one row
+/// per play.
+pub fn fold_plays(plays: &[MediaPlay]) -> Vec<PlayFold> {
+    let mut out: Vec<PlayFold> = Vec::new();
+    for p in plays {
+        if p.kind == MediaClass::Music
+            && let Some(last) = out.last_mut()
+            && let Some(prev) = last.plays.last()
+            && prev.kind == MediaClass::Music
+            && prev.producer == p.producer
+            && service_of(prev) == service_of(p)
+            && p.started_at - last.ended_at() <= MUSIC_FOLD_GAP_MS
+        {
+            last.plays.push(p.clone());
+            continue;
+        }
+        out.push(PlayFold {
+            plays: vec![p.clone()],
+        });
+    }
+    out
+}
+
+/// "Watched: <title> 10:12–10:40" / "Listened: …" / "Call via …" per play of the day (a
+/// music session folded into one row, see [`fold_plays`]); a click opens the URL (of the last
+/// track); right-click "Mark as a call" and "Delete" (every play of the row).
 fn media_section(
     ui: &mut egui::Ui,
     t: &Tokens,
@@ -465,11 +559,14 @@ fn media_section(
                 .color(t.text_secondary),
         );
     });
-    for p in plays {
+    for fold in fold_plays(plays) {
+        let Some(p) = fold.last() else {
+            continue;
+        };
         ui.horizontal(|ui| {
             ui.add_space(MARGIN);
-            let when = crate::timefmt::range(p.started_at, p.ended_at, &Local);
-            let text = RichText::new(play_label(p)).size(12.5);
+            let when = fold.when();
+            let text = RichText::new(fold.label()).size(12.5);
             let resp = match &p.url {
                 Some(url) => {
                     let link = ui
@@ -490,18 +587,23 @@ fn media_section(
                         .truncate(),
                 ),
             };
-            if p.kind.is_media() {
-                resp.context_menu(|ui| {
+            resp.context_menu(|ui| {
+                if p.kind.is_media() {
                     if ui
                         .button("Mark as a call")
                         .on_hover_text("This was a conversation, not media")
                         .clicked()
                     {
-                        actions.push(CalendarAction::MarkPlayAsCall(p.id));
+                        actions.push(CalendarAction::MarkPlaysAsCall(fold.ids()));
                         ui.close();
                     }
-                });
-            }
+                    ui.separator();
+                }
+                if ui.button("Delete").clicked() {
+                    actions.push(CalendarAction::DeletePlays(fold.ids()));
+                    ui.close();
+                }
+            });
             ui.label(RichText::new(when).color(t.text_tertiary).size(11.5));
         });
     }
@@ -661,6 +763,79 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn mp(id: i64, kind: MediaClass, start_min: i64, end_min: i64, title: &str) -> MediaPlay {
+        MediaPlay {
+            id,
+            started_at: start_min * 60_000,
+            ended_at: end_min * 60_000,
+            kind,
+            url: Some("https://open.spotify.com/playlist/p".to_owned()),
+            title: title.to_owned(),
+            producer: "Firefox".to_owned(),
+            segments_count: 0,
+        }
+    }
+
+    #[test]
+    fn consecutive_music_plays_of_one_producer_fold_into_one_row() {
+        let plays = [
+            mp(1, MediaClass::Music, 0, 3, "One — X"),
+            mp(2, MediaClass::Music, 3, 7, "Two — Y"),
+            // a short pause: same session
+            mp(3, MediaClass::Music, 15, 18, "Three — Z"),
+            // a video between breaks the run
+            MediaPlay {
+                url: Some("https://youtu.be/a".to_owned()),
+                ..mp(4, MediaClass::YouTube, 19, 25, "A video")
+            },
+            mp(5, MediaClass::Music, 26, 29, "Four — W"),
+            // more than 10 min later: a new row
+            mp(6, MediaClass::Music, 40, 43, "Five — V"),
+            // the desktop app: another producer
+            MediaPlay {
+                url: None,
+                producer: "Spotify".to_owned(),
+                ..mp(7, MediaClass::Music, 43, 46, "Spotify")
+            },
+            // the same track twice (paused and resumed) is one track
+            mp(8, MediaClass::Music, 60, 62, "Six — U"),
+            mp(9, MediaClass::Music, 63, 65, "Six — U"),
+        ];
+        let folds = fold_plays(&plays);
+        let ids: Vec<Vec<i64>> = folds.iter().map(PlayFold::ids).collect();
+        assert_eq!(
+            ids,
+            [
+                vec![1, 2, 3],
+                vec![4],
+                vec![5],
+                vec![6],
+                vec![7],
+                vec![8, 9]
+            ]
+        );
+        assert_eq!(folds[0].label(), "Listened: Spotify");
+        assert_eq!(folds[0].tracks(), 3);
+        assert!(
+            folds[0].when().ends_with(" · 3 tracks"),
+            "{}",
+            folds[0].when()
+        );
+        assert_eq!(
+            folds[0].last().map(|p| p.id),
+            Some(3),
+            "a click opens the last"
+        );
+        assert_eq!(
+            (folds[0].started_at(), folds[0].ended_at()),
+            (0, 18 * 60_000)
+        );
+        assert_eq!(folds[2].label(), "Listened: Four — W");
+        assert_eq!(folds[1].label(), "Watched: A video");
+        assert_eq!(folds[5].label(), "Listened: Six — U");
+        assert!(!folds[5].when().contains("tracks"));
     }
 
     #[test]

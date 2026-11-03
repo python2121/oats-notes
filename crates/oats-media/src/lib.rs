@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 
 pub mod firefox;
+pub mod spotify;
 mod watcher;
 
 pub use firefox::{FirefoxSession, Tab, WindowTab};
@@ -189,6 +190,10 @@ pub struct MediaContext {
     pub ignored: bool,
     /// A media app the user transcribes anyway (whatever the media policy).
     pub transcribe_anyway: bool,
+    /// The producer shows media that is NOT playing (Spotify's web player with no track in
+    /// its title: paused / idle): no play is logged and nothing is transcribed, and it loses
+    /// to any other producer, like an ignored app.
+    pub idle: bool,
 }
 
 impl MediaContext {
@@ -200,21 +205,30 @@ impl MediaContext {
             kind: MediaKind::Other,
             ignored: false,
             transcribe_anyway: false,
+            idle: false,
         }
     }
 
     /// How decisive this context is among several producers: an ignored app loses to
     /// anything (see `MediaKind::rank`).
     fn rank(&self) -> u8 {
-        if self.ignored { 0 } else { self.kind.rank() }
+        if self.ignored || self.idle {
+            0
+        } else {
+            self.kind.rank()
+        }
     }
 
-    /// The title to show: the video's, else the tab's, else the app's name.
+    /// The title to show: the video's, a Spotify web-player track ("<Track> — <Artist>"),
+    /// else the tab's, else the app's name.
     pub fn title(&self) -> String {
         if let MediaKind::YouTube { title, .. } = &self.kind
             && !title.is_empty()
         {
             return title.clone();
+        }
+        if let Some(track) = self.spotify_track() {
+            return track.label();
         }
         if let Some(tab) = self.tab.as_ref().filter(|t| !t.title.is_empty()) {
             return tab.title.clone();
@@ -230,12 +244,21 @@ impl MediaContext {
             .unwrap_or_default()
     }
 
+    /// The track a Spotify web-player tab is playing (`None`: not such a tab, or idle).
+    pub fn spotify_track(&self) -> Option<spotify::Track> {
+        let tab = self.tab.as_ref()?;
+        if self.kind != MediaKind::Music || !spotify::is_web_player(&tab.url) {
+            return None;
+        }
+        spotify::parse_title(&tab.title)
+    }
+
     /// The stamp the pipeline puts on system segments; `None` when nothing plays.
     pub fn stamp(&self) -> Option<MediaStamp> {
         if self.producer.is_none() && self.tab.is_none() {
             return None;
         }
-        let policy = if self.ignored {
+        let policy = if self.ignored || self.idle {
             Some(MediaPolicy::Ignore)
         } else if self.transcribe_anyway && self.kind.is_media() {
             Some(MediaPolicy::Transcribe)
@@ -509,6 +532,7 @@ pub fn resolve_each(
                 kind: classify_bundle(&p.bundle_id),
                 ignored: false,
                 transcribe_anyway: false,
+                idle: false,
             };
             let mut override_id = p.bundle_id.as_str();
             if is_firefox(&p.bundle_id)
@@ -517,6 +541,17 @@ pub fn resolve_each(
                 override_id = app;
             }
             apply_override(&mut ctx, overrides.get(override_id));
+            if ctx.kind == MediaKind::Music && ctx.tab.is_some() {
+                // music in a browser tab: never transcribed (a web tab has no override)
+                ctx.transcribe_anyway = false;
+                // Spotify's web player names the playing track in its title; without one it
+                // is paused or idle: nothing plays from it
+                ctx.idle = ctx
+                    .tab
+                    .as_ref()
+                    .is_some_and(|t| spotify::is_web_player(&t.url))
+                    && ctx.spotify_track().is_none();
+            }
             ctx
         })
         .collect()
@@ -912,6 +947,55 @@ mod tests {
             ff_ctx(&[meet], &none()).kind,
             MediaKind::Meeting(MeetingApp::Meet)
         );
+    }
+
+    #[test]
+    fn a_spotify_tab_is_one_play_per_track_and_idle_when_paused() {
+        let page = "https://open.spotify.com/playlist/37i9dQZF1DX";
+        let playing = tab(page, "Never Gonna Give You Up • Rick Astley", true);
+        let ctx = ff_ctx(std::slice::from_ref(&playing), &none());
+        assert_eq!(ctx.kind, MediaKind::Music);
+        assert!(!ctx.idle);
+        let stamp = ctx.stamp().unwrap();
+        assert_eq!(stamp.title, "Never Gonna Give You Up — Rick Astley");
+        assert_eq!(stamp.url.as_deref(), Some(page));
+        assert_eq!(stamp.policy, None);
+        assert!(stamp.skips_transcription(MediaPolicy::Transcribe), "music");
+        // another track on the same page: another play
+        let next = tab(page, "Take On Me • a-ha", true);
+        let other = ff_ctx(&[next], &none()).stamp().unwrap();
+        assert_ne!(other.play_key(), stamp.play_key());
+        // paused / idle: nothing plays from the tab (no play, no transcript), and any other
+        // producer wins
+        for idle in ["Spotify – Web Player", "Spotify"] {
+            let ctx = ff_ctx(&[tab(page, idle, true)], &none());
+            assert!(ctx.idle, "{idle}");
+            let s = ctx.stamp().unwrap();
+            assert_eq!(s.policy, Some(MediaPolicy::Ignore));
+            assert!(!s.policy_under(MediaPolicy::Transcribe).logs_plays());
+            assert!(s.skips_transcription(MediaPolicy::Transcribe));
+        }
+        let ff = Producer::from_bundle(10, "org.mozilla.firefox");
+        let game = Producer::from_bundle(2, "com.example.game");
+        let ctx = resolve(
+            &[ff, game],
+            &[tab(page, "Spotify – Web Player", true)],
+            &none(),
+        );
+        assert_eq!(ctx.kind, MediaKind::Other, "the idle tab loses");
+        // a browser classed Media with transcribe-anyway: a web tab has no override
+        let o = ov("org.mozilla.firefox", ProducerClass::Media, true);
+        let s = ff_ctx(&[playing], &o).stamp().unwrap();
+        assert_eq!(s.policy, None);
+        // the desktop app may be transcribed anyway
+        let o = ov("com.spotify.client", ProducerClass::Auto, true);
+        let app = resolve(&[Producer::from_bundle(3, "com.spotify.client")], &[], &o);
+        assert_eq!(app.stamp().unwrap().policy, Some(MediaPolicy::Transcribe));
+        // another music site keeps the tab title
+        let sc = tab("https://soundcloud.com/a/b", "B by A", true);
+        let ctx = ff_ctx(&[sc], &none());
+        assert!(!ctx.idle);
+        assert_eq!(ctx.title(), "B by A");
     }
 
     #[test]

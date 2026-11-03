@@ -2963,7 +2963,15 @@ impl OatsApp {
                     self.jump_to_segment(seg);
                 }
                 CalendarAction::Todo(t) => todo_actions.push(t),
-                CalendarAction::MarkPlayAsCall(id) => self.mark_play_as_call(id),
+                CalendarAction::MarkPlaysAsCall(ids) => {
+                    for id in ids {
+                        self.mark_play_as_call(id);
+                    }
+                }
+                CalendarAction::DeletePlays(ids) => {
+                    self.delete_plays(&ids);
+                    self.reload_media();
+                }
             }
         }
         self.apply_todos(todo_actions);
@@ -3091,7 +3099,8 @@ impl OatsApp {
             return String::new();
         }
         match self.pipeline.media_feed().current() {
-            Some(m) if m.is_media() => {
+            // an idle web player / an ignored app: nothing plays
+            Some(m) if m.is_media() && m.policy != Some(oats_core::MediaPolicy::Ignore) => {
                 let title = if m.title.trim().is_empty() {
                     m.producer.clone()
                 } else {
@@ -3298,7 +3307,8 @@ impl OatsApp {
                         "Never taken for your conversation. Transcribe (default): filed under \
                          Media without a model call (“Summarise” runs one), hidden from \
                          Transcripts unless “Show media”. Log only: “Watched: …” in the \
-                         Calendar, no transcript. Ignore: nothing kept."
+                         Calendar, no transcript. Ignore: nothing kept. Music is logged, never \
+                         transcribed."
                     })
                     .color(t.text_tertiary)
                     .size(11.0),
@@ -3496,7 +3506,13 @@ fn apps_table(
                             }
                         }
                         let media = !row.locked && row.effective() == ProducerClass::Media;
-                        if media && anyway_shown {
+                        // music is never transcribed whatever the policy: a music app can
+                        // always be transcribed anyway
+                        let music = matches!(
+                            oats_media::classify_bundle(&row.bundle_id),
+                            oats_media::MediaKind::Music
+                        );
+                        if media && (anyway_shown || music) {
                             let mut anyway = row.transcribe_anyway;
                             if ui
                                 .checkbox(&mut anyway, "transcribe anyway")

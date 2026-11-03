@@ -318,7 +318,8 @@ scrolled to and flashed). `--selftest out.png --search "commerce cod delay"` see
 
 **Media view** (`View::Media`, ⌘6, View → Media, the last row under Views;
 `oats-ui/src/media.rs`): the watch history from `media_plays` (calls left out), newest first,
-under day headings. Consecutive plays of the same URL at most 10 min apart fold into one row
+under day headings. Consecutive plays of the same media (`MediaPlay::same_media`: the URL; for
+music the URL AND the title, i.e. the track) at most 10 min apart fold into one row
 (`oats_core::store::collapse_plays`, `MediaEntry`, durations summed, gaps not counted; folding
 works across page boundaries). A row: 96×54 thumbnail slot, title (medium face), "YouTube ·
 Firefox" / "Spotify" / "Spotify · Firefox", "2:05–2:41 pm · 36 min", the URL as a link
@@ -861,7 +862,12 @@ from a video creates nothing), and what was watched is recorded.
   decides (no background-tab guessing: the store has no "playing" flag): the front window's
   (`selectedWindow`), else the first window's. youtube.com/watch|shorts|live, youtu.be →
   YouTube{video_id, title}; meet.google.com, *.zoom.us, teams.microsoft.com, whereby, meet.jit.si,
-  … → Meeting (locked); open.spotify.com, music.youtube.com, … → Music; ANY app.slack.com /
+  … → Meeting (locked); open.spotify.com, music.youtube.com, … → Music (Spotify's web player:
+  `oats_media::spotify::parse_title` reads the tab title `"<Track> • <Artist>"` (U+2022; `·`
+  accepted too) → stamp title `"<Track> — <Artist>"`; a title without it — "Spotify – Web
+  Player" / "Spotify", paused or idle — makes the context `idle`: stamp `policy =
+  Some(Ignore)`, ranks last, so no play and no transcript; the exact live title format was
+  not checked against a real session store yet); ANY app.slack.com /
   discord.com page → AppMedia, with the per-app class/override of the desktop app
   (`web_app_bundle`: com.tinyspeck.slackmacgap / com.hnc.discord); anything else → Browser
   (transcribed as "them", no meeting hint, not media). Debug log carries the URL host only.
@@ -919,13 +925,18 @@ from a video creates nothing), and what was watched is recorded.
   longer open. Only a call the producer shows starts one (idle background call tabs never do).
   While a call is latched the watcher re-resolves on every 2 s look.
 - Policy `oats_core::MediaPolicy { Ignore, LogOnly, Transcribe (default since 2026-10-29) }`,
-  media only (YouTube / music / media apps; an app's own `policy` wins): stored in
+  media only (YouTube / media apps; an app's own `policy` wins). **Music is logged, never
+  transcribed**: a `Music` stamp without its own policy is LogOnly whatever the global policy
+  (`MediaStamp::policy_under`); only a music APP with "transcribe anyway" (Spotify desktop; the
+  Apps table always offers it for music apps) is transcribed — a music web tab has no
+  override. Stored in
   `meta.media_policy` (nothing ever seeded it, so an absent key = never chosen = the default; a
   user's explicit "log" stays), read at each session start, `OATS_MEDIA_POLICY` overrides,
   `PipelineHandle::set_media_policy` for a live change. Ignore / LogOnly: no VAD and no
   transcription on the system lane while media plays (the system ring still feeds the mic's
   audio-level echo check, so the room copy is dropped); LogOnly and Transcribe log
-  `media_plays` rows (one per contiguous play of one URL; closed on change, stop, session end
+  `media_plays` rows (one per contiguous play of one media — `MediaStamp::play_key`: the URL,
+  for music URL + title, so each Spotify track is a play; closed on change, stop, session end
   or a pause > 2 min; < 3 s blips dropped; end flushed every 30 s). Transcribe: segments
   stamped and counted in the play. Every stored system segment gets `media_kind` / `media_ref`
   when something is known (calls too: `meeting`).
@@ -956,9 +967,13 @@ from a video creates nothing), and what was watched is recorded.
   rows "Meeting 🔒" greyed, "transcribe anyway" for Media rows only while the policy is Ignore /
   Log only; `OatsApp::set_app_class`); the status strip shows "▶ <title>" while media plays;
   the Calendar day panel lists "Watched: <title>" / "Listened: …" / "Call via …" 10:12–10:40
-  (`Store::media_plays_between_latest`: a URL is listed on the day of its LAST play only, once;
-  calls and URL-less plays are never scrubbed; index `media_plays_url`)
-  (click opens the URL); media rows are tagged "media" instead of "them"; the Transcripts view
+  (`Store::media_plays_between_latest`: a media — URL, for `music` URL + title — is listed on
+  the day of its LAST play only, once; calls and URL-less plays are never scrubbed; index
+  `media_plays_url`) (click opens the URL); consecutive MUSIC plays of one producer and service
+  ≤ 10 min apart fold into one row (`calendar::fold_plays`, `PlayFold`): "Listened: Spotify"
+  "10:00–10:48 pm · 14 tracks" (distinct titles; one track: "Listened: <Track — Artist>"), a
+  click opens the last track's URL, right-click "Mark as a call" / "Delete" act on every play
+  of the row (`CalendarAction::MarkPlaysAsCall` / `DeletePlays`); media rows are tagged "media" instead of "them"; the Transcripts view
   hides media rows unless its header's "Show media" pill (`AppPrefs::show_media`, persisted;
   `Store::segments_page_with` / `segments_after_with`) is on — search still lists them.
 - Checks: `cargo run -p oats-media --example firefox_tabs -- --watch 60` (Firefox tabs, session

@@ -97,7 +97,7 @@ pub fn source_line(p: &MediaPlay) -> String {
 }
 
 /// The music service of a page, by host.
-fn music_service(url: &str) -> &'static str {
+pub(crate) fn music_service(url: &str) -> &'static str {
     let host = url
         .split("://")
         .nth(1)

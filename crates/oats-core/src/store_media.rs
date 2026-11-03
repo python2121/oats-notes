@@ -101,12 +101,11 @@ impl MediaEntry {
         }
     }
 
-    /// `older` (a play that started before this row) continues it: the same URL, at most
+    /// `older` (a play that started before this row) continues it: the same media (the URL;
+    /// for music the URL and the title, see [`MediaPlay::same_media`]), at most
     /// [`MEDIA_COLLAPSE_MS`] before it.
     fn continues(&self, older: &MediaPlay) -> bool {
-        older.url.is_some()
-            && older.url == self.play.url
-            && self.started_at - older.ended_at <= MEDIA_COLLAPSE_MS
+        older.same_media(&self.play) && self.started_at - older.ended_at <= MEDIA_COLLAPSE_MS
     }
 }
 
@@ -546,10 +545,11 @@ impl Store {
         Ok(rows)
     }
 
-    /// The plays overlapping `from..to` that are the LAST play of their URL anywhere in the
+    /// The plays overlapping `from..to` that are the LAST play of their media anywhere in the
     /// history (the Calendar's day panel: a video watched on several days is listed on the
-    /// last one only, and once per day). Calls are never scrubbed — a recurring meeting's
-    /// link repeats by design — and nor are plays without a URL.
+    /// last one only, and once per day). The media is the URL; for music the URL and the
+    /// title (a web player's playlist page plays many tracks). Calls are never scrubbed — a
+    /// recurring meeting's link repeats by design — and nor are plays without a URL.
     pub fn media_plays_between_latest(
         &self,
         from: i64,
@@ -561,6 +561,7 @@ impl Store {
                AND (p.kind IN ('call', 'meeting') OR p.url IS NULL OR NOT EXISTS (
                      SELECT 1 FROM media_plays q
                      WHERE q.url = p.url AND q.kind NOT IN ('call', 'meeting')
+                       AND (p.kind != 'music' AND q.kind != 'music' OR q.title = p.title)
                        AND (q.started_at > p.started_at
                             OR (q.started_at = p.started_at AND q.id > p.id))))
              ORDER BY p.started_at, p.id"
@@ -792,6 +793,28 @@ mod tests {
         );
         // the unscrubbed query still lists every play
         assert_eq!(s.media_plays_between(0, day)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn the_calendar_keeps_the_last_play_of_each_track_of_one_music_page() -> R {
+        let s = Store::open_in_memory()?;
+        let day = 86_400_000;
+        let page = "https://open.spotify.com/playlist/p";
+        let track = |t: &str| MediaStamp::new(MediaClass::Music, Some(page.into()), t, "Firefox");
+        let one = s.begin_media_play(1_000, &track("One — X"))?;
+        s.update_media_play(one, 2_000, 0)?;
+        let two = s.begin_media_play(3_000, &track("Two — Y"))?;
+        s.update_media_play(two, 4_000, 0)?;
+        // track one again the next day: day one keeps track two only
+        let again = s.begin_media_play(day + 1_000, &track("One — X"))?;
+        s.update_media_play(again, day + 2_000, 0)?;
+        let ids = |v: Vec<MediaPlay>| v.into_iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.media_plays_between_latest(0, day)?), vec![two]);
+        assert_eq!(
+            ids(s.media_plays_between_latest(day, 2 * day)?),
+            vec![again]
+        );
         Ok(())
     }
 
@@ -1217,6 +1240,29 @@ mod tests {
             collapse_plays(&mut paged, page);
         }
         assert_eq!(paged, rows);
+        Ok(())
+    }
+
+    #[test]
+    fn music_plays_fold_per_track_not_per_page() -> R {
+        let s = Store::open_in_memory()?;
+        let page = "https://open.spotify.com/playlist/p";
+        let track = |at: i64, end: i64, t: &str| -> Result<i64, StoreError> {
+            let id = s.begin_media_play(
+                at,
+                &MediaStamp::new(MediaClass::Music, Some(page.into()), t, "Firefox"),
+            )?;
+            s.update_media_play(id, end, 0)?;
+            Ok(id)
+        };
+        // one 0–3, one again 4–5 (paused and resumed: folds), two 5–8 (another track)
+        let a = track(0, 3 * MIN, "One — X")?;
+        let b = track(4 * MIN, 5 * MIN, "One — X")?;
+        let c = track(5 * MIN, 8 * MIN, "Two — Y")?;
+        let mut rows = Vec::new();
+        collapse_plays(&mut rows, s.media_history_page(None, 100)?);
+        let ids: Vec<Vec<i64>> = rows.iter().map(|r| r.ids.clone()).collect();
+        assert_eq!(ids, [vec![c], vec![b, a]]);
         Ok(())
     }
 

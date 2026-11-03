@@ -404,3 +404,78 @@ fn a_long_pause_closes_the_play_and_a_resume_opens_another() {
     assert!((67_000..=69_000).contains(&first), "first play {first} ms");
     assert!(plays[1].started_at - plays[0].ended_at >= 130_000);
 }
+
+#[test]
+fn music_is_logged_never_transcribed_even_under_transcribe() {
+    let rig = rig("music", MediaPolicy::Transcribe);
+    play(
+        &rig,
+        Some(stamp(
+            MediaClass::Music,
+            "https://open.spotify.com/playlist/p",
+            "A song — An artist",
+        )),
+    );
+    assert!(
+        system_rows(&rig.db).is_empty(),
+        "music is never transcribed"
+    );
+    assert!(
+        !rig.vad_calls
+            .lock()
+            .unwrap()
+            .contains(&AudioSourceKind::System),
+        "no VAD while music plays"
+    );
+    let p = plays(&rig.db);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0].kind, MediaClass::Music);
+    assert_eq!(p[0].title, "A song — An artist");
+}
+
+#[test]
+fn a_music_app_transcribed_anyway_is_transcribed() {
+    let rig = rig("music-anyway", MediaPolicy::LogOnly);
+    let mut s = MediaStamp::new(MediaClass::Music, None, "Spotify", "Spotify");
+    s.bundle_id = "com.spotify.client".into();
+    s.policy = Some(MediaPolicy::Transcribe);
+    play(&rig, Some(s));
+    assert_eq!(system_rows(&rig.db).len(), 1);
+}
+
+#[test]
+fn a_new_track_on_the_same_page_closes_the_play_and_opens_another() {
+    let rig = rig("tracks", MediaPolicy::LogOnly);
+    wait_for(&rig.h, "idle", |e| {
+        matches!(e, PipelineEvent::Status(PipelineStatus::Idle))
+    });
+    let page = "https://open.spotify.com/playlist/p";
+    rig.h
+        .media_feed()
+        .set(Some(stamp(MediaClass::Music, page, "One — X")));
+    let (tx, rx) = channel();
+    rig.h.start_lanes(rx, ListenOptions::default());
+    send_system(&tx, 0.3, 5_000);
+    // the first track's play is open once its chunks were fed
+    let deadline = Instant::now() + TIMEOUT;
+    while plays(&rig.db).is_empty() {
+        assert!(Instant::now() < deadline, "no play opened");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    rig.h
+        .media_feed()
+        .set(Some(stamp(MediaClass::Music, page, "Two — Y")));
+    send_system(&tx, 0.3, 5_000);
+    drop(tx);
+    wait_for(&rig.h, "session end", |e| {
+        matches!(e, PipelineEvent::SessionEnded(_))
+    });
+    let p = plays(&rig.db);
+    assert_eq!(
+        p.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(),
+        ["One — X", "Two — Y"],
+        "{p:?}"
+    );
+    assert!(p.iter().all(|p| p.url.as_deref() == Some(page)));
+}
