@@ -721,6 +721,11 @@ the terminal's mic permission; a bundled .app will need `NSMicrophoneUsageDescri
 System audio: "System Audio Recording Only", granted to the terminal app when run from one;
 a bundled .app needs `NSAudioCaptureUsageDescription` (see "Audio sources and lanes").
 
+Note cards render a markdown subset (`notes::md_lines`: `#` headings, bullets, `**bold**`) plus
+one `[text](https://…)` link per line (`notes::md_link` → an accent `Hyperlink`; only http(s)
+targets, anything else stays literal), so a media note's `**Media:** [title](url)` header is
+clickable.
+
 ## Topic view and jump-to-note (`crates/oats-ui/src/topic.rs`, `notes.rs`)
 
 Find icon: a 24 pt magnifying glass (`HeaderIcon::Search`, accent while the search bar is open) at the far right of the control bar, tooltip "Find (⌘F)", fires `Command::Search`.

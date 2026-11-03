@@ -534,6 +534,51 @@ pub fn md_lines(summary: &str) -> Vec<MdLine> {
         .collect()
 }
 
+/// The first markdown link in a line, `[text](https://…)`: `(before, text, url, after)`.
+/// Only http(s) targets count; anything else stays literal text.
+pub fn md_link(line: &str) -> Option<(String, String, String, String)> {
+    let open = line.find('[')?;
+    let rest = &line[open + 1..];
+    let close = rest.find("](")?;
+    let text = &rest[..close];
+    let after_text = &rest[close + 2..];
+    let end = after_text.find(')')?;
+    let url = &after_text[..end];
+    if text.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    Some((
+        line[..open].to_owned(),
+        text.to_owned(),
+        url.to_owned(),
+        after_text[end + 1..].to_owned(),
+    ))
+}
+
+/// A summary line that may carry one markdown link: the link is a clickable hyperlink
+/// (accent), the text around it the usual rich line.
+fn linked_line(ui: &mut egui::Ui, t: &Tokens, text: &str, size: f32, hl: &str) {
+    match md_link(text) {
+        Some((before, label, url, after)) => {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if !before.is_empty() {
+                    rich_line(ui, t, &before, size, t.text, hl);
+                }
+                ui.add(egui::Hyperlink::from_label_and_url(
+                    RichText::new(label).size(size).color(t.accent),
+                    url.clone(),
+                ))
+                .on_hover_text(url);
+                if !after.is_empty() {
+                    rich_line(ui, t, &after, size, t.text, hl);
+                }
+            });
+        }
+        None => rich_line(ui, t, text, size, t.text, hl),
+    }
+}
+
 /// Split `**bold**` runs: `(text, is_bold)`.
 pub fn bold_spans(text: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
@@ -716,10 +761,10 @@ fn summary_block(ui: &mut egui::Ui, t: &Tokens, summary: &str, hl: &str) {
                 ui.horizontal_top(|ui| {
                     ui.add_space(6.0);
                     ui.label(RichText::new("•").color(t.text_secondary).size(12.5));
-                    rich_line(ui, t, &b, 12.5, t.text, hl);
+                    linked_line(ui, t, &b, 12.5, hl);
                 });
             }
-            MdLine::Text(x) => rich_line(ui, t, &x, 12.5, t.text, hl),
+            MdLine::Text(x) => linked_line(ui, t, &x, 12.5, hl),
         }
     }
 }
@@ -2435,6 +2480,22 @@ mod tests {
         );
         assert_eq!(bold_spans("**all**"), vec![("all".to_owned(), true)]);
         assert_eq!(bold_spans("none"), vec![("none".to_owned(), false)]);
+    }
+
+    #[test]
+    fn markdown_links_are_split_out() {
+        assert_eq!(
+            md_link("**Media:** [Rust 2026](https://youtu.be/x) · 35 min"),
+            Some((
+                "**Media:** ".to_owned(),
+                "Rust 2026".to_owned(),
+                "https://youtu.be/x".to_owned(),
+                " · 35 min".to_owned()
+            ))
+        );
+        assert_eq!(md_link("no link [here]"), None);
+        assert_eq!(md_link("[x](javascript:alert(1))"), None);
+        assert_eq!(md_link("[](https://a.b)"), None);
     }
 
     #[test]
