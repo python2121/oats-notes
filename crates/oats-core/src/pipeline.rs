@@ -1358,9 +1358,18 @@ impl Session<'_> {
         {
             return None;
         }
-        if source == AudioSourceKind::System && self.stamp_now().is_some_and(|m| m.is_media()) {
-            return None;
-        }
+        // system audio: media (a video, music) gets no speaker pass at all, and only a CALL
+        // (a meeting app / page, or "On a call") may create NEW voices — a film clip in a
+        // browser tab or an unknown app is matched against the voices already known, but its
+        // speakers never become voiceprints
+        let may_create = match source {
+            AudioSourceKind::Mic => true,
+            AudioSourceKind::System => match self.stamp_now() {
+                Some(m) if m.is_media() => return None,
+                Some(m) => m.class == MediaClass::Meeting,
+                None => false,
+            },
+        };
         if self.out.speakers_reload.swap(false, Ordering::Relaxed) {
             self.flush_speakers();
             self.speakers.book = None;
@@ -1407,24 +1416,18 @@ impl Session<'_> {
         let book = self.speakers.book.as_mut()?;
         for span in &spans {
             let secs = span.speech_ms as f64 / 1000.0;
-            let a = book.assign(
-                &span.embedding,
-                secs,
-                mic,
-                ended_at,
-                |centroid, secs| match store.insert_speaker(
-                    centroid,
-                    secs,
-                    if mic { secs } else { 0.0 },
-                    ended_at,
-                ) {
+            let a = book.assign(&span.embedding, secs, mic, ended_at, |centroid, secs| {
+                if !may_create {
+                    return None;
+                }
+                match store.insert_speaker(centroid, secs, if mic { secs } else { 0.0 }, ended_at) {
                     Ok(id) => Some(id),
                     Err(e) => {
                         log::warn!("speakers: could not store a new voice: {e}");
                         None
                     }
-                },
-            );
+                }
+            });
             if let Some(a) = a {
                 if a.created {
                     created += 1;

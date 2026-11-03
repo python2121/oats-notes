@@ -815,7 +815,10 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   not capped). `dominant` = most speech seconds. Auto-me: with no `is_me` voice, the first with
   ≥ `AUTO_ME_MIC_SECS` 60 s of MIC speech in total (`mic_secs`) becomes "me" (logged).
 - **Pipeline**: after transcription, only for non-echo segments with text, ≥ 1 s, and not
-  media on the system lane (a video's voices are nobody's voiceprint), while
+  media on the system lane (a video's voices are nobody's voiceprint); on the system lane a
+  NEW voice is created only during a call (the stamp's class is `Meeting`: a meeting app /
+  page, or "On a call") — other system audio (a film in a non-YouTube browser tab, an unknown
+  app) is matched against the known voices but never enrols one (`may_create`); while
   `PipelineHandle::set_speakers(true)` (default `OATS_SPEAKERS`, else on; the UI sets it from
   `AppPrefs::speakers`). The book loads from the store on the first such segment; a new voice
   is inserted at once (its id), the segment's dominant voice goes into the SAME insert
