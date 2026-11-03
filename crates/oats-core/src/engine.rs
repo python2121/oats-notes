@@ -93,6 +93,22 @@ pub struct Transcription {
     pub processing_ms: f64,
 }
 
+/// One local speaker of a closed speech segment (from [`SpeechEngine::speaker_spans`]): where
+/// they speak within the segment's samples, for how long in total, and what they sound like.
+/// The engine does NO clustering across calls: matching an embedding to a known voice is
+/// [`crate::speakers`]' job, so voiceprints are the app's own (stored, tested, portable).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeakerSpan {
+    /// Offset of the speaker's first speech within the samples, ms.
+    pub start_ms: i64,
+    /// Offset of the end of their last speech within the samples, ms.
+    pub end_ms: i64,
+    /// Active speech, ms (≤ `end_ms - start_ms`).
+    pub speech_ms: i64,
+    /// The speaker embedding (FluidAudio: WeSpeaker, 256 floats, L2-normalised).
+    pub embedding: Vec<f32>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     /// Creating the engine or loading / downloading / compiling its models failed.
@@ -102,6 +118,8 @@ pub enum EngineError {
     Vad(String),
     #[error("transcription failed: {0}")]
     Transcribe(String),
+    #[error("speaker embedding failed: {0}")]
+    Speakers(String),
     /// This build has no engine for this platform.
     #[error("no speech engine is available on this platform")]
     Unavailable,
@@ -138,6 +156,16 @@ pub trait SpeechEngine {
     /// Transcribe one speech segment (≤ ~30 s). Each call is independent: no state carries
     /// over between segments.
     fn transcribe(&mut self, samples: &[f32]) -> Result<Transcription, EngineError>;
+
+    /// The local speakers of one closed speech segment (≤ ~30 s), each with an embedding.
+    /// Called by the pipeline only for transcribed, non-echo segments of ≥ 1 s, after
+    /// [`SpeechEngine::transcribe`], on the same thread. Independent per call. The default
+    /// (and an engine whose speaker models failed to load) returns no spans: transcription
+    /// never depends on speaker recognition.
+    fn speaker_spans(&mut self, samples: &[f32]) -> Result<Vec<SpeakerSpan>, EngineError> {
+        let _ = samples;
+        Ok(Vec::new())
+    }
 }
 
 /// Builds the engine on the pipeline's worker thread.

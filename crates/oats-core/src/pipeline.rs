@@ -43,6 +43,7 @@ use crate::engine::{
 };
 use crate::media::{FeedReader, MediaClass, MediaFeed, MediaPolicy, MediaStamp};
 use crate::segmenter::{Segment, Segmenter, SegmenterConfig};
+use crate::speakers::{self, SpeakerBook};
 use crate::store::{Store, TranscriptRow};
 
 /// How long the worker waits for audio before checking commands again.
@@ -66,6 +67,10 @@ const MEDIA_PAUSE_CLOSES_MS: i64 = 120_000;
 const MEDIA_FLUSH_MS: i64 = 30_000;
 /// Plays shorter than this (a preview, a tab switch) are not kept.
 const MEDIA_MIN_PLAY_MS: i64 = 3_000;
+/// Speaker recognition runs only on segments at least this long.
+const SPEAKER_MIN_SEGMENT_MS: u32 = 1_000;
+/// Changed voiceprints are written back at most this often (and at session end).
+const SPEAKER_FLUSH_EVERY: Duration = Duration::from_secs(60);
 /// "On a call" turns itself off after this long of silence on the system lane.
 pub const ON_CALL_QUIET_MS: u64 = 10 * 60 * 1000;
 /// How long dropping the handle waits for the worker before detaching it (a model load can
@@ -128,6 +133,27 @@ pub enum PipelineEvent {
     OnCallEnded {
         after_silence: bool,
     },
+    /// The stored voices changed (a new voice was heard, or one became the user's "me"):
+    /// reload the speaker labels. Sent before the `Segment` that caused it.
+    SpeakersChanged,
+}
+
+/// Per-session speaker-recognition counters (logged at info when the session ends; the last
+/// ended session's are [`PipelineHandle::speaker_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeakerStats {
+    /// Segments that went through the speaker models.
+    pub speaker_segments: u32,
+    /// Wall time spent in them, ms.
+    pub speaker_ms: u64,
+    /// …and in transcribing those same segments, ms (the cost to compare with).
+    pub transcribe_ms: u64,
+    /// Segments stored with a voice.
+    pub assigned: u32,
+    /// New voices opened.
+    pub speakers_created: u32,
+    /// Speaker-model calls that failed (the segment is stored without a voice).
+    pub failed: u32,
 }
 
 /// Per-session echo counters (logged at info when the session ends; the last ended session's
@@ -193,6 +219,11 @@ pub struct PipelineHandle {
     /// "On a call": every system-audio producer is a meeting (session-only).
     on_call: Arc<AtomicBool>,
     on_call_quiet_ms: Arc<AtomicU64>,
+    /// Speaker recognition on (`OATS_SPEAKERS`, the Preferences switch).
+    speakers: Arc<AtomicBool>,
+    /// The stored voices were changed by someone else (the user): reload the book.
+    speakers_reload: Arc<AtomicBool>,
+    speaker_stats: Arc<Mutex<SpeakerStats>>,
 }
 
 /// The audio a session reads: the plain microphone-only stream (every chunk is the
@@ -256,6 +287,14 @@ impl Pipeline {
         let media_policy = Arc::new(AtomicU8::new(MediaPolicy::default().to_u8()));
         let on_call = Arc::new(AtomicBool::new(false));
         let on_call_quiet_ms = Arc::new(AtomicU64::new(ON_CALL_QUIET_MS));
+        let speakers_on = speakers::speakers_env().unwrap_or(true);
+        log::info!(
+            "speaker recognition: {}",
+            if speakers_on { "on" } else { "off" }
+        );
+        let speakers = Arc::new(AtomicBool::new(speakers_on));
+        let speakers_reload = Arc::new(AtomicBool::new(false));
+        let speaker_stats = Arc::new(Mutex::new(SpeakerStats::default()));
         let out = Outbox {
             tx: event_tx,
             wake,
@@ -268,6 +307,9 @@ impl Pipeline {
             media_policy: media_policy.clone(),
             on_call: on_call.clone(),
             on_call_quiet_ms: on_call_quiet_ms.clone(),
+            speakers: speakers.clone(),
+            speakers_reload: speakers_reload.clone(),
+            speaker_stats: speaker_stats.clone(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
@@ -304,6 +346,9 @@ impl Pipeline {
             media_policy,
             on_call,
             on_call_quiet_ms,
+            speakers,
+            speakers_reload,
+            speaker_stats,
         }
     }
 }
@@ -407,6 +452,29 @@ impl PipelineHandle {
             .store(quiet.as_millis() as u64, Ordering::Relaxed);
     }
 
+    /// Turn speaker recognition on or off (default: `OATS_SPEAKERS`, else on). Takes effect
+    /// at the next segment; off = no speaker model calls and no voice on new segments.
+    pub fn set_speakers(&self, on: bool) {
+        self.speakers.store(on, Ordering::Relaxed);
+    }
+
+    pub fn speakers_enabled(&self) -> bool {
+        self.speakers.load(Ordering::Relaxed)
+    }
+
+    /// The stored voices were changed outside the pipeline (renamed, flagged as me, merged,
+    /// forgotten): the worker writes back its pending voiceprint updates and reloads them
+    /// before the next segment.
+    pub fn reload_speakers(&self) {
+        self.speakers_reload.store(true, Ordering::Relaxed);
+    }
+
+    /// The speaker counters of the current session (as of its last segment), or of the last
+    /// one once it ended.
+    pub fn speaker_stats(&self) -> SpeakerStats {
+        self.speaker_stats.lock().map(|s| *s).unwrap_or_default()
+    }
+
     /// Drain pending events (call once per UI frame).
     pub fn poll(&self) -> Vec<PipelineEvent> {
         self.events.try_iter().collect()
@@ -456,6 +524,9 @@ struct Outbox {
     media_policy: Arc<AtomicU8>,
     on_call: Arc<AtomicBool>,
     on_call_quiet_ms: Arc<AtomicU64>,
+    speakers: Arc<AtomicBool>,
+    speakers_reload: Arc<AtomicBool>,
+    speaker_stats: Arc<Mutex<SpeakerStats>>,
 }
 
 impl Outbox {
@@ -610,6 +681,7 @@ fn worker(
                     out,
                     echo: EchoState::default(),
                     media: MediaState::new(out.media_feed.clone()),
+                    speakers: SpeakerState::default(),
                 };
                 match session.run(config, &listen, cmd_rx) {
                     AfterListen::Idle => next = cmd_rx.recv().ok(),
@@ -737,6 +809,15 @@ impl MediaState {
     }
 }
 
+/// The session's voiceprints ([`crate::speakers`]).
+#[derive(Default)]
+struct SpeakerState {
+    /// Loaded from the store on the first segment that needs it (and after a reload).
+    book: Option<SpeakerBook>,
+    last_flush: Option<Instant>,
+    stats: SpeakerStats,
+}
+
 /// One listening session's borrowed context.
 struct Session<'a> {
     engine: &'a mut dyn SpeechEngine,
@@ -745,6 +826,7 @@ struct Session<'a> {
     out: &'a Outbox,
     echo: EchoState,
     media: MediaState,
+    speakers: SpeakerState,
 }
 
 impl Session<'_> {
@@ -769,6 +851,7 @@ impl Session<'_> {
         };
         // a new session counts from zero
         self.publish_echo_stats();
+        self.publish_speaker_stats();
         let stored = self.store.meta(MediaPolicy::META_KEY).ok().flatten();
         let policy = MediaPolicy::effective(stored.as_deref());
         self.out
@@ -910,6 +993,7 @@ impl Session<'_> {
             });
         }
         self.end_echo_stats(session_id);
+        self.end_speakers(session_id);
         if let Err(e) = self.store.end_session(session_id, now_ms()) {
             self.out.send(PipelineEvent::Warning(format!(
                 "could not close the session: {e}"
@@ -1212,7 +1296,12 @@ impl Session<'_> {
         } else {
             None
         };
-        let mut row = match self.store.insert_segment_from(
+        let speaker_id = if echo_of.is_none() {
+            self.identify_speaker(source, seg, ended_at, t.processing_ms)
+        } else {
+            None
+        };
+        let mut row = match self.store.insert_segment_full(
             session_id,
             started_at,
             ended_at,
@@ -1220,6 +1309,7 @@ impl Session<'_> {
             t.confidence,
             source,
             echo_of,
+            speaker_id,
         ) {
             Ok(row) => row,
             Err(e) => {
@@ -1251,6 +1341,181 @@ impl Session<'_> {
 
     fn media_policy(&self) -> MediaPolicy {
         MediaPolicy::from_u8(self.out.media_policy.load(Ordering::Relaxed))
+    }
+
+    /// The dominant known voice of a transcribed, non-echo segment (see [`crate::speakers`]):
+    /// only while recognition is on, for segments of ≥ [`SPEAKER_MIN_SEGMENT_MS`], and never
+    /// for media on the system lane (a video's voices are nobody's voiceprint). New voices
+    /// are stored at once; changed voiceprints in batches ([`SPEAKER_FLUSH_EVERY`]).
+    fn identify_speaker(
+        &mut self,
+        source: AudioSourceKind,
+        seg: &Segment,
+        ended_at: i64,
+        transcribe_ms: f64,
+    ) -> Option<i64> {
+        if !self.out.speakers.load(Ordering::Relaxed) || seg.duration_ms() < SPEAKER_MIN_SEGMENT_MS
+        {
+            return None;
+        }
+        if source == AudioSourceKind::System && self.stamp_now().is_some_and(|m| m.is_media()) {
+            return None;
+        }
+        if self.out.speakers_reload.swap(false, Ordering::Relaxed) {
+            self.flush_speakers();
+            self.speakers.book = None;
+        }
+        if self.speakers.book.is_none() {
+            match self.store.speakers() {
+                Ok(all) => {
+                    log::debug!("speakers: {} known voices loaded", all.len());
+                    self.speakers.book = Some(SpeakerBook::new(
+                        all.iter().map(crate::speakers::Speaker::entry).collect(),
+                    ));
+                }
+                Err(e) => {
+                    log::warn!("speakers: could not load the voices: {e}");
+                    return None;
+                }
+            }
+        }
+        let t = Instant::now();
+        let spans = match self.engine.speaker_spans(&seg.samples) {
+            Ok(s) => s,
+            Err(e) => {
+                self.speakers.stats.failed += 1;
+                log::warn!(
+                    "{} lane: speaker recognition of a {} ms segment failed: {e}",
+                    source.as_str(),
+                    seg.duration_ms()
+                );
+                return None;
+            }
+        };
+        let model_ms = t.elapsed().as_millis() as u64;
+        if spans.is_empty() && model_ms == 0 {
+            // an engine without speaker models: nothing ran, nothing to count
+            return None;
+        }
+        self.speakers.stats.speaker_segments += 1;
+        self.speakers.stats.speaker_ms += model_ms;
+        self.speakers.stats.transcribe_ms += transcribe_ms.max(0.0) as u64;
+        let mic = source == AudioSourceKind::Mic;
+        let store = self.store;
+        let mut assigned = Vec::with_capacity(spans.len());
+        let mut created = 0u32;
+        let book = self.speakers.book.as_mut()?;
+        for span in &spans {
+            let secs = span.speech_ms as f64 / 1000.0;
+            let a = book.assign(
+                &span.embedding,
+                secs,
+                mic,
+                ended_at,
+                |centroid, secs| match store.insert_speaker(
+                    centroid,
+                    secs,
+                    if mic { secs } else { 0.0 },
+                    ended_at,
+                ) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        log::warn!("speakers: could not store a new voice: {e}");
+                        None
+                    }
+                },
+            );
+            if let Some(a) = a {
+                if a.created {
+                    created += 1;
+                    log::info!(
+                        "speakers: new voice {} ({secs:.1} s of speech)",
+                        a.speaker_id
+                    );
+                }
+                assigned.push((a.speaker_id, secs));
+            }
+        }
+        let mut changed = created > 0;
+        if mic && let Some(me) = book.auto_me() {
+            match store.set_speaker_me(me) {
+                Ok(true) => {
+                    book.set_me(me);
+                    changed = true;
+                    log::info!(
+                        "speakers: voice {me} is the user (the first with {} s of microphone \
+                         speech)",
+                        speakers::AUTO_ME_MIC_SECS
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => log::warn!("speakers: could not flag voice {me} as the user: {e}"),
+            }
+        }
+        let dominant = speakers::dominant(&assigned);
+        log::debug!(
+            "speakers: {} spans in {model_ms} ms ({} ms segment, transcribed in {transcribe_ms:.0} \
+             ms) → {dominant:?}",
+            spans.len(),
+            seg.duration_ms()
+        );
+        self.speakers.stats.speakers_created += created;
+        if dominant.is_some() {
+            self.speakers.stats.assigned += 1;
+        }
+        if changed {
+            self.out.send(PipelineEvent::SpeakersChanged);
+        }
+        if self
+            .speakers
+            .last_flush
+            .is_none_or(|t| t.elapsed() >= SPEAKER_FLUSH_EVERY)
+        {
+            self.flush_speakers();
+        }
+        self.publish_speaker_stats();
+        dominant
+    }
+
+    /// Write the changed voiceprints back (one transaction).
+    fn flush_speakers(&mut self) {
+        self.speakers.last_flush = Some(Instant::now());
+        let Some(book) = self.speakers.book.as_mut() else {
+            return;
+        };
+        let dirty = book.take_dirty();
+        if dirty.is_empty() {
+            return;
+        }
+        match self.store.flush_speakers(&dirty) {
+            Ok(()) => log::debug!("speakers: {} voiceprints written back", dirty.len()),
+            Err(e) => log::warn!("speakers: could not write back the voiceprints: {e}"),
+        }
+    }
+
+    fn publish_speaker_stats(&mut self) {
+        if let Ok(mut shared) = self.out.speaker_stats.lock() {
+            *shared = self.speakers.stats;
+        }
+    }
+
+    /// Flush the voiceprints and log the session's speaker counters.
+    fn end_speakers(&mut self, session_id: i64) {
+        self.flush_speakers();
+        let s = self.speakers.stats;
+        if s.speaker_segments > 0 || s.failed > 0 {
+            log::info!(
+                "session {session_id} speakers: {} segments in {} ms (transcription of the same \
+                 segments: {} ms), {} with a voice, {} new voices, {} failed",
+                s.speaker_segments,
+                s.speaker_ms,
+                s.transcribe_ms,
+                s.assigned,
+                s.speakers_created,
+                s.failed
+            );
+        }
+        self.publish_speaker_stats();
     }
 
     /// What plays on the system lane as the pipeline treats it: the resolver's stamp, or —
@@ -1732,6 +1997,136 @@ mod tests {
 
         let rows = Store::open(&path).and_then(|s| s.segments(View::Transcripts));
         assert!(rows.is_ok_and(|r| r.len() == 1 && r[0].text.contains("no engine")));
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// NullEngine plus one speaker span per segment whose "voice" is the tone's pitch
+    /// (zero crossings): 440 Hz and 880 Hz are two people.
+    struct PitchVoices;
+
+    impl SpeechEngine for PitchVoices {
+        fn name(&self) -> String {
+            "pitch voices".into()
+        }
+        fn load(&mut self, s: &mut dyn FnMut(String)) -> Result<(), crate::EngineError> {
+            NullEngine.load(s)
+        }
+        fn vad_frame_len(&self) -> Option<usize> {
+            None
+        }
+        fn vad(&mut self, _s: &[f32]) -> Result<Vec<crate::VadFrame>, crate::EngineError> {
+            Ok(Vec::new())
+        }
+        fn transcribe(&mut self, s: &[f32]) -> Result<crate::Transcription, crate::EngineError> {
+            NullEngine.transcribe(s)
+        }
+        fn speaker_spans(
+            &mut self,
+            s: &[f32],
+        ) -> Result<Vec<crate::SpeakerSpan>, crate::EngineError> {
+            let crossings = s
+                .windows(2)
+                .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+                .count();
+            let voiced = s.iter().filter(|x| x.abs() > 1e-4).count().max(1);
+            let hz = crossings as f32 / 2.0 / (voiced as f32 / 16_000.0);
+            let mut embedding = vec![0.0f32; 8];
+            embedding[if hz > 660.0 { 1 } else { 0 }] = 1.0;
+            embedding[7] = 0.1;
+            Ok(vec![crate::SpeakerSpan {
+                start_ms: 0,
+                end_ms: s.len() as i64 / 16,
+                speech_ms: s.len() as i64 / 16,
+                embedding,
+            }])
+        }
+    }
+
+    #[test]
+    fn segments_carry_their_voice_and_voices_persist() {
+        let path = temp_db("speakers");
+        let h = Pipeline {
+            engine: Box::new(|| Ok(Box::new(PitchVoices) as Box<dyn SpeechEngine>)),
+            store_path: path.clone(),
+            segmenter: SegmenterConfig::default(),
+            wake: Box::new(|| {}),
+        }
+        .spawn();
+        h.set_speakers(true);
+        wait_for(&h, "idle", |e| {
+            matches!(e, PipelineEvent::Status(PipelineStatus::Idle))
+        });
+        let (audio_tx, audio_rx) = std::sync::mpsc::channel();
+        h.start(audio_rx);
+        wait_for(&h, "session start", |e| {
+            matches!(e, PipelineEvent::SessionStarted(_))
+        });
+        let mut n = 0usize;
+        let mut chunk = |hz: f32| -> Vec<f32> {
+            (0..1600)
+                .map(|_| {
+                    n += 1;
+                    if hz > 0.0 {
+                        0.3 * (n as f32 * 2.0 * std::f32::consts::PI * hz / 16_000.0).sin()
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        };
+        let mut voices = Vec::new();
+        for hz in [440.0, 880.0, 440.0] {
+            for _ in 0..20 {
+                let _ = audio_tx.send(chunk(hz));
+            }
+            for _ in 0..15 {
+                let _ = audio_tx.send(chunk(0.0));
+            }
+            let PipelineEvent::Segment(row) =
+                wait_for(&h, "segment", |e| matches!(e, PipelineEvent::Segment(_)))
+            else {
+                unreachable!()
+            };
+            voices.push(row.speaker_id);
+        }
+        assert!(voices.iter().all(Option::is_some), "{voices:?}");
+        assert_eq!(voices[0], voices[2]);
+        assert_ne!(voices[0], voices[1]);
+        // off: no voice
+        h.set_speakers(false);
+        for _ in 0..20 {
+            let _ = audio_tx.send(chunk(440.0));
+        }
+        for _ in 0..15 {
+            let _ = audio_tx.send(chunk(0.0));
+        }
+        let PipelineEvent::Segment(row) =
+            wait_for(&h, "segment", |e| matches!(e, PipelineEvent::Segment(_)))
+        else {
+            unreachable!()
+        };
+        assert_eq!(row.speaker_id, None);
+        h.stop();
+        wait_for(&h, "session end", |e| {
+            matches!(e, PipelineEvent::SessionEnded(_))
+        });
+        let stats = h.speaker_stats();
+        assert_eq!(stats.speaker_segments, 3);
+        assert_eq!(stats.speakers_created, 2);
+        drop(audio_tx);
+        drop(h);
+        let store = Store::open(&path);
+        let speakers = store.as_ref().map(|s| s.speakers());
+        let speakers = match speakers {
+            Ok(Ok(s)) => s,
+            _ => unreachable!("store"),
+        };
+        assert_eq!(speakers.len(), 2);
+        // the first voice spoke twice: its seconds were flushed at session end
+        let first = speakers.iter().find(|s| Some(s.id) == voices[0]);
+        assert!(first.is_some_and(|s| s.speech_secs > 3.0), "{speakers:?}");
         if let Some(dir) = path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }

@@ -23,6 +23,10 @@ fonts and images are listed in `assets/ATTRIBUTION.md`.
   the cargo build directory and links it statically into the macOS binary.
 - Models it downloads on first run into `~/Library/Application Support/FluidAudio`
   (Parakeet TDT v3, Silero VAD as CoreML conversions) carry their own licenses, listed on
-  their Hugging Face model cards.
+  their Hugging Face model cards. Speaker recognition adds the CoreML conversions in
+  `FluidInference/speaker-diarization-coreml`: the pyannote segmentation model
+  (pyannote.audio, MIT) and the WeSpeaker ResNet speaker-embedding model (WeSpeaker,
+  Apache-2.0; the pretrained weights' terms are on their model cards) — see that repository's
+  model card for the exact licenses before redistributing.
 
 Other Rust dependencies come from crates.io / git under their own licenses (`Cargo.lock`).

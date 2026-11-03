@@ -277,6 +277,22 @@ pub fn render_transcript_titled<Tz: TimeZone>(
 where
     Tz::Offset: std::fmt::Display,
 {
+    render_transcript_full(rows, tz, titles, &HashMap::new())
+}
+
+/// [`render_transcript_titled`] with speaker labels: a line whose segment has a known voice
+/// (`speakers`, by id) is labelled by [`oats_core::speaker_label`] — `[HH:MM] Priya: …` for a
+/// named voice, `them 2:` / `voice 2:` for an anonymous one (system audio / microphone),
+/// `me:` for the user's own voice; a line without one keeps its lane's `me:` / `them:`.
+pub fn render_transcript_full<Tz: TimeZone>(
+    rows: &[TranscriptRow],
+    tz: &Tz,
+    titles: &HashMap<String, String>,
+    speakers: &oats_core::speakers::SpeakerMap,
+) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
     let mut out = String::new();
     let mut current_media: Option<String> = None;
     for r in rows.iter().filter(|r| r.echo_of.is_none()) {
@@ -302,11 +318,17 @@ where
         out.push('[');
         out.push_str(&stamp);
         out.push_str("] ");
-        out.push_str(match r.source {
-            _ if key.is_some() => "media: ",
-            AudioSourceKind::Mic => "me: ",
-            AudioSourceKind::System => "them: ",
-        });
+        match r.speaker_id.and_then(|id| speakers.get(&id)) {
+            Some(s) if key.is_none() => {
+                out.push_str(&one_line(&oats_core::speaker_label(Some(s), r.source)));
+                out.push_str(": ");
+            }
+            _ => out.push_str(match r.source {
+                _ if key.is_some() => "media: ",
+                AudioSourceKind::Mic => "me: ",
+                AudioSourceKind::System => "them: ",
+            }),
+        }
         out.push_str(r.text.trim());
         out.push('\n');
     }
@@ -458,6 +480,44 @@ mod tests {
         assert_eq!(
             render_transcript(&rows, &tz),
             "[13:05] me: segment 1\n[13:06] me: segment 2\n"
+        );
+    }
+
+    #[test]
+    fn renders_speakers_by_name_or_number() {
+        use oats_core::{Speaker, speakers::SpeakerMap};
+        let tz = chrono::FixedOffset::east_opt(0).unwrap();
+        let base = 1_793_106_300;
+        let voice = |id: i64, name: Option<&str>, me: bool| Speaker {
+            id,
+            name: name.map(str::to_owned),
+            is_me: me,
+            ..Speaker::default()
+        };
+        let map: SpeakerMap = [
+            voice(1, None, true),
+            voice(2, Some("Priya"), false),
+            voice(3, None, false),
+        ]
+        .into_iter()
+        .map(|s| (s.id, s))
+        .collect();
+        let with = |r: TranscriptRow, sp: i64| TranscriptRow {
+            speaker_id: Some(sp),
+            ..r
+        };
+        let rows = [
+            with(row(1, base, 5), 1),
+            with(them(2, base + 60, 5), 2),
+            with(them(3, base + 61, 5), 3),
+            with(row(4, base + 62, 5), 3),
+            with(them(5, base + 63, 5), 99), // a forgotten voice: the lane
+            row(6, base + 64, 5),
+        ];
+        assert_eq!(
+            render_transcript_full(&rows, &tz, &HashMap::new(), &map),
+            "[13:05] me: segment 1\n[13:06] Priya: segment 2\n[13:06] them 3: segment 3\n\
+             [13:06] voice 3: segment 4\n[13:06] them: segment 5\n[13:06] me: segment 6\n"
         );
     }
 

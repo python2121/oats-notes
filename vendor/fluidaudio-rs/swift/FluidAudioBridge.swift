@@ -24,6 +24,8 @@ class FluidAudioBridgeInternal {
     // OatsNotes: the threshold `initializeVad` was given, for stateful VAD streams.
     private var vadThreshold: Float = 0.85
     private var diarizerManager: OfflineDiarizerManager?
+    // OatsNotes: segmentation + embedding models for per-segment speaker spans (SpeakerEmbed_ffi.swift).
+    var speakerEmbedder: BridgeSpeakerEmbedder?
     private var streamingAsrManager: SlidingWindowAsrManager?
     private var kokoroManager: KokoroAneManager?
     // Model-path diarization: retain the loaded MLModel (the ~4s-to-load part) keyed by

@@ -2,8 +2,9 @@
 //! pipeline writes segments, the brain writes interpretations, the UI reads). Times are Unix
 //! milliseconds (UTC); the UI formats them in local time.
 //!
-//! Schema version 9 (`meta.schema_version`; v1 to v8 databases are migrated on open; v9
-//! removed the auto-created **Media** category — media notes carry no node — see
+//! Schema version 10 (`meta.schema_version`; v1 to v9 databases are migrated on open; v10
+//! added speakers — `speakers` (one voiceprint per person) and `segments.speaker_id`, see
+//! `store_speakers.rs`; v9 removed the auto-created **Media** category — media notes carry no node — see
 //! `store_media.rs`; v8 added the per-app classes (`producer_overrides`, `producers_seen`, `segments.media_app`) and v7
 //! the media columns and `media_plays`, see `store_media.rs`; v5 added
 //! `episodes.user_edited_at`, the time the user last edited a note by hand; v6 re-keyed
@@ -87,6 +88,9 @@ pub struct TranscriptRow {
     pub media_kind: Option<crate::media::MediaClass>,
     /// The page / stream it came from (`segments.media_ref`, e.g. the YouTube watch URL).
     pub media_ref: Option<String>,
+    /// The dominant voice of the segment (v10: `segments.speaker_id`; see
+    /// [`crate::speakers`]), `None` when speaker recognition is off or nobody could be told.
+    pub speaker_id: Option<i64>,
 }
 
 /// What [`Store::search`] found.
@@ -582,7 +586,7 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// At most this many tags in a search's Tags section.
 pub const TAG_LIMIT: usize = 40;
@@ -740,7 +744,7 @@ ALTER TABLE segments ADD COLUMN source TEXT NOT NULL DEFAULT 'mic';
 ALTER TABLE segments ADD COLUMN echo_of INTEGER;
 ";
 
-const SEGMENT_COLUMNS: &str = "id, session_id, started_at, ended_at, text, confidence, node_id, episode_id, interpreted_at, categorised, source, echo_of, media_kind, media_ref";
+const SEGMENT_COLUMNS: &str = "id, session_id, started_at, ended_at, text, confidence, node_id, episode_id, interpreted_at, categorised, source, echo_of, media_kind, media_ref, speaker_id";
 
 /// Longer than any stored segment (the segmenter caps them at 30 s): how far before a
 /// window [`Store::segments_near`] looks for segments reaching into it.
@@ -771,6 +775,7 @@ fn row_to_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRow> {
             .as_deref()
             .and_then(crate::media::MediaClass::parse),
         media_ref: row.get(13)?,
+        speaker_id: row.get(14)?,
     })
 }
 
@@ -1133,6 +1138,13 @@ impl Store {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
+            Some(9) => {
+                // v9 → v10 is speakers: the `speakers` table and `segments.speaker_id`,
+                // added by `ensure_speakers_schema` below
+                log::info!("migrating the database from schema 9 to {SCHEMA_VERSION}");
+                conn.execute_batch(SCHEMA)?;
+                conn.execute_batch(SCHEMA_REST)?;
+            }
             Some(5) => {
                 // v5 → v6 is the event re-key + orphan cleanup, `migrate_event_keys` below
                 log::info!("migrating the database from schema 5 to {SCHEMA_VERSION}");
@@ -1151,6 +1163,7 @@ impl Store {
         Self::ensure_todos_table(conn)?;
         // after the episodes rebuild (it copies `SELECT *` into the v2 layout)
         Self::ensure_media_schema(conn)?;
+        Self::ensure_speakers_schema(conn)?;
         if from_version.is_some_and(|v| v < 6) {
             Self::migrate_event_keys(conn)?;
         }
@@ -1478,9 +1491,28 @@ impl Store {
         source: AudioSourceKind,
         echo_of: Option<i64>,
     ) -> Result<TranscriptRow, StoreError> {
+        self.insert_segment_full(
+            session_id, started_at, ended_at, text, confidence, source, echo_of, None,
+        )
+    }
+
+    /// [`Self::insert_segment_from`] with the segment's voice (`speakers.id`), in the same
+    /// insert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_segment_full(
+        &self,
+        session_id: i64,
+        started_at: i64,
+        ended_at: i64,
+        text: &str,
+        confidence: Option<f32>,
+        source: AudioSourceKind,
+        echo_of: Option<i64>,
+        speaker_id: Option<i64>,
+    ) -> Result<TranscriptRow, StoreError> {
         self.conn.execute(
-            "INSERT INTO segments(session_id, started_at, ended_at, text, confidence, source, echo_of)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO segments(session_id, started_at, ended_at, text, confidence, source, echo_of, speaker_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 session_id,
                 started_at,
@@ -1488,7 +1520,8 @@ impl Store {
                 text,
                 confidence.map(f64::from),
                 source.as_str(),
-                echo_of
+                echo_of,
+                speaker_id
             ],
         )?;
         Ok(TranscriptRow {
@@ -1506,6 +1539,7 @@ impl Store {
             echo_of,
             media_kind: None,
             media_ref: None,
+            speaker_id,
         })
     }
 
@@ -4798,6 +4832,11 @@ mod tests {
 // `media_plays`) — kept in its own file.
 #[path = "store_media.rs"]
 mod media;
+// v10: speakers (`speakers`, `segments.speaker_id`) — kept in its own file.
+#[path = "store_speakers.rs"]
+mod speakers;
+pub use speakers::{centroid_from_blob, centroid_to_blob};
+
 pub use media::{
     EPISODE_CONVERSATION, EPISODE_MEDIA, MEDIA_COLLAPSE_MS, MediaEntry, Relabel, collapse_plays,
 };

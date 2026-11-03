@@ -1,5 +1,5 @@
 pub mod bridge;
 
 pub use bridge::{
-    AsrResult, DiarizationSegment, FluidAudioBridge, SystemInfo, VadFrame, VadStreamHandle,
+    AsrResult, DiarizationSegment, FluidAudioBridge, SpeakerSpan, SystemInfo, VadFrame, VadStreamHandle,
 };

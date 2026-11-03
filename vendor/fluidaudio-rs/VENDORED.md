@@ -54,6 +54,32 @@ Everything else (ASR, diarization, TTS, Qwen3, examples, tests, `AGENTS.md`) is 
    freed with `fluidaudio_free_string`); `src/ffi/bridge.rs` `last_error()` appends it:
    `transcription failed: <swift error>`. The VAD stream functions have no bridge object and are unchanged.
 
+4. **Per-segment speaker spans** (OatsNotes keeps its own voiceprints; matching lives in
+   Rust, `oats_core::speakers`). Added:
+   - `swift/SpeakerEmbed_ffi.swift` (new): `BridgeSpeakerEmbedder` over FluidAudio's PUBLIC
+     `DiarizerModels.downloadIfNeeded()` (HF `FluidInference/speaker-diarization-coreml`:
+     `pyannote_segmentation` + `wespeaker_v2`), `SegmentationProcessor.getSegments` and
+     `EmbeddingExtractor.getEmbeddings` — the same steps as
+     `DiarizerManager.processChunkWithSpeakerTracking` (10 s windows, clean-frame masks,
+     `minActiveFramesCount` 10, frame step 0.016875 s) but with NO `SpeakerManager`: each
+     window's local speakers come back as spans (start / end / active seconds within the
+     samples, L2-normalised 256-float embedding). Audio under 4 s skips segmentation (one
+     embedding, all-ones mask, as `extractSpeakerEmbedding` does). A trailing window under
+     1 s after a full one is skipped. C exports `fluidaudio_initialize_speaker_embed`
+     (idempotent; errors → `fluidaudio_last_error`), `fluidaudio_is_speaker_embed_available`,
+     `fluidaudio_speaker_embed_samples` (flat out-arrays: starts, ends, speech seconds,
+     span-major embeddings + dim + count; -1 NULL / not loaded, -2 model error),
+     `fluidaudio_free_speaker_spans`.
+   - `swift/FluidAudioBridge.swift`: one stored property, `speakerEmbedder` (marked OatsNotes).
+   - `src/ffi/bridge.rs`: the four declarations, `initialize_speaker_embed`,
+     `is_speaker_embed_available`, `speaker_embed_samples`, and the `SpeakerSpan` struct
+     (re-exported by `src/ffi/mod.rs` and `src/lib.rs`).
+   - `src/lib.rs`: `FluidAudio::init_speaker_embed()`, `is_speaker_embed_available()`,
+     `speaker_spans(&[f32]) -> Result<Vec<SpeakerSpan>>`.
+   Check: `cargo run --release -p oats-engine-fluidaudio --example speakers_wav -- two.wav`.
+   On a FluidAudio update, check that `SegmentationProcessor.getSegments`,
+   `EmbeddingExtractor.getEmbeddings` and `DiarizerModels.downloadIfNeeded` stay public.
+
 ## Why no FluidAudio version bump
 
 The task was to find the least-risk route to a stateful VAD. At the pinned 0.14.8,

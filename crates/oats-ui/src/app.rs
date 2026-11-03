@@ -121,6 +121,9 @@ pub struct AppPrefs {
     /// The Media view shows YouTube thumbnails, fetched from YouTube's image server (the one
     /// network call the app makes itself). Off by default: nothing is fetched while off.
     pub fetch_thumbnails: bool,
+    /// Recognise speakers (a voiceprint per person in the database; `OATS_SPEAKERS`
+    /// overrides). On by default.
+    pub speakers: bool,
 }
 
 impl Default for AppPrefs {
@@ -137,6 +140,7 @@ impl Default for AppPrefs {
             show_media: false,
             clock_24h: false,
             fetch_thumbnails: false,
+            speakers: true,
         }
     }
 }
@@ -494,6 +498,15 @@ struct PrefsWindow {
     focus: bool,
     /// The "Apps" table (apps seen playing ∪ overridden ones).
     apps: Vec<AppRow>,
+    /// The "Speakers" table's name fields, by voice id (edited text, saved on Enter / blur).
+    speaker_names: HashMap<i64, String>,
+}
+
+/// An edit in the Preferences "Speakers" table.
+enum SpeakerEdit {
+    Name(i64, String),
+    Me(i64),
+    Forget(i64),
 }
 
 /// One row of the Preferences "Apps" table.
@@ -585,6 +598,9 @@ struct LatestNote {
 
 pub struct OatsApp {
     pipeline: PipelineHandle,
+    /// Every stored voice, by id: the transcript's speaker labels (published on the context
+    /// every frame, reloaded only when voices change).
+    speakers: std::sync::Arc<crate::speakers::SpeakerMap>,
     audio: AudioStarter,
     /// The capture guard while listening (`Some` = listening is on).
     capture: Option<Box<dyn Any>>,
@@ -738,8 +754,11 @@ impl OatsApp {
         let menu_events = None;
         crate::timefmt::set_24h(prefs.clock_24h);
         let sidebar_open = prefs.sidebar_episodes_open.iter().copied().collect();
+        let speakers_on = oats_core::speakers::speakers_env().unwrap_or(prefs.speakers);
+        pipeline.set_speakers(speakers_on);
         let mut app = OatsApp {
             pipeline,
+            speakers: Default::default(),
             audio,
             capture: None,
             store,
@@ -1314,10 +1333,16 @@ impl OatsApp {
                     self.warning = Some(format!("Apps: {e}"));
                     Vec::new()
                 });
+                let speaker_names = self
+                    .speakers
+                    .values()
+                    .map(|s| (s.id, s.name.clone().unwrap_or_default()))
+                    .collect();
                 self.prefs_window = Some(PrefsWindow {
                     name,
                     focus: true,
                     apps,
+                    speaker_names,
                 });
             }
             Command::ToggleSidebar => self.prefs.sidebar_visible = !self.prefs.sidebar_visible,
@@ -1587,6 +1612,7 @@ impl OatsApp {
 
     /// Re-read the tree, the current view, today's count and the brain's output.
     fn reload(&mut self) {
+        self.reload_speakers();
         match self.store.nodes() {
             Ok(n) => self.nodes = n,
             Err(e) => self.store_error(e),
@@ -2229,6 +2255,36 @@ impl OatsApp {
         false
     }
 
+    /// Read every stored voice into the label map (one query; on startup, on a voice change).
+    fn reload_speakers(&mut self) {
+        match self.store.speakers() {
+            Ok(all) => {
+                self.speakers = std::sync::Arc::new(all.into_iter().map(|s| (s.id, s)).collect());
+            }
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    /// The user changed the stored voices: reload the labels, and have the pipeline reload its
+    /// voiceprints before the next segment.
+    fn speakers_edited(&mut self) {
+        self.reload_speakers();
+        self.pipeline.reload_speakers();
+    }
+
+    /// A voice's label as the user reads it ("Priya", "them 3", "voice 3", "me").
+    fn speaker_name(&self, id: i64) -> String {
+        match self.speakers.get(&id) {
+            Some(s) if s.is_me => "me".to_owned(),
+            Some(s) => s
+                .name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| format!("voice {id}")),
+            None => format!("voice {id}"),
+        }
+    }
+
     fn store_error(&mut self, e: oats_core::StoreError) {
         log::warn!("store: {e}");
         self.warning = Some(format!("Store: {e}"));
@@ -2529,8 +2585,15 @@ impl OatsApp {
                 PipelineEvent::SystemAudio { signal } => {
                     self.system_no_signal = !signal && self.system_on;
                 }
+                PipelineEvent::SpeakersChanged => self.reload_speakers(),
                 PipelineEvent::Segment(row) => {
                     self.supersede_transcription_warning();
+                    if row
+                        .speaker_id
+                        .is_some_and(|id| !self.speakers.contains_key(&id))
+                    {
+                        self.reload_speakers();
+                    }
                     if row.started_at >= self.today_start {
                         self.today_count += 1;
                     }
@@ -2754,6 +2817,22 @@ impl OatsApp {
                     loaded = true;
                     continue;
                 }
+                TranscriptAction::SpeakerName { speaker, name } => {
+                    self.name_speaker(speaker, &name);
+                    continue;
+                }
+                TranscriptAction::SpeakerMe { speaker } => {
+                    self.speaker_is_me(speaker);
+                    continue;
+                }
+                TranscriptAction::SpeakerMerge { speaker, into } => {
+                    self.merge_speaker(speaker, &into);
+                    continue;
+                }
+                TranscriptAction::SpeakerForget { speaker } => {
+                    self.forget_speaker(speaker);
+                    continue;
+                }
             };
             if let Err(e) = r {
                 self.store_error(e);
@@ -2765,6 +2844,73 @@ impl OatsApp {
         if loaded {
             // the next frame measures the shift and looks at the edges again
             ctx.request_repaint();
+        }
+    }
+
+    /// Name a voice (the user's name wins over the brain's; empty clears it).
+    fn name_speaker(&mut self, id: i64, name: &str) {
+        let name = name.trim();
+        match self.store.set_speaker_name(
+            id,
+            Some(name).filter(|n| !n.is_empty()),
+            oats_core::NameSource::User,
+            None,
+        ) {
+            Ok(_) => {
+                self.speakers_edited();
+                let text = if name.is_empty() {
+                    format!("Voice {id}: name cleared")
+                } else {
+                    format!("Voice {id} is now “{name}”")
+                };
+                self.pending_toasts.push((text, false));
+            }
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    fn speaker_is_me(&mut self, id: i64) {
+        match self.store.set_speaker_me(id) {
+            Ok(true) => {
+                self.speakers_edited();
+                self.pending_toasts
+                    .push((format!("Voice {id} is you (“me”)"), false));
+            }
+            Ok(false) => self.speakers_edited(),
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    /// "Merge into…": `text` names the other voice (resolved locally, no model call).
+    fn merge_speaker(&mut self, from: i64, text: &str) {
+        let Some(into) = crate::speakers::resolve_voice(text, &self.speakers, from) else {
+            self.pending_toasts
+                .push((format!("No single voice matches “{}”", text.trim()), true));
+            return;
+        };
+        let (a, b) = (self.speaker_name(from), self.speaker_name(into));
+        match self.store.merge_speakers(from, into) {
+            Ok(true) => {
+                self.speakers_edited();
+                self.reload_rows();
+                self.pending_toasts
+                    .push((format!("Merged {a} into {b}"), false));
+            }
+            Ok(false) => self.speakers_edited(),
+            Err(e) => self.store_error(e),
+        }
+    }
+
+    fn forget_speaker(&mut self, id: i64) {
+        let name = self.speaker_name(id);
+        match self.store.forget_speaker(id) {
+            Ok(_) => {
+                self.speakers_edited();
+                self.reload_rows();
+                self.pending_toasts
+                    .push((format!("Forgot the voice of {name}"), false));
+            }
+            Err(e) => self.store_error(e),
         }
     }
 
@@ -3360,6 +3506,10 @@ impl OatsApp {
         let mut sound = self.prefs.command_sound;
         let mut clock_24h = self.prefs.clock_24h;
         let mut thumbnails = self.prefs.fetch_thumbnails;
+        let mut speakers_on = self.prefs.speakers;
+        let speakers_fixed = oats_core::speakers::speakers_env();
+        let mut speaker_edits: Vec<SpeakerEdit> = Vec::new();
+        let voices = self.speakers.clone();
         // the YouTube & music policy: OATS_MEDIA_POLICY fixes it, else `meta.media_policy`
         let fixed_policy = oats_core::MediaPolicy::env_override();
         let stored_policy = self
@@ -3459,6 +3609,22 @@ impl OatsApp {
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new("Apps").color(t.text_secondary));
                 apps_table(ui, t, &win.apps, policy, &mut app_changes);
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Speakers").color(t.text_secondary));
+                ui.add_enabled_ui(speakers_fixed.is_none(), |ui| {
+                    ui.checkbox(
+                        &mut speakers_on,
+                        "Recognise speakers (keeps a voiceprint per person in the database)",
+                    )
+                    .on_hover_text(if speakers_fixed.is_some() {
+                        "Set by OATS_SPEAKERS."
+                    } else {
+                        "Each person heard gets a voiceprint (256 numbers, stored only in the \
+                         local database) so their lines are labelled on later calls too. Off: \
+                         no speaker model runs and new lines get no voice."
+                    });
+                });
+                speakers_table(ui, t, &voices, &mut win.speaker_names, &mut speaker_edits);
                     });
             });
         if policy != policy_before {
@@ -3483,6 +3649,22 @@ impl OatsApp {
         self.prefs.command_sound = sound;
         self.prefs.clock_24h = clock_24h;
         self.prefs.fetch_thumbnails = thumbnails;
+        if speakers_on != self.prefs.speakers {
+            self.prefs.speakers = speakers_on;
+            self.pipeline.set_speakers(speakers_on);
+        }
+        for edit in speaker_edits {
+            match edit {
+                SpeakerEdit::Name(id, name) => self.name_speaker(id, &name),
+                SpeakerEdit::Me(id) => self.speaker_is_me(id),
+                SpeakerEdit::Forget(id) => {
+                    self.forget_speaker(id);
+                    if let Some(w) = &mut self.prefs_window {
+                        w.speaker_names.remove(&id);
+                    }
+                }
+            }
+        }
         crate::timefmt::set_24h(clock_24h);
         if close {
             self.prefs_window = None;
@@ -3735,6 +3917,98 @@ fn apps_table(
             "Meeting: transcribed as the other side of a call. Media: follows the policy above, \
              its notes in the Media view. Ignore: nothing kept. Changes apply within 5 s. In a call on \
              a media app, turn on “On a call” (⇧⌘C).",
+        )
+        .color(t.text_tertiary)
+        .size(11.0),
+    );
+}
+
+/// The Preferences "Speakers" table: one row per stored voice (the user's first, then the
+/// most recently heard): its name (saved on Enter / when the field loses focus; empty clears
+/// it), "me", when it was last heard, how much it said, and Forget.
+fn speakers_table(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    voices: &crate::speakers::SpeakerMap,
+    names: &mut HashMap<i64, String>,
+    edits: &mut Vec<SpeakerEdit>,
+) {
+    if voices.is_empty() {
+        ui.label(
+            egui::RichText::new("No voices yet: they appear as people are heard.")
+                .color(t.text_tertiary)
+                .size(11.0),
+        );
+        return;
+    }
+    use chrono::Datelike;
+    let this_year = chrono::Local::now().year();
+    egui::Grid::new("prefs-speakers-grid")
+        .num_columns(5)
+        .spacing(vec2(10.0, 6.0))
+        .show(ui, |ui| {
+            for s in crate::speakers::table_order(voices) {
+                let text = names
+                    .entry(s.id)
+                    .or_insert_with(|| s.name.clone().unwrap_or_default());
+                let hint = if s.is_me {
+                    "me".to_owned()
+                } else {
+                    format!("voice {}", s.id)
+                };
+                // add_sized: a Grid cell's first pass offers little width, which a bare
+                // desired_width would yield to
+                let r = ui.add_sized(
+                    vec2(130.0, ui.spacing().interact_size.y),
+                    egui::TextEdit::singleline(text)
+                        .hint_text(hint)
+                        .text_color(t.speaker_colour(s.id)),
+                );
+                let r = match crate::speakers::name_note(&s) {
+                    "" => r,
+                    note => r.on_hover_text(note),
+                };
+                if r.lost_focus() && text.trim() != s.name.as_deref().unwrap_or("").trim() {
+                    edits.push(SpeakerEdit::Name(s.id, text.trim().to_owned()));
+                }
+                let mut me = s.is_me;
+                if ui
+                    .add_enabled(!s.is_me, egui::Checkbox::new(&mut me, "me"))
+                    .on_hover_text("This voice is you: its lines read “me”")
+                    .changed()
+                    && me
+                {
+                    edits.push(SpeakerEdit::Me(s.id));
+                }
+                let heard = crate::transcript::day_of(s.last_heard_at, &chrono::Local)
+                    .map(|d| crate::transcript::day_heading(d, this_year))
+                    .unwrap_or_default();
+                ui.label(
+                    egui::RichText::new(heard)
+                        .color(t.text_secondary)
+                        .size(11.5),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{:.0} min", (s.speech_secs / 60.0).ceil()))
+                        .color(t.text_secondary)
+                        .size(11.5),
+                )
+                .on_hover_text("Speech heard from this voice in total");
+                if ui
+                    .button(egui::RichText::new("Forget").color(t.danger))
+                    .on_hover_text("Delete this voiceprint; its lines lose the label")
+                    .clicked()
+                {
+                    edits.push(SpeakerEdit::Forget(s.id));
+                }
+                ui.end_row();
+            }
+        });
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "Names from the conversation (the brain) never replace yours. Right-click a \
+             transcript line ▸ Speaker to name, merge or forget a voice.",
         )
         .color(t.text_tertiary)
         .size(11.0),
@@ -3997,6 +4271,7 @@ impl eframe::App for OatsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let t = Tokens::get(&ctx);
+        crate::speakers::publish(&ctx, self.speakers.clone());
         let mut cmds = self.handle_keys(&ctx);
         cmds.extend(self.undo_keys(&ctx));
         // Escape closes the search, also from the field (taken before the text edit sees it)
@@ -4487,6 +4762,7 @@ mod tests {
             show_media: true,
             clock_24h: true,
             fetch_thumbnails: true,
+            speakers: false,
         };
         prefs.store(&mut s);
         assert_eq!(AppPrefs::load(&s), prefs);

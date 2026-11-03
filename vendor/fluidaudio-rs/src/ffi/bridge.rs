@@ -123,6 +123,27 @@ extern "C" {
     fn fluidaudio_vad_stream_reset(stream: *mut std::ffi::c_void);
     fn fluidaudio_vad_stream_destroy(stream: *mut std::ffi::c_void);
 
+    // Per-segment speaker spans (OatsNotes addition; swift/SpeakerEmbed_ffi.swift)
+    fn fluidaudio_initialize_speaker_embed(bridge: *mut std::ffi::c_void) -> i32;
+    fn fluidaudio_is_speaker_embed_available(bridge: *mut std::ffi::c_void) -> i32;
+    fn fluidaudio_speaker_embed_samples(
+        bridge: *mut std::ffi::c_void,
+        samples: *const f32,
+        count: u32,
+        out_starts: *mut *mut f32,
+        out_ends: *mut *mut f32,
+        out_speech: *mut *mut f32,
+        out_embeddings: *mut *mut f32,
+        out_dim: *mut u32,
+        out_count: *mut u32,
+    ) -> i32;
+    fn fluidaudio_free_speaker_spans(
+        starts: *mut f32,
+        ends: *mut f32,
+        speech: *mut f32,
+        embeddings: *mut f32,
+    );
+
     // ITN (Inverse Text Normalization)
     fn fluidaudio_itn_normalize(
         bridge: *mut std::ffi::c_void,
@@ -989,6 +1010,72 @@ impl FluidAudioBridge {
         Ok(unsafe { collect_vad_frames(probs_ptr, voice_ptr, times_ptr, count) })
     }
 
+    /// OatsNotes: download (first run) and load the speaker segmentation + embedding models.
+    pub fn initialize_speaker_embed(&self) -> Result<(), String> {
+        let status = unsafe { fluidaudio_initialize_speaker_embed(self.ptr) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!("speaker models failed to load: {}", self.last_error()))
+        }
+    }
+
+    /// OatsNotes: whether `initialize_speaker_embed` succeeded.
+    pub fn is_speaker_embed_available(&self) -> bool {
+        unsafe { fluidaudio_is_speaker_embed_available(self.ptr) != 0 }
+    }
+
+    /// OatsNotes: the local speakers of `samples` (16 kHz mono), one span per speaker per
+    /// 10 s window, each with its L2-normalised embedding.
+    pub fn speaker_embed_samples(&self, samples: &[f32]) -> Result<Vec<SpeakerSpan>, String> {
+        let mut starts: *mut f32 = std::ptr::null_mut();
+        let mut ends: *mut f32 = std::ptr::null_mut();
+        let mut speech: *mut f32 = std::ptr::null_mut();
+        let mut embeddings: *mut f32 = std::ptr::null_mut();
+        let mut dim: u32 = 0;
+        let mut count: u32 = 0;
+        let status = unsafe {
+            fluidaudio_speaker_embed_samples(
+                self.ptr,
+                samples.as_ptr(),
+                samples.len() as u32,
+                &mut starts,
+                &mut ends,
+                &mut speech,
+                &mut embeddings,
+                &mut dim,
+                &mut count,
+            )
+        };
+        if status != 0 {
+            unsafe { fluidaudio_free_speaker_spans(starts, ends, speech, embeddings) };
+            return Err(format!("speaker embedding failed: {}", self.last_error()));
+        }
+        let n = count as usize;
+        let d = dim as usize;
+        let mut out = Vec::with_capacity(n);
+        if n > 0 && !starts.is_null() && !ends.is_null() && !speech.is_null() && !embeddings.is_null() {
+            let (s, e, sp, emb) = unsafe {
+                (
+                    std::slice::from_raw_parts(starts, n),
+                    std::slice::from_raw_parts(ends, n),
+                    std::slice::from_raw_parts(speech, n),
+                    std::slice::from_raw_parts(embeddings, n * d),
+                )
+            };
+            for i in 0..n {
+                out.push(SpeakerSpan {
+                    start: s[i],
+                    end: e[i],
+                    speech: sp[i],
+                    embedding: emb[i * d..(i + 1) * d].to_vec(),
+                });
+            }
+        }
+        unsafe { fluidaudio_free_speaker_spans(starts, ends, speech, embeddings) };
+        Ok(out)
+    }
+
     /// Create a stateful VAD stream (`None` before `initialize_vad`).
     pub fn vad_stream_create(&self) -> Option<VadStreamHandle> {
         let ptr = unsafe { fluidaudio_vad_stream_create(self.ptr) };
@@ -1144,6 +1231,16 @@ unsafe fn take_c_string(ptr: *mut i8) -> String {
     let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
     fluidaudio_free_string(ptr);
     s
+}
+
+/// One local speaker of a sample buffer (OatsNotes addition): seconds within the buffer,
+/// active speech seconds, and the L2-normalised WeSpeaker embedding (256 floats).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeakerSpan {
+    pub start: f32,
+    pub end: f32,
+    pub speech: f32,
+    pub embedding: Vec<f32>,
 }
 
 /// Owned Swift `BridgeVadStream` (OatsNotes addition). It retains the Swift `VadManager`, so

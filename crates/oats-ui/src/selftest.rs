@@ -452,6 +452,30 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
         ),
     ];
     let session = store.begin_session(yesterday + 14 * H, "selftest")?;
+    // voices: the user's own, Priya (named from the conversation) and two anonymous ones —
+    // "them 3" on the call, "voice 4" in the room yesterday
+    let unit = |seed: f32| -> Vec<f32> {
+        let mut v: Vec<f32> = (0..256).map(|i| ((i as f32 + seed) * 0.37).sin()).collect();
+        oats_core::speakers::normalise(&mut v);
+        v
+    };
+    let me = store.insert_speaker(&unit(1.0), 3_600.0, 3_600.0, today + 10 * H + 5 * M)?;
+    store.set_speaker_me(me)?;
+    let priya = store.insert_speaker(&unit(2.0), 540.0, 0.0, today + 9 * H + 15 * M)?;
+    store.set_speaker_name(
+        priya,
+        Some("Priya"),
+        oats_core::NameSource::Brain,
+        Some(0.9),
+    )?;
+    let anon_call = store.insert_speaker(&unit(3.0), 120.0, 0.0, today + 9 * H + 21 * M)?;
+    let anon_room = store.insert_speaker(&unit(4.0), 60.0, 60.0, yesterday + 14 * H + 6 * M)?;
+    let voice_of = |i: usize| match i {
+        1 => anon_room,
+        4 => priya,
+        6 => anon_call,
+        _ => me,
+    };
     let mut ids = Vec::new();
     // this morning's stand-up was a call: the other side (lines 4 and 6) came in as system
     // audio ("them"); the microphone's echo of line 6 is stored but never shown
@@ -462,7 +486,7 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
         } else {
             oats_core::AudioSourceKind::Mic
         };
-        let row = store.insert_segment_from(
+        let row = store.insert_segment_full(
             session,
             start,
             start + 8_000,
@@ -470,6 +494,7 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
             confidence,
             source,
             None,
+            Some(voice_of(i)),
         )?;
         if i == 6 {
             store.insert_segment_from(

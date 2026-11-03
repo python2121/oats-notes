@@ -38,7 +38,7 @@ use std::path::Path;
 use thiserror::Error;
 
 // Re-export FFI types
-pub use ffi::{AsrResult, DiarizationSegment, SystemInfo, VadFrame};
+pub use ffi::{AsrResult, DiarizationSegment, SpeakerSpan, SystemInfo, VadFrame};
 
 /// Errors that can occur when using FluidAudio
 #[derive(Error, Debug)]
@@ -414,6 +414,35 @@ impl FluidAudio {
             .vad_stream_create()
             .map(|handle| VadStream { handle })
             .ok_or_else(|| FluidAudioError::NotInitialized("VAD (call init_vad first)".into()))
+    }
+
+    // ========== Speaker spans (OatsNotes addition) ==========
+
+    /// Download (first run) and load the speaker segmentation (pyannote) and embedding
+    /// (WeSpeaker) models from `FluidInference/speaker-diarization-coreml`. Idempotent.
+    pub fn init_speaker_embed(&self) -> Result<(), FluidAudioError> {
+        self.bridge
+            .initialize_speaker_embed()
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Whether [`Self::init_speaker_embed`] succeeded.
+    pub fn is_speaker_embed_available(&self) -> bool {
+        self.bridge.is_speaker_embed_available()
+    }
+
+    /// The local speakers of `samples` (16 kHz mono f32, ideally ≤ 30 s): the audio is cut
+    /// into 10 s windows; per window, every local speaker the segmentation model finds with
+    /// enough activity comes back as one [`SpeakerSpan`] (start / end / active seconds within
+    /// `samples`, L2-normalised 256-float embedding). No clustering: matching spans to known
+    /// voices is the caller's job.
+    pub fn speaker_spans(&self, samples: &[f32]) -> Result<Vec<SpeakerSpan>, FluidAudioError> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.bridge
+            .speaker_embed_samples(samples)
+            .map_err(FluidAudioError::from)
     }
 
     // ========== Diarization Methods ==========

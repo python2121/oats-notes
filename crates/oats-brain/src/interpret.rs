@@ -23,9 +23,11 @@ use serde_json::{Value, json};
 
 use crate::claude_cli::Request;
 use crate::dates;
-use crate::episodes::{Chunk, render_transcript_titled};
+use crate::episodes::{Chunk, render_transcript_full};
 use oats_core::MediaClass;
+use oats_core::speakers::SpeakerMap;
 use oats_core::store::EPISODE_MEDIA;
+use oats_core::{NameSource, speaker_label};
 use std::collections::HashMap;
 
 pub const INTERPRET_SYSTEM: &str = include_str!("../prompts/interpret.system.md");
@@ -211,6 +213,26 @@ pub struct NodeProposal {
     pub description: String,
 }
 
+/// A voice the conversation itself names ("them 2" is Cody).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ProposedSpeaker {
+    /// The line label the transcript used ("them 2", "voice 3", or a brain name being
+    /// corrected).
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// A brain name is stored only at or above this confidence.
+pub const SPEAKER_NAME_MIN_CONFIDENCE: f64 = 0.8;
+/// Longest name the brain may give a voice.
+const SPEAKER_NAME_MAX_CHARS: usize = 60;
+
 /// A date the interpretation found significant.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct ProposedEvent {
@@ -318,6 +340,9 @@ pub struct Interpretation {
     pub topics: Vec<String>,
     #[serde(default)]
     pub events: Vec<ProposedEvent>,
+    /// Voices the conversation names (see the prompt's speaker rule).
+    #[serde(default)]
+    pub speakers: Vec<ProposedSpeaker>,
 }
 
 fn nullable(ty: &str) -> Value {
@@ -404,10 +429,25 @@ pub fn interpret_schema() -> Value {
                     "required": ["title", "date", "time", "end_date", "all_day", "details", "confidence"],
                     "additionalProperties": false
                 }
+            },
+            "speakers": {
+                "type": "array",
+                "description": "voices the conversation itself names; empty unless it is clear",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string", "description": "the line label, e.g. \"them 2\"" },
+                        "name": { "type": "string" },
+                        "confidence": { "type": "number" },
+                        "reason": { "type": "string" }
+                    },
+                    "required": ["label", "name", "confidence", "reason"],
+                    "additionalProperties": false
+                }
             }
         },
         "required": ["title", "summary", "low_signal", "node_id", "new_project", "new_topic",
-                     "decisions", "action_items", "topics", "events"],
+                     "decisions", "action_items", "topics", "events", "speakers"],
         "additionalProperties": false
     })
 }
@@ -560,10 +600,21 @@ pub fn interpret_request_with(
     model: Option<String>,
     media_titles: &HashMap<String, String>,
 ) -> Request {
-    interpret_request_full(tree, chunk, prior, now, model, media_titles, "")
+    interpret_request_full(
+        tree,
+        chunk,
+        prior,
+        now,
+        model,
+        media_titles,
+        "",
+        &SpeakerMap::new(),
+    )
 }
 
-/// [`interpret_request_with`] plus the [`series_hint`] (the scheduler's request).
+/// [`interpret_request_with`] plus the [`series_hint`] and the stored voices for the
+/// transcript's speaker labels (`Store::speakers`; the scheduler's request).
+#[allow(clippy::too_many_arguments)]
 pub fn interpret_request_full(
     tree: &[Node],
     chunk: &Chunk,
@@ -572,6 +623,7 @@ pub fn interpret_request_full(
     model: Option<String>,
     media_titles: &HashMap<String, String>,
     series: &str,
+    speakers: &SpeakerMap,
 ) -> Request {
     let user = render(
         INTERPRET_USER,
@@ -586,10 +638,11 @@ pub fn interpret_request_full(
             ("series", series),
             (
                 "transcript",
-                &strip_delimiters(&render_transcript_titled(
+                &strip_delimiters(&render_transcript_full(
                     &chunk.segments,
                     &Local,
                     media_titles,
+                    speakers,
                 )),
             ),
         ],
@@ -1122,6 +1175,10 @@ fn apply_interpretation_in_tx(
             store.delete_event(old.id)?;
         }
     }
+    // voices the conversation named (never from media, never in a low-signal episode)
+    if !interp.low_signal && media.is_none() {
+        apply_speaker_names(store, chunk, &interp.speakers, run_id, now_ms)?;
+    }
     let Some(episode) = store.episode(episode_id)? else {
         return Err(StoreError::Io(std::io::Error::other(
             "the episode vanished while being written",
@@ -1132,6 +1189,93 @@ fn apply_interpretation_in_tx(
         new_nodes,
         events,
     })
+}
+
+/// The voice a proposed label means: one of the voices heard in `chunk` whose line label (as
+/// the transcript rendered it, [`speaker_label`]) is `label`, case- and spacing-insensitively.
+/// Only voices of this chunk; `None` for "me", "them" / lane labels and unknown labels.
+pub fn resolve_speaker_label(label: &str, chunk: &Chunk, speakers: &SpeakerMap) -> Option<i64> {
+    let want = name_key(label);
+    if want.is_empty() {
+        return None;
+    }
+    chunk
+        .segments
+        .iter()
+        .filter(|r| r.echo_of.is_none())
+        .filter_map(|r| {
+            r.speaker_id
+                .and_then(|id| speakers.get(&id))
+                .map(|s| (s, r.source))
+        })
+        .find(|(s, source)| !s.is_me && name_key(&speaker_label(Some(s), *source)) == want)
+        .map(|(s, _)| s.id)
+}
+
+/// Store the names the interpretation gave voices of this chunk: only at ≥
+/// [`SPEAKER_NAME_MIN_CONFIDENCE`], never the user's own voice, never over a name the USER
+/// gave, and over an earlier brain name only with a higher confidence
+/// (`Store::set_speaker_name`). Each naming is a `speaker_name` change (undoable). Returns
+/// how many voices were named.
+pub fn apply_speaker_names(
+    store: &Store,
+    chunk: &Chunk,
+    proposed: &[ProposedSpeaker],
+    run_id: Option<i64>,
+    now_ms: i64,
+) -> Result<usize, StoreError> {
+    if proposed.is_empty() {
+        return Ok(0);
+    }
+    let speakers: SpeakerMap = store.speakers()?.into_iter().map(|s| (s.id, s)).collect();
+    let mut named = 0;
+    for p in proposed {
+        if !p.confidence.is_finite() || p.confidence < SPEAKER_NAME_MIN_CONFIDENCE {
+            continue;
+        }
+        let name: String = p
+            .name
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(SPEAKER_NAME_MAX_CHARS)
+            .collect();
+        let name = strip_delimiters(name.trim());
+        let lower = name.to_lowercase();
+        if name.is_empty() || matches!(lower.as_str(), "me" | "them" | "unknown" | "media") {
+            continue;
+        }
+        let Some(id) = resolve_speaker_label(&p.label, chunk, &speakers) else {
+            continue;
+        };
+        let Some(before) = speakers.get(&id) else {
+            continue;
+        };
+        let confidence = p.confidence.min(1.0) as f32;
+        if store.set_speaker_name(id, Some(&name), NameSource::Brain, Some(confidence))? {
+            named += 1;
+            store.record_change(
+                run_id,
+                "speaker_name",
+                &format!("Named voice {id} “{name}” from the conversation"),
+                &json!({
+                    "speaker_id": id,
+                    "name": before.name,
+                    "name_source": before.name_source.map(NameSource::as_str),
+                    "name_confidence": before.name_confidence,
+                }),
+                &json!({
+                    "speaker_id": id,
+                    "name": name,
+                    "confidence": confidence,
+                    "reason": p.reason.trim(),
+                }),
+                now_ms,
+            )?;
+        }
+    }
+    Ok(named)
 }
 
 // ---- categorisation (tier 0) --------------------------------------------------------------
@@ -1177,16 +1321,25 @@ pub fn categorise_request(
     now: &DateTime<Local>,
     model: Option<String>,
 ) -> Request {
+    categorise_request_with(tree, segments, now, model, &SpeakerMap::new())
+}
+
+/// [`categorise_request`] with speaker labels (the same as the interpretation's transcript).
+pub fn categorise_request_with(
+    tree: &[Node],
+    segments: &[TranscriptRow],
+    now: &DateTime<Local>,
+    model: Option<String>,
+    speakers: &SpeakerMap,
+) -> Request {
     let mut lines = String::new();
     for s in segments {
+        let who = speaker_label(s.speaker_id.and_then(|id| speakers.get(&id)), s.source);
         lines.push_str(&format!(
             "#{} [{}] {}: {}\n",
             s.id,
             clock(s.started_at, &Local),
-            match s.source {
-                oats_core::AudioSourceKind::Mic => "me",
-                oats_core::AudioSourceKind::System => "them",
-            },
+            strip_delimiters(&who.split_whitespace().collect::<Vec<_>>().join(" ")),
             strip_delimiters(s.text.trim())
         ));
     }
@@ -1791,6 +1944,34 @@ pub fn undo_change(store: &Store, change_id: i64) -> Result<bool, StoreError> {
             }
             None => false,
         },
+        // only while the voice still carries that brain name (the user renamed it since: no)
+        "speaker_name" => {
+            let after: Value = serde_json::from_str(&c.after_json)?;
+            match id("speaker_id")
+                .map(|s| store.speaker(s))
+                .transpose()?
+                .flatten()
+            {
+                Some(s)
+                    if s.name_source == Some(NameSource::Brain)
+                        && s.name.as_deref() == after.get("name").and_then(|v| v.as_str()) =>
+                {
+                    store.restore_speaker_name(
+                        s.id,
+                        before.get("name").and_then(|v| v.as_str()),
+                        before
+                            .get("name_source")
+                            .and_then(|v| v.as_str())
+                            .and_then(NameSource::parse),
+                        before
+                            .get("name_confidence")
+                            .and_then(|v| v.as_f64())
+                            .map(|c| c as f32),
+                    )?
+                }
+                _ => false,
+            }
+        }
         _ => false,
     };
     if ok {
@@ -2595,5 +2776,206 @@ mod tests {
         assert!(!undo_change(&s, c).unwrap());
         assert!(!s.change(c).unwrap().unwrap().undone);
         assert_eq!(s.node(a.id).unwrap().unwrap().parent_id, Some(work));
+    }
+
+    /// A call with a named voice (Priya, user-named), an anonymous one ("them 2") and the
+    /// user's own ("me").
+    fn speaker_chunk() -> (Store, Vec<Node>, Chunk, i64, i64, i64) {
+        let s = Store::open_in_memory().unwrap();
+        let sid = s.begin_session(0, "e").unwrap();
+        let v = |seed: f32| -> Vec<f32> { (0..8).map(|i| (i as f32 + seed).sin()).collect() };
+        let me = s.insert_speaker(&v(1.0), 100.0, 100.0, 0).unwrap();
+        s.set_speaker_me(me).unwrap();
+        let priya = s.insert_speaker(&v(2.0), 10.0, 0.0, 0).unwrap();
+        s.set_speaker_name(priya, Some("Priya"), NameSource::User, None)
+            .unwrap();
+        let anon = s.insert_speaker(&v(3.0), 10.0, 0.0, 0).unwrap();
+        let src = oats_core::AudioSourceKind::System;
+        let mic = oats_core::AudioSourceKind::Mic;
+        let rows = vec![
+            s.insert_segment_full(
+                sid,
+                1_000,
+                3_000,
+                "Cody, can you take the export?",
+                None,
+                mic,
+                None,
+                Some(me),
+            )
+            .unwrap(),
+            s.insert_segment_full(
+                sid,
+                4_000,
+                6_000,
+                "Sure, I'll do it by Friday.",
+                None,
+                src,
+                None,
+                Some(anon),
+            )
+            .unwrap(),
+            s.insert_segment_full(
+                sid,
+                7_000,
+                9_000,
+                "And I review it.",
+                None,
+                src,
+                None,
+                Some(priya),
+            )
+            .unwrap(),
+        ];
+        let tree = s.nodes().unwrap();
+        let chunk = Chunk {
+            started_at: 1_000,
+            ended_at: 9_000,
+            segments: rows,
+        };
+        (s, tree, chunk, me, priya, anon)
+    }
+
+    fn with_speakers(speakers: serde_json::Value) -> Interpretation {
+        parse_interpretation(&json!({
+            "title": "Export handover", "summary": "x", "low_signal": false, "node_id": null,
+            "new_project": null, "new_topic": null, "decisions": [], "action_items": [],
+            "topics": [], "events": [], "speakers": speakers
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_transcript_carries_speaker_labels() {
+        let (s, tree, chunk, ..) = speaker_chunk();
+        let map: SpeakerMap = s
+            .speakers()
+            .unwrap()
+            .into_iter()
+            .map(|x| (x.id, x))
+            .collect();
+        let req = interpret_request_full(
+            &tree,
+            &chunk,
+            None,
+            &Local::now(),
+            None,
+            &HashMap::new(),
+            "",
+            &map,
+        );
+        assert!(
+            req.user_prompt.contains("] me: Cody, can you"),
+            "{}",
+            req.user_prompt
+        );
+        assert!(
+            req.user_prompt.contains("] them 3: Sure"),
+            "{}",
+            req.user_prompt
+        );
+        assert!(
+            req.user_prompt.contains("] Priya: And I review"),
+            "{}",
+            req.user_prompt
+        );
+        let cat = categorise_request_with(&tree, &chunk.segments, &Local::now(), None, &map);
+        assert!(
+            cat.user_prompt.contains("] them 3: Sure"),
+            "{}",
+            cat.user_prompt
+        );
+        assert!(INTERPRET_SYSTEM.contains("`them 2:`"));
+        assert!(
+            interpret_schema()["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("speakers"))
+        );
+    }
+
+    #[test]
+    fn a_clear_clue_names_an_anonymous_voice_and_undo_restores_it() {
+        let (s, tree, chunk, me, priya, anon) = speaker_chunk();
+        let interp = with_speakers(json!([
+            {"label": "them 3", "name": "Cody", "confidence": 0.9,
+             "reason": "addressed as Cody, then answered"},
+            // too unsure, the user's own voice, a user-named voice: all ignored
+            {"label": "them 3", "name": "Cory", "confidence": 0.5, "reason": "?"},
+            {"label": "me", "name": "Alex", "confidence": 1.0, "reason": "x"},
+            {"label": "Priya", "name": "Pria", "confidence": 1.0, "reason": "x"},
+            {"label": "them 77", "name": "Nobody", "confidence": 1.0, "reason": "x"}
+        ]));
+        apply_interpretation(
+            &s, &tree, &chunk, &interp, None, "sonnet", None, None, 3, 10,
+        )
+        .unwrap();
+        let get = |id: i64| s.speaker(id).unwrap().unwrap();
+        assert_eq!(get(anon).name.as_deref(), Some("Cody"));
+        assert_eq!(get(anon).name_source, Some(NameSource::Brain));
+        assert_eq!(get(priya).name.as_deref(), Some("Priya"));
+        assert_eq!(get(me).name, None);
+        let changes = s.changes(10).unwrap();
+        let named: Vec<_> = changes
+            .iter()
+            .filter(|c| c.kind == "speaker_name")
+            .collect();
+        assert_eq!(named.len(), 1);
+
+        // a later, LESS confident brain name doesn't replace it; a more confident one does
+        let lower = with_speakers(json!([
+            {"label": "Cody", "name": "Cole", "confidence": 0.85, "reason": "x"}
+        ]));
+        apply_interpretation(&s, &tree, &chunk, &lower, None, "sonnet", None, None, 3, 20).unwrap();
+        assert_eq!(get(anon).name.as_deref(), Some("Cody"));
+
+        assert!(undo_change(&s, named[0].id).unwrap());
+        assert_eq!(get(anon).name, None);
+        assert!(!undo_change(&s, named[0].id).unwrap());
+    }
+
+    #[test]
+    fn undo_leaves_a_name_the_user_gave_since() {
+        let (s, tree, chunk, _, _, anon) = speaker_chunk();
+        let interp = with_speakers(json!([
+            {"label": "them 3", "name": "Cody", "confidence": 0.95, "reason": "intro"}
+        ]));
+        apply_interpretation(
+            &s, &tree, &chunk, &interp, None, "sonnet", None, None, 3, 10,
+        )
+        .unwrap();
+        s.set_speaker_name(anon, Some("Cody Banks"), NameSource::User, None)
+            .unwrap();
+        let c = s
+            .changes(5)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.kind == "speaker_name")
+            .unwrap();
+        assert!(!undo_change(&s, c.id).unwrap());
+        assert_eq!(
+            s.speaker(anon).unwrap().unwrap().name.as_deref(),
+            Some("Cody Banks")
+        );
+        // and a brain name never replaces the user's
+        apply_interpretation(
+            &s,
+            &tree,
+            &chunk,
+            &with_speakers(json!([
+                {"label": "Cody Banks", "name": "Cody", "confidence": 1.0, "reason": "x"}
+            ])),
+            None,
+            "sonnet",
+            None,
+            None,
+            3,
+            30,
+        )
+        .unwrap();
+        assert_eq!(
+            s.speaker(anon).unwrap().unwrap().name.as_deref(),
+            Some("Cody Banks")
+        );
     }
 }

@@ -138,7 +138,7 @@ fn migrates_a_realistic_v1_file_keeping_every_row_and_id() -> R {
     let v1 = write_v1(&path);
 
     let s = Store::open(&path)?;
-    assert_eq!(s.meta("schema_version")?.as_deref(), Some("9"));
+    assert_eq!(s.meta("schema_version")?.as_deref(), Some("10"));
 
     // categories became root nodes with the same ids, in position order; nothing re-seeded
     let cats = s.categories()?;
@@ -1262,5 +1262,42 @@ fn events_of_a_reset_episode_are_not_adopted_by_the_next_episode() -> R {
         b.id,
         a.id
     );
+    Ok(())
+}
+
+#[test]
+fn a_v9_database_gains_speakers_and_a_newer_one_is_refused()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("oats-v9-speakers-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("oats.sqlite");
+    {
+        let s = Store::open(&path)?;
+        let session = s.begin_session(0, "test")?;
+        s.insert_segment(session, 0, 1000, "before speakers", None)?;
+    }
+    {
+        // make it look like a v9 file: no speakers table, no speaker_id column
+        let c = rusqlite::Connection::open(&path)?;
+        c.execute_batch(
+            "DROP INDEX segments_speaker;
+             ALTER TABLE segments DROP COLUMN speaker_id;
+             DROP TABLE speakers;
+             UPDATE meta SET value = '9' WHERE key = 'schema_version';",
+        )?;
+    }
+    let s = Store::open(&path)?;
+    assert_eq!(s.meta("schema_version")?.as_deref(), Some("10"));
+    assert!(s.speakers()?.is_empty());
+    let rows = s.segments_between(0, 10_000)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].speaker_id, None);
+    s.set_meta("schema_version", "11")?;
+    drop(s);
+    assert!(matches!(
+        Store::open(&path),
+        Err(oats_core::StoreError::SchemaTooNew(11))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }

@@ -14,7 +14,7 @@ use oats_core::{Event, MediaPlay, Node, SearchResults, TranscriptRow};
 use crate::notes::{NotesAction, NotesState, chip_max, episode_card, node_path};
 use crate::sidebar::{HeaderIcon, header_icon};
 use crate::theme::Tokens;
-use crate::transcript::{clock, day_heading, day_of, source_label, source_tag};
+use crate::transcript::{clock, day_heading, day_of};
 
 /// Hits per section.
 pub const SEARCH_LIMIT: i64 = 200;
@@ -298,7 +298,8 @@ fn marked_label(
 fn transcript_hit(ui: &mut egui::Ui, t: &Tokens, row: &TranscriptRow, hl: &str) -> bool {
     clickable_row(ui, t, ui.id().with(("hit-seg", row.id)), |ui| {
         ui.add_space(8.0);
-        let tag = source_label(row);
+        let voices = crate::speakers::map(ui.ctx());
+        let tag = crate::speakers::row_label(row, &voices);
         let (time_rect, _) = ui.allocate_exact_size(
             vec2(60.0, if tag.is_some() { 32.0 } else { 18.0 }),
             Sense::hover(),
@@ -311,12 +312,8 @@ fn transcript_hit(ui: &mut egui::Ui, t: &Tokens, row: &TranscriptRow, hl: &str) 
             t.text_tertiary,
         );
         if let Some(tag) = tag {
-            source_tag(
-                ui,
-                t,
-                pos2(time_rect.left() + 4.0, time_rect.top() + 18.0),
-                tag,
-            );
+            let (at, max_w) = crate::speakers::tag_pos(time_rect);
+            crate::speakers::paint_tag(ui, t, at, &tag, max_w);
         }
         ui.vertical(|ui| {
             ui.set_width((ui.available_width() - 44.0).max(60.0));

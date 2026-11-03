@@ -14,6 +14,8 @@
 //!   loudness envelopes BEFORE the model runs, and the system-audio ring it reads — pure.
 //! - [`media`]: what plays on the system lane (YouTube, music, a call, …), the stamp its
 //!   segments carry, the YouTube / music policy and the feed the media resolver writes.
+//! - [`speakers`]: the voiceprint book — matches a speaker embedding to a known voice (cosine
+//!   distance to running centroids) or opens a new one — pure.
 //! - [`paths`]: where the database and logs live.
 //!
 //! The engine implementation (`oats-engine-fluidaudio` on macOS) and the audio capture
@@ -28,21 +30,23 @@ pub mod media;
 pub mod paths;
 pub mod pipeline;
 pub mod segmenter;
+pub mod speakers;
 pub mod store;
 pub mod when;
 
 pub use echo::DedupMode;
 pub use echo_audio::EchoAudioMode;
 pub use engine::{
-    AudioChunk, AudioSourceKind, EngineError, EngineFactory, NullEngine, SAMPLE_RATE, SpeechEngine,
-    Transcription, VadFrame,
+    AudioChunk, AudioSourceKind, EngineError, EngineFactory, NullEngine, SAMPLE_RATE, SpeakerSpan,
+    SpeechEngine, Transcription, VadFrame,
 };
 pub use media::{
     MediaClass, MediaFeed, MediaPlay, MediaPolicy, MediaStamp, ProducerClass, ProducerOverride,
     ProducerSeen,
 };
-pub use pipeline::{Pipeline, PipelineEvent, PipelineHandle, PipelineStatus};
+pub use pipeline::{Pipeline, PipelineEvent, PipelineHandle, PipelineStatus, SpeakerStats};
 pub use segmenter::{Segment, Segmenter, SegmenterConfig};
+pub use speakers::{Assignment, NameSource, Speaker, SpeakerBook, SpeakerEntry, speaker_label};
 pub use store::{
     ActionItem, BrainRun, Change, Decision, Episode, EpisodeContent, Event, NewEvent, NewTodo,
     Node, NodeKind, Note, NoteItem, Origin, RunOutcome, SearchResults, Session, Store, StoreError,

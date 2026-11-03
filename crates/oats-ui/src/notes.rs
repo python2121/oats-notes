@@ -1027,6 +1027,7 @@ fn brain_strip(
                         | "node_description"
                         | "episode_node"
                         | "episode_low_signal"
+                        | "speaker_name"
                 );
             ui.horizontal(|ui| {
                 ui.add_space(16.0);

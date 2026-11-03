@@ -1,4 +1,5 @@
-//! The macOS speech engine: Parakeet TDT v3 (ASR) and Silero VAD, both on CoreML / the Neural
+//! The macOS speech engine: Parakeet TDT v3 (ASR), Silero VAD and per-segment speaker
+//! embeddings (pyannote segmentation + WeSpeaker), all on CoreML / the Neural
 //! Engine, through FluidAudio (`fluidaudio-rs`, vendored in `vendor/fluidaudio-rs` with a
 //! stateful VAD stream added; see its `VENDORED.md`). On other platforms this crate still exports
 //! [`factory`], whose engine is [`oats_core::EngineError::Unavailable`], so the app compiles everywhere.
@@ -30,7 +31,9 @@ pub fn factory() -> EngineFactory {
 #[cfg(target_os = "macos")]
 mod mac {
     use fluidaudio_rs::{FluidAudio, VadStream};
-    use oats_core::{AudioSourceKind, EngineError, SpeechEngine, Transcription, VadFrame};
+    use oats_core::{
+        AudioSourceKind, EngineError, SpeakerSpan, SpeechEngine, Transcription, VadFrame,
+    };
 
     /// Silero VAD chunk in FluidAudio: `VadManager.chunkSize = 4096` (256 ms at 16 kHz), from
     /// `Sources/FluidAudio/VAD/VadManager.swift` in FluidAudio 0.14.8; the vendored bridge's
@@ -54,6 +57,9 @@ mod mac {
         chip: String,
         vad_loaded: bool,
         asr_loaded: bool,
+        /// Speaker segmentation + embedding models: `None` = not tried yet, `Some(false)` =
+        /// failed to load (a warning; transcription carries on without speakers).
+        speakers_loaded: Option<bool>,
     }
 
     impl std::fmt::Debug for FluidAudioEngine {
@@ -62,6 +68,7 @@ mod mac {
                 .field("chip", &self.chip)
                 .field("vad_loaded", &self.vad_loaded)
                 .field("asr_loaded", &self.asr_loaded)
+                .field("speakers_loaded", &self.speakers_loaded)
                 .finish_non_exhaustive()
         }
     }
@@ -80,6 +87,7 @@ mod mac {
                 chip,
                 vad_loaded: false,
                 asr_loaded: false,
+                speakers_loaded: None,
             })
         }
 
@@ -107,6 +115,7 @@ mod mac {
             "Swift bridge error: ",
             "transcription failed: ",
             "VAD process samples failed: ",
+            "speaker embedding failed: ",
         ] {
             if let Some(rest) = s.strip_prefix(prefix) {
                 s = rest.to_owned();
@@ -140,6 +149,24 @@ mod mac {
                     .map_err(|e| EngineError::Load(format!("ASR: {e}")))?;
                 self.asr_loaded = true;
                 log::info!("FluidAudio ASR (Parakeet TDT v3) loaded");
+            }
+            if self.speakers_loaded.is_none() {
+                // never an engine failure: transcription must not depend on speaker models
+                status("Loading speaker models…".to_owned());
+                let t = std::time::Instant::now();
+                match self.fluid.init_speaker_embed() {
+                    Ok(()) => {
+                        self.speakers_loaded = Some(true);
+                        log::info!(
+                            "FluidAudio speaker models (pyannote segmentation + WeSpeaker) loaded in {} ms",
+                            t.elapsed().as_millis()
+                        );
+                    }
+                    Err(e) => {
+                        self.speakers_loaded = Some(false);
+                        log::warn!("speaker models failed to load, speakers are off: {e}");
+                    }
+                }
             }
             Ok(())
         }
@@ -194,6 +221,26 @@ mod mac {
                 confidence,
                 processing_ms: r.processing_time * 1000.0,
             })
+        }
+
+        fn speaker_spans(&mut self, samples: &[f32]) -> Result<Vec<SpeakerSpan>, EngineError> {
+            if self.speakers_loaded != Some(true) {
+                return Ok(Vec::new());
+            }
+            let spans = self
+                .fluid
+                .speaker_spans(samples)
+                .map_err(|e| EngineError::Speakers(bridge_reason(&e)))?;
+            let ms = |s: f32| (f64::from(s) * 1000.0).round() as i64;
+            Ok(spans
+                .into_iter()
+                .map(|s| SpeakerSpan {
+                    start_ms: ms(s.start),
+                    end_ms: ms(s.end),
+                    speech_ms: ms(s.speech),
+                    embedding: s.embedding,
+                })
+                .collect())
         }
     }
 }

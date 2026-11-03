@@ -30,15 +30,15 @@ one engine crate and one status crate against those contracts, and nothing else 
 never changes.
 
 ```
-crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, echo rules (text + audio), `when` date parser, paths  (no platform code)
+crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, echo rules (text + audio), speaker voiceprint matching (`speakers`), `when` date parser, paths  (no platform code)
 crates/oats-brain              the brain: `claude` CLI wrapper, episode cutting, prompts (prompts/*.md), hotword commands, tiered scheduler  (no platform code)
 crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mic/system + own FIR resampler: microphone (InputPolicy, MicMode plain | voice processing) and system audio (SystemCapture); the voice-command ding (chime)
-crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
+crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) + per-segment speaker embeddings (pyannote segmentation + WeSpeaker) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
 crates/oats-status-macos       macOS status item: tray-icon (muda menu), template waveform icon (THE other swappable crate)
 crates/oats-ui                 eframe shell: theme (SF Pro from the system), native menu bar (muda), sidebar tree, transcript / All notes / Calendar (month grid) / Todos / Media views, node view (notes + projects), reminder + confirmation pop-ups, drag-to-merge (merge.rs)
 apps/oats-notes                the binary: wires engine + audio + store + status item + brain + UI
-vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI; NOT a workspace member
+vendor/fluidaudio-rs           vendored, pinned fluidaudio-rs 0.14.8 (MIT) + our stateful VAD FFI and speaker-span FFI; NOT a workspace member
 vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crates-io] + an explicit loopback stream and a voice-processing input stream (macOS); NOT a workspace member
 ```
 
@@ -539,7 +539,10 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   Media is never merged with conversation. System audio is a continuity signal: in a chunk that already has system
   segments, a further system segment continues it across up to twice the gap (calls pause).
   Echoes never take part. `render_transcript` writes `[HH:MM] me: …` / `[HH:MM] them: …`
-  (mic / system; echoes left out); the categorise prompt uses the same prefixes.
+  (mic / system; echoes left out); `render_transcript_full(…, speakers)` (the scheduler's, via
+  `interpret_request_full(…, speakers)` / `categorise_request_with`) labels a line by its voice
+  instead (`oats_core::speaker_label`: `Priya:`, `them 2:`, `voice 3:`, `me:`); the categorise
+  prompt uses the same labels.
 - `interpret`: prompts in `crates/oats-brain/prompts/*.md` (`include_str!`; edit the text,
   rebuild) — `interpret.*` (episode → title, markdown summary, filing into an existing node or
   a proposed project/topic, decisions, action items, topics, significant dates; `low_signal`
@@ -713,12 +716,15 @@ through the REAL CLI (a few cents) — the end-to-end check.
 `vad_frame_len()` / `vad(samples)` (cheap, runs all day; `None` = the core's energy VAD is used),
 `vad_lane(lane, samples)` (per-lane VAD state; the default forwards to `vad`; FluidAudio keeps
 one `VadStream` per lane — the mic's made by `load`, the system's on its first chunk),
-`transcribe(samples)` (one closed segment, ≤ ~30 s, stateless between calls). Engines are built
+`transcribe(samples)` (one closed segment, ≤ ~30 s, stateless between calls), `speaker_spans(samples)`
+(default `Ok(vec![])`: the local speakers of one closed segment, `SpeakerSpan { start_ms, end_ms,
+speech_ms, embedding }`, no clustering across calls — see "Speakers"). Engines are built
 on the pipeline's own thread via an `EngineFactory`, so they need not be `Send`
 (`fluidaudio_rs::VadStream` isn't). The pipeline calls `vad` once per `vad_frame_len()` frame
 as audio arrives. FluidAudio's engine runs each 4096-sample frame through a stateful Silero
 stream (`FluidAudio::vad_stream_start`, LSTM state carried across calls): one inference per
-256 ms, no context re-feed. The contract has no session boundary, so that state also carries
+256 ms, no context re-feed. `load` loads the speaker models last ("Loading speaker models…");
+their failure is a logged warning, never an engine failure (`speaker_spans` then returns nothing). The contract has no session boundary, so that state also carries
 across a listen stop/start (harmless: Silero re-converges within a few chunks). `NullEngine` runs the whole app without a model
 (`OATS_ENGINE=null`): energy VAD, placeholder "transcripts".
 
@@ -749,6 +755,8 @@ OATS_CLAUDE_BIN=/path/claude OATS_CLAUDE_MODEL=haiku OATS_INTERPRET_EVERY_MIN=5 
 OATS_CLAUDE_PASS_PROXY=1 …                # pass HTTPS_PROXY / HTTP_PROXY / NO_PROXY / ANTHROPIC_BASE_URL through to claude (off by default)
 cargo run --release -p oats-engine-fluidaudio --example vad_parity -- long.wav   # stateful VAD stream vs FluidAudio's batch VAD, chunk by chunk (expect 100 % / delta 0)
 cargo run -p oats-engine-fluidaudio --example transcribe_wav -- speech.wav        # engine end to end on a WAV (load, VAD, transcribe)
+cargo run --release -p oats-engine-fluidaudio --example speakers_wav -- two.wav [--piece 5]   # speaker spans per piece, pairwise cosine distances, ms per 10 s vs transcription
+OATS_SPEAKERS=on|off …                    # speaker recognition (overrides the Preferences switch; default on)
 cargo run -p oats-brain --example interpret_demo   # real claude call: a fake meeting + "hey computer" command, prints the structured results and cost
 swift scripts/generate_icon.swift         # regenerate assets/icon_1024.png
 ```
@@ -790,6 +798,75 @@ that matches (`notes::focus_card`, run for every laid-out `episode_card`) consum
 fades). Search-result clicks on a note use the same path.
 Selftest: `--selftest out.png --topic "Q4 roadmap"`.
 
+## Speakers (`oats-core::speakers`, `store_speakers.rs`, pipeline, `oats-ui::speakers`, brain)
+
+Who said a line, with a voiceprint per person KEPT across sessions. Design: the engine only
+returns embeddings; matching and storage are ours (pure, tested, portable).
+- **Engine**: `SpeechEngine::speaker_spans` (see the contract). FluidAudio: the vendored
+  bridge's `SpeakerEmbed_ffi.swift` (VENDORED.md modification 4) runs pyannote segmentation over
+  10 s windows (≤ 3 local speakers each) and WeSpeaker once per active local speaker; audio
+  under 4 s skips segmentation (one embedding, all-ones mask). Models from HF
+  `FluidInference/speaker-diarization-coreml` into `~/Library/Application Support/FluidAudio`.
+- **Matching** (`oats_core::speakers`, pure): ONE global `SpeakerBook` (a person is the same on
+  either lane). Cosine distance to every centroid (plain f32 loop): ≤ `ASSIGN_THRESHOLD` 0.65 →
+  that voice; else a new voice when the span has ≥ `MIN_NEW_SPEAKER_SECS` 1 s, else none. The
+  centroid learns (weighted mean, re-normalised) only at ≤ `UPDATE_THRESHOLD` 0.45 and ≥ 2 s;
+  the history's weight is capped at `MAX_WEIGHT_SECS` 600 (the stored `speech_secs` total is
+  not capped). `dominant` = most speech seconds. Auto-me: with no `is_me` voice, the first with
+  ≥ `AUTO_ME_MIC_SECS` 60 s of MIC speech in total (`mic_secs`) becomes "me" (logged).
+- **Pipeline**: after transcription, only for non-echo segments with text, ≥ 1 s, and not
+  media on the system lane (a video's voices are nobody's voiceprint), while
+  `PipelineHandle::set_speakers(true)` (default `OATS_SPEAKERS`, else on; the UI sets it from
+  `AppPrefs::speakers`). The book loads from the store on the first such segment; a new voice
+  is inserted at once (its id), the segment's dominant voice goes into the SAME insert
+  (`Store::insert_segment_full`), changed centroids are flushed in one transaction at most every
+  60 s and at session end (`flush_speakers`). `PipelineHandle::reload_speakers()` (the UI after
+  the user's edits): flush, then reload before the next segment (a merged-away / forgotten
+  voice's pending update is a no-op UPDATE). `PipelineEvent::SpeakersChanged` (new voice,
+  auto-me) precedes the `Segment`; `Segment` rows carry `speaker_id`. Debug log per segment
+  ("speakers: 2 spans in 38 ms (… transcribed in … ms)"); `SpeakerStats` (`speaker_segments`,
+  `speaker_ms`, `transcribe_ms`, `assigned`, `speakers_created`, `failed`) logged at info at
+  session end, `PipelineHandle::speaker_stats()`.
+- **Store v10**: `speakers(id AUTOINCREMENT, name, name_source user|brain, name_confidence,
+  is_me, centroid BLOB f32 LE, speech_secs, mic_secs, created_at, last_heard_at)`,
+  `segments.speaker_id` (index `segments_speaker`), added in place by `ensure_speakers_schema`
+  (a v9 binary refuses v10: `SchemaTooNew`). API: `speakers`, `speaker`, `insert_speaker`,
+  `update_speaker_centroid` / `flush_speakers`, `set_speaker_name(id, name, source,
+  confidence)` (a brain name never replaces a user name, nor a brain name of higher or equal
+  confidence), `restore_speaker_name`, `set_speaker_me` (clears the others), `forget_speaker`
+  (row deleted, segments → NULL, WAL checkpoint), `merge_speakers(from, into)` (segments
+  repointed, centroids averaged by capped weight, counters summed, `into` keeps its name else
+  takes `from`'s).
+- **Labels** (`oats_core::speaker_label`, shared by UI and brain): `is_me` → "me" (wins over a
+  name); a name; else "them N" (system) / "voice N" (mic), N = the voice id (stable); no voice →
+  the lane ("me" / "them").
+- **UI**: the app loads the voices once into `OatsApp::speakers` (on `reload`, on
+  `SpeakersChanged`, on a segment naming an unknown voice, after its own edits) and publishes the
+  map on the egui context every frame (`speakers::publish` / `map`); rows resolve labels by
+  hash lookup (`speakers::row_label`). Transcript rows (and search hits) show the tag under the
+  time in the voice's stable colour (`Tokens::speaker_colour`, 6 muted hues); the user's own
+  mic lines keep no tag; a brain-named voice's hover reads "named from the conversation —
+  right-click to correct". Row context menu: "Speaker: <label> ▸" Name… (inline field; empty
+  clears), This is me, Merge into… (inline field resolved locally by
+  `speakers::resolve_voice`: "them 3" / "voice 3" / "#3" / "3" / exact name / unique prefix /
+  "me"), Forget this voice — each a toast, `speakers_edited` (reload + `pipeline.reload_speakers`).
+  Preferences: "Recognise speakers (keeps a voiceprint per person in the database)"
+  (`AppPrefs::speakers`, default on; greyed when `OATS_SPEAKERS` is set) and the "Speakers"
+  table under Apps (name field saved on blur/Enter, "me", last heard, minutes, Forget).
+  `--selftest out.png --listening` seeds me / Priya (brain-named) / "them 3" / "voice 4".
+- **Brain**: the interpret prompt explains the labels and asks for `speakers: [{label, name,
+  confidence, reason}]` only from clear conversational clues (address + reply,
+  self-introduction, a series' participant); in the schema (required, may be empty).
+  `apply_interpretation` (not for media / low-signal) → `apply_speaker_names`: confidence ≥
+  `SPEAKER_NAME_MIN_CONFIDENCE` 0.8, label resolved among THIS chunk's voices
+  (`resolve_speaker_label`), never "me", name one line ≤ 60 chars, stored `brain` via
+  `set_speaker_name` (higher confidence replaces an earlier brain name; a user name is never
+  replaced), plus a `speaker_name` change row — undoable (`undo_change` restores the previous
+  name only while the voice still carries that brain name). Hotwords unchanged (mic-only).
+- **Cost** (`docs/performance-2026-10-28.md`, 2026-11-03 addendum): ~45 ms per short segment,
+  ~65 ms per 10 s window on the M2 — roughly 0.6–1× the Parakeet time per segment (both
+  models take a fixed 10 s input), nothing while silent or for echoes / media.
+
 ## Database (`crates/oats-core/src/store.rs`)
 
 SQLite, WAL, one connection per thread (pipeline writes segments, the brain writes
@@ -805,7 +882,8 @@ nested transaction (`Store::with_savepoint`; outermost `BEGIN IMMEDIATE`, inner 
 `SAVEPOINT`, rolled back on error or panic). `episodes.id` is `AUTOINCREMENT` (an older table
 is rebuilt in place on open, same schema version), so a reset or merged episode's id is never
 handed to a later episode that would adopt its events.
-Schema version 9 (`meta.schema_version`; v9 removed the Media category — see "Media on the
+Schema version 10 (`meta.schema_version`; v10 added `speakers` + `segments.speaker_id` — see
+"Speakers" —, v9 removed the Media category — see "Media on the
 system lane" —, v7/v8 added the media tables, v6 re-keyed events; v5 added `episodes.user_edited_at`; a v1 file is migrated on open — `categories` become
 the root `nodes` with the same ids, `segments` is rebuilt — a v2 file gets two columns
 in place, `segments.source TEXT NOT NULL DEFAULT 'mic'` and `segments.echo_of INTEGER NULL`,
@@ -813,7 +891,7 @@ and a v3 file's `reminders` table is rebuilt as the todos, same ids, by
 `Store::ensure_todos_table`):
 `sessions`; `nodes` (ONE tree:
 `kind` category | project | topic, `parent_id`, `description`, `created_by` user | auto |
-hotword, `archived`; categories seeded Work/Admin/Personal); `segments` (`node_id` = most
+hotword, `archived`; categories seeded Work/Admin/Personal); `segments` (`speaker_id` = the dominant voice (v10), `node_id` = most
 specific node, `episode_id`, `interpreted_at`, `categorised`, `source` mic | system,
 `echo_of` = the system segment a mic segment repeats — echoes are left out of every listing:
 views, counts, `uninterpreted_*` / `uncategorised_*`, `segments_between`, `segments_of_episode`;
@@ -890,7 +968,7 @@ Brain: undo for node merges (recorded, not reversible yet), reminders that notif
 the window (macOS notifications; today they pop up in the window only), a week-start pref
 for the calendar, drag to reorder undated todos (`position` exists), prompt editing without
 a rebuild, per-tier
-budgets in the UI. Elsewhere: diarization (FluidAudio has it); system audio phase 5
+budgets in the UI. Elsewhere: speakers (built 2026-11-03, see "Speakers") — a cheaper per-segment speaker pass (cost is ~0.6–1× transcription), a speakers audit view; system audio phase 5
 (`docs/research-system-audio.md`: per-app taps and "which app is on the call" from the Core
 Audio process list, starting the lane only during calls, VPIO/AEC if text dedup is not
 enough), an input-device picker in the UI over `InputPolicy`, a "show echoes" audit view,

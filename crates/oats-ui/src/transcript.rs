@@ -27,6 +27,24 @@ pub enum TranscriptAction {
     Delete {
         segment: i64,
     },
+    /// "Speaker ▸ Name…": name a voice (empty clears the name).
+    SpeakerName {
+        speaker: i64,
+        name: String,
+    },
+    /// "Speaker ▸ This is me".
+    SpeakerMe {
+        speaker: i64,
+    },
+    /// "Speaker ▸ Merge into…": the voice the user typed (resolved by the app).
+    SpeakerMerge {
+        speaker: i64,
+        into: String,
+    },
+    /// "Speaker ▸ Forget this voice".
+    SpeakerForget {
+        speaker: i64,
+    },
     /// Load the page of rows before the first loaded one.
     LoadEarlier,
     /// Load the page of rows after the last loaded one (only after a jump: otherwise the
@@ -453,15 +471,6 @@ pub fn transcript_rows(
 /// Width of the time column.
 const TIME_W: f32 = 60.0;
 
-/// The small lane tag ("them") of a system-audio row, top-left at `at`.
-pub(crate) fn source_tag(ui: &egui::Ui, t: &Tokens, at: egui::Pos2, label: &str) {
-    let p = ui.painter();
-    let galley = p.layout_no_wrap(label.to_owned(), t.mono(8.5), t.accent);
-    let rect = Rect::from_min_size(at, galley.size() + vec2(8.0, 2.0));
-    p.rect_filled(rect, 3.0, t.accent_alpha(0.16));
-    p.galley(at + vec2(4.0, 1.0), galley, t.accent);
-}
-
 /// The label a row's lane gets in the list ("them" for system audio, "media" for a YouTube
 /// video / music on it, none for the microphone); echoes are never listed.
 pub fn source_label(row: &TranscriptRow) -> Option<&'static str> {
@@ -485,13 +494,15 @@ fn transcript_row(
     let fill = ui.painter().add(egui::Shape::Noop);
     let left = ui.max_rect().left();
     let right = ui.max_rect().right();
+    let voices = crate::speakers::map(ui.ctx());
     let inner = ui
         .horizontal_top(|ui| {
             ui.add_space(8.0);
-            let tag = source_label(row);
+            let tag = crate::speakers::row_label(row, &voices);
             let them = tag.is_some();
-            // "them" rows (system audio: the other side of a call) carry a small tag under
-            // the time; "me" rows (the microphone) look as they always did
+            // rows of anyone but the user (system audio, another voice on the microphone)
+            // carry a small speaker tag under the time; the user's own lines look as they
+            // always did
             let (time_rect, time_resp) = ui
                 .allocate_exact_size(vec2(TIME_W, if them { 32.0 } else { 18.0 }), Sense::hover());
             // a real (non-selectable) label so the time is also in the accessibility tree
@@ -509,13 +520,9 @@ fn transcript_row(
                 .wrap_mode(egui::TextWrapMode::Extend),
             );
             if let Some(tag) = tag {
-                source_tag(
-                    ui,
-                    t,
-                    pos2(time_rect.left() + 4.0, time_rect.top() + 18.0),
-                    tag,
-                );
-                time_resp.on_hover_text("them — system audio (what the computer played)");
+                let (at, max_w) = crate::speakers::tag_pos(time_rect);
+                crate::speakers::paint_tag(ui, t, at, &tag, max_w);
+                time_resp.on_hover_text(tag.hover);
             }
             let w = (ui.available_width() - 44.0).max(60.0);
             ui.vertical(|ui| {
@@ -568,6 +575,12 @@ fn transcript_row(
             ui.ctx().copy_text(row.text.clone());
             ui.close();
         }
+        if row.speaker_id.is_some_and(|id| voices.contains_key(&id)) {
+            ui.separator();
+            if let Some(a) = crate::speakers::speaker_menu(ui, row, &voices) {
+                actions.push(a);
+            }
+        }
         ui.separator();
         if ui.button("Delete").clicked() {
             actions.push(TranscriptAction::Delete { segment: row.id });
@@ -579,6 +592,9 @@ fn transcript_row(
             segment: row.id,
             text,
         });
+    }
+    if let Some(a) = crate::speakers::speaker_field(ui, t, row.id) {
+        actions.push(a);
     }
     ui.add_space(2.0);
     rect

@@ -117,6 +117,21 @@ impl Tokens {
         self.accent.gamma_multiply(alpha)
     }
 
+    /// A voice's stable colour (transcript speaker tags): the voice id hashed into six muted
+    /// hues in the accent's family (the accent itself first), lighter in the dark set.
+    pub fn speaker_colour(&self, id: i64) -> Color32 {
+        const DARK: [u32; 6] = [0x5b9bd5, 0x4fb3a5, 0xd4a35a, 0xc97a8f, 0x9d8bd6, 0x8bb36a];
+        const LIGHT: [u32; 6] = [0x2f74c0, 0x23867a, 0xa8742a, 0xa3506a, 0x6c58b0, 0x5a8738];
+        let palette = if self.dark { DARK } else { LIGHT };
+        // splitmix-style mix so neighbouring ids land on different hues
+        let mut x = id as u64 ^ 0x9e37_79b9_7f4a_7c15;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        let v = palette[(x % palette.len() as u64) as usize];
+        Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+    }
+
     /// Primary text at `alpha`.
     pub fn text_alpha(&self, alpha: f32) -> Color32 {
         self.text.gamma_multiply(alpha)

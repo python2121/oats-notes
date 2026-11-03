@@ -21,6 +21,7 @@ pub mod search;
 #[cfg(feature = "selftest")]
 pub mod selftest;
 pub mod sidebar;
+pub mod speakers;
 pub mod system_font;
 pub mod theme;
 pub mod thumbs;

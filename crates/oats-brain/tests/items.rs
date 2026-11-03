@@ -355,6 +355,7 @@ fn a_meeting_link_heard_on_an_earlier_day_makes_a_series() {
         None,
         &Default::default(),
         &hint,
+        &Default::default(),
     );
     assert!(req.user_prompt.contains("series: true"));
 

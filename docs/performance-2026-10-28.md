@@ -363,3 +363,35 @@ copy recognised acoustically and skipped before the model (3 empty echo rows, 0 
 `top` over 60 s: CPU mean 5.6 % of one core, p95 8.7 %, max 57.8 % (one transcription burst), energy
 impact 5.6 — down from 15.0 % mean / 34 % p95 in the earlier meeting sample where every echo was
 transcribed first. Same machine, same lanes, no builds running.
+
+## Addendum (2026-11-03): speaker recognition — what one segment costs
+
+Measured with `cargo run --release -p oats-engine-fluidaudio --example speakers_wav -- two-voices.wav --piece N`
+(this machine, models cached, warm; median of 3 runs over the whole file). The file: macOS
+`say` voices Daniel / Samantha / Daniel / Samantha, ~9 s each, 36.8 s in total. "Transcribe" is
+Parakeet on the same pieces, for comparison.
+
+| pieces (= segment length) | speaker spans | transcribe | speakers / transcribe |
+|---|---:|---:|---:|
+| 3 s (fast path: one embedding, no segmentation) | ~44 ms per piece (156 ms / 10 s) | ~74 ms per piece | 60 % |
+| 9.5 s (segmentation + one embedding per local speaker) | ~67 ms per piece (72 ms / 10 s) | ~98 ms per piece | 67 % |
+| 30 s (three 10 s windows) | 85 ms / 10 s | 81 ms / 10 s | ~100 % |
+
+- The cost is per CALL, not per second: both models take a fixed 10 s input (WeSpeaker a
+  3 × 160 000 batch), so a short segment costs nearly as much as a 10 s one. Segments under
+  4 s therefore skip the segmentation model (one embedding with an all-ones mask, FluidAudio's
+  `extractSpeakerEmbedding` approach): that halves the calls for the common short segment.
+- Compute units: FluidAudio's default `.all` was fastest; `.cpuAndNeuralEngine` was ~30 %
+  slower, `.cpuOnly` ~2.5× slower.
+- First call after load: 0.4–1.1 s (CoreML warm-up), once per process. Loading the two speaker
+  models: ~5 s (first ever: download + compile, ~20 s here).
+- It is NOT a small fraction of transcription: roughly 0.6–1× the Parakeet time per
+  segment. In absolute terms it is ~45–70 ms of model time per transcribed, non-echo segment
+  ≥ 1 s (nothing while silent, nothing for echoes, media or short blips). At the "continuous
+  speech" rate above (one segment per few seconds) that is an estimated +1–2 % of one core on
+  top of the 4.6 % mean; not yet profiled with `scripts/perf.sh`. The session log line
+  ("session N speakers: … segments in … ms (transcription of the same segments: … ms)")
+  gives the live ratio.
+- Separation on this file: same voice 0.07–0.09 cosine distance (whole turns) / 0.13–0.20
+  (3 s pieces); different voices 0.78–0.96; spans under 1 s land in between (0.35–0.45),
+  which is why they never open a voice.

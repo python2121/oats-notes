@@ -39,11 +39,16 @@ model only on closed speech segments.
 Everything stays on the machine. The database is owner-only on disk, in
 `~/Library/Application Support/OatsNotes`. The app makes no network calls of its own except:
 
-- the one-time speech model download (FluidAudio fetches Parakeet and Silero VAD from
-  Hugging Face on first run);
+- the one-time speech model downloads (FluidAudio fetches Parakeet, Silero VAD and the two
+  speaker-recognition models from Hugging Face on first run);
 - the `claude` CLI, which sends transcript text to Anthropic under your own Claude login when
   the brain runs (turn it off with `OATS_BRAIN=off` and the app is a plain transcriber);
 - YouTube thumbnails, only if you opt in under Preferences.
+
+Speaker recognition (Preferences, on by default; `OATS_SPEAKERS=off`) keeps a voiceprint per
+person heard — 256 numbers, in the local database only, never sent anywhere (the brain sees
+names and labels like "them 2", never voiceprints). Preferences ▸ Speakers lists them, with
+Forget.
 
 The brain child process gets a minimal environment, no tools, no project settings and its own
 empty working directory. `docs/security-review-2026-10-28.md` has the details.

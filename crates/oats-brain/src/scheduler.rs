@@ -1128,6 +1128,18 @@ impl Worker {
         r
     }
 
+    /// Every stored voice by id, for the transcript's speaker labels (one query per request;
+    /// a failure renders the lanes' `me:` / `them:` as before).
+    fn speaker_map(&self) -> oats_core::speakers::SpeakerMap {
+        match self.store.speakers() {
+            Ok(all) => all.into_iter().map(|s| (s.id, s)).collect(),
+            Err(e) => {
+                log::warn!("brain: could not read the voices: {e}");
+                Default::default()
+            }
+        }
+    }
+
     /// Re-read the user's name: `OATS_USER_NAME`, else the store's `meta.user_name`.
     fn refresh_user_name(&mut self) {
         let env = std::env::var("OATS_USER_NAME")
@@ -1488,7 +1500,14 @@ impl Worker {
         let ok = self
             .run_job(Tier::Reactive, "categorise", move |w, _| {
                 let tree = w.store.nodes().map_err(|e| e.to_string())?;
-                let req = interpret::categorise_request(&tree, &batch, &Local::now(), Some(model));
+                let speakers = w.speaker_map();
+                let req = interpret::categorise_request_with(
+                    &tree,
+                    &batch,
+                    &Local::now(),
+                    Some(model),
+                    &speakers,
+                );
                 let resp = w.call(&req).map_err(JobError::from)?;
                 let cat: interpret::Categorisation = resp
                     .structured
@@ -1584,6 +1603,7 @@ impl Worker {
                 Some(model.clone()),
                 &titles,
                 &series,
+                &w.speaker_map(),
             );
             let resp = w.call(&req).map_err(JobError::from)?;
             let interp = resp
@@ -1884,6 +1904,7 @@ impl Worker {
             Some(model.to_owned()),
             &titles,
             &series,
+            &self.speaker_map(),
         );
         let resp = match self.call(&req) {
             Ok(r) => r,
