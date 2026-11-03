@@ -46,7 +46,7 @@ vendor/cpal                    vendored cpal 0.18.2 (Apache-2.0) via [patch.crat
 
 Categories are folders. Selecting a category / project / topic (`View::Node(id)`) shows its
 path as the header, its child projects (topics, under a project) as clickable rows with note
-count and last activity, the notes (episode cards, `Store::episodes_under`, newest first) of
+count and last activity, the notes (`Store::episodes_under`, newest first, as collapsed rows — see the project landing page below) of
 the subtree, and "Show transcript (N segments)" — the raw segments filed under the subtree,
 collapsed by default (`NotesState::show_transcript`, reset on every view change). Transcripts
 (`View::Transcripts`, ⌘1; there is no Today view — old prefs saying `Today` / `All` load as it) stays a transcript view, paged by day (below); Conversations (`View::Notes`, name kept for the saved pref; ⌘3) shows only UNFILED episodes (`Store::episodes_unfiled`: no node or a top-level category, i.e. not under a project or topic; low-signal included); filed ones live on the project pages. The app menus are File, Edit, Listen, View, Brain (the one formerly titled "Notes" is now "Brain"). The sidebar shows a muted
@@ -67,7 +67,12 @@ card's action items carry the same checkbox and strike-through. Then "Notes": ev
 (the rest of the app is newest first), one collapsed 24 pt row each (triangle, date, time range,
 title, topic chips); a click toggles the full `episode_card` inline (`NotesState::open_notes`,
 not persisted; "Expand all · Collapse all"). Topics and the transcript toggle follow.
-Categories and topics keep the flat view.
+Categories and topics use the same layout (Next steps → child rows → collapsed Notes →
+transcript): Next steps are a subtree roll-up (`episodes_under` / `items_filed_under`); on a
+category each step carries a "→ Project" chip (`project_of`: the item's own node else the
+note's home, a topic mapped to its project; clickable → `SelectNode`; no chip on project /
+topic pages); an empty category skips the section (projects and topics keep "No next steps
+yet"); the Notes are the same collapsed rows (`project_notes`) of the whole subtree.
 
 **Cross-filed items and the click chain**: "Next steps" also lists, INLINE in the same list
 (sorted newest note first, deduped by note + text), the action items filed under this project

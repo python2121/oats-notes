@@ -263,6 +263,9 @@ pub fn run_with(
         if !app.selftest_show_node("Work") {
             return Err("no Work category in the seeded store".to_owned());
         }
+        if options.expanded {
+            app.selftest_expand_notes();
+        }
     } else if options.project {
         let app = harness.state_mut();
         let name = options.project_name.as_deref().unwrap_or("Export rewrite");

@@ -1542,7 +1542,6 @@ pub fn node_view(
     let t = Tokens::get(ui.ctx());
     let mut out = NodeViewOut::default();
     let children = child_summaries(nodes, node.id, episodes);
-    let this_year = chrono::Datelike::year(&Local::now());
     egui::ScrollArea::vertical()
         .id_salt("node-scroll")
         .auto_shrink([false, false])
@@ -1575,13 +1574,24 @@ pub fn node_view(
             }
             ui.add_space(8.0);
             let is_project = node.kind == oats_core::NodeKind::Project;
+            let is_category = node.kind == oats_core::NodeKind::Category;
             if is_project {
-                next_steps(ui, &t, state, episodes, filed, &mut out.notes);
+                next_steps(ui, &t, state, episodes, filed, nodes, false, &mut out.notes);
                 project_notes(ui, &t, state, episodes, nodes, &mut out.notes);
                 children_section(ui, &t, node, &children, &mut out);
             } else {
+                next_steps(
+                    ui,
+                    &t,
+                    state,
+                    episodes,
+                    filed,
+                    nodes,
+                    is_category,
+                    &mut out.notes,
+                );
                 children_section(ui, &t, node, &children, &mut out);
-                flat_notes(ui, &t, state, episodes, nodes, this_year, &mut out);
+                project_notes(ui, &t, state, episodes, nodes, &mut out.notes);
             }
             ui.add_space(8.0);
             let label = format!(
@@ -1673,49 +1683,6 @@ fn children_section(
     }
 }
 
-fn flat_notes(
-    ui: &mut egui::Ui,
-    t: &Tokens,
-    state: &mut NotesState,
-    episodes: &[Episode],
-    nodes: &[Node],
-    this_year: i32,
-    out: &mut NodeViewOut,
-) {
-    section_label(ui, t, "Notes");
-    if episodes.is_empty() {
-        ui.horizontal(|ui| {
-            ui.add_space(14.0);
-            ui.label(
-                RichText::new("No notes here yet.")
-                    .color(t.text_tertiary)
-                    .size(12.0),
-            );
-        });
-    }
-    ui.add_space(4.0);
-    let mut last_day = None;
-    for e in episodes {
-        let day = day_of(e.started_at, &Local);
-        if last_day != Some(day) {
-            last_day = Some(day);
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
-                ui.label(
-                    RichText::new(
-                        day.map(|d| day_heading(d, this_year))
-                            .unwrap_or_else(|| "Unknown date".to_owned()),
-                    )
-                    .font(crate::theme::font_medium(ui.ctx(), 12.5))
-                    .color(t.text_secondary),
-                );
-            });
-            ui.add_space(4.0);
-        }
-        episode_card(ui, t, state, e, nodes, &mut out.notes, "", None);
-    }
-}
-
 /// "29 Oct" in local time.
 pub fn short_date(ms: i64) -> String {
     crate::transcript::at(ms, &Local)
@@ -1734,6 +1701,22 @@ pub struct NextStep {
     pub started_at: i64,
     /// When the user ticked it complete (`None` = open).
     pub done_at: Option<i64>,
+    /// The project the step belongs to (its own `node_id` or the note's home, a topic mapped
+    /// to its project); `None` when it is only in a category or unfiled.
+    pub project_id: Option<i64>,
+}
+
+/// The project a node belongs to: itself for a project, the nearest project ancestor for a
+/// topic, `None` for a category or an unknown id.
+pub fn project_of(nodes: &[Node], node_id: i64) -> Option<&Node> {
+    let mut cur = nodes.iter().find(|n| n.id == node_id)?;
+    for _ in 0..=nodes.len() {
+        if cur.kind == oats_core::NodeKind::Project {
+            return Some(cur);
+        }
+        cur = nodes.iter().find(|n| Some(n.id) == cur.parent_id)?;
+    }
+    None
 }
 
 /// A project page's next steps: the action items of its own `episodes` (low-signal notes
@@ -1742,8 +1725,17 @@ pub struct NextStep {
 /// once (by note and text), each tagged with its source note. The open items come first,
 /// newest note first (a note's items in their order), then the completed ones, most recently
 /// completed first.
-pub fn collect_next_steps(episodes: &[Episode], filed: &[(Episode, NoteItem)]) -> Vec<NextStep> {
+pub fn collect_next_steps(
+    episodes: &[Episode],
+    filed: &[(Episode, NoteItem)],
+    nodes: &[Node],
+) -> Vec<NextStep> {
     let step = |e: &Episode, a: &ActionItem| NextStep {
+        project_id: a
+            .node_id
+            .or(e.node_id)
+            .and_then(|id| project_of(nodes, id))
+            .map(|p| p.id),
         text: a.text.clone(),
         owner: a.owner.clone(),
         due: a.due.clone(),
@@ -1809,16 +1801,24 @@ fn link(ui: &mut egui::Ui, t: &Tokens, text: &str, size: f32) -> egui::Response 
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// The project page's "Next steps": action items across its notes, each linking to its source.
+/// "Next steps": action items across the page's notes, each linking to its source. On a
+/// category page (`chips`) each carries a chip naming its project; an empty category skips
+/// the section.
+#[allow(clippy::too_many_arguments)]
 fn next_steps(
     ui: &mut egui::Ui,
     t: &Tokens,
     state: &mut NotesState,
     episodes: &[Episode],
     filed: &[(Episode, NoteItem)],
+    nodes: &[Node],
+    chips: bool,
     actions: &mut Vec<NotesAction>,
 ) {
-    let steps = collect_next_steps(episodes, filed);
+    let steps = collect_next_steps(episodes, filed, nodes);
+    if chips && steps.is_empty() {
+        return;
+    }
     section_label(ui, t, "Next steps");
     if steps.is_empty() {
         ui.horizontal(|ui| {
@@ -1897,6 +1897,27 @@ fn next_steps(
             }
             if resp.clicked() {
                 actions.push(NotesAction::GoToNote(s.episode_id));
+            }
+            if chips
+                && let Some(p) = s
+                    .project_id
+                    .and_then(|id| nodes.iter().find(|n| n.id == id))
+            {
+                let r = ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(format!("→ {}", p.name))
+                                .color(t.accent)
+                                .size(11.0),
+                        )
+                        .sense(Sense::click())
+                        .selectable(false),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(format!("Filed under {}", node_path(nodes, p.id)));
+                if r.clicked() {
+                    actions.push(NotesAction::SelectNode(p.id));
+                }
             }
         });
         ui.add_space(2.0);
@@ -2237,13 +2258,86 @@ mod tests {
             ..old.clone()
         };
         let filed = vec![(old.clone(), NoteItem::Action(old.action_items[0].clone()))];
-        let steps = collect_next_steps(std::slice::from_ref(&own), &filed);
+        let steps = collect_next_steps(std::slice::from_ref(&own), &filed, &[]);
         let texts: Vec<&str> = steps.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["Do x", "Own step"]);
         assert_eq!(steps[0].episode_id, 1);
         // a note both homed here and cross-filed lists its item once
-        let both = collect_next_steps(std::slice::from_ref(&old), &filed);
+        let both = collect_next_steps(std::slice::from_ref(&old), &filed, &[]);
         assert_eq!(both.len(), 1);
+    }
+
+    #[test]
+    fn project_of_walks_up_and_steps_carry_their_project() {
+        let node = |id, parent_id, kind| Node {
+            id,
+            parent_id,
+            kind,
+            name: format!("n{id}"),
+            description: String::new(),
+            created_by: Origin::User,
+            position: 0,
+            archived: false,
+        };
+        let nodes = vec![
+            node(1, None, NodeKind::Category),
+            node(2, Some(1), NodeKind::Project),
+            node(3, Some(2), NodeKind::Topic),
+            node(4, Some(1), NodeKind::Project),
+        ];
+        assert_eq!(project_of(&nodes, 3).map(|n| n.id), Some(2));
+        assert_eq!(project_of(&nodes, 2).map(|n| n.id), Some(2));
+        assert!(project_of(&nodes, 1).is_none());
+        assert!(project_of(&nodes, 99).is_none());
+
+        let ep = |id: i64, home: Option<i64>, item_node: Option<i64>, text: &str| Episode {
+            id,
+            started_at: id,
+            node_id: home,
+            action_items: vec![ActionItem {
+                text: text.into(),
+                node_id: item_node,
+                ..Default::default()
+            }],
+            title: format!("n{id}"),
+            ended_at: id,
+            summary: String::new(),
+            decisions: vec![],
+            topics: vec![],
+            low_signal: false,
+            model: String::new(),
+            cost_usd: None,
+            revision: 1,
+            created_at: 0,
+            last_revised_at: 0,
+            user_edited_at: None,
+            kind: "conversation".into(),
+        };
+        let own = ep(1, Some(3), None, "own, homed on a topic");
+        let cross = ep(2, Some(4), None, "cross-filed");
+        let unfiled = ep(3, None, None, "unfiled");
+        let filed = vec![(
+            cross.clone(),
+            NoteItem::Action(ActionItem {
+                text: "cross-filed".into(),
+                node_id: Some(3),
+                ..Default::default()
+            }),
+        )];
+        let steps = collect_next_steps(&[own, unfiled], &filed, &nodes);
+        let project = |t: &str| {
+            steps
+                .iter()
+                .find(|s| s.text.starts_with(t))
+                .map(|s| s.project_id)
+        };
+        assert_eq!(project("own"), Some(Some(2)));
+        assert_eq!(
+            project("cross"),
+            Some(Some(2)),
+            "item node (topic) beats the note's home"
+        );
+        assert_eq!(project("unfiled"), Some(None));
     }
 
     #[test]
@@ -2282,7 +2376,7 @@ mod tests {
                 &[("new a", None), ("new b", Some(9)), ("new c", None)],
             ),
         ];
-        let steps = collect_next_steps(&eps, &[]);
+        let steps = collect_next_steps(&eps, &[], &[]);
         let texts: Vec<&str> = steps.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["new a", "new c", "old b", "new b", "old a"]);
         // collapsed: the open ones only, and the link because two are completed
@@ -2290,18 +2384,18 @@ mod tests {
         assert_eq!(next_steps_shown(&steps, true), (5, true));
         // nothing completed, under the cap: no link
         let open = vec![ep(3, 1, &[("x", None), ("y", None)])];
-        let steps = collect_next_steps(&open, &[]);
+        let steps = collect_next_steps(&open, &[], &[]);
         assert_eq!(next_steps_shown(&steps, false), (2, false));
         // every item completed: nothing shown collapsed, only the link
         let done = vec![ep(4, 1, &[("x", Some(1))])];
-        let steps = collect_next_steps(&done, &[]);
+        let steps = collect_next_steps(&done, &[], &[]);
         assert_eq!(next_steps_shown(&steps, false), (0, true));
         // more open items than the cap
         let many: Vec<(String, Option<i64>)> = (0..NEXT_STEPS_CAP + 2)
             .map(|i| (format!("s{i}"), None))
             .collect();
         let refs: Vec<(&str, Option<i64>)> = many.iter().map(|(t, d)| (t.as_str(), *d)).collect();
-        let steps = collect_next_steps(&[ep(5, 1, &refs)], &[]);
+        let steps = collect_next_steps(&[ep(5, 1, &refs)], &[], &[]);
         assert_eq!(next_steps_shown(&steps, false), (NEXT_STEPS_CAP, true));
     }
 
