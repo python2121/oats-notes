@@ -87,16 +87,17 @@ fn seed_apps(store: &Store) -> Result<(), oats_core::StoreError> {
     Ok(())
 }
 
-/// Four plays over yesterday and today: two YouTube videos in Firefox (one watched in two
-/// sittings five minutes apart, which the view folds into one row, and transcribed into a
-/// media note — returned, so the view can show it open), Spotify, a Discord stream.
+/// Six plays over yesterday and today: two YouTube videos in Firefox (one watched yesterday
+/// and again today, which the view lists once, today; the other in two sittings five minutes
+/// apart, listed on the last, and transcribed into a media note — returned, so the view can
+/// jump to its row), Spotify, a Discord stream.
 fn seed_media(store: &Store) -> Result<i64, oats_core::StoreError> {
     use oats_core::{AudioSourceKind, EpisodeContent, MediaClass, MediaStamp};
     const H: i64 = 3_600_000;
     const M: i64 = 60_000;
     let today = midnight_ms(&Local::now());
     let yesterday = today - 24 * H;
-    let plays: [(i64, i64, MediaClass, Option<&str>, &str, &str, i64); 5] = [
+    let plays: [(i64, i64, MediaClass, Option<&str>, &str, &str, i64); 6] = [
         (
             yesterday + 20 * H + 5 * M,
             yesterday + 20 * H + 41 * M,
@@ -140,6 +141,15 @@ fn seed_media(store: &Store) -> Result<i64, oats_core::StoreError> {
             Some("https://discord.com/channels/1/2"),
             "Game night stream",
             "Discord",
+            0,
+        ),
+        (
+            today + 11 * H,
+            today + 11 * H + 12 * M,
+            MediaClass::YouTube,
+            Some("https://www.youtube.com/watch?v=8Xg7E9shq0Y"),
+            "How SQLite stores data on disk",
+            "Firefox",
             0,
         ),
     ];
@@ -359,7 +369,8 @@ pub fn harness(
     } else if options.media {
         let app = harness.state_mut();
         app.run(Command::ShowMediaView);
-        // the transcribed video's note, open under its row
+        // a jump to the transcribed video's note: its row, scrolled to and flashed (the note's
+        // Summarise / Re-interpret are in the row's context menu)
         if let Some(note) = media_note
             && !app.open_media_note(note)
         {

@@ -268,7 +268,7 @@ fn usage() -> ExitCode {
          --todos        with --selftest: the Todos view (open, snoozed, undated, completed)\n\
          --toast        with --selftest: a due reminder and a voice-command confirmation pop-up\n\
          --prefs        with --selftest: Preferences open over seeded apps (the Apps table)\n\
-         --media        with --selftest: the Media view (four seeded plays over two days, thumbnails off)\n\
+         --media        with --selftest: the Media view (seeded plays over two days, each media once, thumbnails off)\n\
          --search TEXT  with --selftest: open the search bar (⌘F) with this query\n\
          --topic TEXT   with --selftest: open the Topic view for this topic"
     );

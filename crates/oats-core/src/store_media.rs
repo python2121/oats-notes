@@ -58,6 +58,19 @@ fn row_to_play(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaPlay> {
 /// The `media_kind` values that are media proper (see [`MediaClass::is_media`]).
 const MEDIA_KINDS_SQL: &str = "('youtube', 'music', 'app')";
 
+/// `q` is the same media as `p` (`p` a play that may be scrubbed): the URL, for music the URL
+/// and the title; calls and meetings never count as `q`.
+const SAME_MEDIA_SQL: &str = "q.url = p.url AND q.kind NOT IN ('call', 'meeting')
+       AND (p.kind != 'music' AND q.kind != 'music' OR q.title = p.title)";
+
+/// `p` is the LAST play of its media (a later play of the same media scrubs it): calls,
+/// meetings and URL-less plays always are.
+const LAST_OF_MEDIA_SQL: &str = "(p.kind IN ('call', 'meeting') OR p.url IS NULL OR NOT EXISTS (
+       SELECT 1 FROM media_plays q
+       WHERE q.url = p.url AND q.kind NOT IN ('call', 'meeting')
+         AND (p.kind != 'music' AND q.kind != 'music' OR q.title = p.title)
+         AND (q.started_at > p.started_at OR (q.started_at = p.started_at AND q.id > p.id))))";
+
 /// What a relabel ("Mark as a call", "Mark as media") changed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Relabel {
@@ -556,13 +569,7 @@ impl Store {
     ) -> Result<Vec<MediaPlay>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {PLAY_COLUMNS} FROM media_plays p
-             WHERE p.started_at < ?2 AND p.ended_at >= ?1
-               AND (p.kind IN ('call', 'meeting') OR p.url IS NULL OR NOT EXISTS (
-                     SELECT 1 FROM media_plays q
-                     WHERE q.url = p.url AND q.kind NOT IN ('call', 'meeting')
-                       AND (p.kind != 'music' AND q.kind != 'music' OR q.title = p.title)
-                       AND (q.started_at > p.started_at
-                            OR (q.started_at = p.started_at AND q.id > p.id))))
+             WHERE p.started_at < ?2 AND p.ended_at >= ?1 AND {LAST_OF_MEDIA_SQL}
              ORDER BY p.started_at, p.id"
         ))?;
         let rows = stmt
@@ -588,6 +595,65 @@ impl Store {
         let rows = stmt
             .query_map(rusqlite::params![t, id, limit], row_to_play)?
             .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// [`Self::media_history_page`] with each media listed ONCE, on its last play (the Media
+    /// view; the same rule as [`Self::media_plays_between_latest`]: the URL, for music the URL
+    /// and the title; calls are left out, meetings and URL-less plays never scrubbed).
+    pub fn media_history_page_latest(
+        &self,
+        before: Option<(i64, i64)>,
+        limit: i64,
+    ) -> Result<Vec<MediaPlay>, StoreError> {
+        let (t, id) = before.unwrap_or((i64::MAX, i64::MAX));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PLAY_COLUMNS} FROM media_plays p
+             WHERE p.kind != 'call' AND (p.started_at < ?1 OR (p.started_at = ?1 AND p.id < ?2))
+               AND {LAST_OF_MEDIA_SQL}
+             ORDER BY p.started_at DESC, p.id DESC LIMIT ?3"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![t, id, limit], row_to_play)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The last play of the media `id` played (itself when it is the last, a call, a meeting
+    /// or URL-less): where the deduplicated Media view lists it. `None`: no such play.
+    pub fn latest_play_of(&self, id: i64) -> Result<Option<i64>, StoreError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE((
+                         SELECT q.id FROM media_plays q
+                         WHERE p.kind NOT IN ('call', 'meeting') AND p.url IS NOT NULL
+                           AND {SAME_MEDIA_SQL}
+                         ORDER BY q.started_at DESC, q.id DESC LIMIT 1), p.id)
+                     FROM media_plays p WHERE p.id = ?1"
+                ),
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Every play of the media `id` played, `id` included, newest first (a deduplicated Media
+    /// view row stands for all of them: its Delete removes them all). A call, a meeting or a
+    /// URL-less play is only itself.
+    pub fn plays_of_same_media(&self, id: i64) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT q.id FROM media_plays p JOIN media_plays q
+               ON q.id = p.id OR (p.kind NOT IN ('call', 'meeting') AND p.url IS NOT NULL
+                                  AND {SAME_MEDIA_SQL})
+             WHERE p.id = ?1
+             ORDER BY q.started_at DESC, q.id DESC"
+        ))?;
+        let rows = stmt
+            .query_map([id], |r| r.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
         Ok(rows)
     }
 
@@ -947,6 +1013,65 @@ mod tests {
         );
         // the unscrubbed query still lists every play
         assert_eq!(s.media_plays_between(0, day)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn the_media_history_lists_each_media_once_on_its_last_play() -> R {
+        let s = Store::open_in_memory()?;
+        let day = 86_400_000;
+        // one video on three days
+        let mut video = Vec::new();
+        for d in 0..3 {
+            let id = s.begin_media_play(d * day + 1_000, &stamp("https://youtu.be/a", "A"))?;
+            s.update_media_play(id, d * day + 2_000, 0)?;
+            video.push(id);
+        }
+        // a music track twice (one web-player page)
+        let page = "https://open.spotify.com/playlist/p";
+        let track = MediaStamp::new(MediaClass::Music, Some(page.into()), "One — X", "Firefox");
+        let t1 = s.begin_media_play(3_000, &track)?;
+        s.update_media_play(t1, 4_000, 0)?;
+        let t2 = s.begin_media_play(day + 3_000, &track)?;
+        s.update_media_play(t2, day + 4_000, 0)?;
+        // another track of the same page, once
+        let other = MediaStamp::new(MediaClass::Music, Some(page.into()), "Two — Y", "Firefox");
+        let o = s.begin_media_play(5_000, &other)?;
+        s.update_media_play(o, 6_000, 0)?;
+        // an app play without a URL, twice
+        let app = MediaStamp::new(MediaClass::App, None, "", "Discord");
+        let a1 = s.begin_media_play(7_000, &app)?;
+        s.update_media_play(a1, 8_000, 0)?;
+        let a2 = s.begin_media_play(day + 7_000, &app)?;
+        s.update_media_play(a2, day + 8_000, 0)?;
+        let ids = |v: Vec<MediaPlay>| v.into_iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(s.media_history_page_latest(None, 100)?),
+            vec![video[2], a2, t2, a1, o]
+        );
+        // paging past the first rows still leaves the scrubbed plays out
+        let first = s.media_history_page_latest(None, 2)?;
+        assert_eq!(ids(first.clone()), vec![video[2], a2]);
+        let last = first.last().map(|p| (p.started_at, p.id));
+        assert_eq!(
+            ids(s.media_history_page_latest(last, 100)?),
+            vec![t2, a1, o]
+        );
+        // the unscrubbed page lists every play
+        assert_eq!(s.media_history_page(None, 100)?.len(), 8);
+        // an older play maps to its media's last play; the rest to themselves
+        assert_eq!(s.latest_play_of(video[0])?, Some(video[2]));
+        assert_eq!(s.latest_play_of(video[2])?, Some(video[2]));
+        assert_eq!(s.latest_play_of(t1)?, Some(t2));
+        assert_eq!(s.latest_play_of(o)?, Some(o));
+        assert_eq!(s.latest_play_of(a1)?, Some(a1));
+        assert_eq!(s.latest_play_of(9_999)?, None);
+        assert_eq!(
+            s.plays_of_same_media(video[0])?,
+            vec![video[2], video[1], video[0]]
+        );
+        assert_eq!(s.plays_of_same_media(t2)?, vec![t2, t1]);
+        assert_eq!(s.plays_of_same_media(a2)?, vec![a2]);
         Ok(())
     }
 

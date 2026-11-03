@@ -2836,7 +2836,7 @@ fn the_media_view_says_nothing_watched_yet_when_empty() {
 }
 
 #[test]
-fn the_media_view_lists_plays_folded_and_open_in_browser_opens_the_url() {
+fn the_media_view_lists_each_media_once_and_open_in_browser_opens_the_url() {
     let dir = TempDir::new("media-view");
     let ([a, b], sp) = seed_plays(&dir.db());
     let mut rig = build(&dir.db(), None, None);
@@ -2850,9 +2850,9 @@ fn the_media_view_lists_plays_folded_and_open_in_browser_opens_the_url() {
         rig.app().media_rows(),
         [
             ("Deep focus".to_owned(), vec![sp]),
-            ("Never gonna give you up".to_owned(), vec![b, a]),
+            ("Never gonna give you up".to_owned(), vec![b]),
         ],
-        "newest first; the two sittings are one row"
+        "newest first; the video once, on its last sitting"
     );
     assert!(rig.shows("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
     // right-click → Open in browser: the app asks egui to open the URL
@@ -2869,7 +2869,7 @@ fn the_media_view_lists_plays_folded_and_open_in_browser_opens_the_url() {
         rig.app().last_opened_url(),
         Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
     );
-    // Delete removes the whole folded row
+    // Delete removes the row: every play of its media
     rig.harness
         .get_by_label("Never gonna give you up")
         .click_secondary();
@@ -3235,7 +3235,7 @@ fn a_next_step_of_a_note_without_a_sidebar_row_opens_inline() {
 }
 
 #[test]
-fn a_media_note_opens_under_its_play_in_the_media_view() {
+fn a_media_notes_row_does_not_expand_and_its_menu_offers_summarise_and_reinterpret() {
     use oats_core::{MediaClass, MediaStamp};
     let dir = TempDir::new("media-note");
     let ep = seed_discord_episode(&dir.db());
@@ -3248,30 +3248,129 @@ fn a_media_note_opens_under_its_play_in_the_media_view() {
         )
         .unwrap();
     s.update_media_play(play, e.ended_at, 2).unwrap();
-    let mut rig = build(&dir.db(), None, None);
+    let brain = Brain {
+        config: BrainConfig {
+            cli: fake_cli_logging(&dir.0),
+            ..BrainConfig::default()
+        },
+        store_path: dir.db(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    let mut rig = build(&dir.db(), None, Some(brain));
     rig.app().run(Command::ShowMediaView);
-    rig.harness.run_steps(3);
+    rig.until("the brain to report in", |app| {
+        interpret_enabled(app) == Some(true)
+    });
     assert_eq!(
         rig.app().media_notes().get(&play).map(|n| n.id),
         Some(ep),
         "the play's media note"
     );
-    assert!(!rig.shows("Re-interpret"), "closed by default");
-    // a click on the row opens the card inline, with its actions
-    rig.harness.get_by_label("Discord (note)").click();
+    // a click on the row opens nothing: no card, no "(note)" toggle
+    assert!(!rig.shows("(note)"));
+    rig.harness.get_by_label("Discord").click();
     rig.harness.run_steps(3);
-    assert!(rig.app().open_notes().contains(&ep));
-    assert!(rig.shows("Re-interpret"));
-    rig.harness.get_by_label("Discord (note)").click();
-    rig.harness.run_steps(3);
+    assert!(!rig.shows("Re-interpret"), "nothing expands");
     assert!(!rig.app().open_notes().contains(&ep));
-    // a jump to the note (search, topic) lands here, open
+    // the note's Summarise / Re-interpret are in the row's context menu
+    rig.harness.get_by_label("Discord").click_secondary();
+    rig.harness.run_steps(2);
+    assert!(rig.shows("Summarise"));
+    assert!(rig.shows("Re-interpret"));
+    assert!(rig.shows("Show transcript"));
+    rig.harness.get_by_label("Summarise").click();
+    rig.harness.run_steps(2);
+    assert_eq!(
+        rig.app().last_message(),
+        Some("Summarising the media note…"),
+        "the cards' Summarise handler"
+    );
+    // a jump to the note (search, topic) lands on its row, flashed, with no card
     rig.app().run(Command::ShowNotes);
     rig.harness.run_steps(2);
     assert!(rig.app().open_media_note(ep));
-    rig.harness.run_steps(3);
     assert_eq!(rig.app().prefs().view, View::Media);
-    assert!(rig.shows("Re-interpret"));
+    assert_eq!(rig.app().pending_media_focus(), Some(play));
+    rig.harness.run_steps(3);
+    assert_eq!(rig.app().media_flash(), Some(play), "the row flashes");
+    assert!(!rig.app().open_notes().contains(&ep));
+    assert!(!rig.shows("Re-interpret"));
+}
+
+#[test]
+fn the_media_view_lists_a_video_once_under_the_day_of_its_last_play() {
+    use chrono::{Datelike, Local};
+    use oats_core::{MediaClass, MediaStamp};
+    let dir = TempDir::new("media-dedup");
+    let s = Store::open(&dir.db()).unwrap();
+    let now = now_ms();
+    let day = 86_400_000;
+    let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    let yt = MediaStamp::new(
+        MediaClass::YouTube,
+        Some(url.into()),
+        "Rewatched",
+        "Firefox",
+    );
+    let old = s.begin_media_play(now - 3 * day, &yt).unwrap();
+    s.update_media_play(old, now - 3 * day + 600_000, 0)
+        .unwrap();
+    let last = s.begin_media_play(now - 3_600_000, &yt).unwrap();
+    s.update_media_play(last, now - 3_000_000, 0).unwrap();
+    let other = s
+        .begin_media_play(
+            now - 2 * day,
+            &MediaStamp::new(MediaClass::Music, None, "Deep focus", "Spotify"),
+        )
+        .unwrap();
+    s.update_media_play(other, now - 2 * day + 600_000, 0)
+        .unwrap();
+    let mut rig = build(&dir.db(), None, None);
+    rig.app().run(Command::ShowMediaView);
+    rig.harness.run_steps(3);
+    let heading = |ms: i64| {
+        let d = Local
+            .timestamp_millis_opt(ms)
+            .single()
+            .unwrap()
+            .date_naive();
+        oats_ui::transcript::day_heading(d, Local::now().year())
+    };
+    let y = |rig: &Rig, label: &str| rig.harness.get_by_label(label).rect().center().y;
+    assert_eq!(
+        rig.harness.query_all_by_label("Rewatched").count(),
+        1,
+        "the video is listed once"
+    );
+    assert!(
+        !rig.shows(&heading(now - 3 * day)),
+        "its first day is empty now"
+    );
+    let later = y(&rig, &heading(now - 3_600_000));
+    let middle = y(&rig, &heading(now - 2 * day));
+    let row = y(&rig, "Rewatched");
+    assert!(later < row && row < middle, "under the later day's heading");
+    assert_eq!(
+        rig.app().media_rows(),
+        [
+            ("Rewatched".to_owned(), vec![last]),
+            ("Deep focus".to_owned(), vec![other]),
+        ]
+    );
+    // a jump to the older play lands on the row of its last play
+    rig.app().run(Command::Search);
+    rig.harness.run_steps(2);
+    rig.harness.event(egui::Event::Text("Rewatched".to_owned()));
+    rig.harness.run_steps(3);
+    rig.harness
+        .get_all_by_label_contains("Rewatched")
+        .last()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(1);
+    assert_eq!(rig.app().prefs().view, View::Media);
+    assert!(rig.app().pending_media_focus().is_none_or(|p| p == last));
 }
 
 /// Every node of the AccessKit tree whose rect reaches into the window must lie inside it

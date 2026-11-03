@@ -1,15 +1,14 @@
-//! The Media view (`View::Media`, ⌘6): the watch history — every play in `media_plays` (calls
-//! left out), newest first, under the usual day headings. One row per play, consecutive plays
-//! of the same URL at most 10 min apart folded into one (`oats_core::store::collapse_plays`,
-//! durations summed): a thumbnail slot, the title, "YouTube · Firefox" / "Spotify", "2:05–2:41
-//! pm · 36 min" and the URL as a link. Right-click: Open in browser, Copy link, Mark as a call,
-//! Show transcript (when something was transcribed), Delete. Paged 200 plays at a time; the
-//! next (older) page is fetched as the bottom edge comes within reach.
-//!
-//! A row whose plays were transcribed into a media NOTE (`Store::episode_of_play`; media notes
-//! have no node, so this is where they live) gets a disclosure triangle: a click on the row
-//! opens the note's card inline (`NotesState::open_notes`), with the card's own actions
-//! (Summarise, Re-interpret, Mark as a call, Edit, Delete) returned as [`NotesAction`]s.
+//! The Media view (`View::Media`, ⌘6): the watch history — `media_plays` (calls left out),
+//! newest first, under the usual day headings, each media listed ONCE, on its last play
+//! (`Store::media_history_page_latest`: the URL, for music the URL and the title; URL-less
+//! plays are never scrubbed). Consecutive plays of the same media at most 10 min apart would
+//! fold into one row (`oats_core::store::collapse_plays`; a no-op on deduplicated pages). A
+//! row: a thumbnail slot, the title, "YouTube · Firefox" / "Spotify", "2:05–2:41 pm · 36 min"
+//! and the URL as a link — nothing expands. Right-click: Open in browser, Copy link, Summarise
+//! and Re-interpret (when the row's plays were transcribed into a media note,
+//! `Store::episode_of_play`), Mark as a call, Show transcript (when something was
+//! transcribed), Delete (every play of the media). Paged 200 rows at a time; the next (older)
+//! page is fetched as the bottom edge comes within reach.
 //!
 //! Thumbnails are opt-in (see `thumbs`); without them, and for anything but YouTube, the slot
 //! is a flat placeholder with a ▶.
@@ -21,9 +20,9 @@ use chrono::{Datelike, Local};
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{Align2, Rect, Sense, TextFormat, pos2, vec2};
 use oats_core::store::{MediaEntry, collapse_plays};
-use oats_core::{Episode, MediaClass, MediaPlay, Node};
+use oats_core::{Episode, MediaClass, MediaPlay};
 
-use crate::notes::{NotesAction, NotesState};
+use crate::notes::BrainStatus;
 use crate::theme::Tokens;
 use crate::thumbs::Thumbs;
 use crate::transcript::{TranscriptFocus, day_heading, day_of, focus_row, near_viewport};
@@ -34,9 +33,6 @@ pub const MEDIA_PAGE: usize = 200;
 pub const THUMB_SIZE: egui::Vec2 = egui::vec2(96.0, 54.0);
 const ROW_H: f32 = 72.0;
 const MARGIN: f32 = 14.0;
-/// From this list width up an open media note's card sits under the row's text column;
-/// narrower, it takes the row's whole width from the thumbnail's left edge.
-const MEDIA_CARD_UNDER_TEXT: f32 = 600.0;
 
 /// The loaded part of the history: rows (folded), and where the next page starts.
 #[derive(Clone, Debug, Default)]
@@ -81,8 +77,12 @@ pub enum MediaAction {
     MarkAsCall(Vec<i64>),
     /// Jump to the first transcribed line of these plays.
     ShowTranscript(Vec<i64>),
-    /// Delete these plays (one folded row).
+    /// Delete these plays (one row: the app deletes every play of its media).
     Delete(Vec<i64>),
+    /// "Summarise" the row's media note (one model call with the media prompt).
+    Summarise(i64),
+    /// "Re-interpret" the row's media note.
+    Reinterpret(i64),
     /// Fetch the next (older) page.
     LoadOlder,
 }
@@ -200,12 +200,31 @@ fn one_line(
     ui.painter().layout_job(job)
 }
 
-/// The media notes of the loaded rows (play id → its note; see `Store::episode_of_play`) and
-/// what the cards need.
-pub struct MediaNotes<'a> {
-    pub by_play: &'a HashMap<i64, Episode>,
-    pub state: &'a mut NotesState,
-    pub nodes: &'a [Node],
+/// The note-related context-menu items of a row: `Summarise` and `Re-interpret` when the
+/// row has a media note (`note`), each `(label, action, enabled)` — greyed, like the cards'
+/// buttons, while the brain is unavailable or already busy with that note.
+pub fn note_menu(note: Option<&Episode>, brain: &BrainStatus) -> Vec<(String, MediaAction, bool)> {
+    let Some(n) = note else {
+        return Vec::new();
+    };
+    let enabled = |kind: &str| brain.available() && !brain.busy(kind, Some(n.id));
+    let reinterpret = if n.user_edited_at.is_some() {
+        "Re-interpret (replaces your edits)"
+    } else {
+        "Re-interpret"
+    };
+    vec![
+        (
+            "Summarise".to_owned(),
+            MediaAction::Summarise(n.id),
+            enabled("summarise"),
+        ),
+        (
+            reinterpret.to_owned(),
+            MediaAction::Reinterpret(n.id),
+            enabled("reinterpret"),
+        ),
+    ]
 }
 
 /// The note of a row: the first of its plays that has one.
@@ -213,24 +232,19 @@ pub fn note_of<'e>(by_play: &'e HashMap<i64, Episode>, e: &MediaEntry) -> Option
     e.ids.iter().find_map(|id| by_play.get(id))
 }
 
-/// The view, in `ui`'s rect. `previews`: the thumbnails pref. Returns the view's actions and
-/// those of the note cards opened in it.
+/// The view, in `ui`'s rect. `previews`: the thumbnails pref; `notes`: the loaded rows' media
+/// notes by play id; `brain`: greys the notes' menu items while busy.
 pub fn media_view(
     ui: &mut egui::Ui,
     pages: &MediaPages,
     focus: &mut TranscriptFocus,
     thumbs: &mut Thumbs,
     previews: bool,
-    notes: MediaNotes<'_>,
-) -> (Vec<MediaAction>, Vec<NotesAction>) {
+    notes: &HashMap<i64, Episode>,
+    brain: &BrainStatus,
+) -> Vec<MediaAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
-    let mut note_actions = Vec::new();
-    let MediaNotes {
-        by_play,
-        state,
-        nodes,
-    } = notes;
     if pages.entries.is_empty() && !pages.has_more {
         let rect = ui.available_rect_before_wrap();
         ui.put(
@@ -241,7 +255,7 @@ pub fn media_view(
                     .color(t.text_tertiary),
             ),
         );
-        return (actions, note_actions);
+        return actions;
     }
     let this_year = Local::now().year();
     let jumping = focus.pending.is_some();
@@ -273,51 +287,8 @@ pub fn media_view(
                     });
                     ui.add_space(4.0);
                 }
-                let note = note_of(by_play, e);
-                let open = note.is_some_and(|n| state.open_notes.contains(&n.id));
-                let (rect, toggled) = media_row(
-                    ui,
-                    &t,
-                    e,
-                    thumbs,
-                    previews,
-                    note.map(|_| open),
-                    &mut actions,
-                );
-                if let Some(n) = note {
-                    if toggled {
-                        if open {
-                            state.open_notes.remove(&n.id);
-                        } else {
-                            state.open_notes.insert(n.id);
-                        }
-                    }
-                    if open {
-                        // under the text column; in a narrow list from the thumbnail's left
-                        // edge (the card's fill starts 6 pt into its column)
-                        let indent = if ui.available_width() >= MEDIA_CARD_UNDER_TEXT {
-                            MARGIN + THUMB_SIZE.x - 12.0
-                        } else {
-                            MARGIN - 6.0
-                        };
-                        ui.horizontal(|ui| {
-                            ui.add_space(indent);
-                            ui.vertical(|ui| {
-                                crate::notes::episode_card(
-                                    ui,
-                                    &t,
-                                    state,
-                                    n,
-                                    nodes,
-                                    &mut note_actions,
-                                    "",
-                                    None,
-                                );
-                            });
-                        });
-                        ui.add_space(4.0);
-                    }
-                }
+                let menu = note_menu(note_of(notes, e), brain);
+                let rect = media_row(ui, &t, e, thumbs, previews, &menu, &mut actions);
                 if let Some(id) = focus
                     .pending
                     .filter(|p| e.ids.contains(p))
@@ -345,60 +316,30 @@ pub fn media_view(
             }
             ui.add_space(10.0);
         });
-    (actions, note_actions)
+    actions
 }
 
-/// One play: thumbnail, title, source, time · duration, link. `note`: the row has a media
-/// note, open (`Some(true)`) or closed — a disclosure triangle in the left margin, and a
-/// click on the row toggles it. Returns its rect and whether it was toggled.
+/// One row: thumbnail, title, source, time · duration, link. `note_menu`: the row's media-note
+/// items for its context menu ([`note_menu`]). Returns its rect.
 fn media_row(
     ui: &mut egui::Ui,
     t: &Tokens,
     e: &MediaEntry,
     thumbs: &mut Thumbs,
     previews: bool,
-    note: Option<bool>,
+    note_menu: &[(String, MediaAction, bool)],
     actions: &mut Vec<MediaAction>,
-) -> (Rect, bool) {
+) -> Rect {
     let p = &e.play;
     let title = entry_title(p);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-    resp.widget_info(|| match note {
-        Some(open) => egui::WidgetInfo::selected(
-            egui::WidgetType::Button,
-            true,
-            open,
-            format!("{title} (note)"),
-        ),
-        None => egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &title),
-    });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &title));
     let url = p.url.clone();
     if ui.is_rect_visible(rect) {
         let painter = ui.painter_at(rect);
         let row = rect.shrink2(vec2(4.0, 1.0));
         if resp.hovered() || resp.context_menu_opened() {
             painter.rect_filled(row, 6.0, t.hover.gamma_multiply(0.6));
-        }
-        if let Some(open) = note {
-            let c = pos2(rect.left() + MARGIN / 2.0 + 1.0, rect.center().y);
-            let tri = if open {
-                vec![
-                    pos2(c.x - 3.5, c.y - 2.0),
-                    pos2(c.x + 3.5, c.y - 2.0),
-                    pos2(c.x, c.y + 2.5),
-                ]
-            } else {
-                vec![
-                    pos2(c.x - 2.0, c.y - 3.5),
-                    pos2(c.x - 2.0, c.y + 3.5),
-                    pos2(c.x + 2.5, c.y),
-                ]
-            };
-            painter.add(egui::Shape::convex_polygon(
-                tri,
-                t.text_secondary,
-                egui::Stroke::NONE,
-            ));
         }
         // the thumbnail slot
         let slot = Rect::from_min_size(
@@ -497,6 +438,18 @@ fn media_row(
             }
             ui.separator();
         }
+        if !note_menu.is_empty() {
+            for (label, action, enabled) in note_menu {
+                if ui
+                    .add_enabled(*enabled, egui::Button::new(label.as_str()))
+                    .clicked()
+                {
+                    actions.push(action.clone());
+                    ui.close();
+                }
+            }
+            ui.separator();
+        }
         if ui
             .button("Mark as a call")
             .on_hover_text("This was a conversation, not media")
@@ -515,11 +468,7 @@ fn media_row(
             ui.close();
         }
     });
-    let toggled = note.is_some() && resp.clicked();
-    if note.is_some() {
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    }
-    (rect, toggled)
+    rect
 }
 
 #[cfg(test)]

@@ -316,8 +316,7 @@ flow (after the last line, else on the next one; a chip is one piece: `Label::tr
 title wraps in what is left, or the buttons take their own right-aligned row when the title
 would get under `CARD_TITLE_MIN` (150 pt). Collapsed note rows keep the title ≥ 110 pt (chips
 dropped, the filing chip cut with …) and, under day headings below 520 pt, drop the repeated
-date. The open media note's card sits under the row's text column from 600 pt, else spans the
-row from the thumbnail. The calendar grid's rows shrink (78 → 40 pt, fewer chips, "+N") so the
+date. The calendar grid's rows shrink (78 → 40 pt, fewer chips, "+N") so the
 day panel keeps 110 pt. Toast cards are 340 pt, narrower in a narrow column (≥ 240). The search
 field takes what its count leaves (at least half the bar; the count is cut with …). The kittest
 `every_view_fits_a_constrained_window` builds each view at 660×520 (`oats_ui::selftest::harness`)
@@ -346,27 +345,34 @@ scrolled to and flashed). `--selftest out.png --search "commerce cod delay"` see
 
 **Media view** (`View::Media`, ⌘6, View → Media, the last row under Views;
 `oats-ui/src/media.rs`): the watch history from `media_plays` (calls left out), newest first,
-under day headings. Consecutive plays of the same media (`MediaPlay::same_media`: the URL; for
-music the URL AND the title, i.e. the track) at most 10 min apart fold into one row
-(`oats_core::store::collapse_plays`, `MediaEntry`, durations summed, gaps not counted; folding
-works across page boundaries). A row: 96×54 thumbnail slot, title (medium face), "YouTube ·
-Firefox" / "Spotify" / "Spotify · Firefox", "2:05–2:41 pm · 36 min", the URL as a link
-(`ctx.open_url`, tooltip = full URL). Right-click: Open in browser, Copy link, Mark as a call
-(each play of the row; `Store::mark_play_as_call`), Show transcript (only when the plays have
-transcribed segments: `Store::first_segment_of_plays` → the usual jump), Delete
-(`Store::delete_media_plays` + a WAL checkpoint). Paged by `Store::media_history_page(before,
-limit)` 200 plays at a time; the next (older) page loads when the bottom "Loading older…" marker
-comes within 1.5 viewports. Empty: "Nothing watched yet." **Media notes live here** (they have
-no node, there is no Media category): a row whose plays were transcribed into a media note
-(`Store::episode_of_play` — the play's media-stamped system segments' `kind = media` episode;
-`episodes_of_plays` batch, `plays_of_episode` the inverse; `OatsApp::media_notes`, reloaded with
-the pages and on every data change while the view is open) gets a disclosure triangle in the
-left margin; a click on the row toggles the note's `episode_card` inline under it
-(`NotesState::open_notes`; AccessKit label "<title> (note)"), whose actions (Summarise,
-Re-interpret, Mark as a call, Edit, Delete) go through `apply_notes` as on a node page. A jump
-to a media note (search, Topic view: `jump_to_episode`) opens it here (`OatsApp::open_media_note`:
-its last play's row paged in, flashed, card open). `--selftest out.png --media` (seeds a
-transcribed video with its note and renders it open).
+under day headings, **each media listed ONCE, on its last play** — the Calendar's rule
+(`Store::media_history_page_latest(before, limit)`: `media_history_page`'s paging plus the
+`NOT EXISTS` scrub of `media_plays_between_latest`; identity = the URL, for music the URL AND
+the title, i.e. the track; meetings and URL-less plays are never scrubbed), so a video watched
+on three days shows once, under the last day, with that play's time and duration.
+`collapse_plays` (consecutive plays of one media ≤ 10 min apart → one `MediaEntry`) still runs
+on each page, a no-op on deduplicated data. A row (nothing expands): 96×54 thumbnail slot,
+title (medium face), "YouTube · Firefox" / "Spotify" / "Spotify · Firefox", "2:05–2:41 pm ·
+36 min", the URL as a link (`ctx.open_url`, tooltip = full URL). Right-click: Open in browser,
+Copy link, Summarise and Re-interpret (only on a row with a media note, see below; greyed while
+the brain is unavailable or busy with that note), Mark as a call (each play of the row;
+`Store::mark_play_as_call`), Show transcript (only when the plays have transcribed segments:
+`Store::first_segment_of_plays` → the usual jump), Delete (every play of the media,
+`Store::plays_of_same_media`, so no older play resurfaces; `Store::delete_media_plays` + a WAL
+checkpoint). Paged 200 rows at a time; the next (older) page loads when the bottom "Loading
+older…" marker comes within 1.5 viewports. Empty: "Nothing watched yet." **Media notes live
+here** (they have no node, there is no Media category) — without a card: a row whose plays were
+transcribed into a media note (`Store::episode_of_play` — the play's media-stamped system
+segments' `kind = media` episode; `episodes_of_plays` batch, `plays_of_episode` the inverse;
+`OatsApp::media_notes`, reloaded with the pages and on every data change while the view is
+open) offers the note's Summarise / Re-interpret in its context menu (`media::note_menu` →
+`MediaAction::Summarise` / `Reinterpret`, handed to `apply_notes` as `NotesAction`s: the
+cards' own handlers); the note's Edit / Delete are not offered here. A jump to a play (search)
+or a media note (search, Topic view: `jump_to_episode` → `OatsApp::open_media_note`, its last
+play) goes through `show_media_play`: the play is mapped to its media's last play
+(`Store::latest_play_of`), that row paged in, scrolled to and flashed. `--selftest out.png
+--media` (seeds a video watched on two days, listed once, and a transcribed video with its
+note, whose row is jumped to).
 
 **Thumbnails are opt-in (privacy rule)**: the app makes no network calls of its own except the
 model download and the `claude` CLI. Preferences "Fetch video thumbnails (contacts YouTube's
@@ -1058,5 +1064,5 @@ from a video creates nothing), and what was watched is recorded.
 Commands block — add:
 OATS_MEDIA_POLICY=ignore|log|transcribe …  # media on system audio (default transcribe; Preferences sets meta.media_policy)
 cargo run -p oats-notes -- --selftest out.png --prefs   # Preferences over seeded apps (the Apps table)
-cargo run -p oats-notes -- --selftest out.png --media   # the Media view (seeded plays over two days, thumbnails off; a transcribed video's media note open under its row)
+cargo run -p oats-notes -- --selftest out.png --media   # the Media view (seeded plays over two days, thumbnails off; each media once; a jump to a transcribed video's media note flashes its row)
 OATS_MEDIA=off …                            # no media detection (no producer polling, no Firefox reads)

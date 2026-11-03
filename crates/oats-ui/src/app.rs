@@ -1395,7 +1395,9 @@ impl OatsApp {
                     self.set_view(View::Calendar);
                 }
                 SearchAction::OpenTag(name) => self.open_topic(name),
-                SearchAction::OpenMedia(id) => self.show_media_play(id),
+                SearchAction::OpenMedia(id) => {
+                    self.show_media_play(id);
+                }
             }
         }
     }
@@ -1797,7 +1799,10 @@ impl OatsApp {
         before: Option<(i64, i64)>,
         limit: usize,
     ) -> (Vec<oats_core::MediaPlay>, bool) {
-        match self.store.media_history_page(before, limit as i64 + 1) {
+        match self
+            .store
+            .media_history_page_latest(before, limit as i64 + 1)
+        {
             Ok(mut plays) => {
                 let more = plays.len() > limit;
                 plays.truncate(limit);
@@ -1841,8 +1846,8 @@ impl OatsApp {
         self.media_notes = found;
     }
 
-    /// Open a media note in the Media view: its row (paged back until loaded) scrolled to and
-    /// flashed, its card open. `false`: none of its plays is in the history.
+    /// Open a media note in the Media view: its row (its media's last play, paged back until
+    /// loaded) scrolled to and flashed. `false`: none of its plays is in the history.
     pub fn open_media_note(&mut self, id: i64) -> bool {
         let plays = match self.store.plays_of_episode(id) {
             Ok(p) => p,
@@ -1854,12 +1859,7 @@ impl OatsApp {
         let Some(play) = plays.last().copied() else {
             return false;
         };
-        self.show_media_play(play);
-        if self.media_pages.row_of(play).is_none() {
-            return false;
-        }
-        self.notes_state.open_notes.insert(id);
-        true
+        self.show_media_play(play)
     }
 
     /// The Media view's media notes, by play id (tests).
@@ -1879,8 +1879,9 @@ impl OatsApp {
     }
 
     /// A search hit on a play: the Media view, paged back until its row is loaded, scrolled
-    /// to and flashed.
-    fn show_media_play(&mut self, id: i64) {
+    /// to and flashed. The view lists each media on its last play, so an older play of it
+    /// lands on that row. `false`: the play is gone.
+    fn show_media_play(&mut self, id: i64) -> bool {
         self.close_search();
         self.topic = None;
         self.focus_episode = None;
@@ -1889,13 +1890,23 @@ impl OatsApp {
         } else {
             self.set_view(View::Media);
         }
+        let id = match self.store.latest_play_of(id) {
+            Ok(Some(latest)) => latest,
+            Ok(None) => id,
+            Err(e) => {
+                self.store_error(e);
+                id
+            }
+        };
         while self.media_pages.row_of(id).is_none() && self.media_pages.has_more {
             self.load_older_media();
         }
         if self.media_pages.row_of(id).is_some() {
             self.media_focus.pending = Some(id);
+            true
         } else {
             self.warning = Some("That play is gone".to_owned());
+            false
         }
     }
 
@@ -1918,6 +1929,11 @@ impl OatsApp {
         self.media_focus.pending
     }
 
+    /// The Media view row flashing after a jump (tests).
+    pub fn media_flash(&self) -> Option<i64> {
+        self.media_focus.flash.map(|f| f.0)
+    }
+
     /// Use another thumbnail cache (tests point it at a temp directory and a fake fetcher).
     #[doc(hidden)]
     pub fn set_thumbs(&mut self, thumbs: Thumbs) {
@@ -1926,6 +1942,8 @@ impl OatsApp {
 
     fn apply_media(&mut self, ctx: &egui::Context, actions: Vec<MediaAction>) {
         let mut changed = false;
+        // a media note's Summarise / Re-interpret: the cards' own handlers
+        let mut notes = Vec::new();
         for a in actions {
             match a {
                 MediaAction::OpenUrl(url) => {
@@ -1947,9 +1965,24 @@ impl OatsApp {
                     Err(e) => self.store_error(e),
                 },
                 MediaAction::Delete(ids) => {
-                    self.delete_plays(&ids);
+                    // a row stands for every play of its media: older ones would resurface
+                    let mut all = Vec::new();
+                    for id in ids {
+                        match self.store.plays_of_same_media(id) {
+                            Ok(same) => all.extend(same),
+                            Err(e) => {
+                                self.store_error(e);
+                                all.push(id);
+                            }
+                        }
+                    }
+                    all.sort_unstable();
+                    all.dedup();
+                    self.delete_plays(&all);
                     changed = true;
                 }
+                MediaAction::Summarise(id) => notes.push(NotesAction::Summarise(id)),
+                MediaAction::Reinterpret(id) => notes.push(NotesAction::Reinterpret(id)),
                 MediaAction::LoadOlder => {
                     self.load_older_media();
                     ctx.request_repaint();
@@ -1959,6 +1992,7 @@ impl OatsApp {
         if changed {
             self.reload_media();
         }
+        self.apply_notes(ctx, notes);
     }
 
     /// Delete plays (a Media view row); a YouTube thumbnail cached for them goes too unless
@@ -4215,21 +4249,15 @@ impl eframe::App for OatsApp {
                             }
                         }
                         View::Media => {
-                            self.notes_state.brain = self.brain_status.clone();
-                            let (media, notes) = media_view(
+                            media_actions = media_view(
                                 &mut list_ui,
                                 &self.media_pages,
                                 &mut self.media_focus,
                                 &mut self.thumbs,
                                 self.prefs.fetch_thumbnails,
-                                crate::media::MediaNotes {
-                                    by_play: &self.media_notes,
-                                    state: &mut self.notes_state,
-                                    nodes: &self.nodes,
-                                },
+                                &self.media_notes,
+                                &self.brain_status,
                             );
-                            media_actions = media;
-                            notes_actions = notes;
                         }
                         View::Todos => {
                             todo_actions = todos_view(
