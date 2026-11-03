@@ -3077,7 +3077,8 @@ impl OatsApp {
             self.media_plays.clear();
             return;
         };
-        match self.store.media_plays_between(from, to) {
+        // a video watched on several days is listed on the last one only
+        match self.store.media_plays_between_latest(from, to) {
             Ok(p) => self.media_plays = p,
             Err(e) => self.store_error(e),
         }

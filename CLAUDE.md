@@ -956,6 +956,8 @@ from a video creates nothing), and what was watched is recorded.
   rows "Meeting 🔒" greyed, "transcribe anyway" for Media rows only while the policy is Ignore /
   Log only; `OatsApp::set_app_class`); the status strip shows "▶ <title>" while media plays;
   the Calendar day panel lists "Watched: <title>" / "Listened: …" / "Call via …" 10:12–10:40
+  (`Store::media_plays_between_latest`: a URL is listed on the day of its LAST play only, once;
+  calls and URL-less plays are never scrubbed; index `media_plays_url`)
   (click opens the URL); media rows are tagged "media" instead of "them"; the Transcripts view
   hides media rows unless its header's "Show media" pill (`AppPrefs::show_media`, persisted;
   `Store::segments_page_with` / `segments_after_with`) is on — search still lists them.

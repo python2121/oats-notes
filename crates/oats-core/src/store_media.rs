@@ -174,7 +174,8 @@ impl Store {
                  producer       TEXT NOT NULL DEFAULT '',
                  segments_count INTEGER NOT NULL DEFAULT 0
              );
-             CREATE INDEX IF NOT EXISTS media_plays_started ON media_plays(started_at);",
+             CREATE INDEX IF NOT EXISTS media_plays_started ON media_plays(started_at);
+             CREATE INDEX IF NOT EXISTS media_plays_url ON media_plays(url, started_at);",
         )?;
         // v8: the per-app classes
         if !has_column(conn, "segments", "media_app")? {
@@ -545,6 +546,31 @@ impl Store {
         Ok(rows)
     }
 
+    /// The plays overlapping `from..to` that are the LAST play of their URL anywhere in the
+    /// history (the Calendar's day panel: a video watched on several days is listed on the
+    /// last one only, and once per day). Calls are never scrubbed — a recurring meeting's
+    /// link repeats by design — and nor are plays without a URL.
+    pub fn media_plays_between_latest(
+        &self,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<MediaPlay>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PLAY_COLUMNS} FROM media_plays p
+             WHERE p.started_at < ?2 AND p.ended_at >= ?1
+               AND (p.kind IN ('call', 'meeting') OR p.url IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM media_plays q
+                     WHERE q.url = p.url AND q.kind NOT IN ('call', 'meeting')
+                       AND (q.started_at > p.started_at
+                            OR (q.started_at = p.started_at AND q.id > p.id))))
+             ORDER BY p.started_at, p.id"
+        ))?;
+        let rows = stmt
+            .query_map([from, to], row_to_play)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// One page of the watch history: the newest `limit` plays strictly before `before`
     /// (`(started_at, id)`; `None` = from the newest), NEWEST first. Calls are left out (they
     /// were never media).
@@ -732,6 +758,41 @@ mod tests {
 
     fn stamp(url: &str, title: &str) -> MediaStamp {
         MediaStamp::new(MediaClass::YouTube, Some(url.into()), title, "Firefox")
+    }
+
+    #[test]
+    fn the_calendar_lists_a_video_on_its_last_play_only_and_keeps_calls() -> R {
+        let s = Store::open_in_memory()?;
+        let day = 86_400_000;
+        // the same video on day 1 (twice) and day 2; another video on day 1 only
+        let a1 = s.begin_media_play(1_000, &stamp("https://youtu.be/a", "A"))?;
+        s.update_media_play(a1, 2_000, 0)?;
+        let a2 = s.begin_media_play(5_000, &stamp("https://youtu.be/a", "A"))?;
+        s.update_media_play(a2, 6_000, 0)?;
+        let a3 = s.begin_media_play(day + 1_000, &stamp("https://youtu.be/a", "A"))?;
+        s.update_media_play(a3, day + 2_000, 0)?;
+        let b = s.begin_media_play(3_000, &stamp("https://youtu.be/b", "B"))?;
+        s.update_media_play(b, 4_000, 0)?;
+        // a call with a repeating link, both days
+        let call = MediaStamp::new(
+            MediaClass::Call,
+            Some("https://meet.example/team".into()),
+            "Team",
+            "Firefox",
+        );
+        let c1 = s.begin_media_play(7_000, &call)?;
+        s.update_media_play(c1, 8_000, 0)?;
+        let c2 = s.begin_media_play(day + 7_000, &call)?;
+        s.update_media_play(c2, day + 8_000, 0)?;
+        let ids = |v: Vec<MediaPlay>| v.into_iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.media_plays_between_latest(0, day)?), vec![b, c1]);
+        assert_eq!(
+            ids(s.media_plays_between_latest(day, 2 * day)?),
+            vec![a3, c2]
+        );
+        // the unscrubbed query still lists every play
+        assert_eq!(s.media_plays_between(0, day)?.len(), 4);
+        Ok(())
     }
 
     #[test]
