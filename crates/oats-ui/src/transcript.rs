@@ -332,11 +332,8 @@ pub fn transcript_list(
                 actions.push(TranscriptAction::LoadEarlier);
             }
             let mut next_break = breaks.iter().peekable();
-            let voices = crate::speakers::map(ui.ctx());
-            let mut run = crate::speakers::LabelRun::default();
             for (i, row) in rows.iter().enumerate() {
                 if let Some((_, day)) = next_break.next_if(|(at, _)| *at == i) {
-                    run.reset();
                     if i > 0 {
                         ui.add_space(10.0);
                     }
@@ -353,12 +350,7 @@ pub fn transcript_list(
                     });
                     ui.add_space(4.0);
                 }
-                let labelled = run.show(
-                    &crate::speakers::row_key(row, &voices),
-                    row.started_at,
-                    row.ended_at,
-                );
-                let rect = transcript_row(ui, &t, row, labelled, draft, &mut actions);
+                let rect = transcript_row(ui, &t, row, draft, &mut actions);
                 focus_row(ui, &t, focus, row.id, rect);
                 let y = rect.top() - origin;
                 if was_armed {
@@ -456,11 +448,8 @@ pub fn transcript_rows(
     let breaks = day_breaks(rows, &Local);
     let this_year = Local::now().year();
     let mut next_break = breaks.iter().peekable();
-    let voices = crate::speakers::map(ui.ctx());
-    let mut run = crate::speakers::LabelRun::default();
     for (i, row) in rows.iter().enumerate() {
         if let Some((_, day)) = next_break.next_if(|(at, _)| *at == i) {
-            run.reset();
             let heading = day
                 .map(|d| day_heading(d, this_year))
                 .unwrap_or_else(|| "Unknown date".to_owned());
@@ -474,12 +463,7 @@ pub fn transcript_rows(
             });
             ui.add_space(4.0);
         }
-        let labelled = run.show(
-            &crate::speakers::row_key(row, &voices),
-            row.started_at,
-            row.ended_at,
-        );
-        transcript_row(ui, &t, row, labelled, draft, &mut actions);
+        transcript_row(ui, &t, row, draft, &mut actions);
     }
     actions
 }
@@ -502,7 +486,6 @@ fn transcript_row(
     ui: &mut egui::Ui,
     t: &Tokens,
     row: &TranscriptRow,
-    labelled: bool,
     draft: &mut Option<MoveDraft>,
     actions: &mut Vec<TranscriptAction>,
 ) -> Rect {
@@ -515,19 +498,10 @@ fn transcript_row(
     let inner = ui
         .horizontal_top(|ui| {
             ui.add_space(8.0);
-            // the speaker tag under the time, only where the speaker changes (`labelled`,
-            // see `speakers::LabelRun`); "me" then shows too, when the floor comes back
-            let tag = if labelled {
-                Some(
-                    crate::speakers::row_label(row, &voices)
-                        .unwrap_or_else(|| crate::speakers::me_label(&voices)),
-                )
-            } else {
-                None
-            };
-            let them = tag.is_some();
-            let (time_rect, time_resp) = ui
-                .allocate_exact_size(vec2(TIME_W, if them { 32.0 } else { 18.0 }), Sense::hover());
+            // every row carries its speaker under the time, the user's own lines as "me"
+            let tag = crate::speakers::row_label(row, &voices)
+                .unwrap_or_else(|| crate::speakers::me_label(&voices));
+            let (time_rect, time_resp) = ui.allocate_exact_size(vec2(TIME_W, 32.0), Sense::hover());
             // a real (non-selectable) label so the time is also in the accessibility tree
             ui.put(
                 Rect::from_min_size(
@@ -542,11 +516,9 @@ fn transcript_row(
                 .selectable(false)
                 .wrap_mode(egui::TextWrapMode::Extend),
             );
-            if let Some(tag) = tag {
-                let (at, max_w) = crate::speakers::tag_pos(time_rect);
-                crate::speakers::paint_tag(ui, t, at, &tag, max_w);
-                time_resp.on_hover_text(tag.hover);
-            }
+            let (at, max_w) = crate::speakers::tag_pos(time_rect);
+            crate::speakers::paint_tag(ui, t, at, &tag, max_w);
+            time_resp.on_hover_text(tag.hover);
             let w = (ui.available_width() - 44.0).max(60.0);
             ui.vertical(|ui| {
                 ui.set_width(w);

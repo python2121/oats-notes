@@ -858,12 +858,10 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   `SpeakersChanged`, on a segment naming an unknown voice, after its own edits) and publishes the
   map on the egui context every frame (`speakers::publish` / `map`); rows resolve labels by
   hash lookup (`speakers::row_label`). Transcript rows (and search hits) show the tag under the
-  time in the voice's stable colour (`Tokens::speaker_colour`, 6 muted hues) — but only where
-  the SPEAKER CHANGES (`speakers::LabelRun`: the first row, a different `row_key` than the row
-  before, a gap > `LABEL_GAP_MS` 3 min since it ended, or after a day heading — `reset`),
-  like a chat's turn markers; "me" is a speaker for that rule and shows once (`me_label`, the
-  user's voice's colour) when the floor comes back to the user, otherwise the user's own mic
-  lines carry no tag; a brain-named voice's hover reads "named from the conversation —
+  time in the voice's stable colour (`Tokens::speaker_colour`, 6 muted hues) on EVERY row —
+  the user's own lines as "me" (`speakers::me_label`, the user's voice's colour); a
+  change-only rule (tags as a chat's turn markers) was tried and the user preferred every
+  row; a brain-named voice's hover reads "named from the conversation —
   right-click to correct". Row context menu: "Speaker: <label> ▸" Name… (inline field; empty
   clears), This is me, Merge into… (inline field resolved locally by
   `speakers::resolve_voice`: "them 3" / "voice 3" / "#3" / "3" / exact name / unique prefix /
