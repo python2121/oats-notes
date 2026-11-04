@@ -1667,17 +1667,26 @@ impl OatsApp {
             .store
             .unfiled_episodes_since(self.today_start)
             .unwrap_or(0);
-        self.latest_note = self.store.latest_note().ok().flatten().map(|e| {
-            let filed = e.node_id.is_some_and(|n| {
-                self.nodes
-                    .iter()
-                    .any(|x| x.id == n && x.kind != oats_core::NodeKind::Category)
+        // the most recent note is marked only on the day it started: after midnight it is
+        // an ordinary row again (this reload runs on the midnight rollover)
+        let today = self.today_start;
+        self.latest_note = self
+            .store
+            .latest_note()
+            .ok()
+            .flatten()
+            .filter(|e| e.started_at >= today)
+            .map(|e| {
+                let filed = e.node_id.is_some_and(|n| {
+                    self.nodes
+                        .iter()
+                        .any(|x| x.id == n && x.kind != oats_core::NodeKind::Category)
+                });
+                LatestNote {
+                    id: e.id,
+                    unfiled: !filed,
+                }
             });
-            LatestNote {
-                id: e.id,
-                unfiled: !filed,
-            }
-        });
         let mut map = HashMap::new();
         let projects: Vec<i64> = self
             .nodes
