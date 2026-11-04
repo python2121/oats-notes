@@ -379,8 +379,12 @@ Parakeet on the same pieces, for comparison.
 
 - The cost is per CALL, not per second: both models take a fixed 10 s input (WeSpeaker a
   3 × 160 000 batch), so a short segment costs nearly as much as a 10 s one. Segments under
-  4 s therefore skip the segmentation model (one embedding with an all-ones mask, FluidAudio's
-  `extractSpeakerEmbedding` approach): that halves the calls for the common short segment.
+  10 s therefore skip the segmentation model (one embedding with an all-ones mask, FluidAudio's
+  `extractSpeakerEmbedding` approach): that halves the calls for every segment under 10 s.
+  (Originally the cut was 4 s; a cross-length check of ONE voice showed padded 4–9 s windows
+  drifting 0.6–0.95 from the 2 s and 9.4 s clips, splitting the user into several voices, so
+  padded windows are gone: under 10 s one embedding, above it full windows + an end-aligned
+  tail window.)
 - Compute units: FluidAudio's default `.all` was fastest; `.cpuAndNeuralEngine` was ~30 %
   slower, `.cpuOnly` ~2.5× slower.
 - First call after load: 0.4–1.1 s (CoreML warm-up), once per process. Loading the two speaker

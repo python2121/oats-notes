@@ -2081,7 +2081,8 @@ mod tests {
         };
         let mut voices = Vec::new();
         for hz in [440.0, 880.0, 440.0] {
-            for _ in 0..20 {
+            // 4 s of tone: a NEW voice needs ≥ MIN_NEW_SPEAKER_SECS (3 s) of speech
+            for _ in 0..40 {
                 let _ = audio_tx.send(chunk(hz));
             }
             for _ in 0..15 {

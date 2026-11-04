@@ -13,15 +13,19 @@
 //!   [`UPDATE_THRESHOLD`]) and long enough (≥ [`MIN_UPDATE_SECS`]): weighted mean with the
 //!   voice's weight capped at [`MAX_WEIGHT_SECS`], so a long history still adapts.
 //!
-//! The thresholds are FluidAudio's `SpeakerManager` defaults (0.65 assign / 0.45 update, 1 s /
+//! The thresholds: assign 0.7 (FluidAudio's `DiarizerConfig.clusteringThreshold`; its
+//! `SpeakerManager` uses 0.65 — a laptop microphone in a room is noisier than its benchmarks),
+//! update 0.45 (its default), a NEW voice only from ≥ 3 s of speech (a 2 s room-mic span of the
+//! same person came out ~0.65 from a centroid built on longer ones; 3 s clips sit within 0.2),
+//! update from ≥ 2 s (FluidAudio: 1 s /
 //! 2 s), whose WeSpeaker embeddings we use.
 
 /// Cosine distance at or under which an embedding belongs to a known voice.
-pub const ASSIGN_THRESHOLD: f32 = 0.65;
+pub const ASSIGN_THRESHOLD: f32 = 0.7;
 /// Cosine distance at or under which a voice's centroid learns from the embedding.
 pub const UPDATE_THRESHOLD: f32 = 0.45;
 /// A span shorter than this never opens a new voice.
-pub const MIN_NEW_SPEAKER_SECS: f64 = 1.0;
+pub const MIN_NEW_SPEAKER_SECS: f64 = 3.0;
 /// A span shorter than this never moves a centroid.
 pub const MIN_UPDATE_SECS: f64 = 2.0;
 /// The weight of a voice's history in the running mean is capped here (seconds of speech).
@@ -450,10 +454,11 @@ mod tests {
     fn a_far_embedding_opens_a_new_voice_and_a_short_one_does_not() {
         let mut book = SpeakerBook::default();
         let mut create = counter();
-        let first = book.assign(&base(1), 2.0, false, 0, &mut create);
+        let first = book.assign(&base(1), 3.0, false, 0, &mut create);
         assert_eq!(first.map(|a| (a.speaker_id, a.created)), Some((1, true)));
         assert_eq!(book.assign(&base(2), 0.5, false, 0, &mut create), None);
-        let second = book.assign(&base(2), 1.5, false, 0, &mut create);
+        assert_eq!(book.assign(&base(2), 2.5, false, 0, &mut create), None);
+        let second = book.assign(&base(2), 3.0, false, 0, &mut create);
         assert_eq!(second.map(|a| (a.speaker_id, a.created)), Some((2, true)));
         // a short span of a KNOWN voice is still assigned (no new voice needed)
         let short = book.assign(&near(&base(1), 3, 0.1), 0.3, false, 0, &mut create);

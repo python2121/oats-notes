@@ -63,9 +63,11 @@ Everything else (ASR, diarization, TTS, Qwen3, examples, tests, `AGENTS.md`) is 
      `DiarizerManager.processChunkWithSpeakerTracking` (10 s windows, clean-frame masks,
      `minActiveFramesCount` 10, frame step 0.016875 s) but with NO `SpeakerManager`: each
      window's local speakers come back as spans (start / end / active seconds within the
-     samples, L2-normalised 256-float embedding). Audio under 4 s skips segmentation (one
-     embedding, all-ones mask, as `extractSpeakerEmbedding` does). A trailing window under
-     1 s after a full one is skipped. C exports `fluidaudio_initialize_speaker_embed`
+     samples, L2-normalised 256-float embedding). Audio under 10 s skips segmentation (one
+     embedding of the whole clip, all-ones mask, as `extractSpeakerEmbedding` does); longer
+     audio is cut into FULL 10 s windows plus, for a remainder ≥ 1 s, one window aligned to
+     the end of the audio (overlap embedded again, not counted as speech again). A window is
+     never zero-padded: the fixed-input models drift on padding (same voice 0.85–0.95 apart). C exports `fluidaudio_initialize_speaker_embed`
      (idempotent; errors → `fluidaudio_last_error`), `fluidaudio_is_speaker_embed_available`,
      `fluidaudio_speaker_embed_samples` (flat out-arrays: starts, ends, speech seconds,
      span-major embeddings + dim + count; -1 NULL / not loaded, -2 model error),

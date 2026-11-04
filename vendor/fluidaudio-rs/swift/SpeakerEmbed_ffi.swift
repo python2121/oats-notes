@@ -26,12 +26,16 @@ final class BridgeSpeakerEmbedder {
     static let frameStep: Float = 0.016875
     /// `DiarizerConfig.minActiveFramesCount`.
     static let minActiveFrames: Float = 10.0
-    /// A trailing window shorter than this (after a full one) is not worth a model call.
+    /// A remainder shorter than this after the full windows gets no extra (end-aligned)
+    /// window: those seconds are already represented well enough.
     static let minTailSamples = 16_000
-    /// Audio shorter than this is taken as ONE speaker: no segmentation, one embedding with
-    /// an all-ones mask (FluidAudio's `extractSpeakerEmbedding`), half the model calls. Short
-    /// VAD segments are nearly always one voice.
-    static let singleSpeakerSamples = 64_000
+    /// Audio shorter than one window is taken as ONE speaker: no segmentation, one embedding
+    /// with an all-ones mask (FluidAudio's `extractSpeakerEmbedding`). The models take a
+    /// fixed 10 s input, and a window that is mostly zero padding drifts: the same voice at
+    /// 4.5 s and 9.4 s came out 0.85 apart, and 2 s vs 4.5 s 0.95, while 2 s / 3.5 s / 9.4 s
+    /// clips through this single-embedding path sit within 0.2 of each other. So the
+    /// segmentation path only ever sees FULL windows.
+    static let singleSpeakerSamples = windowSamples
 
     struct Span {
         var start: Float
@@ -76,30 +80,32 @@ final class BridgeSpeakerEmbedder {
             out.append(Span(start: 0, end: secs, speech: secs, embedding: e))
             return out
         }
-        var offset = 0
-        while offset < total {
-            let n = min(windowSamples, total - offset)
-            if offset > 0 && n < Self.minTailSamples { break }
+        // full windows at 0, 10, 20 s…; a remainder of at least `minTailSamples` gets one
+        // more window aligned to the END of the audio (overlapping the previous one), never
+        // a zero-padded one. Overlapped frames are embedded again (harmless) but counted as
+        // speech only once (`newFromFrame`).
+        var offsets: [Int] = Array(stride(from: 0, through: total - windowSamples, by: windowSamples))
+        let covered = (offsets.last ?? -windowSamples) + windowSamples
+        if total - covered >= Self.minTailSamples {
+            offsets.append(total - windowSamples)
+        }
+        for (wi, offset) in offsets.enumerated() {
+            let n = windowSamples
+            let previousEnd = wi == 0 ? 0 : offsets[wi - 1] + windowSamples
+            let newFromFrame = max(0, Int((Float(previousEnd - offset) / Float(Self.sampleRate)) / Self.frameStep))
             window.withUnsafeMutableBufferPointer { buf in
                 guard let dst = buf.baseAddress else { return }
                 dst.update(from: base.advanced(by: offset), count: n)
-                if n < windowSamples {
-                    dst.advanced(by: n).update(repeating: 0, count: windowSamples - n)
-                }
             }
             let slice = window[0..<windowSamples]
             let (segments, _) = try segmentation.getSegments(
                 audioChunk: slice, segmentationModel: models.segmentationModel)
             guard let frames = segments.first, let firstFrame = frames.first else {
-                offset += windowSamples
                 continue
             }
             let numSpeakers = firstFrame.count
             let numFrames = frames.count
-            // frames past the real audio are padding
-            let usableFrames = min(
-                numFrames,
-                Int((Float(n) / Float(Self.sampleRate)) / Self.frameStep) + 1)
+            let usableFrames = numFrames
 
             var masks: [[Float]] = Array(
                 repeating: [Float](repeating: 0, count: numFrames), count: numSpeakers)
@@ -113,15 +119,16 @@ final class BridgeSpeakerEmbedder {
                 for s in 0..<numSpeakers {
                     let v = row[s]
                     masks[s][f] = v * clean
-                    activity[s] += v
-                    if v > 0.5 {
-                        if firstActive[s] < 0 { firstActive[s] = f }
-                        lastActive[s] = f
+                    if f >= newFromFrame {
+                        activity[s] += v
+                        if v > 0.5 {
+                            if firstActive[s] < 0 { firstActive[s] = f }
+                            lastActive[s] = f
+                        }
                     }
                 }
             }
             guard activity.contains(where: { $0 > Self.minActiveFrames }) else {
-                offset += windowSamples
                 continue
             }
             let embeddings = try extractor.getEmbeddings(
@@ -140,7 +147,6 @@ final class BridgeSpeakerEmbedder {
                         speech: activity[s] * Self.frameStep,
                         embedding: embedding))
             }
-            offset += windowSamples
         }
         return out
     }

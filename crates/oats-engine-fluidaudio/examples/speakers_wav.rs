@@ -98,6 +98,11 @@ fn main() -> Result<(), String> {
             s.speech_ms as f64 / 1000.0,
             s.embedding.iter().map(|x| x * x).sum::<f32>().sqrt()
         );
+        if std::env::var_os("SPEAKERS_DUMP").is_some() {
+            // the raw vector, one line, for cross-run comparisons
+            let v: Vec<String> = s.embedding.iter().map(|x| format!("{x:.5}")).collect();
+            println!("EMB {i} {}", v.join(" "));
+        }
     }
     if spans.len() > 1 {
         println!("pairwise cosine distance:");
