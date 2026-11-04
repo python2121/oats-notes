@@ -815,7 +815,12 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
 - **Matching** (`oats_core::speakers`, pure): ONE global `SpeakerBook` (a person is the same on
   either lane). Cosine distance to every centroid (plain f32 loop): ≤ `ASSIGN_THRESHOLD` 0.7 →
   that voice; else a new voice when the span has ≥ `MIN_NEW_SPEAKER_SECS` 3 s, else none (a
-  short unmatched span gets no voice rather than opening a phantom one). The
+  short unmatched span gets no voice rather than opening a phantom one). **Auto-merge**
+  (`SpeakerBook::merge_if_close`, after every centroid update): a voice whose centroid now sits
+  within `MERGE_THRESHOLD` 0.3 of another's, both with ≥ `MIN_MERGE_SECS` 30 s of speech, is
+  folded into it (the user's voice survives, else a user-named one, else the older; two
+  user-named voices are never merged automatically) — the pipeline then calls
+  `Store::merge_speakers(from, into)` (one write; logged at info; `SpeakersChanged`). The
   centroid learns (weighted mean, re-normalised) only at ≤ `UPDATE_THRESHOLD` 0.45 and ≥ 2 s;
   the history's weight is capped at `MAX_WEIGHT_SECS` 600 (the stored `speech_secs` total is
   not capped). `dominant` = most speech seconds. Auto-me: with no `is_me` voice, the first with

@@ -33,6 +33,11 @@ pub const MAX_WEIGHT_SECS: f64 = 600.0;
 /// With no voice flagged as the user's, the first voice with this much MICROPHONE speech in
 /// total becomes "me".
 pub const AUTO_ME_MIC_SECS: f64 = 60.0;
+/// Two voices whose centroids come within this distance are the same person: merged
+/// (different voices sit at 0.8+; the same voice across clip lengths within 0.2).
+pub const MERGE_THRESHOLD: f32 = 0.3;
+/// …only when both have at least this much speech (a young centroid is still noisy).
+pub const MIN_MERGE_SECS: f64 = 30.0;
 
 /// `OATS_SPEAKERS=on|off` (also 1/0, true/false): `None` when unset or unreadable (logged).
 pub fn speakers_env() -> Option<bool> {
@@ -134,6 +139,7 @@ impl Speaker {
             speech_secs: self.speech_secs,
             mic_secs: self.mic_secs,
             is_me: self.is_me,
+            user_named: self.name.is_some() && self.name_source == Some(NameSource::User),
             last_heard_at: self.last_heard_at,
             dirty: false,
         }
@@ -179,6 +185,8 @@ pub struct SpeakerEntry {
     /// …of which heard on the microphone (the auto-"me" rule).
     pub mic_secs: f64,
     pub is_me: bool,
+    /// Named by the user: two such voices are never merged automatically.
+    pub user_named: bool,
     pub last_heard_at: i64,
     /// Changed since the last [`SpeakerBook::take_dirty`].
     pub dirty: bool,
@@ -193,10 +201,20 @@ impl SpeakerEntry {
             speech_secs,
             mic_secs: 0.0,
             is_me: false,
+            user_named: false,
             last_heard_at,
             dirty: false,
         }
     }
+}
+
+/// Two voices the book found to be one person ([`SpeakerBook::merge_if_close`]): `from` was
+/// folded into `into` (the caller merges the store rows the same way).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Merge {
+    pub from: i64,
+    pub into: i64,
+    pub distance: f32,
 }
 
 /// What [`SpeakerBook::assign`] decided for one span.
@@ -341,6 +359,59 @@ impl SpeakerBook {
         }
     }
 
+    /// After `id`'s centroid moved: when it now sits within [`MERGE_THRESHOLD`] of another
+    /// voice and both carry ≥ [`MIN_MERGE_SECS`] of speech, they are one person — folded
+    /// into one entry (the user's voice survives, else a user-named one, else the older;
+    /// two user-named voices are never merged: that is the user's call) with the same
+    /// weighted centroid the store computes. The caller merges the rows with
+    /// `Store::merge_speakers(from, into)`.
+    pub fn merge_if_close(&mut self, id: i64) -> Option<Merge> {
+        let i = self.entries.iter().position(|e| e.id == id)?;
+        if self.entries[i].speech_secs < MIN_MERGE_SECS {
+            return None;
+        }
+        let (j, distance) = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(j, e)| *j != i && e.speech_secs >= MIN_MERGE_SECS)
+            .map(|(j, e)| (j, cosine_distance(&self.entries[i].centroid, &e.centroid)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        if distance > MERGE_THRESHOLD {
+            return None;
+        }
+        let (a, b) = (&self.entries[i], &self.entries[j]);
+        if a.user_named && b.user_named {
+            return None;
+        }
+        let rank = |e: &SpeakerEntry| (e.is_me, e.user_named, std::cmp::Reverse(e.id));
+        let (keep, drop) = if rank(a) >= rank(b) { (i, j) } else { (j, i) };
+        let gone = self.entries.remove(drop);
+        let keep = if drop < keep { keep - 1 } else { keep };
+        let e = &mut self.entries[keep];
+        let (wa, wb) = (
+            gone.speech_secs.min(MAX_WEIGHT_SECS) as f32,
+            e.speech_secs.min(MAX_WEIGHT_SECS) as f32,
+        );
+        if wa + wb > 0.0 {
+            for (c, x) in e.centroid.iter_mut().zip(&gone.centroid) {
+                *c = (*c * wb + x * wa) / (wa + wb);
+            }
+            normalise(&mut e.centroid);
+        }
+        e.speech_secs += gone.speech_secs;
+        e.mic_secs += gone.mic_secs;
+        e.is_me |= gone.is_me;
+        e.user_named |= gone.user_named;
+        e.last_heard_at = e.last_heard_at.max(gone.last_heard_at);
+        e.dirty = true;
+        Some(Merge {
+            from: gone.id,
+            into: e.id,
+            distance,
+        })
+    }
+
     /// The entries changed since the last call (their dirty flags cleared).
     pub fn take_dirty(&mut self) -> Vec<SpeakerEntry> {
         let mut out = Vec::new();
@@ -448,6 +519,50 @@ mod tests {
         let alice_entry = book.get(1).map(|e| (e.speech_secs, e.mic_secs));
         assert_eq!(alice_entry, Some((30.0, 30.0)));
         assert_eq!(book.get(2).map(|e| e.mic_secs), Some(0.0));
+    }
+
+    #[test]
+    fn voices_that_drift_close_merge_into_one_unless_both_are_user_named() {
+        let mut book = SpeakerBook::default();
+        let mut create = counter();
+        book.assign(&base(1), 40.0, true, 1, &mut create);
+        book.assign(&base(2), 40.0, false, 2, &mut create);
+        assert_eq!(book.len(), 2, "unrelated at creation: two voices");
+        // voice 2's centroid moves next to voice 1's
+        let id2 = book.entries[1].id;
+        book.entries[1].centroid = near(&base(1), 8, 0.05);
+        normalise(&mut book.entries[1].centroid);
+        let none = Merge {
+            from: 0,
+            into: 0,
+            distance: 9.0,
+        };
+        let m = book.merge_if_close(id2).unwrap_or(none);
+        assert_eq!((m.from, m.into), (id2, 1), "the older voice survives");
+        assert!(m.distance < MERGE_THRESHOLD);
+        assert_eq!(book.len(), 1);
+        assert_eq!(book.get(1).map(|e| e.speech_secs), Some(80.0));
+        assert_eq!(book.get(1).map(|e| e.mic_secs), Some(40.0));
+        // young voices (under MIN_MERGE_SECS) are left alone
+        book.assign(&base(4), 5.0, false, 3, &mut create);
+        assert_eq!(book.len(), 2);
+        let young = book.entries[1].id;
+        assert_eq!(book.merge_if_close(young), None);
+        // two user-named voices are never merged automatically; "me" wins the survivor rank
+        let mut book = SpeakerBook::default();
+        book.assign(&base(2), 40.0, false, 1, &mut create);
+        book.assign(&base(3), 40.0, false, 2, &mut create);
+        book.entries[1].centroid = near(&base(2), 4, 0.05);
+        normalise(&mut book.entries[1].centroid);
+        let (a, b) = (book.entries[0].id, book.entries[1].id);
+        book.entries[0].user_named = true;
+        book.entries[1].user_named = true;
+        assert_eq!(book.merge_if_close(b), None);
+        book.entries[0].user_named = false;
+        book.set_me(b);
+        let m = book.merge_if_close(b).unwrap_or(none);
+        assert_eq!((m.from, m.into), (a, b));
+        assert!(book.get(b).is_some_and(|e| e.is_me && e.user_named));
     }
 
     #[test]

@@ -1440,6 +1440,34 @@ impl Session<'_> {
             }
         }
         let mut changed = created > 0;
+        // a centroid that moved may now sit on top of another voice's: one person, merged
+        let moved: Vec<i64> = assigned.iter().map(|(id, _)| *id).collect();
+        for id in moved {
+            let Some(m) = book.merge_if_close(id) else {
+                continue;
+            };
+            match store.merge_speakers(m.from, m.into) {
+                Ok(_) => {
+                    for (id, _) in &mut assigned {
+                        if *id == m.from {
+                            *id = m.into;
+                        }
+                    }
+                    changed = true;
+                    log::info!(
+                        "speakers: voice {} merged into {} (centroids {:.2} apart)",
+                        m.from,
+                        m.into,
+                        m.distance
+                    );
+                }
+                Err(e) => log::warn!(
+                    "speakers: could not merge voice {} into {}: {e}",
+                    m.from,
+                    m.into
+                ),
+            }
+        }
         if mic && let Some(me) = book.auto_me() {
             match store.set_speaker_me(me) {
                 Ok(true) => {
