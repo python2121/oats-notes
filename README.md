@@ -72,6 +72,9 @@ cargo build --release -p oats-notes        # the first build compiles the Swift 
 ./target/release/oats-notes --listen       # start listening as soon as the model is ready
 ```
 
+The app opens idle: ⌘L (or the status-bar item) starts listening, and Preferences has "Start
+listening when the app opens" for an app that should listen from launch.
+
 The first run downloads the speech model (about 600 MB) into
 `~/Library/Application Support/FluidAudio`. Run from a terminal, macOS asks that terminal for
 microphone access; system audio needs "System Audio Recording Only" under System Settings →

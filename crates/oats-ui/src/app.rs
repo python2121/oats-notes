@@ -106,8 +106,11 @@ pub struct AppPrefs {
     pub sidebar_visible: bool,
     pub sidebar_width: f32,
     pub view: View,
-    /// Listening was on at quit: start again once the engine is ready ("listen all day").
+    /// Listening was on at quit (a record of the user's choice; by itself it starts nothing).
     pub listening: bool,
+    /// Start listening (the remembered lanes) as soon as the engine is ready at every launch.
+    /// Off by default: the app opens idle until ⌘L, the status item or `--listen`.
+    pub listen_at_launch: bool,
     /// The lane set "Start Listening" (⌘L, the status item, `--listen`) opens: the last one the
     /// user chose with the Mic / System audio pills. Default: both.
     pub lanes: Lanes,
@@ -147,6 +150,7 @@ impl Default for AppPrefs {
             sidebar_width: 220.0,
             view: View::Transcripts,
             listening: false,
+            listen_at_launch: false,
             lanes: Lanes::default(),
             capture_system: None,
             command_sound: true,
@@ -789,7 +793,7 @@ impl OatsApp {
             audio,
             capture: None,
             store,
-            auto_listen: prefs.listening || options.start_listening,
+            auto_listen: prefs.listen_at_launch || options.start_listening,
             prefs,
             persist: options.persist,
             native_menu: cfg!(target_os = "macos") && options.native_menu,
@@ -1090,7 +1094,7 @@ impl OatsApp {
     /// The lanes the pills show: the running ones, or (while a lane change restarts the
     /// captures) the set being opened.
     fn lanes_shown(&self) -> Lanes {
-        if self.auto_listen && !self.is_listening() && self.prefs.listening {
+        if self.auto_listen && !self.is_listening() {
             self.prefs.lanes
         } else {
             self.session_lanes()
@@ -3605,6 +3609,7 @@ impl OatsApp {
         let mut save = false;
         let mut close = false;
         let mut sound = self.prefs.command_sound;
+        let mut listen_at_launch = self.prefs.listen_at_launch;
         let mut clock_24h = self.prefs.clock_24h;
         let mut thumbnails = self.prefs.fetch_thumbnails;
         let mut keep = self.prefs.keep_transcripts;
@@ -3687,6 +3692,11 @@ impl OatsApp {
                     .size(11.0),
                 );
                 ui.add_space(8.0);
+                ui.checkbox(&mut listen_at_launch, "Start listening when the app opens")
+                    .on_hover_text(
+                        "Off: the app opens idle; ⌘L, the status item or `--listen` starts \
+                         listening. On: the remembered lanes open as soon as the engine is ready.",
+                    );
                 ui.checkbox(&mut sound, "Play a sound for voice commands");
                 ui.checkbox(&mut clock_24h, "Use 24-hour time");
                 ui.checkbox(
@@ -3799,6 +3809,7 @@ impl OatsApp {
             }
         }
         self.prefs.command_sound = sound;
+        self.prefs.listen_at_launch = listen_at_launch;
         self.prefs.clock_24h = clock_24h;
         self.prefs.fetch_thumbnails = thumbnails;
         if keep != self.prefs.keep_transcripts {
@@ -4846,7 +4857,8 @@ impl eframe::App for OatsApp {
     }
 
     fn on_exit(&mut self) {
-        // prefs.listening keeps the user's choice: listening resumes at the next launch
+        // prefs.listening keeps the user's choice on record; whether the next launch listens
+        // is prefs.listen_at_launch
         self.stop_listening();
     }
 }
@@ -4920,6 +4932,7 @@ mod tests {
             sidebar_width: 250.0,
             view: View::Node(7),
             listening: true,
+            listen_at_launch: true,
             lanes: Lanes {
                 mic: true,
                 system: false,

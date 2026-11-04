@@ -279,8 +279,9 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
   `AudioRequest { mic, system }` / `ListenOptions { mic, system }`; system-only listening never
   opens the microphone, and the "microphone stopped" warning is off when `mic` is false.
   `AppPrefs::lanes` (`Lanes { mic, system }`, default both) remembers the last lane set; the
-  master switch (⌘L / "Start Listening", the status item's toggle, `--listen`, listening
-  resumed at launch) opens that set, "Stop Listening" turns every lane off (the set is kept).
+  master switch (⌘L / "Start Listening", the status item's toggle, `--listen`, and the
+  launch when Preferences "Start listening when the app opens" — `AppPrefs::listen_at_launch`,
+  OFF by default: the app opens idle — is on) opens that set, "Stop Listening" turns every lane off (the set is kept).
   The old `capture_system` pref is read once into `lanes.system` on load and no longer
   written. A starter that opens nothing (system-only and the tap fails) returns `Err`. The status item's tooltip reads "Listening · mic + system" /
   "… · mic" / "… · system" (`state_label`; the status strip itself no longer repeats the
@@ -409,7 +410,7 @@ Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui:
 the window below the in-window menu bar, 12 pt clear of every edge (`constrain_to`), up to
 560 pt wide (narrower when the window is), its whole body in a vertical `ScrollArea` (the Apps
 table has none of its own) so it is never taller than the window, with one field, "Your name", saved on Enter / blur / close via `Store::set_user_name`
-(a blank name clears it). Its checkboxes: "Play a sound for voice commands" (on), "Use 24-hour
+(a blank name clears it). Its checkboxes: "Start listening when the app opens" (off), "Play a sound for voice commands" (on), "Use 24-hour
 time" (off), "Fetch video thumbnails" (off), "Keep transcripts indefinitely" (ON by default),
 "Recognise speakers" (OFF by default — a fresh install keeps no voiceprints until asked).
 **Keep transcripts off** (`AppPrefs::keep_transcripts = false`): a transcript line is deleted
