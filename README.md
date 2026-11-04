@@ -18,9 +18,10 @@ model only on closed speech segments.
 
 ## What it does
 
-- **Transcripts**: everything heard, paged by day, with "me" and "them" lanes (microphone and
-  system audio). Echoes of the Mac's own playback picked up by the microphone are detected
-  and hidden.
+- **Transcripts**: everything heard, one scrolling history with day headings, with "me" and
+  "them" lanes (microphone and system audio) and, with speaker recognition on, a name or a
+  stable "them 2" / "voice 3" tag on every line. Echoes of the Mac's own playback picked up by
+  the microphone are detected and hidden.
 - **Notes**: the brain cuts the transcript into episodes and writes a note for each, filed under
   a project. Project pages roll up next steps (action items with checkboxes), categories roll
   those up further. Notes can be edited, moved, merged, re-interpreted or deleted.
@@ -40,7 +41,8 @@ Everything stays on the machine. The database is owner-only on disk, in
 `~/Library/Application Support/OatsNotes`. The app makes no network calls of its own except:
 
 - the one-time speech model downloads (FluidAudio fetches Parakeet, Silero VAD and the two
-  speaker-recognition models from Hugging Face on first run);
+  speaker-recognition models from Hugging Face on first run, whether or not speaker
+  recognition is turned on);
 - the `claude` CLI, which sends transcript text to Anthropic under your own Claude login when
   the brain runs (turn it off with `OATS_BRAIN=off` and the app is a plain transcriber);
 - YouTube thumbnails, only if you opt in under Preferences.
@@ -69,11 +71,12 @@ empty working directory. `docs/security-review-2026-10-28.md` has the details.
 
 ```bash
 cargo build --release -p oats-notes        # the first build compiles the Swift package (minutes)
-./target/release/oats-notes --listen       # start listening as soon as the model is ready
+./target/release/oats-notes                # opens idle: ⌘L or the status-bar item starts listening
+./target/release/oats-notes --listen       # or start listening as soon as the model is ready
 ```
 
-The app opens idle: ⌘L (or the status-bar item) starts listening, and Preferences has "Start
-listening when the app opens" for an app that should listen from launch.
+Preferences has "Start listening when the app opens" (off by default) for an app that should
+listen from launch.
 
 The first run downloads the speech model (about 600 MB) into
 `~/Library/Application Support/FluidAudio`. Run from a terminal, macOS asks that terminal for
@@ -128,4 +131,6 @@ See `THIRD_PARTY.md` for the vendored crates and the fetched Swift package, and
 
 ## License
 
-GPL-3.0-only, as declared in `Cargo.toml`. See `LICENSE`.
+GPL-3.0-only, as declared in `Cargo.toml`; the full text is in `LICENSE`. The vendored crates
+and the bundled font keep their own licenses (MIT, Apache-2.0, OFL), listed in `THIRD_PARTY.md`
+and `assets/ATTRIBUTION.md`.
