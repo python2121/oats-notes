@@ -43,6 +43,12 @@ use serde::Deserialize as _;
 /// eframe storage key for [`AppPrefs`] (RON).
 /// How long a warning stays in the status strip before it clears itself.
 pub const WARNING_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// With "Keep transcripts indefinitely" off, a transcript line is deleted this long after it
+/// ended, once the brain is done with it: longer than the episode cutter's widest gap (twice
+/// 10 min inside a call), so a note is never purged while the brain could still revise it.
+pub const TRANSCRIPT_GRACE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Purges run at most this often.
+const PURGE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub const PREFS_KEY: &str = "oatsnotes.prefs";
 /// Height of the Transcripts view's header strip ("Show media").
@@ -122,8 +128,16 @@ pub struct AppPrefs {
     /// network call the app makes itself). Off by default: nothing is fetched while off.
     pub fetch_thumbnails: bool,
     /// Recognise speakers (a voiceprint per person in the database; `OATS_SPEAKERS`
-    /// overrides). On by default.
+    /// overrides). Off by default: a fresh install keeps no voiceprints until asked.
     pub speakers: bool,
+    /// Keep every transcript line for good (default). Off: a line is deleted
+    /// [`TRANSCRIPT_GRACE`] after the brain is done with it (see
+    /// [`OatsApp::purge_transcripts`]); the notes made from it stay.
+    pub keep_transcripts: bool,
+    /// When `keep_transcripts` was last turned off (unix ms): only lines that started at or
+    /// after it are deleted; the earlier history stays until the user asks for it to go too
+    /// (then 0 = everything).
+    pub drop_transcripts_from: i64,
 }
 
 impl Default for AppPrefs {
@@ -140,7 +154,9 @@ impl Default for AppPrefs {
             show_media: false,
             clock_24h: false,
             fetch_thumbnails: false,
-            speakers: true,
+            speakers: false,
+            keep_transcripts: true,
+            drop_transcripts_from: 0,
         }
     }
 }
@@ -496,6 +512,11 @@ struct PrefsWindow {
     name: String,
     /// Focus the field on the first frame.
     focus: bool,
+    /// `(drop_transcripts_from, lines before it)`: what "Keep transcripts" off leaves alone,
+    /// counted once per value of the boundary.
+    kept_before: Option<(i64, i64)>,
+    /// "Delete them too" was clicked: the confirmation is showing.
+    confirm_purge: bool,
     /// The "Apps" table (apps seen playing ∪ overridden ones).
     apps: Vec<AppRow>,
     /// The "Speakers" table's name fields, by voice id (edited text, saved on Enter / blur).
@@ -668,6 +689,12 @@ pub struct OatsApp {
     due_now: Vec<Todo>,
     /// When the next todo comes due (a repaint is scheduled for then).
     next_due: Option<i64>,
+    /// "Keep transcripts" off: something happened that may have left lines to delete.
+    purge_due: bool,
+    /// When the last purge ran (at most one a minute).
+    purge_last: Option<std::time::Instant>,
+    /// When the earliest line not yet old enough to go will be (a repaint is scheduled).
+    purge_next_at: Option<i64>,
     changes: Vec<Change>,
     notes_state: NotesState,
     calendar_state: CalendarState,
@@ -800,6 +827,9 @@ impl OatsApp {
             todos: Vec::new(),
             due_now: Vec::new(),
             next_due: None,
+            purge_due: true,
+            purge_last: None,
+            purge_next_at: None,
             changes: Vec::new(),
             notes_state: NotesState::default(),
             calendar_state: CalendarState::default(),
@@ -1341,6 +1371,8 @@ impl OatsApp {
                 self.prefs_window = Some(PrefsWindow {
                     name,
                     focus: true,
+                    kept_before: None,
+                    confirm_purge: false,
                     apps,
                     speaker_names,
                 });
@@ -2382,7 +2414,10 @@ impl OatsApp {
                     self.confirm(ctx, confirmations);
                     reload = true;
                 }
-                BrainEvent::Changed(_) => reload = true,
+                BrainEvent::Changed(_) => {
+                    reload = true;
+                    self.purge_due = true;
+                }
                 BrainEvent::Spend { today_usd } => self.brain_status.spend_today_usd = today_usd,
                 BrainEvent::Warning(w) => {
                     // the text can quote claude's output: details at debug level only
@@ -2493,6 +2528,62 @@ impl OatsApp {
         }
     }
 
+    /// "Keep transcripts indefinitely" off: delete the lines the brain is done with
+    /// (`Store::purge_transcripts` from `drop_transcripts_from`, older than
+    /// [`TRANSCRIPT_GRACE`]) — at most once a minute, and only when something happened (a
+    /// stored segment, a brain change, the preference itself) or when the earliest waiting
+    /// line has aged past the grace, for which ONE repaint is scheduled. Nothing polls.
+    fn purge_transcripts(&mut self, ctx: &egui::Context) {
+        if self.prefs.keep_transcripts {
+            return;
+        }
+        let now = chrono::Local::now().timestamp_millis();
+        if self.purge_next_at.is_some_and(|at| at <= now) {
+            self.purge_due = true;
+        }
+        if !self.purge_due {
+            return;
+        }
+        if let Some(last) = self.purge_last
+            && last.elapsed() < PURGE_EVERY
+        {
+            ctx.request_repaint_after(
+                PURGE_EVERY - last.elapsed() + std::time::Duration::from_millis(50),
+            );
+            return;
+        }
+        self.purge_due = false;
+        self.purge_last = Some(std::time::Instant::now());
+        self.purge_next_at = None;
+        let grace = TRANSCRIPT_GRACE.as_millis() as i64;
+        match self
+            .store
+            .purge_transcripts(self.prefs.drop_transcripts_from, now - grace)
+        {
+            Ok(p) => {
+                if p.deleted > 0 {
+                    log::info!(
+                        "transcripts: {} lines deleted (keep transcripts is off)",
+                        p.deleted
+                    );
+                    self.reload();
+                    match self.store.segment_count_since(self.today_start) {
+                        Ok(n) => self.today_count = n,
+                        Err(e) => self.store_error(e),
+                    }
+                    ctx.request_repaint();
+                }
+                self.purge_next_at = p.next.map(|ended| ended + grace);
+            }
+            Err(e) => self.store_error(e),
+        }
+        if let Some(at) = self.purge_next_at {
+            ctx.request_repaint_after(std::time::Duration::from_millis(
+                (at - now).max(0) as u64 + 50,
+            ));
+        }
+    }
+
     /// A brain run's outcome as a small pop-up (4 s, no chime).
     fn brain_toast(&mut self, ctx: &egui::Context, text: String, error: bool) {
         let now = ctx.input(|i| i.time);
@@ -2588,6 +2679,7 @@ impl OatsApp {
                 PipelineEvent::SpeakersChanged => self.reload_speakers(),
                 PipelineEvent::Segment(row) => {
                     self.supersede_transcription_warning();
+                    self.purge_due = true;
                     if row
                         .speaker_id
                         .is_some_and(|id| !self.speakers.contains_key(&id))
@@ -3506,6 +3598,22 @@ impl OatsApp {
         let mut sound = self.prefs.command_sound;
         let mut clock_24h = self.prefs.clock_24h;
         let mut thumbnails = self.prefs.fetch_thumbnails;
+        let mut keep = self.prefs.keep_transcripts;
+        let mut purge_old = false;
+        // the lines from before "Keep transcripts" was turned off: kept until asked
+        let from = self.prefs.drop_transcripts_from;
+        let kept_before = if !keep && from > 0 {
+            match win.kept_before {
+                Some((f, n)) if f == from => Some(n),
+                _ => {
+                    let n = self.store.segment_count_before(from).unwrap_or(0);
+                    win.kept_before = Some((from, n));
+                    Some(n)
+                }
+            }
+        } else {
+            None
+        };
         let mut speakers_on = self.prefs.speakers;
         let speakers_fixed = oats_core::speakers::speakers_env();
         let mut speaker_edits: Vec<SpeakerEdit> = Vec::new();
@@ -3580,6 +3688,41 @@ impl OatsApp {
                     "The Media view shows a YouTube video's thumbnail, fetched once from \
                      i.ytimg.com and kept in the data folder. Off: nothing is fetched.",
                 );
+                ui.checkbox(&mut keep, "Keep transcripts indefinitely")
+                    .on_hover_text(
+                        "On: every transcript line stays in the database. Off: a line is \
+                         deleted 30 minutes after the brain has turned it into a note (or \
+                         marked it as an echo); the notes, events and todos made from it stay, \
+                         but there is no transcript left to show or re-interpret. Lines the \
+                         brain has not processed yet are kept until it has.",
+                    );
+                if let Some(n) = kept_before.filter(|n| *n > 0) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{n} lines from before this was turned off are kept."
+                            ))
+                            .color(t.text_tertiary)
+                            .size(11.0),
+                        );
+                        if win.confirm_purge {
+                            ui.label(
+                                egui::RichText::new("Delete them? Undo not available.")
+                                    .color(t.danger)
+                                    .size(11.0),
+                            );
+                            if ui.small_button("Delete").clicked() {
+                                purge_old = true;
+                                win.confirm_purge = false;
+                            }
+                            if ui.small_button("Cancel").clicked() {
+                                win.confirm_purge = false;
+                            }
+                        } else if ui.small_button("Delete them too").clicked() {
+                            win.confirm_purge = true;
+                        }
+                    });
+                }
                 ui.add_space(10.0);
                 ui.label(
                     egui::RichText::new("Media (YouTube, music, media apps)")
@@ -3649,6 +3792,21 @@ impl OatsApp {
         self.prefs.command_sound = sound;
         self.prefs.clock_24h = clock_24h;
         self.prefs.fetch_thumbnails = thumbnails;
+        if keep != self.prefs.keep_transcripts {
+            self.prefs.keep_transcripts = keep;
+            if !keep {
+                // the history up to now is kept; only new lines go
+                self.prefs.drop_transcripts_from = chrono::Local::now().timestamp_millis();
+                win.kept_before = None;
+                win.confirm_purge = false;
+            }
+            self.purge_due = true;
+        }
+        if purge_old {
+            self.prefs.drop_transcripts_from = 0;
+            win.kept_before = None;
+            self.purge_due = true;
+        }
         if speakers_on != self.prefs.speakers {
             self.prefs.speakers = speakers_on;
             self.pipeline.set_speakers(speakers_on);
@@ -4256,6 +4414,7 @@ impl eframe::App for OatsApp {
                 (at - now).max(0) as u64 + 50,
             ));
         }
+        self.purge_transcripts(ctx);
         self.route_menu_events();
         self.sync_status_item(ctx);
         self.handle_close(ctx);
@@ -4762,7 +4921,9 @@ mod tests {
             show_media: true,
             clock_24h: true,
             fetch_thumbnails: true,
-            speakers: false,
+            speakers: true,
+            keep_transcripts: false,
+            drop_transcripts_from: 1_700_000_000_000,
         };
         prefs.store(&mut s);
         assert_eq!(AppPrefs::load(&s), prefs);
@@ -5007,6 +5168,90 @@ mod tests {
         assert!((level_fraction(-30.0) - 0.5).abs() < 1e-6);
         assert_eq!(level_fraction(0.0), 1.0);
         assert_eq!(level_fraction(6.0), 1.0);
+    }
+
+    /// "Keep transcripts indefinitely" off: the headless app deletes the lines the brain is
+    /// done with (older than the grace), keeps the uninterpreted ones, and leaves the history
+    /// from before the switch alone until asked; on by default nothing is touched.
+    #[test]
+    fn keep_transcripts_off_purges_interpreted_lines_past_the_grace() {
+        let Ok(store) = Store::open_in_memory() else {
+            eprintln!("skipped: Store::open_in_memory unavailable");
+            return;
+        };
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let dir = std::env::temp_dir().join(format!("oats-ui-purge-{}", std::process::id()));
+        let pipeline = oats_core::Pipeline {
+            engine: Box::new(|| {
+                Ok(Box::new(oats_core::NullEngine) as Box<dyn oats_core::SpeechEngine>)
+            }),
+            store_path: dir.join("oats.sqlite"),
+            segmenter: Default::default(),
+            wake: Box::new(|| {}),
+        }
+        .spawn();
+        let audio: AudioStarter = Box::new(|_tx, _req| Err("no microphone in tests".to_owned()));
+        let mut app = OatsApp::new(
+            &cc,
+            AppOptions {
+                native_menu: false,
+                system_font: false,
+                persist: false,
+                start_listening: false,
+            },
+            pipeline,
+            audio,
+            store,
+            None,
+            None,
+        );
+        let now = chrono::Local::now().timestamp_millis();
+        let grace = TRANSCRIPT_GRACE.as_millis() as i64;
+        let hour = 3_600_000;
+        let sess = app.store.begin_session(now - 3 * hour, "t").unwrap();
+        let seg = |app: &OatsApp, at: i64, text: &str| {
+            app.store
+                .insert_segment(sess, at, at + 1_000, text, None)
+                .unwrap()
+                .id
+        };
+        let before_switch = seg(&app, now - 2 * hour, "history");
+        app.store.mark_segment_consumed(before_switch, now).unwrap();
+        let done = seg(&app, now - 2 * grace, "interpreted");
+        app.store.mark_segment_consumed(done, now).unwrap();
+        let waiting = seg(&app, now - 2 * grace, "not interpreted yet");
+        let fresh = seg(&app, now - grace / 2, "interpreted, too recent");
+        app.store.mark_segment_consumed(fresh, now).unwrap();
+        let alive = |app: &OatsApp, id: i64| app.store.segment(id).unwrap().is_some();
+        // the default: everything stays
+        assert!(app.prefs.keep_transcripts);
+        app.purge_due = true;
+        app.purge_transcripts(&cc.egui_ctx);
+        assert!(alive(&app, done));
+        // off since an hour ago: the interpreted line past the grace goes, the rest stays
+        app.prefs.keep_transcripts = false;
+        app.prefs.drop_transcripts_from = now - hour;
+        app.purge_due = true;
+        app.purge_transcripts(&cc.egui_ctx);
+        assert!(!alive(&app, done));
+        assert!(alive(&app, waiting));
+        assert!(alive(&app, fresh));
+        assert!(alive(&app, before_switch));
+        assert!(!app.purge_due);
+        assert_eq!(app.purge_next_at, Some(now - grace / 2 + 1_000 + grace));
+        // "Delete them too": the history goes on the next purge (throttled to one a minute,
+        // so the request waits until then)
+        app.prefs.drop_transcripts_from = 0;
+        app.purge_due = true;
+        app.purge_transcripts(&cc.egui_ctx);
+        assert!(app.purge_due);
+        assert!(alive(&app, before_switch));
+        app.purge_last = None;
+        app.purge_transcripts(&cc.egui_ctx);
+        assert!(!alive(&app, before_switch));
+        assert!(alive(&app, waiting));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The whole app built headlessly (kittest's creation context, the null engine, an

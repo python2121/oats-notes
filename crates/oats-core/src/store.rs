@@ -64,6 +64,15 @@ pub struct Session {
     pub engine: String,
 }
 
+/// The outcome of [`Store::purge_transcripts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptPurge {
+    /// Lines deleted.
+    pub deleted: usize,
+    /// When the earliest line not yet old enough to go ended (`None`: nothing is waiting).
+    pub next: Option<i64>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TranscriptRow {
     pub id: i64,
@@ -1806,6 +1815,43 @@ impl Store {
         Ok(())
     }
 
+    /// The "keep transcripts" preference turned off: delete the transcript lines the brain is
+    /// done with — interpreted into a note (or consumed by a voice command), or marked as an
+    /// echo — that started at or after `from` (the moment the preference was turned off; 0 =
+    /// everything) and ended before `before` (a grace period behind "now", so an episode is
+    /// never purged while the brain could still revise it). Uninterpreted lines are never
+    /// touched: the brain still needs them (they go on the next purge after it has). Notes,
+    /// events and todos stay; the WAL is truncated when anything went (`secure_delete` is on).
+    /// `next` is when the earliest line not yet old enough will be: the caller schedules the
+    /// next purge for `next + grace`.
+    pub fn purge_transcripts(&self, from: i64, before: i64) -> Result<TranscriptPurge, StoreError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM segments WHERE started_at >= ?1 AND ended_at < ?2
+               AND (interpreted_at IS NOT NULL OR echo_of IS NOT NULL)",
+            [from, before],
+        )?;
+        let next: Option<i64> = self.conn.query_row(
+            "SELECT MIN(ended_at) FROM segments WHERE started_at >= ?1 AND ended_at >= ?2
+               AND (interpreted_at IS NOT NULL OR echo_of IS NOT NULL)",
+            [from, before],
+            |r| r.get(0),
+        )?;
+        if deleted > 0 {
+            self.checkpoint();
+        }
+        Ok(TranscriptPurge { deleted, next })
+    }
+
+    /// How many transcript lines (echoes included) started before `at` — the lines a purge
+    /// from `at` leaves alone.
+    pub fn segment_count_before(&self, at: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM segments WHERE started_at < ?1",
+            [at],
+            |r| r.get(0),
+        )?)
+    }
+
     /// `PRAGMA wal_checkpoint(TRUNCATE)` after a user-initiated delete, so the deleted text
     /// doesn't survive in the WAL. Best effort (a no-op inside a transaction or while another
     /// connection is mid-read; the next checkpoint catches up).
@@ -3346,6 +3392,71 @@ mod tests {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    #[test]
+    fn purging_transcripts_drops_only_lines_the_brain_is_done_with() -> Result<(), StoreError> {
+        let s = Store::open_in_memory()?;
+        let sess = s.begin_session(0, "t")?;
+        // before `from`: left alone whatever its state
+        let old = s.insert_segment(sess, 1_000, 2_000, "old and interpreted", None)?;
+        s.mark_segment_consumed(old.id, 2_500)?;
+        // interpreted and old enough: goes
+        let done = s.insert_segment(sess, 10_000, 11_000, "interpreted", None)?;
+        s.mark_segment_consumed(done.id, 12_000)?;
+        // an echo (never interpreted) old enough: goes
+        let them = s.insert_segment_from(
+            sess,
+            10_500,
+            11_500,
+            "them",
+            None,
+            AudioSourceKind::System,
+            None,
+        )?;
+        s.mark_segment_consumed(them.id, 12_000)?;
+        let echo = s.insert_segment_from(
+            sess,
+            10_600,
+            11_600,
+            "them",
+            None,
+            AudioSourceKind::Mic,
+            Some(them.id),
+        )?;
+        // not interpreted yet: stays however old
+        let waiting = s.insert_segment(sess, 13_000, 14_000, "still waiting", None)?;
+        // interpreted but too recent: stays, and names the next purge
+        let recent = s.insert_segment(sess, 20_000, 21_000, "recent", None)?;
+        s.mark_segment_consumed(recent.id, 21_500)?;
+        assert_eq!(s.segment_count_before(5_000)?, 1);
+        let p = s.purge_transcripts(5_000, 15_000)?;
+        assert_eq!(
+            p,
+            TranscriptPurge {
+                deleted: 3,
+                next: Some(21_000)
+            }
+        );
+        let left: Vec<i64> = s
+            .segments(View::Transcripts)?
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(left, vec![old.id, waiting.id, recent.id]);
+        assert!(s.segment(echo.id)?.is_none());
+        // once the line is old enough it goes too, and nothing waits any more
+        assert_eq!(
+            s.purge_transcripts(5_000, 30_000)?,
+            TranscriptPurge {
+                deleted: 1,
+                next: None
+            }
+        );
+        // from 0: the line from before the preference was turned off goes as well
+        assert_eq!(s.purge_transcripts(0, 30_000)?.deleted, 1);
+        assert_eq!(s.segment_count_before(i64::MAX)?, 1);
+        Ok(())
     }
 
     #[test]

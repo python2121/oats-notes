@@ -409,7 +409,26 @@ Preferences (File → "Preferences…", ⌘,; `Command::Preferences`): an `egui:
 the window below the in-window menu bar, 12 pt clear of every edge (`constrain_to`), up to
 560 pt wide (narrower when the window is), its whole body in a vertical `ScrollArea` (the Apps
 table has none of its own) so it is never taller than the window, with one field, "Your name", saved on Enter / blur / close via `Store::set_user_name`
-(a blank name clears it). Stored in the database, `meta` key `user_name`
+(a blank name clears it). Its checkboxes: "Play a sound for voice commands" (on), "Use 24-hour
+time" (off), "Fetch video thumbnails" (off), "Keep transcripts indefinitely" (ON by default),
+"Recognise speakers" (OFF by default — a fresh install keeps no voiceprints until asked).
+**Keep transcripts off** (`AppPrefs::keep_transcripts = false`): a transcript line is deleted
+once the brain is done with it — interpreted into a note, consumed by a voice command, or marked
+as an echo — and `TRANSCRIPT_GRACE` (30 min, longer than the cutter's widest 2 × 10 min call
+gap, so an episode is never purged while it could still be revised) has passed since it ended;
+uninterpreted lines stay until the brain has processed them (a backlog while `claude` is
+unavailable is kept). Notes, events and todos stay; their "Show in transcript" links then say
+"No transcript for this item", and Re-interpret / Summarise / Rewrite on such a note is refused
+by the brain with "no transcript was kept for this note" (`reset_episode` would otherwise
+delete the note with nothing to re-create it from). Turning the box off records
+`AppPrefs::drop_transcripts_from = now`: only lines that started after it go; the window then
+says "N lines from before this was turned off are kept" with "Delete them too" (confirmed inline,
+"Undo not available"; sets it to 0 = everything). `OatsApp::purge_transcripts` (from `logic`)
+runs `Store::purge_transcripts(from, now − grace)` (one DELETE + a WAL truncate when anything
+went; `secure_delete` is on) at most once a minute and only when something happened (a stored
+segment, a `BrainEvent::Changed`, the preference) or when the earliest waiting line has aged
+past the grace — ONE scheduled repaint, no polling; a purge that deleted anything reloads the
+views. Stored in the database, `meta` key `user_name`
 (`Store::user_name()` / `set_user_name()`). The brain re-reads it at the start of every job
 (`BrainConfig::user_name`, `Worker::refresh_user_name`), so no restart or plumbing is needed;
 `OATS_USER_NAME` overrides the stored value for scripted runs. It is injected by
@@ -756,7 +775,7 @@ OATS_CLAUDE_PASS_PROXY=1 …                # pass HTTPS_PROXY / HTTP_PROXY / NO
 cargo run --release -p oats-engine-fluidaudio --example vad_parity -- long.wav   # stateful VAD stream vs FluidAudio's batch VAD, chunk by chunk (expect 100 % / delta 0)
 cargo run -p oats-engine-fluidaudio --example transcribe_wav -- speech.wav        # engine end to end on a WAV (load, VAD, transcribe)
 cargo run --release -p oats-engine-fluidaudio --example speakers_wav -- two.wav [--piece 5]   # speaker spans per piece, pairwise cosine distances, ms per 10 s vs transcription
-OATS_SPEAKERS=on|off …                    # speaker recognition (overrides the Preferences switch; default on)
+OATS_SPEAKERS=on|off …                    # speaker recognition (overrides the Preferences switch, which is off on a fresh install)
 cargo run -p oats-brain --example interpret_demo   # real claude call: a fake meeting + "hey computer" command, prints the structured results and cost
 swift scripts/generate_icon.swift         # regenerate assets/icon_1024.png
 ```
@@ -867,7 +886,8 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   `speakers::resolve_voice`: "them 3" / "voice 3" / "#3" / "3" / exact name / unique prefix /
   "me"), Forget this voice — each a toast, `speakers_edited` (reload + `pipeline.reload_speakers`).
   Preferences: "Recognise speakers (keeps a voiceprint per person in the database)"
-  (`AppPrefs::speakers`, default on; greyed when `OATS_SPEAKERS` is set) and the "Speakers"
+  (`AppPrefs::speakers`, default OFF — a fresh install enrols nobody until the user opts in;
+  greyed when `OATS_SPEAKERS` is set) and the "Speakers"
   table under Apps (name field saved on blur/Enter, "me", last heard, minutes, Forget).
   `--selftest out.png --listening` seeds me / Priya (brain-named) / "them 3" / "voice 4".
 - **Brain**: the interpret prompt explains the labels and asks for `speakers: [{label, name,

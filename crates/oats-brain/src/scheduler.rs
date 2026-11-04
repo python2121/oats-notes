@@ -871,6 +871,24 @@ impl Worker {
                 continue;
             }
             if let Some(id) = self.reinterpret.pop_front() {
+                // with "keep transcripts" off the lines may be gone: resetting the note then
+                // would delete it with nothing to re-create it from
+                let kept = match self.store.segments_of_episode(id) {
+                    Ok(segs) => !segs.is_empty(),
+                    Err(e) => {
+                        self.out
+                            .send(BrainEvent::Warning(format!("re-interpret: {e}")));
+                        self.settled("reinterpret", Some(id));
+                        continue;
+                    }
+                };
+                if !kept {
+                    self.out.send(BrainEvent::Warning(
+                        "re-interpret: no transcript was kept for this note".to_owned(),
+                    ));
+                    self.settled("reinterpret", Some(id));
+                    continue;
+                }
                 if let Err(e) = self.store.reset_episode(id) {
                     self.out
                         .send(BrainEvent::Warning(format!("re-interpret: {e}")));

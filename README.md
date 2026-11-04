@@ -45,10 +45,15 @@ Everything stays on the machine. The database is owner-only on disk, in
   the brain runs (turn it off with `OATS_BRAIN=off` and the app is a plain transcriber);
 - YouTube thumbnails, only if you opt in under Preferences.
 
-Speaker recognition (Preferences, on by default; `OATS_SPEAKERS=off`) keeps a voiceprint per
-person heard — 256 numbers, in the local database only, never sent anywhere (the brain sees
-names and labels like "them 2", never voiceprints). Preferences ▸ Speakers lists them, with
-Forget.
+Speaker recognition (Preferences, off by default; `OATS_SPEAKERS=on|off` overrides) keeps a
+voiceprint per person heard — 256 numbers, in the local database only, never sent anywhere (the
+brain sees names and labels like "them 2", never voiceprints). Preferences ▸ Speakers lists
+them, with Forget.
+
+Transcripts are kept indefinitely by default. Untick "Keep transcripts indefinitely" in
+Preferences and every transcript line is deleted half an hour after the brain has turned it
+into a note (the notes, events and todos stay; lines the brain has not processed yet are kept
+until it has). The history from before the switch stays until you ask for it to go too.
 
 The brain child process gets a minimal environment, no tools, no project settings and its own
 empty working directory. `docs/security-review-2026-10-28.md` has the details.
