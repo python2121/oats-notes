@@ -36,6 +36,53 @@ pub fn map(ctx: &egui::Context) -> Arc<SpeakerMap> {
         .unwrap_or_default()
 }
 
+/// Rows are labelled only where the speaker CHANGES (a chat's turn marker, not a stamp on
+/// every line), and again after a day heading or a gap of [`LABEL_GAP_MS`] between rows, so
+/// the reader never has to scroll up to find who is talking. "me" is a speaker like any
+/// other for this rule: it shows once when the floor comes back to the user.
+pub const LABEL_GAP_MS: i64 = 3 * 60_000;
+
+/// The running "who spoke last" of a list of rows ([`LabelRun::show`] per row, in order).
+#[derive(Default)]
+pub struct LabelRun {
+    prev: Option<(String, i64)>,
+}
+
+impl LabelRun {
+    /// A day heading (or any break): the next row is labelled again.
+    pub fn reset(&mut self) {
+        self.prev = None;
+    }
+
+    /// Whether this row carries its label: the first row, a different speaker than the row
+    /// before, or a gap longer than [`LABEL_GAP_MS`] since that row ended.
+    pub fn show(&mut self, key: &str, started_at: i64, ended_at: i64) -> bool {
+        let show = match &self.prev {
+            None => true,
+            Some((k, ended)) => k != key || started_at - *ended > LABEL_GAP_MS,
+        };
+        self.prev = Some((key.to_owned(), ended_at));
+        show
+    }
+}
+
+/// What a row's speaker IS, for the change rule: the tag text, or "me" for the user's own
+/// lines (which carry no tag otherwise).
+pub fn row_key(row: &TranscriptRow, map: &SpeakerMap) -> String {
+    row_label(row, map)
+        .map(|l| l.text)
+        .unwrap_or_else(|| "me".to_owned())
+}
+
+/// The tag a labelled "me" row carries (the user's voice's colour when one is known).
+pub fn me_label(map: &SpeakerMap) -> RowLabel {
+    RowLabel {
+        text: "me".to_owned(),
+        voice: map.values().find(|s| s.is_me).map(|s| s.id),
+        hover: "me (microphone)".to_owned(),
+    }
+}
+
 /// A row's speaker tag.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowLabel {
@@ -387,5 +434,21 @@ mod tests {
         assert_eq!(t.speaker_colour(7), t.speaker_colour(7));
         let distinct: std::collections::HashSet<_> = (1..=6).map(|i| t.speaker_colour(i)).collect();
         assert!(distinct.len() >= 4, "{distinct:?}");
+    }
+
+    #[test]
+    fn labels_show_on_a_change_of_speaker_a_gap_or_a_reset() {
+        let mut run = LabelRun::default();
+        assert!(run.show("me", 0, 1_000), "the first row");
+        assert!(!run.show("me", 2_000, 3_000), "same speaker, no gap");
+        assert!(run.show("them 3", 4_000, 5_000), "a change");
+        assert!(!run.show("them 3", 6_000, 7_000));
+        assert!(run.show("me", 8_000, 9_000), "back to the user");
+        assert!(
+            run.show("me", 9_000 + LABEL_GAP_MS + 1, 9_000 + LABEL_GAP_MS + 2_000),
+            "a gap"
+        );
+        run.reset();
+        assert!(run.show("me", 0, 1), "after a day heading");
     }
 }
