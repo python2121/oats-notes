@@ -1393,7 +1393,7 @@ pub(crate) fn episode_card(
                                     .font(crate::theme::font_medium(ui.ctx(), 12.0))
                                     .color(t.text_secondary),
                             );
-                            for a in &e.action_items {
+                            for a in card_item_order(&e.action_items) {
                                 ui.horizontal_top(|ui| {
                                     ui.set_min_height(ui.spacing().interact_size.y);
                                     ui.add_space(6.0);
@@ -2117,6 +2117,16 @@ pub fn collect_next_steps(
     steps
 }
 
+/// A note card's action items in display order: the open ones in the note's own order, then
+/// the completed ones, most recently completed first — a ticked item moves down to the top of
+/// the completed block, as in the Todos view and Next steps.
+pub fn card_item_order(items: &[oats_core::ActionItem]) -> Vec<&oats_core::ActionItem> {
+    let mut v: Vec<&oats_core::ActionItem> = items.iter().collect();
+    // stable: open items keep the note's order
+    v.sort_by_key(|a| (a.done_at.is_some(), std::cmp::Reverse(a.done_at)));
+    v
+}
+
 /// How many of `steps` ([`collect_next_steps`] order: open, then completed) the page shows,
 /// and whether the "Show all N" / "Show fewer" link is drawn. Collapsed: the open items up to
 /// [`NEXT_STEPS_CAP`]; completed items only behind the link, which shows whenever something
@@ -2805,6 +2815,31 @@ fn section_label(ui: &mut egui::Ui, t: &Tokens, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cards_items_list_open_ones_first_then_completed_newest_first() {
+        let item = |text: &str, done_at: Option<i64>| oats_core::ActionItem {
+            text: text.to_owned(),
+            owner: None,
+            due: None,
+            node_id: None,
+            at_ms: None,
+            segment_id: None,
+            done_at,
+        };
+        let items = [
+            item("a", Some(10)),
+            item("b", None),
+            item("c", Some(30)),
+            item("d", None),
+            item("e", Some(20)),
+        ];
+        let order: Vec<&str> = super::card_item_order(&items)
+            .iter()
+            .map(|a| a.text.as_str())
+            .collect();
+        assert_eq!(order, ["b", "d", "c", "e", "a"]);
+    }
+
     use super::*;
     use oats_core::{NodeKind, Origin};
 

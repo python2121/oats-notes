@@ -69,7 +69,10 @@ and only behind "Show all N" (N = open + completed), which shows whenever more t
 are open OR anything is completed (`notes::next_steps_shown`); unticking reopens. Expanded,
 "Show fewer" is drawn twice: where "Show all" sat (after the items the collapsed list shows,
 so it toggles back under the same pointer) and at the bottom of the full list. A note
-card's action items carry the same checkbox and strike-through. Then "Notes": every note NEWEST FIRST
+card's action items carry the same checkbox and the same order (`notes::card_item_order`:
+open items in the note's order, then completed ones, newest completion first — a ticked item
+moves down to the top of the completed block); the calendar's grid chips and day panel put a
+day's completed todos after its open ones the same way (`calendar::items_by_day`). Then "Notes": every note NEWEST FIRST
 (the rest of the app is newest first), one collapsed 24 pt row each (triangle, date, time range,
 title, topic chips); a click toggles the full `episode_card` inline (`NotesState::open_notes`,
 not persisted; "Expand all · Collapse all"). Topics and the transcript toggle follow.

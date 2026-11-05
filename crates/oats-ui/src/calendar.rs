@@ -102,7 +102,15 @@ pub fn items_by_day<'a, Tz: TimeZone>(
         }
     }
     let mut tds: Vec<&Todo> = todos.iter().filter(|t| t.due.is_some()).collect();
-    tds.sort_by_key(|t| (t.due, t.id));
+    // open todos by due time; completed ones after them, most recently completed first
+    tds.sort_by_key(|t| {
+        (
+            t.completed_at.is_some(),
+            std::cmp::Reverse(t.completed_at),
+            t.due,
+            t.id,
+        )
+    });
     for t in tds {
         let Some(d) = t.due.and_then(day) else {
             continue;
