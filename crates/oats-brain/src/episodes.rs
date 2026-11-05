@@ -293,9 +293,42 @@ pub fn render_transcript_full<Tz: TimeZone>(
 where
     Tz::Offset: std::fmt::Display,
 {
+    render_lines(rows, tz, titles, speakers, false)
+}
+
+/// [`render_transcript_full`] with a line number before every line: `[12] [17:13] me: …`,
+/// 12 being the 1-based index of the line among the rendered (non-echo) rows — the numbers the
+/// split prompt's `new_lines` refer to ([`numbered_rows`] maps them back). Media headers carry
+/// no number.
+pub fn render_transcript_numbered<Tz: TimeZone>(
+    rows: &[TranscriptRow],
+    tz: &Tz,
+    speakers: &oats_core::speakers::SpeakerMap,
+) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    render_lines(rows, tz, &HashMap::new(), speakers, true)
+}
+
+/// The rows [`render_transcript_numbered`] numbers, in order: line `n` is `numbered_rows(rows)[n - 1]`.
+pub fn numbered_rows(rows: &[TranscriptRow]) -> Vec<&TranscriptRow> {
+    rows.iter().filter(|r| r.echo_of.is_none()).collect()
+}
+
+fn render_lines<Tz: TimeZone>(
+    rows: &[TranscriptRow],
+    tz: &Tz,
+    titles: &HashMap<String, String>,
+    speakers: &oats_core::speakers::SpeakerMap,
+    numbered: bool,
+) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
     let mut out = String::new();
     let mut current_media: Option<String> = None;
-    for r in rows.iter().filter(|r| r.echo_of.is_none()) {
+    for (i, r) in numbered_rows(rows).into_iter().enumerate() {
         let key = media_key(r);
         if key.is_some() && key != current_media {
             let k = key.as_deref().unwrap_or("");
@@ -315,6 +348,9 @@ where
             .single()
             .map(|d: DateTime<Tz>| d.format("%H:%M").to_string())
             .unwrap_or_else(|| "--:--".to_owned());
+        if numbered {
+            out.push_str(&format!("[{}] ", i + 1));
+        }
         out.push('[');
         out.push_str(&stamp);
         out.push_str("] ");
@@ -519,6 +555,27 @@ mod tests {
             "[13:05] me: segment 1\n[13:06] Priya: segment 2\n[13:06] them 3: segment 3\n\
              [13:06] voice 3: segment 4\n[13:06] them: segment 5\n[13:06] me: segment 6\n"
         );
+    }
+
+    #[test]
+    fn the_numbered_transcript_counts_lines_without_echoes() {
+        let tz = chrono::FixedOffset::east_opt(0).unwrap();
+        let base = 1_793_106_300;
+        let rows = [
+            row(1, base, 5),
+            TranscriptRow {
+                echo_of: Some(9),
+                ..row(2, base + 30, 5)
+            },
+            them(3, base + 60, 5),
+            row(4, base + 120, 5),
+        ];
+        assert_eq!(
+            render_transcript_numbered(&rows, &tz, &HashMap::new()),
+            "[1] [13:05] me: segment 1\n[2] [13:06] them: segment 3\n[3] [13:07] me: segment 4\n"
+        );
+        let ids: Vec<i64> = numbered_rows(&rows).iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 3, 4]);
     }
 
     #[test]

@@ -31,7 +31,7 @@ never changes.
 
 ```
 crates/oats-core               engine contract, segmenter, SQLite store, pipeline worker, echo rules (text + audio), speaker voiceprint matching (`speakers`), `when` date parser, paths  (no platform code)
-crates/oats-brain              the brain: `claude` CLI wrapper, episode cutting, prompts (prompts/*.md), hotword commands, tiered scheduler  (no platform code)
+crates/oats-brain              the brain: `claude` CLI wrapper, episode cutting, prompts (prompts/*.md), hotword commands, note splitting (`split`), tiered scheduler  (no platform code)
 crates/oats-audio              cpal capture → 16 kHz mono f32 chunks tagged mic/system + own FIR resampler: microphone (InputPolicy, MicMode plain | voice processing) and system audio (SystemCapture); the voice-command ding (chime)
 crates/oats-engine-fluidaudio  macOS engine: Parakeet TDT + Silero VAD (stateful stream, 1 inference / 256 ms) + per-segment speaker embeddings (pyannote segmentation + WeSpeaker) on CoreML via the vendored fluidaudio-rs (THE swappable crate)
 crates/oats-status             status-item contract: StatusState in, StatusAction out, NoStatusItem  (no platform code)
@@ -108,7 +108,7 @@ breadcrumb link returns to the project page. `--selftest out.png --project [--ex
 [--project-name "Development team call"]` (the seed has a dev-call note with an item and a
 decision filed under Export rewrite).
 
-**Editing notes**: every card has Edit next to Re-interpret. Edit mode (`notes::edit_card`)
+**Editing notes**: a conversation card's header buttons read Split… · Move to… · Edit · Re-interpret (a media card: Move to… · Edit · Re-interpret · Summarise; `card_buttons` adds them right to left, `card_buttons_width` measures them; see "Split…" under The brain). Every card has Edit next to Re-interpret. Edit mode (`notes::edit_card`)
 shows title, summary (markdown source), decisions (one per line), action items (one per line,
 `text | owner | due`, parsed leniently) and topics (comma separated); Save (⌘S) sends
 `NotesAction::SaveEdit` → `Store::update_episode_content`, Cancel / Escape discards. A saved
@@ -395,7 +395,7 @@ ticked / unticked (the first `done_at` comes back), a todo's done / snooze / due
 `TodoState` before and after, `Store::restore_todo_state`; the pop-ups' Done / Snooze too), a
 hand edit of a note (content + `user_edited_at`, `Store::restore_episode_content`), and a note
 moved by "Move to…" when the tree resolved the name (`Store::restore_episode_node`, no change
-row). Not recorded (and not clearing it): deletes, merges, brain moves and runs, node
+row). Not recorded (and not clearing it): deletes, merges, splits, brain moves and runs, node
 re-parenting, preferences. A new edit clears the redo list; undo / redo apply straight to the
 store, reload, and pop a 4 s toast ("Undo: Mark complete", "Nothing to undo", "Couldn't undo:
 … (it no longer exists)" — that step is dropped). The menu items read "Undo Mark complete" and
@@ -569,7 +569,8 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   a proposed project/topic, decisions, action items, topics, significant dates; `low_signal`
   for TV / music / self-talk), `categorise.*` (a batch of new segments → node per segment),
   `review.*` (tier 2: merge split episodes, re-file, mark low signal, drop duplicate events),
-  `reorganise.*` (tier 3: merge / rename / move / archive projects and topics). Each job is
+  `reorganise.*` (tier 3: merge / rename / move / archive projects and topics), `split.*`
+  ("Split…" on a note, see below). Each job is
   request builder → `serde` parse of the structured output → `apply_*` against the store,
   so tests use canned JSON. `render` substitutes `{{key}}` in ONE pass (inserted values are
   never re-scanned); transcripts, segment text and spoken commands sit between
@@ -661,7 +662,7 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   or an empty name is a warning and nothing changes; a new project is
   `created_by = user` with a `node_create` change; the result is a `BrainEvent::Command`
   confirmation ("Moved to …" / "Created Admin › X and moved the note") so the usual toast and
-  ding show. Kinds in `Queued` / `Settled`: `move` (episode id) and `move_segment`. Tier-0
+  ding show. Kinds in `Queued` / `Settled`: `move` (episode id), `move_segment` and `split` (episode id). Tier-0
   caps apply. While it runs the field is disabled with a spinner; on failure (or when the wait
   ends) it reopens with the text and a warning toast. Needs claude: without it only names in
   the tree work. Also in a note's EDIT view: "Move to…" next to Save / Cancel opens the same
@@ -675,6 +676,50 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   under a category or project, a topic anywhere below; never into its own subtree;
   a `node_move` change, undoable). Tree rows carry AccessKit labels "Category: …" / "Project:
   …" / "Topic: …".
+- `split` ("Split…" on a note; `crates/oats-brain/src/split.rs`): the note card header's
+  leftmost button "Split…" (a brain button, kind `split`: "Splitting…" with a spinner while
+  pending, greyed with the backlog reason while claude is unavailable; never on media notes;
+  fine on low-signal ones) and a "Split…" entry under "Move to…" in the title / project-row
+  context menu open an inline field under the title like Move to's ("Split off", placeholder
+  "what goes into the new note…", Enter submits, Escape cancels, disabled with a spinner +
+  "Splitting…" while sent; `move_to::SplitDraft`, `NotesState::split_draft`, the same
+  `drop_stale_split` lifetime rule; opening one of Move to / Split closes the other). Submit →
+  `NotesAction::SplitText { episode, text }`; on a hand-edited note the header first asks
+  "Replace your edits?" (`NotesState::confirm_replace: ConfirmReplace::{Reinterpret, Split}`,
+  shared with Re-interpret) → `BrainCommand::Split { episode, text }` (pending `split` / id).
+  Scheduler (`run_split`, tier 1 / sonnet, runs at once like Rewrite, daily budget + hourly
+  cap, `catch_unwind` via `run_job`, a `brain_runs` row, info logs counts / cost only).
+  Refusals before any call, each a `Warning` + `Settled`: "split: the note no longer exists",
+  "split: media notes can't be split", "split: no transcript was kept for this note",
+  "split: the note has only one transcript line" (fewer than 2 non-echo segments). Prompt:
+  `prompts/split.{system,user}.md` (personalised with `{{user_name_note}}`; the user prompt
+  has the tree, the note — title, summary, decisions / action items with `(project:)`
+  `(at: HH:MM)`, topics —, the transcript numbered by
+  `episodes::render_transcript_numbered` (`[12] [17:13] me: …`, 1-based over non-echo rows,
+  `episodes::numbered_rows` maps back) and the user's text, all data in `<transcript>`).
+  Strict schema `{keep: Note, new: Note, new_lines: [int]}`, `Note = {title, summary,
+  decisions[{text, project, at}], action_items[{text, owner, due, project, at}], topics,
+  node_id}` (item fragments shared with `interpret_schema`; `node_id` = an existing project /
+  topic for the NEW note, null = the original's home, ignored on `keep`). `lines_to_segments`
+  drops out-of-range numbers; none or every line = "split: the model didn't separate the
+  transcript lines" (nothing changes). `apply_split`, one savepoint: re-read the note and its
+  segments (listed segments no longer in it dropped; nothing left to move or to keep = the
+  same failure) → insert the new note (conversation, its lines' span, `new.node_id` when an
+  existing unarchived project / topic else the original's node, revision 1, this run's model
+  and cost, not low-signal, not edited) → repoint the segments
+  (`Store::move_segments_to_episode`, `interpreted_at` kept) → rewrite the original with
+  `keep` (`revise_episode`: revision + 1, `last_revised_at`; `user_edited_at` cleared) and the
+  new note with `new`, items resolved against each note's OWN segments (`resolve_at`,
+  `resolve_item_node`; an item whose trimmed text is unchanged keeps its `done_at`) → both
+  spans recomputed (`Store::recompute_episode_span`) → events untouched (they stay on the
+  original) → an `episode_split` change (`by: user`; before = the original's id, content and
+  `moved_segment_ids`, after = both ids; recorded, NOT undoable). Success sends
+  `BrainEvent::Split { episode, new_episode }`, a `Command` confirmation "Split off “<title>”"
+  (toast + ding), `Changed` and `Settled("split", id)`. The app (`settle_split_draft`) then
+  closes the field, leaves a single-note view of the original for its project page and flashes
+  the new note there (`pending_focus`, when it shows on the current page); on failure the field
+  reopens with its text and a "Couldn't split it: <reason>" danger toast (the split run itself
+  pops no run toast).
 - Drag-to-merge (`oats-ui::merge`): a note card's title, a project-page note row and a sidebar
   note row are egui drag sources (payload `DraggedNote(episode id)`, the title follows the
   pointer); cards and note rows are drop zones (accent outline while a note hovers). A drop
@@ -992,7 +1037,7 @@ VENDORED.md's list of our modifications current. Attribution: `THIRD_PARTY.md`.
   menu generated from the same `menu_model()` as the in-window fallback). Keep that parity.
   Menu key equivalents live in `SHORTCUTS` (muda accelerators, ⌘-chords only); a chord a focused
   text field must keep (⌘Z / ⇧⌘Z) is never one — read it from egui input instead.
-- Brain actions give feedback: Interpret / Review / Reorganise (strip, Brain menu, ⌘I) and the cards' Summarise / Re-interpret go pending the moment they are triggered (`BrainStatus::queue`, confirmed by `BrainEvent::Queued`, ended by `Settled`, which the scheduler sends even when no run came out of it), grey out with a spinner and "Interpreting…" etc., ignore further clicks, and re-enable after 5 min with "Timed out waiting for the brain"; unavailable shows the backlog reason as the tooltip. The spinner repaints only while something is pending. `BrainEvent::Progress` (phase boundaries only: interpret "chunk i/n", review / reorganise gathering → asking claude → applying) feeds the strip line and the button label ("Interpreting 2/3…"); a finished user-triggered run pops one 4 s toast (`notes::run_toast`: "Interpreted: …", "Nothing new to interpret", or "<Kind> failed: …" in the danger colour).
+- Brain actions give feedback (the app copies its `BrainStatus` into `NotesState::brain` once per frame, so every card — All notes, a project page, a single note, search — reads the same state): Interpret / Review / Reorganise (strip, Brain menu, ⌘I) and the cards' Summarise / Re-interpret go pending the moment they are triggered (`BrainStatus::queue`, confirmed by `BrainEvent::Queued`, ended by `Settled`, which the scheduler sends even when no run came out of it), grey out with a spinner and "Interpreting…" etc., ignore further clicks, and re-enable after 5 min with "Timed out waiting for the brain"; unavailable shows the backlog reason as the tooltip. The spinner repaints only while something is pending. `BrainEvent::Progress` (phase boundaries only: interpret "chunk i/n", review / reorganise gathering → asking claude → applying) feeds the strip line and the button label ("Interpreting 2/3…"); a finished user-triggered run pops one 4 s toast (`notes::run_toast`: "Interpreted: …", "Nothing new to interpret", or "<Kind> failed: …" in the danger colour).
 - Alignment: a checkbox beside text goes through `oats-ui::widgets::check_box(ui, &mut on, &font)` (box centred on the first line's cap height; a top-aligned row may `set_min_height(interact_size.y)` to keep egui's pitch); icon glyphs that must sit on a text line use `widgets::paint_glyph_centered` + `cap_center` (the toasts' ×).
 - Clock times: every displayed time of day goes through `oats-ui::timefmt` (12-hour "2:05 pm" by default, `AppPrefs::clock_24h` / Preferences "Use 24-hour time" → "14:05"; ranges drop a shared am/pm; monospace columns use `clock_col`). Never write `%H:%M` in UI code (the due editor's input text is the one exception).
 - Diagnostics: the binary logs to stderr AND appends to `<data dir>/oats.log` (0600; at start only the last 2 MB are kept; level via `RUST_LOG`, default info; not for `--help` / `--selftest`; named in `--help`). A failed transcription is retried once after 200 ms (`pipeline::TRANSCRIBE_RETRY_DELAY`); only a second failure warns (`EchoStats::transcribe_failed` / `transcribe_retried_ok`, logged at session end; the warn log has lane, length and error, never text). The vendored bridge carries the Swift error text (`fluidaudio_last_error`, VENDORED.md modification 3). Status-strip warnings clear themselves after `WARNING_TTL` (60 s, one scheduled repaint; `OatsApp::expire_warning`), and a stored segment clears a "transcription failed…" warning; the claude-unavailable / backlog and "system audio: no signal" lines are separate and exempt.

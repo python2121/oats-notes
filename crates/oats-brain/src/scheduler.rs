@@ -250,6 +250,14 @@ pub enum BrainCommand {
         text: String,
         current_node: Option<i64>,
     },
+    /// "Split…" on a note: `text` (the user's words) says what goes into a NEW note. One
+    /// tier-1 call returns both notes and the transcript lines that move; the original is
+    /// rewritten in place (its edits replaced: the UI asked "Replace your edits?") and the new
+    /// note created from those lines (`crate::split`). Kind `split`, id = the episode.
+    Split {
+        episode: i64,
+        text: String,
+    },
     Shutdown,
 }
 
@@ -299,6 +307,11 @@ pub enum BrainEvent {
         segment_id: i64,
         lines: Vec<String>,
         confirmations: Vec<String>,
+    },
+    /// "Split…" worked: `new_episode` was split off `episode` (sent before the `Settled`).
+    Split {
+        episode: i64,
+        new_episode: i64,
     },
     /// Episodes, nodes, events or changes were written: the UI should reload.
     Changed(Vec<String>),
@@ -550,6 +563,7 @@ struct Worker {
     summarise: VecDeque<i64>,
     rewrite: VecDeque<i64>,
     moves: VecDeque<(crate::moveto::MoveTarget, String, Option<i64>)>,
+    splits: VecDeque<(i64, String)>,
     undo: VecDeque<i64>,
     categorise_due: Option<Instant>,
     interpret_due: Option<Instant>,
@@ -652,6 +666,7 @@ impl Worker {
             summarise: VecDeque::new(),
             rewrite: VecDeque::new(),
             moves: VecDeque::new(),
+            splits: VecDeque::new(),
             undo: VecDeque::new(),
             categorise_due: None,
             interpret_due: None,
@@ -925,6 +940,11 @@ impl Worker {
                     self.settled("rewrite", Some(id));
                     continue;
                 }
+                if let Some((id, text)) = self.splits.pop_front() {
+                    self.run_split(id, &text);
+                    self.settled("split", Some(id));
+                    continue;
+                }
                 if due(self.categorise_due) {
                     self.categorise_due = None;
                     self.run_categorise();
@@ -1022,6 +1042,10 @@ impl Worker {
                 let (kind, id) = target.kind_and_id();
                 self.queued(kind, Some(id));
                 self.moves.push_back((target, text, current_node));
+            }
+            BrainCommand::Split { episode, text } => {
+                self.queued("split", Some(episode));
+                self.splits.push_back((episode, text));
             }
             BrainCommand::UndoChange(id) => self.undo.push_back(id),
             BrainCommand::Shutdown => return false,
@@ -1438,6 +1462,93 @@ impl Worker {
                 duration_ms: resp.duration_ms,
                 model: resp.model,
                 lines: vec![done.confirmation],
+                changed: true,
+            })
+        });
+    }
+
+    /// "Split…": refusals (gone, media, no transcript, one line) are warnings before any call;
+    /// otherwise one tier-1 call and [`crate::split::apply_split`]. Success is reported as a
+    /// `Split` event plus a confirmation pop-up ("Split off “…”"); a failure is a warning
+    /// (the UI reopens the field with the text). Nothing is retried.
+    fn run_split(&mut self, id: i64, text: &str) {
+        use crate::split;
+        let refuse =
+            |w: &Worker, why: &str| w.out.send(BrainEvent::Warning(format!("split: {why}")));
+        let ep = match self.store.episode(id) {
+            Ok(Some(e)) => e,
+            Ok(None) => return refuse(self, "the note no longer exists"),
+            Err(e) => return refuse(self, &e.to_string()),
+        };
+        if ep.is_media() {
+            return refuse(self, "media notes can't be split");
+        }
+        let rows = match self.store.segments_of_episode(id) {
+            Ok(r) => r,
+            Err(e) => return refuse(self, &e.to_string()),
+        };
+        if rows.is_empty() {
+            return refuse(self, "no transcript was kept for this note");
+        }
+        if crate::episodes::numbered_rows(&rows).len() < 2 {
+            return refuse(self, "the note has only one transcript line");
+        }
+        if !self.within_budget(Tier::Rolling) {
+            return refuse(self, "the brain's budget is reached; try again later");
+        }
+        let model = self.cfg.models.rolling.clone();
+        let text = text.to_owned();
+        let _ = self.run_job(Tier::Rolling, "split", move |w, run_id| {
+            let tree = w.store.nodes().map_err(|e| e.to_string())?;
+            let req = split::split_request(
+                &tree,
+                &ep,
+                &rows,
+                &text,
+                &w.speaker_map(),
+                Some(model.clone()),
+            );
+            let resp = w.call(&req).map_err(JobError::from)?;
+            let fail = |msg: String| JobError {
+                cost_usd: resp.cost_usd,
+                ..JobError::from(msg)
+            };
+            let result = resp
+                .structured
+                .as_ref()
+                .ok_or_else(|| "no structured output".to_owned())
+                .and_then(|v| split::parse_split(v).map_err(|e| e.to_string()))
+                .map_err(fail)?;
+            let moving = split::lines_to_segments(&rows, &result.new_lines).map_err(fail)?;
+            let model_name = resp.model.clone().unwrap_or_else(|| model.clone());
+            let done = split::apply_split(
+                &w.store,
+                &tree,
+                ep.id,
+                &result,
+                &moving,
+                &model_name,
+                resp.cost_usd,
+                Some(run_id),
+                now_ms(),
+            )
+            .map_err(fail)?;
+            let confirmation = done.confirmation();
+            w.out.send(BrainEvent::Split {
+                episode: ep.id,
+                new_episode: done.new.id,
+            });
+            w.out.send(BrainEvent::Command {
+                segment_id: 0,
+                lines: vec![confirmation.clone()],
+                confirmations: vec![confirmation.clone()],
+            });
+            Ok(JobOutput {
+                summary: format!("{} of {} lines split off", done.moved, rows.len()),
+                cost_usd: resp.cost_usd,
+                duration_ms: resp.duration_ms,
+                model: resp.model,
+                lines: vec![confirmation],
                 changed: true,
             })
         });
@@ -2625,6 +2736,206 @@ esac
         assert_eq!(e.revision, 2);
         assert_eq!(w.store.segments_of_episode(note.id).unwrap().len(), 2);
         assert_eq!(w.store.episodes(10).unwrap().len(), 1, "not split again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_split_moves_the_listed_lines_into_a_new_note_and_rewrites_the_original() {
+        let dir = temp_dir("split");
+        let t = now_ms() - 86_400_000;
+        let hm = |ms: i64| {
+            Local
+                .timestamp_millis_opt(ms)
+                .single()
+                .unwrap()
+                .format("%H:%M")
+                .to_string()
+        };
+        // four lines three minutes apart: 1–2 the shopping list, 3–4 the to-dos
+        let at: Vec<i64> = (0..4).map(|i| t + i * 180_000).collect();
+        let answer = format!(
+            r#"{{"type":"result","is_error":false,"result":"","total_cost_usd":0.02,"structured_output":{{"keep":{{"title":"Shopping list","summary":"- milk","decisions":[],"action_items":[{{"text":"buy milk","owner":"me","due":null,"project":null,"at":"{a0}"}}],"topics":["shopping"],"node_id":null}},"new":{{"title":"To-dos","summary":"- van","decisions":[{{"text":"use the big van","project":null,"at":"{a3}"}}],"action_items":[{{"text":"book the van","owner":"me","due":null,"project":null,"at":"{a2}"}}],"topics":["to-dos"],"node_id":null}},"new_lines":[3,4]}}}}"#,
+            a0 = hm(at[0]),
+            a2 = hm(at[2]),
+            a3 = hm(at[3]),
+        );
+        let (mut w, events) =
+            bare_worker_with_events(script_cli(&dir, &format!("echo '{answer}'")));
+        let work = w
+            .store
+            .nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.name == "Work")
+            .unwrap()
+            .id;
+        let sid = w.store.begin_session(0, "e").unwrap();
+        let segs: Vec<i64> = at
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                w.store
+                    .insert_segment(sid, *a, a + 5_000, &format!("line {}", i + 1), None)
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        let note = w
+            .store
+            .insert_episode(
+                t,
+                at[3] + 5_000,
+                &EpisodeContent {
+                    title: "Shopping list and to-dos".into(),
+                    node_id: Some(work),
+                    action_items: vec![oats_core::ActionItem {
+                        text: "book the van".into(),
+                        done_at: Some(77),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                t,
+            )
+            .unwrap();
+        w.store
+            .mark_segments_interpreted(&segs, note.id, t)
+            .unwrap();
+        w.store
+            .update_episode_content(
+                note.id,
+                &EpisodeContent {
+                    title: "My list".into(),
+                    action_items: vec![oats_core::ActionItem {
+                        text: "book the van".into(),
+                        done_at: Some(77),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                t + 1,
+            )
+            .unwrap();
+        w.handle(BrainCommand::Split {
+            episode: note.id,
+            text: "the to-dos".into(),
+        });
+        let (id, text) = w.splits.pop_front().unwrap();
+        w.run_split(id, &text);
+
+        let orig = w.store.episode(note.id).unwrap().unwrap();
+        assert_eq!(orig.title, "Shopping list");
+        assert!(orig.user_edited_at.is_none(), "the edits were replaced");
+        assert_eq!(orig.revision, 2);
+        assert_eq!((orig.started_at, orig.ended_at), (at[0], at[1] + 5_000));
+        assert_eq!(orig.node_id, Some(work));
+        assert_eq!(orig.action_items[0].segment_id, Some(segs[0]));
+        let kept: Vec<i64> = w
+            .store
+            .segments_of_episode(note.id)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(kept, segs[..2].to_vec());
+
+        let all = w.store.episodes(10).unwrap();
+        assert_eq!(all.len(), 2);
+        let new = all.iter().find(|e| e.id != note.id).unwrap();
+        assert_eq!(new.title, "To-dos");
+        assert_eq!(new.node_id, Some(work), "the original's home");
+        assert_eq!((new.started_at, new.ended_at), (at[2], at[3] + 5_000));
+        assert!(new.user_edited_at.is_none());
+        assert!(!new.is_media());
+        assert_eq!(new.action_items[0].segment_id, Some(segs[2]));
+        assert_eq!(
+            new.action_items[0].done_at,
+            Some(77),
+            "the tick moved along"
+        );
+        assert_eq!(new.decisions[0].segment_id, Some(segs[3]));
+        let moved: Vec<i64> = w
+            .store
+            .segments_of_episode(new.id)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(moved, segs[2..].to_vec());
+
+        let change = w
+            .store
+            .changes(5)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.kind == "episode_split")
+            .unwrap();
+        assert!(change.before_json.contains("\"moved_segment_ids\""));
+        assert!(
+            change
+                .after_json
+                .contains(&format!("\"new_episode_id\":{}", new.id))
+        );
+        assert!(
+            !interpret::undo_change(&w.store, change.id).unwrap(),
+            "not undoable"
+        );
+        let evs: Vec<BrainEvent> = events.try_iter().collect();
+        assert!(evs.contains(&BrainEvent::Split {
+            episode: note.id,
+            new_episode: new.id
+        }));
+        assert!(evs.iter().any(|e| matches!(e,
+            BrainEvent::Command { confirmations, .. } if confirmations == &vec!["Split off “To-dos”".to_owned()])));
+        let run = w.store.runs(1).unwrap().remove(0);
+        assert_eq!((run.kind.as_str(), run.ok), ("split", true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_split_is_refused_before_any_call_for_media_one_line_or_no_transcript() {
+        let dir = temp_dir("split-refuse");
+        // any call would fail the test: the script exits non-zero
+        let (mut w, events) = bare_worker_with_events(script_cli(&dir, "exit 9"));
+        let sid = w.store.begin_session(0, "e").unwrap();
+        let t = now_ms() - 86_400_000;
+        let one = w
+            .store
+            .insert_segment(sid, t, t + 5_000, LONG_TEXT, None)
+            .unwrap();
+        let ep = |w: &Worker| {
+            w.store
+                .insert_episode(t, t + 5_000, &EpisodeContent::default(), t)
+                .unwrap()
+                .id
+        };
+        let single = ep(&w);
+        w.store
+            .mark_segments_interpreted(&[one.id], single, t)
+            .unwrap();
+        let empty = ep(&w);
+        let media = ep(&w);
+        w.store.set_episode_kind(media, "media").unwrap();
+        for id in [single, empty, media, 9_999] {
+            w.run_split(id, "the rest");
+        }
+        let warnings: Vec<String> = events
+            .try_iter()
+            .filter_map(|e| match e {
+                BrainEvent::Warning(w) => Some(w),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            warnings,
+            vec![
+                "split: the note has only one transcript line",
+                "split: no transcript was kept for this note",
+                "split: media notes can't be split",
+                "split: the note no longer exists",
+            ]
+        );
+        assert!(w.store.runs(5).unwrap().is_empty(), "no call was made");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

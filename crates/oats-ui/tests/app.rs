@@ -3604,3 +3604,125 @@ fn every_view_fits_a_constrained_window() {
         failures.join("\n")
     );
 }
+
+/// A fake `claude` that answers the split schema: line 2 of the note goes to a new note.
+fn fake_cli_split(dir: &Path) -> ClaudeCli {
+    let script = dir.join("claude");
+    let body = format!(
+        r#"#!/bin/sh
+case " $* " in *" --version "*) echo "2.1.312 (Claude Code)"; exit 0;; esac
+cat >> '{prompts}'
+case "$*" in
+  *new_lines*) echo '{{"type":"result","is_error":false,"result":"","total_cost_usd":0.01,"duration_ms":10,"structured_output":{{"keep":{{"title":"Pricing sync","summary":"- prices","decisions":[],"action_items":[{{"text":"Draft the price table","owner":"Ana","due":null,"project":null,"at":null}}],"topics":[],"node_id":null}},"new":{{"title":"VAT follow-ups","summary":"- vat","decisions":[],"action_items":[{{"text":"Check VAT rules","owner":null,"due":null,"project":null,"at":null}}],"topics":[],"node_id":null}},"new_lines":[2]}}}}';;
+  *) echo '{{"type":"result","is_error":true,"result":"unexpected request"}}';;
+esac
+"#,
+        prompts = dir.join("prompts").display()
+    );
+    std::fs::write(&script, body).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    ClaudeCli {
+        binary: script,
+        model: None,
+        timeout: Duration::from_secs(10),
+        max_budget_usd: None,
+        work_dir: Some(dir.join("work")),
+        isolate: true,
+    }
+}
+
+#[test]
+fn split_asks_before_replacing_edits_then_splits_the_note_in_two() {
+    let dir = TempDir::new("split");
+    let (commerce, pricing, _launch) = seed_project_notes(&dir.db());
+    {
+        let s = Store::open(&dir.db()).unwrap();
+        let e = s.episode(pricing).unwrap().unwrap();
+        let sid = s.begin_session(e.started_at, "seed").unwrap();
+        let a = s
+            .insert_segment(
+                sid,
+                e.started_at,
+                e.started_at + 5_000,
+                "the price table",
+                None,
+            )
+            .unwrap();
+        let b = s
+            .insert_segment(
+                sid,
+                e.started_at + 20_000,
+                e.started_at + 25_000,
+                "and the VAT rules",
+                None,
+            )
+            .unwrap();
+        s.mark_segments_interpreted(&[a.id, b.id], pricing, e.started_at)
+            .unwrap();
+        // a hand edit: Split asks "Replace your edits?" first
+        let mut c = e.content();
+        c.summary = "my own words".into();
+        s.update_episode_content(pricing, &c, now_ms()).unwrap();
+    }
+    let brain = Brain {
+        config: BrainConfig {
+            cli: fake_cli_split(&dir.0),
+            ..BrainConfig::default()
+        },
+        store_path: dir.db(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    let mut rig = build(&dir.db(), None, Some(brain));
+    rig.app().selftest_view_node(commerce);
+    rig.until("the brain to report in", |app| {
+        interpret_enabled(app) == Some(true)
+    });
+    rig.harness.run_steps(3);
+    rig.harness.get_by_label("Note: Pricing sync").click();
+    rig.harness.run_steps(3);
+    rig.harness.get_by_label("Split…").click();
+    rig.harness.run_steps(3);
+    rig.harness
+        .get_by_role(egui::accesskit::Role::TextInput)
+        .type_text("the VAT part");
+    rig.harness.run_steps(2);
+    rig.harness.key_press(egui::Key::Enter);
+    rig.harness.run_steps(3);
+    assert!(
+        rig.shows("Replace your edits?"),
+        "a hand-edited note asks first"
+    );
+    rig.harness.get_by_label("Yes").click();
+    rig.until("the split note to appear", |app| {
+        app.listed_episodes()
+            .iter()
+            .any(|e| e.title == "VAT follow-ups")
+    });
+    rig.harness.run_steps(3);
+    assert!(rig.shows("Split off “VAT follow-ups”"));
+    let s = Store::open(&dir.db()).unwrap();
+    let orig = s.episode(pricing).unwrap().unwrap();
+    assert!(orig.user_edited_at.is_none());
+    assert_eq!(s.segments_of_episode(pricing).unwrap().len(), 1);
+    let new = s
+        .episodes(10)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.title == "VAT follow-ups")
+        .unwrap();
+    assert_eq!(new.node_id, Some(commerce));
+    assert_eq!(
+        s.segments_of_episode(new.id).unwrap()[0].text,
+        "and the VAT rules"
+    );
+    let prompts = std::fs::read_to_string(dir.0.join("prompts")).unwrap();
+    assert!(prompts.contains("the VAT part") && prompts.contains("[2] ["));
+    assert!(
+        !rig.shows("what goes into the new note"),
+        "the field closed"
+    );
+}

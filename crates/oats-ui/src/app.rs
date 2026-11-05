@@ -678,6 +678,9 @@ pub struct OatsApp {
     /// Confirmation pop-ups raised where no `Context` is at hand (a local "Move to…"); shown
     /// at the next brain-event pass.
     pending_confirms: Vec<String>,
+    /// The latest "Split…" that worked: (original, new note), from `BrainEvent::Split`; taken
+    /// when the split field settles.
+    split_done: Option<(i64, i64)>,
     /// Plain 4 s pop-ups (`text`, `error`) raised where no `Context` is at hand (undo / redo).
     pending_toasts: Vec<(String, bool)>,
     /// The in-session undo / redo of the user's own quick edits ([`crate::undo`]).
@@ -823,6 +826,7 @@ impl OatsApp {
             brain_status: BrainStatus::default(),
             last_command: None,
             pending_confirms: Vec::new(),
+            split_done: None,
             pending_toasts: Vec::new(),
             undo: Default::default(),
             episodes: Vec::new(),
@@ -1297,6 +1301,7 @@ impl OatsApp {
                 let (kind, id) = target.kind_and_id();
                 (kind, Some(id))
             }
+            BrainCommand::Split { episode, .. } => ("split", Some(*episode)),
             _ => ("", None),
         };
         if !kind.is_empty() {
@@ -2411,7 +2416,9 @@ impl OatsApp {
                 BrainEvent::RunFinished(run) => {
                     self.brain_status.running = None;
                     self.brain_status.progress = None;
-                    if self.brain_status.waiting_for(&run.kind) {
+                    // a split says how it went itself: the confirmation pop-up, or the
+                    // reopened field's "Couldn't split it"
+                    if run.kind != "split" && self.brain_status.waiting_for(&run.kind) {
                         let (text, error) = crate::notes::run_toast(&run);
                         self.brain_toast(ctx, text, error);
                     }
@@ -2425,6 +2432,13 @@ impl OatsApp {
                 } => {
                     self.last_command = Some(lines.join(" · "));
                     self.confirm(ctx, confirmations);
+                    reload = true;
+                }
+                BrainEvent::Split {
+                    episode,
+                    new_episode,
+                } => {
+                    self.split_done = Some((episode, new_episode));
                     reload = true;
                 }
                 BrainEvent::Changed(_) => {
@@ -2446,6 +2460,77 @@ impl OatsApp {
         if reload {
             self.reload();
         }
+        self.settle_split_draft(ctx);
+    }
+
+    /// A "Split…" has settled (or its wait ended): when it worked the field closes and the new
+    /// note is flashed on the page (a single-note view of the original goes back to the
+    /// project page, so both show); otherwise the field reopens with its text and a "Couldn't
+    /// split it: …" pop-up.
+    fn settle_split_draft(&mut self, ctx: &egui::Context) {
+        let Some(d) = self.notes_state.split_draft.clone() else {
+            self.split_done = None;
+            return;
+        };
+        if !d.sent || self.brain_status.busy("split", Some(d.episode)) {
+            return;
+        }
+        match self.split_done.take() {
+            Some((orig, new)) if orig == d.episode => {
+                self.notes_state.split_draft = None;
+                if self.focus_episode == Some(orig) {
+                    self.focus_episode = None;
+                }
+                // flashed where it shows: on this page, or in All notes
+                let shown_here = match self.prefs.view {
+                    View::Notes => true,
+                    View::Node(view) => self
+                        .store
+                        .episode(new)
+                        .ok()
+                        .flatten()
+                        .and_then(|e| e.node_id)
+                        .is_some_and(|n| self.in_subtree(n, view)),
+                    _ => false,
+                };
+                if shown_here {
+                    self.notes_state.pending_focus = Some(new);
+                }
+            }
+            _ => {
+                if let Some(d) = self.notes_state.split_draft.as_mut() {
+                    d.sent = false;
+                    d.focus = true;
+                }
+                let why = self
+                    .warning
+                    .as_deref()
+                    .and_then(|w| w.strip_prefix("split: "))
+                    .unwrap_or("the brain didn't answer")
+                    .to_owned();
+                let why: String = why.chars().take(120).collect();
+                self.brain_toast(ctx, format!("Couldn't split it: {why}"), true);
+            }
+        }
+    }
+
+    /// "Split…": the user's words go to the brain (`BrainCommand::Split`); the field stays
+    /// open, disabled with a spinner, until it settles.
+    fn submit_split(&mut self, episode: i64, text: String) {
+        if self.brain.is_none() || !self.brain_status.available() {
+            self.warning = Some("Splitting a note needs claude (it isn't available)".to_owned());
+            return;
+        }
+        // the field may have gone (the "Replace your edits?" Yes came from the header)
+        let draft = self
+            .notes_state
+            .split_draft
+            .get_or_insert_with(|| crate::move_to::SplitDraft::new(episode));
+        draft.episode = episode;
+        draft.text = text.clone();
+        draft.sent = true;
+        self.split_done = None;
+        self.brain_send(BrainCommand::Split { episode, text });
     }
 
     /// A "Move to…" the model was asked about has settled (or its wait ended): the field
@@ -3081,6 +3166,7 @@ impl OatsApp {
                 NotesAction::MoveText { episode, text } => {
                     self.submit_move(MoveTarget::Episode(episode), text)
                 }
+                NotesAction::SplitText { episode, text } => self.submit_split(episode, text),
                 NotesAction::SaveEdit(id, content) => {
                     let now = chrono::Local::now().timestamp_millis();
                     let before = self.store.episode(id).ok().flatten();
@@ -3119,6 +3205,7 @@ impl OatsApp {
                 self.store.checkpoint();
                 self.notes_state.editing = None;
                 self.notes_state.move_draft = None;
+                self.notes_state.split_draft = None;
                 if self.focus_episode == Some(id) {
                     self.focus_episode = None;
                 }
@@ -4451,6 +4538,9 @@ impl eframe::App for OatsApp {
         let ctx = ui.ctx().clone();
         let t = Tokens::get(&ctx);
         crate::move_to::drop_stale(&mut self.notes_state.move_draft);
+        crate::move_to::drop_stale_split(&mut self.notes_state.split_draft);
+        // every card's brain buttons read it (All notes, a project page, a single note, search)
+        self.notes_state.brain.clone_from(&self.brain_status);
         crate::speakers::publish(&ctx, self.speakers.clone());
         let mut cmds = self.handle_keys(&ctx);
         cmds.extend(self.undo_keys(&ctx));
@@ -4472,6 +4562,7 @@ impl eframe::App for OatsApp {
             && self.prefs_window.is_none()
             && self.notes_state.editing.is_none()
             && self.notes_state.move_draft.is_none()
+            && self.notes_state.split_draft.is_none()
             && self.notes_state.confirm_merge.is_none()
             && self.notes_state.confirm_delete.is_none()
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))

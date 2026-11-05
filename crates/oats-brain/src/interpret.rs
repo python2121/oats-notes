@@ -180,7 +180,7 @@ pub fn render_tree(nodes: &[Node], usage: Option<&[(i64, i64, i64)]>) -> String 
     out
 }
 
-fn clock<Tz: TimeZone>(ms: i64, tz: &Tz) -> String
+pub(crate) fn clock<Tz: TimeZone>(ms: i64, tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -362,6 +362,49 @@ fn proposal_schema() -> Value {
     })
 }
 
+/// One decision in the output: `{text, project, at}` (shared with the split schema).
+pub(crate) fn decision_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": { "type": "string" },
+            "project": {
+                "type": ["string", "null"],
+                "description": "name of the existing project/topic it concerns; null = the note's home"
+            },
+            "at": {
+                "type": ["string", "null"],
+                "description": "HH:MM of the transcript line it came from"
+            }
+        },
+        "required": ["text", "project", "at"],
+        "additionalProperties": false
+    })
+}
+
+/// One action item in the output: `{text, owner, due, project, at}` (shared with the split
+/// schema).
+pub(crate) fn action_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": { "type": "string" },
+            "owner": nullable("string"),
+            "due": nullable("string"),
+            "project": {
+                "type": ["string", "null"],
+                "description": "name of the existing project/topic it concerns; null = the note's home"
+            },
+            "at": {
+                "type": ["string", "null"],
+                "description": "HH:MM of the transcript line it came from"
+            }
+        },
+        "required": ["text", "owner", "due", "project", "at"],
+        "additionalProperties": false
+    })
+}
+
 pub fn interpret_schema() -> Value {
     json!({
         "type": "object",
@@ -372,46 +415,8 @@ pub fn interpret_schema() -> Value {
             "node_id": nullable("integer"),
             "new_project": proposal_schema(),
             "new_topic": proposal_schema(),
-            "decisions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": { "type": "string" },
-                        "project": {
-                            "type": ["string", "null"],
-                            "description": "name of the existing project/topic it concerns; null = the note's home"
-                        },
-                        "at": {
-                            "type": ["string", "null"],
-                            "description": "HH:MM of the transcript line it came from"
-                        }
-                    },
-                    "required": ["text", "project", "at"],
-                    "additionalProperties": false
-                }
-            },
-            "action_items": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": { "type": "string" },
-                        "owner": nullable("string"),
-                        "due": nullable("string"),
-                        "project": {
-                            "type": ["string", "null"],
-                            "description": "name of the existing project/topic it concerns; null = the note's home"
-                        },
-                        "at": {
-                            "type": ["string", "null"],
-                            "description": "HH:MM of the transcript line it came from"
-                        }
-                    },
-                    "required": ["text", "owner", "due", "project", "at"],
-                    "additionalProperties": false
-                }
-            },
+            "decisions": { "type": "array", "items": decision_item_schema() },
+            "action_items": { "type": "array", "items": action_item_schema() },
             "topics": { "type": "array", "items": { "type": "string" } },
             "events": {
                 "type": "array",
@@ -748,6 +753,60 @@ fn resolve_node(
     Ok((node_id, created))
 }
 
+/// The model's decisions as stored: blank ones dropped, `project` → [`resolve_item_node`]
+/// (against `home`, the note's node), `at` → [`resolve_at`] in `chunk`.
+pub(crate) fn decisions_of(
+    tree: &[Node],
+    chunk: &Chunk,
+    proposed: &[ProposedDecision],
+    home: Option<i64>,
+) -> Vec<Decision> {
+    proposed
+        .iter()
+        .filter(|d| !d.text.trim().is_empty())
+        .map(|d| {
+            let (at_ms, segment_id) = resolve_at(chunk, d.at.as_deref(), &Local).unzip();
+            Decision {
+                text: d.text.trim().to_owned(),
+                node_id: resolve_item_node(tree, d.project.as_deref(), home),
+                at_ms,
+                segment_id,
+            }
+        })
+        .collect()
+}
+
+/// The model's action items as stored ([`decisions_of`]'s rules); an item whose trimmed text
+/// matches one of `previous` keeps that item's `done_at` (the user's tick survives a revision).
+pub(crate) fn action_items_of(
+    tree: &[Node],
+    chunk: &Chunk,
+    proposed: &[ProposedAction],
+    home: Option<i64>,
+    previous: Option<&[ActionItem]>,
+) -> Vec<ActionItem> {
+    proposed
+        .iter()
+        .filter(|a| !a.text.trim().is_empty())
+        .map(|a| {
+            let (at_ms, segment_id) = resolve_at(chunk, a.at.as_deref(), &Local).unzip();
+            ActionItem {
+                text: a.text.trim().to_owned(),
+                owner: a.owner.clone().filter(|o| !o.trim().is_empty()),
+                due: a.due.clone().filter(|d| !d.trim().is_empty()),
+                node_id: resolve_item_node(tree, a.project.as_deref(), home),
+                at_ms,
+                segment_id,
+                done_at: previous.and_then(|p| {
+                    p.iter()
+                        .find(|o| o.text.trim() == a.text.trim())
+                        .and_then(|o| o.done_at)
+                }),
+            }
+        })
+        .collect()
+}
+
 /// The node an item's `project` names: an existing, unarchived project or topic matched by
 /// [`name_key`] (or cited as `[id] name`, the way the tree is shown). Items never create
 /// nodes: an unknown name, a category, or the note's own `home` is `None` (= filed with the
@@ -1046,43 +1105,15 @@ fn apply_interpretation_in_tx(
         title,
         summary: interp.summary.trim().to_owned(),
         node_id,
-        decisions: interp
-            .decisions
-            .iter()
-            .filter(|d| !d.text.trim().is_empty())
-            .map(|d| {
-                let (at_ms, segment_id) = resolve_at(chunk, d.at.as_deref(), &Local).unzip();
-                Decision {
-                    text: d.text.trim().to_owned(),
-                    node_id: resolve_item_node(tree, d.project.as_deref(), node_id),
-                    at_ms,
-                    segment_id,
-                }
-            })
-            .collect(),
-        action_items: interp
-            .action_items
-            .iter()
-            .filter(|a| !a.text.trim().is_empty())
-            .map(|a| {
-                let (at_ms, segment_id) = resolve_at(chunk, a.at.as_deref(), &Local).unzip();
-                ActionItem {
-                    text: a.text.trim().to_owned(),
-                    owner: a.owner.clone().filter(|o| !o.trim().is_empty()),
-                    due: a.due.clone().filter(|d| !d.trim().is_empty()),
-                    node_id: resolve_item_node(tree, a.project.as_deref(), node_id),
-                    at_ms,
-                    segment_id,
-                    // a revision keeps the user's tick on an item it still proposes
-                    done_at: prior.and_then(|p| {
-                        p.action_items
-                            .iter()
-                            .find(|o| o.text.trim() == a.text.trim())
-                            .and_then(|o| o.done_at)
-                    }),
-                }
-            })
-            .collect(),
+        decisions: decisions_of(tree, chunk, &interp.decisions, node_id),
+        // a revision keeps the user's tick on an item it still proposes
+        action_items: action_items_of(
+            tree,
+            chunk,
+            &interp.action_items,
+            node_id,
+            prior.map(|p| p.action_items.as_slice()),
+        ),
         topics: interp
             .topics
             .iter()

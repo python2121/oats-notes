@@ -2725,6 +2725,48 @@ impl Store {
         Ok(())
     }
 
+    /// "Split…": attach the segments `ids` that belong to episode `from` to episode `to`
+    /// (`interpreted_at` stays as it is). Ids no longer in `from` are skipped. Returns how
+    /// many moved.
+    pub fn move_segments_to_episode(
+        &self,
+        ids: &[i64],
+        from: i64,
+        to: i64,
+    ) -> Result<usize, StoreError> {
+        let tx = Savepoint::begin(&self.conn)?;
+        let mut n = 0;
+        for id in ids {
+            n += tx.execute(
+                "UPDATE segments SET episode_id = ?3 WHERE id = ?1 AND episode_id = ?2",
+                [*id, from, to],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Set an episode's span to its (non-echo) segments' first start and last end; `false`
+    /// (nothing changed) when it has none.
+    pub fn recompute_episode_span(&self, id: i64) -> Result<bool, StoreError> {
+        let (first, last): (Option<i64>, Option<i64>) = self.conn.query_row(
+            &format!(
+                "SELECT MIN(started_at), MAX(ended_at) FROM segments
+                 WHERE episode_id = ?1 AND {NOT_ECHO}"
+            ),
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let (Some(first), Some(last)) = (first, last) else {
+            return Ok(false);
+        };
+        let n = self.conn.execute(
+            "UPDATE episodes SET started_at = ?2, ended_at = ?3 WHERE id = ?1",
+            [id, first, last],
+        )?;
+        Ok(n > 0)
+    }
+
     // ---- events and notes -----------------------------------------------------
 
     /// Insert an event, or update the one with the same `dedupe_key`. Returns the row.

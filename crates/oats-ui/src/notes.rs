@@ -57,6 +57,12 @@ pub enum NotesAction {
         episode: i64,
         text: String,
     },
+    /// "Split…" on a note: the user's words for what goes into a new note (sent to the brain;
+    /// a hand-edited note's "Replace your edits?" was answered Yes).
+    SplitText {
+        episode: i64,
+        text: String,
+    },
     /// A note was dragged onto another one and dropped at `at`: the app asks before merging
     /// `dragged` INTO `into`.
     MergeDrop {
@@ -107,6 +113,7 @@ pub fn run_toast(run: &BrainRun) -> (String, bool) {
         "reorganise" => "Reorganise",
         "summarise" => "Summarise",
         "rewrite" => "Re-interpret",
+        "split" => "Split",
         other => other,
     };
     if !run.ok {
@@ -171,6 +178,7 @@ pub fn busy_label(kind: &str) -> &'static str {
         "reinterpret" | "rewrite" => "Re-interpreting…",
         "summarise" => "Summarising…",
         "move" | "move_segment" => "Moving…",
+        "split" => "Splitting…",
         _ => "Working…",
     }
 }
@@ -379,8 +387,9 @@ pub struct NotesState {
     pub pending_focus: Option<i64>,
     /// The note being edited by hand and its draft text.
     pub editing: Option<EditDraft>,
-    /// A hand-edited note whose "Re-interpret" awaits the "Replace your edits?" answer.
-    pub confirm_reinterpret: Option<i64>,
+    /// A hand-edited note whose "Re-interpret" or "Split…" awaits the "Replace your edits?"
+    /// answer.
+    pub confirm_replace: Option<ConfirmReplace>,
     /// The brain's status, refreshed by the app every frame (the cards' Summarise /
     /// Re-interpret buttons read their busy state from it).
     pub brain: BrainStatus,
@@ -400,10 +409,40 @@ pub struct NotesState {
     pub media_convertible: std::collections::HashSet<i64>,
     /// "Move to…": the open inline field, for a note or a transcript segment.
     pub move_draft: Option<crate::move_to::MoveDraft>,
+    /// "Split…": the open inline field under a note's title (never open beside the same
+    /// note's "Move to" field).
+    pub split_draft: Option<crate::move_to::SplitDraft>,
     /// A note dropped on another, waiting for the user's Yes / No.
     pub confirm_merge: Option<crate::merge::MergeConfirm>,
     /// A note whose Delete was clicked in the edit view: (episode id, title, popup anchor).
     pub confirm_delete: Option<(i64, String, egui::Pos2)>,
+}
+
+/// What a "Replace your edits?" question in a hand-edited note's header confirms.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConfirmReplace {
+    Reinterpret(i64),
+    /// The split field's text, sent on Yes.
+    Split(i64, String),
+}
+
+impl ConfirmReplace {
+    pub fn episode(&self) -> i64 {
+        match self {
+            ConfirmReplace::Reinterpret(id) | ConfirmReplace::Split(id, _) => *id,
+        }
+    }
+
+    /// The action Yes sends.
+    fn action(&self) -> NotesAction {
+        match self {
+            ConfirmReplace::Reinterpret(id) => NotesAction::Reinterpret(*id),
+            ConfirmReplace::Split(id, text) => NotesAction::SplitText {
+                episode: *id,
+                text: text.clone(),
+            },
+        }
+    }
 }
 
 /// The text fields of a note being edited. Decisions: one per line. Action items: one per
@@ -769,11 +808,61 @@ fn item_line(
 /// "Move to…" on a note's context menu: opens the inline field.
 fn move_menu(ui: &mut egui::Ui, e: &Episode, state: &mut NotesState) {
     if ui.button("Move to…").clicked() {
-        state.move_draft = Some(crate::move_to::MoveDraft::new(
-            oats_brain::MoveTarget::Episode(e.id),
-            e.node_id,
-        ));
+        open_move_field(state, e);
         ui.close();
+    }
+    // a brain action: offered while claude is up and the note isn't being split already
+    if !e.is_media()
+        && ui
+            .add_enabled(
+                state.brain.available() && !state.brain.busy("split", Some(e.id)),
+                egui::Button::new("Split…"),
+            )
+            .on_hover_text("Split part of this note off into a new note")
+            .clicked()
+    {
+        open_split_field(state, e);
+        ui.close();
+    }
+}
+
+/// Open the "Move to" field on a note's card (closing its "Split off" field).
+fn open_move_field(state: &mut NotesState, e: &Episode) {
+    state.move_draft = Some(crate::move_to::MoveDraft::new(
+        oats_brain::MoveTarget::Episode(e.id),
+        e.node_id,
+    ));
+    if state.split_draft.as_ref().is_some_and(|d| !d.sent) {
+        state.split_draft = None;
+    }
+}
+
+/// Open the "Split off" field on a note's card (closing its "Move to" field).
+fn open_split_field(state: &mut NotesState, e: &Episode) {
+    state.split_draft = Some(crate::move_to::SplitDraft::new(e.id));
+    if state.move_draft.as_ref().is_some_and(|d| !d.sent) {
+        state.move_draft = None;
+    }
+}
+
+/// The inline "Split off" field under a note's title: Enter sends the text (after "Replace
+/// your edits?" on a hand-edited note).
+fn split_field(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    e: &Episode,
+    state: &mut NotesState,
+    actions: &mut Vec<NotesAction>,
+) {
+    if let Some(text) = crate::move_to::split_field(ui, t, &mut state.split_draft, e.id) {
+        if e.user_edited_at.is_some() {
+            state.confirm_replace = Some(ConfirmReplace::Split(e.id, text));
+        } else {
+            actions.push(NotesAction::SplitText {
+                episode: e.id,
+                text,
+            });
+        }
     }
 }
 
@@ -1239,6 +1328,7 @@ pub(crate) fn episode_card(
                 });
             }
             move_field(ui, t, e, state, actions);
+            split_field(ui, t, e, state, actions);
             inset_wrapped(ui, 12.0, 12.0, |ui| {
                 ui.label(
                     RichText::new(crate::timefmt::range(e.started_at, e.ended_at, &Local))
@@ -1367,8 +1457,8 @@ pub(crate) fn episode_card(
 /// The narrowest a card's title gets beside its buttons before they move to their own row.
 const CARD_TITLE_MIN: f32 = 150.0;
 
-/// A card's buttons (Move to…, Edit, Re-interpret, Summarise on a media note; or the "Replace
-/// your edits?" question), added right to left.
+/// A card's buttons (Split…, Move to…, Edit, Re-interpret, Summarise on a media note; or the
+/// "Replace your edits?" question), added right to left.
 fn card_buttons(
     ui: &mut egui::Ui,
     t: &Tokens,
@@ -1376,14 +1466,18 @@ fn card_buttons(
     e: &Episode,
     actions: &mut Vec<NotesAction>,
 ) {
-    if state.confirm_reinterpret == Some(e.id) {
+    if let Some(confirm) = state
+        .confirm_replace
+        .clone()
+        .filter(|c| c.episode() == e.id)
+    {
         // right to left: No, Yes, then the question
         if small_button(ui, "No", true) {
-            state.confirm_reinterpret = None;
+            state.confirm_replace = None;
         }
         if small_button(ui, "Yes", true) {
-            state.confirm_reinterpret = None;
-            actions.push(NotesAction::Reinterpret(e.id));
+            state.confirm_replace = None;
+            actions.push(confirm.action());
         }
         ui.label(
             RichText::new("Replace your edits?")
@@ -1403,7 +1497,7 @@ fn card_buttons(
             "Re-interpret",
         ) {
             if e.user_edited_at.is_some() {
-                state.confirm_reinterpret = Some(e.id);
+                state.confirm_replace = Some(ConfirmReplace::Reinterpret(e.id));
             } else {
                 actions.push(NotesAction::Reinterpret(e.id));
             }
@@ -1411,14 +1505,30 @@ fn card_buttons(
         if small_button(ui, "Edit", true) {
             state.editing = Some(EditDraft::from_episode(e));
         }
-        // leftmost: toggles the inline "Move to" field (the title's context menu opens it too)
+        // toggles the inline "Move to" field (the title's context menu opens it too)
         if small_button(ui, "Move to…", true) {
             let target = oats_brain::MoveTarget::Episode(e.id);
             let open = state
                 .move_draft
                 .as_ref()
                 .is_some_and(|d| d.target == target && !d.sidebar);
-            state.move_draft = (!open).then(|| crate::move_to::MoveDraft::new(target, e.node_id));
+            if open {
+                state.move_draft = None;
+            } else {
+                open_move_field(state, e);
+            }
+        }
+        // leftmost: toggles the inline "Split off" field (a brain action; not on media)
+        if !e.is_media() && brain_button(ui, t, &state.brain, "split", Some(e.id), "Split…") {
+            let open = state
+                .split_draft
+                .as_ref()
+                .is_some_and(|d| d.episode == e.id);
+            if open {
+                state.split_draft = None;
+            } else {
+                open_split_field(state, e);
+            }
         }
     }
 }
@@ -1441,7 +1551,11 @@ fn card_buttons_width(ui: &egui::Ui, state: &NotesState, e: &Episode) -> f32 {
             crate::widgets::button_width(ui, label, 11.5)
         }
     };
-    let widths: Vec<f32> = if state.confirm_reinterpret == Some(e.id) {
+    let widths: Vec<f32> = if state
+        .confirm_replace
+        .as_ref()
+        .is_some_and(|c| c.episode() == e.id)
+    {
         vec![
             crate::widgets::button_width(ui, "No", 11.5),
             crate::widgets::button_width(ui, "Yes", 11.5),
@@ -1462,6 +1576,8 @@ fn card_buttons_width(ui: &egui::Ui, state: &NotesState, e: &Episode) -> f32 {
         ];
         if e.is_media() {
             w.push(brain("summarise", Some(e.id), "Summarise"));
+        } else {
+            w.push(brain("split", Some(e.id), "Split…"));
         }
         w
     };
@@ -2326,11 +2442,15 @@ fn note_list(
                 ui.add_space(2.0);
             }
         }
-        // "Move to…" from a closed row: its field lives in the open card
+        // "Move to…" / "Split…" from a closed row: its field lives in the open card
         if state
             .move_draft
             .as_ref()
             .is_some_and(|d| d.target == oats_brain::MoveTarget::Episode(e.id) && !d.sidebar)
+            || state
+                .split_draft
+                .as_ref()
+                .is_some_and(|d| d.episode == e.id)
         {
             state.open_notes.insert(e.id);
         }

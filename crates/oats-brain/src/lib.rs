@@ -12,6 +12,8 @@
 //!   canned JSON.
 //! - [`hotword`]: "hey computer, …" detected on transcript text, turned into actions (event,
 //!   reminder, note, project) by a dedicated prompt and executed against the store.
+//! - [`split`]: "Split…" on a note — the user's words say what goes into a new note; one
+//!   request returns both notes and the lines that move, applied in one transaction.
 //! - [`dates`]: local-time date helpers shared by the above.
 //! - [`scheduler`]: the worker thread with the tiered job model (reactive haiku jobs; the
 //!   15-minute rolling-window interpretation; the 4-hourly review; the nightly
@@ -31,6 +33,7 @@ pub mod hotword;
 pub mod interpret;
 pub mod moveto;
 pub mod scheduler;
+pub mod split;
 
 pub use claude_cli::{ClaudeCli, CliError, Request, Response, Version};
 pub use episodes::{Chunk, EpisodeRule};
