@@ -541,14 +541,21 @@ fn transcript_row(
                         .wrap()
                         .selectable(true),
                 );
-                // The label's hit area is widened to the whole text column (egui keeps the LAST
-                // rect registered under an id for the next frame's hit test): a press in the
-                // empty space right of a line lands on the label and egui's cursor mapping
-                // clamps it to that line's end, so dragging left from there selects from the
-                // end of the line, as in any text view. The layout is untouched (nothing is
-                // allocated), and the focus bit is left off like the label's own sense.
-                let wide =
-                    Rect::from_min_max(text.rect.min, pos2(text.rect.left() + w, text.rect.max.y));
+                // The label's hit area is widened to the whole text column AND the row's full
+                // height (egui keeps the LAST rect registered under an id for the next frame's
+                // hit test): a press in the empty space right of a line, or below a line that
+                // doesn't wrap (the time column with its speaker tag makes the row taller than
+                // one line of text), lands on the label, and egui's cursor mapping clamps it
+                // to the end of the text, so dragging from there selects from the line's end,
+                // as in any text view. The layout is untouched (nothing is allocated), and the
+                // focus bit is left off like the label's own sense.
+                let wide = Rect::from_min_max(
+                    pos2(text.rect.left(), time_rect.top() - 2.0),
+                    pos2(
+                        text.rect.left() + w,
+                        text.rect.bottom().max(time_rect.bottom()) + 2.0,
+                    ),
+                );
                 ui.interact(wide, text.id, Sense::CLICK | Sense::DRAG);
                 labels = Some(time_label.union(text));
             });
@@ -835,6 +842,22 @@ mod tests {
         harness.hover_at(start);
         harness.run();
         harness.drop_at(start);
+        harness.run();
+        assert_copied_in_order(&mut harness);
+
+        // a press in the empty space BELOW the first row's one-line text (beside the speaker
+        // tag, inside the row), dragged down to the end of the second row: the selection is
+        // anchored at the end of the first line
+        let below = pos2(first.center().x, first.bottom() + 10.0);
+        harness.hover_at(below);
+        harness.run();
+        harness.drag_at(below);
+        harness.run();
+        harness.hover_at(pos2(below.x + 20.0, below.y + 10.0));
+        harness.run();
+        harness.hover_at(end);
+        harness.run();
+        harness.drop_at(end);
         harness.run();
         assert_copied_in_order(&mut harness);
 
