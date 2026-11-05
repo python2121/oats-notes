@@ -64,7 +64,7 @@ inline and flashed on the page via `pending_focus` instead);
 "No next steps yet" when empty. The checkbox
 (`NotesAction::SetActionItemDone` → `Store::set_action_item_done`: `done_at` in the item's
 JSON, not a hand edit, so `user_edited_at` stays) completes an item like a todo: completed
-items go after the open ones (newest completion first), struck through in `t.text_tertiary`,
+items go after the open ones (newest completion first), dimmed in `t.text_tertiary` (no strikethrough anywhere: the tick and the colour say it),
 and only behind "Show all N" (N = open + completed), which shows whenever more than the cap
 are open OR anything is completed (`notes::next_steps_shown`); unticking reopens. Expanded,
 "Show fewer" is drawn twice: where "Show all" sat (after the items the collapsed list shows,
@@ -443,7 +443,7 @@ hotword; hotwords are unchanged.
 
 - **Todos view** (⌘5, View ▸ Todos, sidebar "Todos"; `View::Todos`): `Store::todos(All)`
   order — open dated (soonest first), open undated (manual `position`), completed (most recent
-  first) at the BOTTOM, crossed through (`RichText::strikethrough`, text_tertiary, "done
+  first) at the BOTTOM, dimmed (text_tertiary, never struck through, "done
   <date>"). Open rows: checkbox, text, due ("in 20 min" / "today, 15:00" / "tomorrow, 09:00" /
   "in 3 days" / "Thu 12 Dec, 09:00"; overdue in `t.danger`; `todos::due_label`), "snoozed
   until …", node chip, source chip. "+ Add todo" text field plus a "due" field (Enter in
@@ -484,7 +484,7 @@ hotword; hotwords are unchanged.
 - **Calendar** (⌘4): month grid, ‹ month year › + Today, weeks Monday–Sunday (a pref later),
   outside days dimmed, today outlined in accent, selected day tinted; per cell up to 3
   one-line chips (events `t.accent_alpha`, dated todos `t.button` — `t.field` is invisible on
-  the canvas — completed todos struck through) and "+N"; a hotword event's own same-titled
+  the canvas — completed todos dimmed, not struck through) and "+N"; a hotword event's own same-titled
   todo is folded into the event in the grid (`calendar::items_by_day`). The day panel below
   lists the selected day's events and todos in full with their right-click actions.
 - **Selectable transcript text** (`transcript::transcript_row`, also the notes' "Show transcript" lists): each row's time and text are selectable labels, so a drag selects across rows in reading order and ⌘C copies it (egui's `LabelSelectionState`; there is no Edit ▸ Copy menu item, so no muda accelerator takes ⌘C). The row's own click target is registered BEFORE its labels (a zero-size placeholder, re-registered with the real rect after them — egui keeps the first hit-test position), so the labels sit on top and own presses, double-clicks and drags; the labels' responses are unioned into the row's, so a right-click on the text still opens the row's menu, and the hover fill uses `contains_pointer`. The text label's hit rect is re-registered as the whole text column at the row's full height (the last rect under an id is what the next frame's hit test uses; nothing is allocated), so a press in the empty space right of a line, or below a line that doesn't wrap (beside the speaker tag), anchors the selection at the text's end, as in any text view. Search hits stay non-selectable (a click there jumps).

@@ -434,7 +434,7 @@ fn todo_row(
             } else {
                 let mut text = RichText::new(&todo.text).size(13.0);
                 text = if todo.done() {
-                    text.strikethrough().color(t.text_tertiary)
+                    text.color(t.text_tertiary)
                 } else {
                     text.color(t.text)
                 };

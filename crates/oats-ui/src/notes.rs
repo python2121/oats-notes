@@ -720,11 +720,8 @@ fn item_line(
     actions: &mut Vec<NotesAction>,
 ) {
     let mut job = egui::text::LayoutJob::default();
-    let (color, strikethrough) = if done {
-        (t.text_tertiary, egui::Stroke::new(1.0, t.text_tertiary))
-    } else {
-        (t.text, egui::Stroke::NONE)
-    };
+    // a completed item is dimmed, not struck through (the user's call: the tick says it)
+    let color = if done { t.text_tertiary } else { t.text };
     for (span, bold) in bold_spans(text) {
         let font = if bold {
             crate::theme::font_medium(ui.ctx(), 12.5)
@@ -739,7 +736,6 @@ fn item_line(
             egui::TextFormat {
                 font_id: font,
                 color,
-                strikethrough,
                 ..Default::default()
             },
         );
@@ -2203,10 +2199,10 @@ fn next_steps(
                     done,
                 });
             }
-            let (color, strikethrough) = if s.done_at.is_some() {
-                (t.text_tertiary, egui::Stroke::new(1.0, t.text_tertiary))
+            let color = if s.done_at.is_some() {
+                t.text_tertiary
             } else {
-                (t.text, egui::Stroke::NONE)
+                t.text
             };
             let mut text = s.text.clone();
             if let Some(o) = &s.owner {
@@ -2227,7 +2223,6 @@ fn next_steps(
                             t.font(12.5)
                         },
                         color,
-                        strikethrough,
                         ..Default::default()
                     },
                 );

@@ -746,7 +746,7 @@ fn todo_row(
         );
         let mut text = RichText::new(&td.text).size(13.0);
         text = if td.done() {
-            text.strikethrough().color(t.text_tertiary)
+            text.color(t.text_tertiary)
         } else {
             text.color(t.text)
         };
