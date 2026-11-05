@@ -541,6 +541,15 @@ fn transcript_row(
                         .wrap()
                         .selectable(true),
                 );
+                // The label's hit area is widened to the whole text column (egui keeps the LAST
+                // rect registered under an id for the next frame's hit test): a press in the
+                // empty space right of a line lands on the label and egui's cursor mapping
+                // clamps it to that line's end, so dragging left from there selects from the
+                // end of the line, as in any text view. The layout is untouched (nothing is
+                // allocated), and the focus bit is left off like the label's own sense.
+                let wide =
+                    Rect::from_min_max(text.rect.min, pos2(text.rect.left() + w, text.rect.max.y));
+                ui.interact(wide, text.id, Sense::CLICK | Sense::DRAG);
                 labels = Some(time_label.union(text));
             });
         })
@@ -746,6 +755,30 @@ mod tests {
         assert_eq!(p.rows.len(), 4);
     }
 
+    /// ⌘C copies the selection; the first row's words come before the second's.
+    #[cfg(feature = "selftest")]
+    fn assert_copied_in_order(harness: &mut egui_kittest::Harness<'_>) {
+        harness.event(egui::Event::Copy);
+        harness.step();
+        let copied = harness
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                egui::OutputCommand::CopyText(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("⌘C copied the selection");
+        let a = copied
+            .find("alpha bravo charlie")
+            .expect("first row copied");
+        let d = copied
+            .find("delta echo foxtrot")
+            .expect("second row copied");
+        assert!(a < d, "reading order: {copied:?}");
+    }
+
     /// A drag from the first row's text into the second's selects across both rows (the row's
     /// own click target sits under the labels), ⌘C copies them in reading order, and a
     /// right-click on the text still opens the row's menu.
@@ -788,25 +821,22 @@ mod tests {
         harness.run();
         harness.drop_at(end);
         harness.run();
-        harness.event(egui::Event::Copy);
-        harness.step();
-        let copied = harness
-            .output()
-            .platform_output
-            .commands
-            .iter()
-            .find_map(|c| match c {
-                egui::OutputCommand::CopyText(s) => Some(s.clone()),
-                _ => None,
-            })
-            .expect("⌘C copied the selection");
-        let a = copied
-            .find("alpha bravo charlie")
-            .expect("first row copied");
-        let d = copied
-            .find("delta echo foxtrot")
-            .expect("second row copied");
-        assert!(a < d, "reading order: {copied:?}");
+        assert_copied_in_order(&mut harness);
+
+        // a press in the empty space RIGHT of the second row's text, dragged up-left into the
+        // first row: the selection is anchored at the end of the second line
+        let beyond = pos2(second.right() + 60.0, second.center().y);
+        harness.hover_at(beyond);
+        harness.run();
+        harness.drag_at(beyond);
+        harness.run();
+        harness.hover_at(pos2(beyond.x - 30.0, beyond.y - 10.0));
+        harness.run();
+        harness.hover_at(start);
+        harness.run();
+        harness.drop_at(start);
+        harness.run();
+        assert_copied_in_order(&mut harness);
 
         // right-click on the text: the row's menu
         let at = second.center();
