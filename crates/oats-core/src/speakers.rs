@@ -11,12 +11,20 @@
 //!   too short to trust);
 //! - the centroid moves toward the new embedding only when it is close (≤
 //!   [`UPDATE_THRESHOLD`]) and long enough (≥ [`MIN_UPDATE_SECS`]): weighted mean with the
-//!   voice's weight capped at [`MAX_WEIGHT_SECS`], so a long history still adapts.
+//!   voice's weight capped at [`MAX_WEIGHT_SECS`], so a long history still adapts; and only
+//!   when the second-nearest voice is at least [`UPDATE_MARGIN`] further away (an ambiguous
+//!   line is tagged but teaches nobody). A mature voice (≥ [`MATURE_SECS`] of speech) learns
+//!   at [`MATURE_LEARN_RATE`] from automatic matches, and a line's weight ramps with its
+//!   length ([`learn_ramp`]: short lines barely teach);
+//! - the user's corrections ([`SpeakerBook::learn`] / [`SpeakerBook::unlearn`]) are exempt
+//!   from both and count [`CORRECTION_WEIGHT`] times.
 //!
 //! The thresholds: assign 0.7 (FluidAudio's `DiarizerConfig.clusteringThreshold`; its
 //! `SpeakerManager` uses 0.65 — a laptop microphone in a room is noisier than its benchmarks),
-//! update 0.45 (its default), a NEW voice only from ≥ 3 s of speech (a 2 s room-mic span of the
-//! same person came out ~0.65 from a centroid built on longer ones; 3 s clips sit within 0.2),
+//! update 0.45 (its default), a NEW voice only from ≥ 5 s of speech (a 2 s room-mic span of the
+//! same person came out ~0.65 from a centroid built on longer ones; 3 s clips sit within 0.2;
+//! a new voice is defined by its first line, so it is enrolled only from a clip the model
+//! embeds well),
 //! update from ≥ 2 s (FluidAudio: 1 s /
 //! 2 s), whose WeSpeaker embeddings we use.
 
@@ -25,7 +33,7 @@ pub const ASSIGN_THRESHOLD: f32 = 0.7;
 /// Cosine distance at or under which a voice's centroid learns from the embedding.
 pub const UPDATE_THRESHOLD: f32 = 0.45;
 /// A span shorter than this never opens a new voice.
-pub const MIN_NEW_SPEAKER_SECS: f64 = 3.0;
+pub const MIN_NEW_SPEAKER_SECS: f64 = 5.0;
 /// A span shorter than this never moves a centroid.
 pub const MIN_UPDATE_SECS: f64 = 2.0;
 /// The weight of a voice's history in the running mean is capped here (seconds of speech).
@@ -38,6 +46,32 @@ pub const AUTO_ME_MIC_SECS: f64 = 60.0;
 pub const MERGE_THRESHOLD: f32 = 0.3;
 /// …only when both have at least this much speech (a young centroid is still noisy).
 pub const MIN_MERGE_SECS: f64 = 30.0;
+/// An automatic match teaches its voice only when the second-nearest voice is at least this
+/// much further away than the nearest (an ambiguous line is tagged, never learned from: a wrong
+/// automatic match must not pollute a voiceprint). One voice alone always passes.
+pub const UPDATE_MARGIN: f32 = 0.15;
+/// Automatic learning ramps up with the line's length: a line of [`LEARN_RAMP_FROM`] s or
+/// less teaches nothing, one of [`LEARN_RAMP_TO`] s or more in full (see [`learn_ramp`]) — a
+/// short clip's embedding is noisier (the model works on 10 s windows).
+pub const LEARN_RAMP_FROM: f64 = MIN_UPDATE_SECS;
+/// …the length from which a line teaches at its full length.
+pub const LEARN_RAMP_TO: f64 = 8.0;
+/// A voice with this much stored speech (seconds, the uncapped total) is mature: automatic
+/// updates move it at [`MATURE_LEARN_RATE`] (corrections keep their full weight).
+pub const MATURE_SECS: f64 = 600.0;
+/// The weight multiplier of an automatic update of a mature voice.
+pub const MATURE_LEARN_RATE: f64 = 0.25;
+/// A user's correction of one line ("This line was ▸") learns its embedding into the chosen
+/// voice with this many times the line's speech as weight: the user confirmed it, so it counts
+/// three times an automatic match.
+pub const CORRECTION_WEIGHT: f64 = 3.0;
+/// After a correction, other lines of the same note (else session) whose stored embedding is
+/// within this distance of the corrected line's are offered for the same move
+/// ([`UPDATE_THRESHOLD`]: as close as a centroid would learn from).
+pub const SIMILAR_LINE_THRESHOLD: f32 = UPDATE_THRESHOLD;
+/// Each line's own embedding (`segment_voices`, schema v11) is kept this long, for corrections
+/// (made soon after the fact); ~1 KB per line.
+pub const VOICE_EMBEDDING_KEEP_DAYS: i64 = 30;
 
 /// `OATS_SPEAKERS=on|off` (also 1/0, true/false): `None` when unset or unreadable (logged).
 pub fn speakers_env() -> Option<bool> {
@@ -227,6 +261,9 @@ pub struct Assignment {
     pub distance: f32,
     /// The centroid learned from it.
     pub updated: bool,
+    /// Close enough to learn from, but another voice was within [`UPDATE_MARGIN`]: tagged,
+    /// not learned from.
+    pub ambiguous: bool,
 }
 
 /// The known voices. See the module docs.
@@ -268,6 +305,29 @@ impl SpeakerBook {
         best
     }
 
+    /// The nearest voice, its distance, and the second-nearest voice's distance (`None` with
+    /// one voice; `None` overall for an empty book).
+    pub fn nearest_two(&self, embedding: &[f32]) -> Option<(usize, f32, Option<f32>)> {
+        let mut best: Option<(usize, f32)> = None;
+        let mut second: Option<f32> = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            let d = cosine_distance(embedding, &e.centroid);
+            match best {
+                Some((_, b)) if d >= b => {
+                    if second.is_none_or(|s| d < s) {
+                        second = Some(d);
+                    }
+                }
+                Some((_, b)) => {
+                    second = Some(b);
+                    best = Some((i, d));
+                }
+                None => best = Some((i, d)),
+            }
+        }
+        best.map(|(i, d)| (i, d, second))
+    }
+
     /// Assign one span (`embedding`, `speech_secs` of speech, heard at `now_ms`, on the
     /// microphone when `mic`). A new voice gets its id from `create(centroid, speech_secs)`
     /// (the store's insert; `None` = could not be created → no assignment). `None` also when
@@ -284,23 +344,22 @@ impl SpeakerBook {
             return None;
         }
         let speech_secs = speech_secs.max(0.0);
-        if let Some((i, distance)) = self.nearest(embedding)
+        if let Some((i, distance, second)) = self.nearest_two(embedding)
             && distance <= ASSIGN_THRESHOLD
         {
             let e = &mut self.entries[i];
-            let updated = distance <= UPDATE_THRESHOLD && speech_secs >= MIN_UPDATE_SECS;
+            let close = distance <= UPDATE_THRESHOLD && speech_secs >= MIN_UPDATE_SECS;
+            // the margin rule: a line nearly as close to another voice teaches neither
+            let ambiguous = close && second.is_some_and(|d2| d2 - distance < UPDATE_MARGIN);
+            let updated = close && !ambiguous;
             if updated {
-                let mut new = embedding.to_vec();
-                normalise(&mut new);
-                let w_old = e.speech_secs.min(MAX_WEIGHT_SECS) as f32;
-                let w_new = speech_secs as f32;
-                let total = w_old + w_new;
-                if total > 0.0 {
-                    for (c, x) in e.centroid.iter_mut().zip(&new) {
-                        *c = (*c * w_old + x * w_new) / total;
-                    }
-                    normalise(&mut e.centroid);
-                }
+                // a mature voice learns slowly from automatic matches
+                let rate = if e.speech_secs >= MATURE_SECS {
+                    MATURE_LEARN_RATE
+                } else {
+                    1.0
+                };
+                blend_in(e, embedding, speech_secs * learn_ramp(speech_secs) * rate);
             }
             e.speech_secs += speech_secs;
             if mic {
@@ -313,6 +372,7 @@ impl SpeakerBook {
                 created: false,
                 distance,
                 updated,
+                ambiguous,
             });
         }
         if speech_secs < MIN_NEW_SPEAKER_SECS {
@@ -335,7 +395,82 @@ impl SpeakerBook {
             created: true,
             distance: 0.0,
             updated: false,
+            ambiguous: false,
         })
+    }
+
+    /// Learn `embedding` (`secs` of speech) into voice `id`: the weighted-mean update of an
+    /// automatic match (the history's weight capped at [`MAX_WEIGHT_SECS`]), the embedding's
+    /// weight multiplied by `weight_multiplier` ([`CORRECTION_WEIGHT`] for a user's
+    /// correction). The counters grow by `secs` (`mic_secs` too when `mic`). `false` when the
+    /// voice is unknown or the embedding unusable.
+    pub fn learn(
+        &mut self,
+        id: i64,
+        embedding: &[f32],
+        secs: f64,
+        weight_multiplier: f64,
+        mic: bool,
+    ) -> bool {
+        if embedding.is_empty() || !embedding.iter().all(|x| x.is_finite()) {
+            return false;
+        }
+        let Some(e) = self.entries.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        let secs = secs.max(0.0);
+        if e.centroid.is_empty() {
+            // a voice enrolled without a voiceprint (relabel only) takes its first one
+            let mut c = embedding.to_vec();
+            if normalise(&mut c) {
+                e.centroid = c;
+            }
+        } else if e.centroid.len() == embedding.len() {
+            blend_in(e, embedding, secs * weight_multiplier.max(0.0));
+        }
+        e.speech_secs += secs;
+        if mic {
+            e.mic_secs += secs;
+        }
+        e.dirty = true;
+        true
+    }
+
+    /// The inverse of [`Self::learn`] (with multiplier 1): take `embedding` (`secs` of speech)
+    /// back out of voice `id` — `(c·w − e·s) / (w − s)`, re-normalised, `w` the voice's
+    /// (capped) weight. The counters shrink by `secs`, never below 0. A voice whose weight
+    /// would drop to about nothing keeps its centroid (there is nothing left to average).
+    /// `false` when the voice is unknown or the embedding unusable.
+    pub fn unlearn(&mut self, id: i64, embedding: &[f32], secs: f64, mic: bool) -> bool {
+        if embedding.is_empty() || !embedding.iter().all(|x| x.is_finite()) {
+            return false;
+        }
+        let Some(e) = self.entries.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        let secs = secs.max(0.0);
+        let w = e.speech_secs.min(MAX_WEIGHT_SECS);
+        let rest = w - secs;
+        if e.centroid.len() == embedding.len() && rest > MIN_UPDATE_SECS * 0.5 && secs > 0.0 {
+            let mut x = embedding.to_vec();
+            normalise(&mut x);
+            let (w, s, rest) = (w as f32, secs as f32, rest as f32);
+            let mut out: Vec<f32> = e
+                .centroid
+                .iter()
+                .zip(&x)
+                .map(|(c, x)| (c * w - x * s) / rest)
+                .collect();
+            if normalise(&mut out) {
+                e.centroid = out;
+            }
+        }
+        e.speech_secs = (e.speech_secs - secs).max(0.0);
+        if mic {
+            e.mic_secs = (e.mic_secs - secs).max(0.0);
+        }
+        e.dirty = true;
+        true
     }
 
     /// The voice to flag as the user's, when none is yet: the first with ≥
@@ -429,6 +564,29 @@ impl SpeakerBook {
     }
 }
 
+/// The share of a line's speech an automatic update learns from:
+/// `clamp((secs − LEARN_RAMP_FROM) / (LEARN_RAMP_TO − LEARN_RAMP_FROM), 0, 1)` — 3 s counts as
+/// 0.5 s, 5 s as 2.5 s, 8 s and longer in full. Corrections are exempt.
+pub fn learn_ramp(secs: f64) -> f64 {
+    ((secs - LEARN_RAMP_FROM) / (LEARN_RAMP_TO - LEARN_RAMP_FROM)).clamp(0.0, 1.0)
+}
+
+/// Move `e`'s centroid toward `embedding` with weight `w_new` against its history's (capped)
+/// weight: the running mean every learning step uses.
+fn blend_in(e: &mut SpeakerEntry, embedding: &[f32], w_new: f64) {
+    let mut new = embedding.to_vec();
+    normalise(&mut new);
+    let w_old = e.speech_secs.min(MAX_WEIGHT_SECS) as f32;
+    let w_new = w_new as f32;
+    let total = w_old + w_new;
+    if total > 0.0 {
+        for (c, x) in e.centroid.iter_mut().zip(&new) {
+            *c = (*c * w_old + x * w_new) / total;
+        }
+        normalise(&mut e.centroid);
+    }
+}
+
 /// The speaker who speaks most in a segment, from its assigned (speaker id, speech seconds)
 /// spans, summing the seconds per speaker. `None` when nothing was assigned.
 pub fn dominant(assigned: &[(i64, f64)]) -> Option<i64> {
@@ -489,6 +647,78 @@ mod tests {
         }
     }
 
+    fn book_of(centroid: Vec<f32>, secs: f64) -> SpeakerBook {
+        let mut e = SpeakerEntry::new(1, centroid, secs, 0);
+        e.mic_secs = secs;
+        SpeakerBook::new(vec![e])
+    }
+
+    #[test]
+    fn learn_and_unlearn_are_inverses_up_to_normalisation() {
+        let original = base(1);
+        let line = near(&original, 7, 0.4);
+        let mut book = book_of(original.clone(), 40.0);
+        assert!(book.learn(1, &line, 6.0, 1.0, true));
+        let learned = book.get(1).map(|e| e.centroid.clone()).unwrap_or_default();
+        let moved = chord(&learned, &original);
+        assert!(moved > 0.02, "learning moved the centroid ({moved})");
+        assert!(cosine_distance(&learned, &line) < cosine_distance(&original, &line));
+        assert_eq!(
+            book.get(1).map(|e| (e.speech_secs, e.mic_secs)),
+            Some((46.0, 46.0))
+        );
+        assert!(book.unlearn(1, &line, 6.0, true));
+        let back = book.get(1).map(|e| e.centroid.clone()).unwrap_or_default();
+        let err = chord(&back, &original);
+        assert!(err < moved / 20.0, "unlearn undid it: {err} vs {moved}");
+        let n: f32 = back.iter().map(|x| x * x).sum();
+        assert!((n - 1.0).abs() < 1e-4);
+        assert_eq!(
+            book.get(1).map(|e| (e.speech_secs, e.mic_secs)),
+            Some((40.0, 40.0))
+        );
+        assert!(book.take_dirty().len() == 1);
+        // unknown voices and unusable embeddings change nothing
+        assert!(!book.learn(9, &line, 6.0, 1.0, false));
+        assert!(!book.unlearn(1, &[f32::NAN; DIM], 6.0, false));
+    }
+
+    #[test]
+    fn a_correction_counts_three_times_an_automatic_match() {
+        let original = base(1);
+        let line = near(&original, 7, 0.6);
+        let mut once = book_of(original.clone(), 40.0);
+        let mut corrected = book_of(original.clone(), 40.0);
+        once.learn(1, &line, 4.0, 1.0, false);
+        corrected.learn(1, &line, 4.0, CORRECTION_WEIGHT, false);
+        let d = |b: &SpeakerBook| cosine_distance(&b.entries()[0].centroid, &line);
+        assert!(
+            d(&corrected) < d(&once),
+            "{} vs {}",
+            d(&corrected),
+            d(&once)
+        );
+        // the same as an automatic step of three times the speech
+        let mut thrice = book_of(original, 40.0);
+        thrice.learn(1, &line, 12.0, 1.0, false);
+        assert!((d(&thrice) - d(&corrected)).abs() < 1e-5);
+        // the counters grow by the line's real speech
+        assert_eq!(corrected.entries()[0].speech_secs, 44.0);
+    }
+
+    #[test]
+    fn unlearning_a_voice_down_to_nothing_keeps_its_centroid() {
+        let original = base(3);
+        let mut book = book_of(original.clone(), 3.0);
+        let before = book.entries()[0].centroid.clone();
+        assert!(book.unlearn(1, &near(&original, 2, 0.5), 3.0, true));
+        let e = &book.entries()[0];
+        assert_eq!(e.centroid, before);
+        assert_eq!((e.speech_secs, e.mic_secs), (0.0, 0.0));
+        assert!(book.unlearn(1, &original, 3.0, true));
+        assert_eq!(book.entries()[0].speech_secs, 0.0, "never below 0");
+    }
+
     #[test]
     fn distances() {
         let a = base(1);
@@ -508,8 +738,8 @@ mod tests {
         let mut create = counter();
         let mut ids = (Vec::new(), Vec::new());
         for i in 0..10 {
-            let a = book.assign(&near(&alice, i, 0.3), 3.0, true, i as i64, &mut create);
-            let b = book.assign(&near(&bob, 50 + i, 0.3), 3.0, false, i as i64, &mut create);
+            let a = book.assign(&near(&alice, i, 0.3), 5.0, true, i as i64, &mut create);
+            let b = book.assign(&near(&bob, 50 + i, 0.3), 5.0, false, i as i64, &mut create);
             ids.0.push(a.map(|a| a.speaker_id));
             ids.1.push(b.map(|b| b.speaker_id));
         }
@@ -517,7 +747,7 @@ mod tests {
         assert!(ids.1.iter().all(|i| *i == Some(2)), "{ids:?}");
         assert_eq!(book.len(), 2);
         let alice_entry = book.get(1).map(|e| (e.speech_secs, e.mic_secs));
-        assert_eq!(alice_entry, Some((30.0, 30.0)));
+        assert_eq!(alice_entry, Some((50.0, 50.0)));
         assert_eq!(book.get(2).map(|e| e.mic_secs), Some(0.0));
     }
 
@@ -569,11 +799,11 @@ mod tests {
     fn a_far_embedding_opens_a_new_voice_and_a_short_one_does_not() {
         let mut book = SpeakerBook::default();
         let mut create = counter();
-        let first = book.assign(&base(1), 3.0, false, 0, &mut create);
+        let first = book.assign(&base(1), 5.0, false, 0, &mut create);
         assert_eq!(first.map(|a| (a.speaker_id, a.created)), Some((1, true)));
         assert_eq!(book.assign(&base(2), 0.5, false, 0, &mut create), None);
-        assert_eq!(book.assign(&base(2), 2.5, false, 0, &mut create), None);
-        let second = book.assign(&base(2), 3.0, false, 0, &mut create);
+        assert_eq!(book.assign(&base(2), 4.5, false, 0, &mut create), None);
+        let second = book.assign(&base(2), 5.0, false, 0, &mut create);
         assert_eq!(second.map(|a| (a.speaker_id, a.created)), Some((2, true)));
         // a short span of a KNOWN voice is still assigned (no new voice needed)
         let short = book.assign(&near(&base(1), 3, 0.1), 0.3, false, 0, &mut create);
@@ -582,7 +812,7 @@ mod tests {
             Some((1, false, false))
         );
         // a failed insert assigns nothing
-        assert_eq!(book.assign(&base(9), 3.0, false, 0, |_, _| None), None);
+        assert_eq!(book.assign(&base(9), 5.0, false, 0, |_, _| None), None);
         assert_eq!(book.len(), 2);
     }
 
@@ -605,6 +835,121 @@ mod tests {
         assert_eq!(a.map(|a| a.updated), Some(false));
         assert_eq!(book.get(7).map(|e| e.centroid.clone()), before);
         assert_eq!(book.get(7).map(|e| e.last_heard_at), Some(6));
+    }
+
+    #[test]
+    fn an_ambiguous_line_is_tagged_but_teaches_neither_voice() {
+        // two voices, a line halfway between them (both within the update threshold)
+        let (a, b) = (base(1), near(&base(1), 3, 0.9));
+        let mid: Vec<f32> = {
+            let mut m: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+            normalise(&mut m);
+            m
+        };
+        let mut book = SpeakerBook::new(vec![
+            SpeakerEntry::new(1, a.clone(), 50.0, 0),
+            SpeakerEntry::new(2, b.clone(), 50.0, 0),
+        ]);
+        let before: Vec<Vec<f32>> = book.entries().iter().map(|e| e.centroid.clone()).collect();
+        let (d1, d2) = (cosine_distance(&mid, &a), cosine_distance(&mid, &b));
+        assert!(
+            d1 <= UPDATE_THRESHOLD && d2 <= UPDATE_THRESHOLD,
+            "{d1} {d2}"
+        );
+        assert!((d1 - d2).abs() < UPDATE_MARGIN);
+        let got = book.assign(&mid, 10.0, false, 1, |_, _| None);
+        let got = got.map(|g| (g.updated, g.ambiguous));
+        assert_eq!(got, Some((false, true)), "tagged, not learned from");
+        let after: Vec<Vec<f32>> = book.entries().iter().map(|e| e.centroid.clone()).collect();
+        assert_eq!(before, after);
+        // alone, the same line teaches its voice
+        let mut alone = SpeakerBook::new(vec![SpeakerEntry::new(1, a, 50.0, 0)]);
+        let got = alone.assign(&mid, 10.0, false, 1, |_, _| None);
+        assert_eq!(got.map(|g| (g.updated, g.ambiguous)), Some((true, false)));
+    }
+
+    #[test]
+    fn a_mature_voice_learns_a_quarter_as_fast_unless_corrected() {
+        let start = base(1);
+        let line = near(&start, 5, 0.5);
+        // just under / at maturity: the capped weight is about the same, only the rate differs
+        let auto = |history: f64| {
+            let mut book = SpeakerBook::new(vec![SpeakerEntry::new(1, start.clone(), history, 0)]);
+            book.assign(&line, 10.0, false, 0, |_, _| None);
+            chord(&start, &book.entries()[0].centroid)
+        };
+        let young = auto(MATURE_SECS - 0.001);
+        let mature = auto(MATURE_SECS);
+        let ratio = mature / young;
+        assert!(
+            (ratio - MATURE_LEARN_RATE as f32).abs() < 0.03,
+            "{mature} / {young} = {ratio}"
+        );
+        // a correction of a mature voice keeps its full weight
+        let corrected = |history: f64| {
+            let mut book = SpeakerBook::new(vec![SpeakerEntry::new(1, start.clone(), history, 0)]);
+            book.learn(1, &line, 10.0, CORRECTION_WEIGHT, false);
+            chord(&start, &book.entries()[0].centroid)
+        };
+        let (c_young, c_mature) = (corrected(MATURE_SECS - 0.001), corrected(MATURE_SECS));
+        assert!(
+            (c_mature / c_young - 1.0).abs() < 0.01,
+            "{c_mature} vs {c_young}"
+        );
+        assert!(c_mature > mature * 10.0);
+    }
+
+    /// How far a unit vector moved (the chord, ~the angle for small moves; a cosine distance
+    /// is quadratic in the angle and loses precision there).
+    fn chord(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f32>()
+            .sqrt()
+    }
+
+    #[test]
+    fn short_lines_barely_teach_and_long_ones_in_full() {
+        let ramp: Vec<f64> = [2.0, 3.0, 5.0, 8.0, 20.0].map(learn_ramp).to_vec();
+        let want = [0.0, 1.0 / 6.0, 0.5, 1.0, 1.0];
+        for (got, want) in ramp.iter().zip(want) {
+            assert!((got - want).abs() < 1e-9, "{ramp:?}");
+        }
+        assert_eq!(learn_ramp(0.5), 0.0);
+        let start = base(1);
+        let line = near(&start, 5, 0.5);
+        let young = || SpeakerBook::new(vec![SpeakerEntry::new(1, start.clone(), 100.0, 0)]);
+        let moved = |b: &SpeakerBook| chord(&start, &b.entries()[0].centroid);
+        let auto = |secs: f64| {
+            let mut b = young();
+            b.assign(&line, secs, false, 0, |_, _| None);
+            moved(&b)
+        };
+        let by_hand = |secs: f64, mult: f64| {
+            let mut b = young();
+            b.learn(1, &line, secs, mult, false);
+            moved(&b)
+        };
+        // a 3 s line teaches as 0.5 s: a sixth of its length…
+        let (three, unramped_three) = (auto(3.0), by_hand(3.0, 1.0));
+        assert!(
+            (three / unramped_three - 1.0 / 6.0).abs() < 0.01,
+            "{three} / {unramped_three}"
+        );
+        // …so about an eighteenth of a 9 s line (0.5 s vs 9 s of weight)
+        let nine = auto(9.0);
+        assert!((three / nine - 0.5 / 9.0).abs() < 0.01, "{three} / {nine}");
+        assert!(
+            (nine / by_hand(9.0, 1.0) - 1.0).abs() < 1e-3,
+            "9 s: in full"
+        );
+        // a correction of a 3 s line learns at the full corrected weight
+        let corrected = by_hand(3.0, CORRECTION_WEIGHT);
+        assert!(
+            (corrected / by_hand(9.0, 1.0) - 1.0).abs() < 1e-3,
+            "{corrected}"
+        );
     }
 
     #[test]

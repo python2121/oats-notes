@@ -138,7 +138,7 @@ fn migrates_a_realistic_v1_file_keeping_every_row_and_id() -> R {
     let v1 = write_v1(&path);
 
     let s = Store::open(&path)?;
-    assert_eq!(s.meta("schema_version")?.as_deref(), Some("10"));
+    assert_eq!(s.meta("schema_version")?.as_deref(), Some("11"));
 
     // categories became root nodes with the same ids, in position order; nothing re-seeded
     let cats = s.categories()?;
@@ -1287,16 +1287,62 @@ fn a_v9_database_gains_speakers_and_a_newer_one_is_refused()
         )?;
     }
     let s = Store::open(&path)?;
-    assert_eq!(s.meta("schema_version")?.as_deref(), Some("10"));
+    assert_eq!(s.meta("schema_version")?.as_deref(), Some("11"));
     assert!(s.speakers()?.is_empty());
     let rows = s.segments_between(0, 10_000)?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].speaker_id, None);
-    s.set_meta("schema_version", "11")?;
+    s.set_meta("schema_version", "12")?;
     drop(s);
     assert!(matches!(
         Store::open(&path),
-        Err(oats_core::StoreError::SchemaTooNew(11))
+        Err(oats_core::StoreError::SchemaTooNew(12))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn a_v10_database_gains_line_voices_and_a_v10_build_would_refuse_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("oats-v10-voices-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("oats.sqlite");
+    let seg = {
+        let s = Store::open(&path)?;
+        let session = s.begin_session(0, "test")?;
+        s.insert_segment(session, 0, 1000, "before line voices", None)?
+            .id
+    };
+    {
+        // make it look like a v10 file: no segment_voices table
+        let c = rusqlite::Connection::open(&path)?;
+        c.execute_batch(
+            "DROP TABLE segment_voices;
+             UPDATE meta SET value = '10' WHERE key = 'schema_version';",
+        )?;
+    }
+    let s = Store::open(&path)?;
+    assert_eq!(s.meta("schema_version")?.as_deref(), Some("11"));
+    assert!(s.segment_voice(seg)?.is_none());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    s.insert_segment_voice(seg, &[0.6, 0.8], 2_500, now)?;
+    assert_eq!(s.segment_voice(seg)?, Some((vec![0.6, 0.8], 2_500)));
+    drop(s);
+    // reopened (pruning runs at open: a fresh row stays), then the line is deleted: its
+    // voice goes with it (foreign keys are on for a file connection)
+    let s = Store::open(&path)?;
+    assert!(s.segment_voice(seg)?.is_some());
+    s.delete_segment(seg)?;
+    assert!(s.segment_voice(seg)?.is_none());
+    // a v10 build (SCHEMA_VERSION 10) refuses a v11 file exactly like this one refuses v12
+    s.set_meta("schema_version", "12")?;
+    drop(s);
+    assert!(matches!(
+        Store::open(&path),
+        Err(oats_core::StoreError::SchemaTooNew(12))
     ));
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

@@ -23,6 +23,8 @@ use crate::todos::{SNOOZES, absolute};
 
 /// How long a confirmation stays up.
 pub const CONFIRM_SECS: f64 = 4.0;
+/// …and one with a button ("Move them too"): long enough to read and decide.
+pub const ACTION_SECS: f64 = 10.0;
 /// Confirmations shown at once (the oldest goes).
 pub const MAX_CONFIRMATIONS: usize = 3;
 /// Reminder cards shown at once ("and N more" below).
@@ -50,6 +52,8 @@ pub struct Confirmation {
     pub expires: f64,
     /// A failure: the warning colour and a "!" instead of the check.
     pub error: bool,
+    /// A button under the text (its label and what it does); clicking it closes the card.
+    pub action: Option<(String, ToastAction)>,
 }
 
 /// The confirmations on screen.
@@ -76,6 +80,23 @@ impl ToastState {
                 text,
                 expires: now + CONFIRM_SECS,
                 error,
+                action: None,
+            },
+        );
+        self.confirmations.truncate(MAX_CONFIRMATIONS);
+    }
+
+    /// A confirmation with a button (`label`, sending `action`), up for [`ACTION_SECS`].
+    pub fn confirm_action(&mut self, text: String, now: f64, label: &str, action: ToastAction) {
+        self.next_id += 1;
+        self.confirmations.insert(
+            0,
+            Confirmation {
+                id: self.next_id,
+                text,
+                expires: now + ACTION_SECS,
+                error: false,
+                action: Some((label.to_owned(), action)),
             },
         );
         self.confirmations.truncate(MAX_CONFIRMATIONS);
@@ -102,6 +123,11 @@ pub enum ToastAction {
     },
     /// "and N more": open the Todos view.
     ShowTodos,
+    /// "Move them too": these lines were the same person as the line just corrected.
+    ReassignLines {
+        segments: Vec<i64>,
+        target: oats_core::SpeakerTarget,
+    },
 }
 
 /// The reminder cards to show: newest due first.
@@ -145,7 +171,8 @@ pub fn toasts(
             ui.set_width(width);
             ui.spacing_mut().item_spacing.y = 8.0;
             for c in &mut state.confirmations {
-                let hovered = confirmation_card(ui, &t, shadow, width, c, &mut dismissed);
+                let hovered =
+                    confirmation_card(ui, &t, shadow, width, c, &mut dismissed, &mut actions);
                 if hovered {
                     // hovering holds it open; re-checked when the pointer leaves
                     c.expires = c.expires.max(now + 1.5);
@@ -251,6 +278,7 @@ fn confirmation_card(
     width: f32,
     c: &Confirmation,
     dismissed: &mut Vec<u64>,
+    actions: &mut Vec<ToastAction>,
 ) -> bool {
     let resp = card_frame(t, shadow, true).show(ui, |ui| {
         ui.set_width(width - 24.0);
@@ -286,6 +314,25 @@ fn confirmation_card(
                 dismissed.push(c.id);
             }
         });
+        if let Some((label, action)) = &c.action {
+            ui.add_space(4.0);
+            // a row (a right-to-left layout straight in the card would take every free point
+            // of the area's height, growing the card each frame)
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // styled like a reminder's Done
+                    let b =
+                        egui::Button::new(RichText::new(label).size(12.0).color(Color32::WHITE))
+                            .fill(t.accent)
+                            .corner_radius(5)
+                            .min_size(vec2(54.0, 20.0));
+                    if ui.add(b).clicked() {
+                        actions.push(action.clone());
+                        dismissed.push(c.id);
+                    }
+                });
+            });
+        }
     });
     resp.response.contains_pointer()
 }

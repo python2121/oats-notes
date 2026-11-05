@@ -595,7 +595,7 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// At most this many tags in a search's Tags section.
 pub const TAG_LIMIT: usize = 40;
@@ -1216,6 +1216,13 @@ impl Store {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
+            Some(10) => {
+                // v10 → v11 is the per-line voices: `segment_voices`, added by
+                // `ensure_voices_schema` below
+                log::info!("migrating the database from schema 10 to {SCHEMA_VERSION}");
+                conn.execute_batch(SCHEMA)?;
+                conn.execute_batch(SCHEMA_REST)?;
+            }
             Some(5) => {
                 // v5 → v6 is the event re-key + orphan cleanup, `migrate_event_keys` below
                 log::info!("migrating the database from schema 5 to {SCHEMA_VERSION}");
@@ -1235,6 +1242,7 @@ impl Store {
         // after the episodes rebuild (it copies `SELECT *` into the v2 layout)
         Self::ensure_media_schema(conn)?;
         Self::ensure_speakers_schema(conn)?;
+        Self::ensure_voices_schema(conn)?;
         if from_version.is_some_and(|v| v < 6) {
             Self::migrate_event_keys(conn)?;
         }
@@ -1247,6 +1255,11 @@ impl Store {
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
         )?;
+        // per-line voices are kept for a while only (corrections come soon after the fact)
+        let pruned = self.prune_segment_voices(Self::now_ms())?;
+        if pruned > 0 {
+            log::info!("speakers: {pruned} line voiceprints past retention deleted");
+        }
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM nodes WHERE parent_id IS NULL",
             [],
@@ -5173,6 +5186,10 @@ mod media;
 #[path = "store_speakers.rs"]
 mod speakers;
 pub use speakers::{centroid_from_blob, centroid_to_blob};
+// v11: each line's own speaker embedding (`segment_voices`) and the user's corrections.
+#[path = "store_voices.rs"]
+mod voices;
+pub use voices::{Correction, LineScope, LinesCorrection, SpeakerTarget};
 
 pub use media::{
     EPISODE_CONVERSATION, EPISODE_MEDIA, MEDIA_COLLAPSE_MS, MediaEntry, Relabel, collapse_plays,

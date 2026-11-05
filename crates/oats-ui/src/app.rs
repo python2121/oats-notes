@@ -683,6 +683,9 @@ pub struct OatsApp {
     split_done: Option<(i64, i64)>,
     /// Plain 4 s pop-ups (`text`, `error`) raised where no `Context` is at hand (undo / redo).
     pending_toasts: Vec<(String, bool)>,
+    /// The view changed: drop the transcript rows' selection at the next pass
+    /// ([`crate::transcript::RowSelection`]).
+    clear_row_selection: bool,
     /// The in-session undo / redo of the user's own quick edits ([`crate::undo`]).
     undo: crate::undo::UndoStack<crate::undo::Entry>,
     episodes: Vec<Episode>,
@@ -828,6 +831,7 @@ impl OatsApp {
             pending_confirms: Vec::new(),
             split_done: None,
             pending_toasts: Vec::new(),
+            clear_row_selection: false,
             undo: Default::default(),
             episodes: Vec::new(),
             filed_items: Vec::new(),
@@ -1573,6 +1577,7 @@ impl OatsApp {
             self.notes_state.show_low_signal = false;
             self.notes_state.moves.clear();
             self.todos_state.moves.clear();
+            self.clear_row_selection = true;
             self.reload_rows();
             self.reload_brain_data();
         }
@@ -3025,6 +3030,10 @@ impl OatsApp {
                     self.forget_speaker(speaker);
                     continue;
                 }
+                TranscriptAction::SpeakerReassign { segments, target } => {
+                    self.reassign_lines(ctx, &segments, target);
+                    continue;
+                }
             };
             if let Err(e) = r {
                 self.store_error(e);
@@ -3091,6 +3100,153 @@ impl OatsApp {
             Ok(false) => self.speakers_edited(),
             Err(e) => self.store_error(e),
         }
+    }
+
+    /// "This line was ▸" / "These N lines were ▸": who said `segments`. One line goes through
+    /// `Store::correct_segment_speaker` and may offer the lines that sound like it ("Move
+    /// them too"); a selection through `correct_segments_speaker` (and is then cleared). The
+    /// voiceprints learn only while speaker recognition is on.
+    fn reassign_lines(
+        &mut self,
+        ctx: &egui::Context,
+        segments: &[i64],
+        target: oats_core::SpeakerTarget,
+    ) {
+        let learn = self.pipeline.speakers_enabled();
+        let now = chrono::Utc::now().timestamp_millis();
+        if segments.len() > 1 {
+            crate::transcript::clear_row_selection(ctx);
+            self.correct_lines(segments, target, learn, now);
+            return;
+        }
+        let Some(&segment) = segments.first() else {
+            return;
+        };
+        let row = match self.store.segment(segment) {
+            Ok(r) => r,
+            Err(e) => return self.store_error(e),
+        };
+        let c = match self
+            .store
+            .correct_segment_speaker(segment, target, learn, now)
+        {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                self.pending_toasts
+                    .push(("That line no longer exists".to_owned(), true));
+                return;
+            }
+            Err(e) => return self.store_error(e),
+        };
+        self.speakers_edited();
+        self.reload_rows();
+        let who = c.to.map(|id| self.speaker_name(id));
+        let kept = match self.store.segment_voice(segment) {
+            Ok(v) => v.is_some(),
+            Err(e) => return self.store_error(e),
+        };
+        let note = relabel_note(c.learned, learn, kept);
+        let text = match (&who, c.new_voice) {
+            (Some(who), Some(_)) => format!("New voice from this line: {who}{note}"),
+            (Some(who), None) => format!("Line moved to {who}{note}"),
+            (None, _) => "Speaker cleared".to_owned(),
+        };
+        let now_t = ctx.input(|i| i.time);
+        self.toasts.confirm(text, now_t);
+        // the lines of the same note (else session) that sound like this one
+        let Some(row) = row else {
+            return;
+        };
+        let scope = match row.episode_id {
+            Some(e) => oats_core::LineScope::Episode(e),
+            None => oats_core::LineScope::Session(row.session_id),
+        };
+        match self.store.segments_like(
+            segment,
+            scope,
+            c.from,
+            c.to,
+            oats_core::speakers::SIMILAR_LINE_THRESHOLD,
+        ) {
+            Ok(like) if !like.is_empty() => {
+                let n = like.len();
+                let place = if row.episode_id.is_some() {
+                    "this note"
+                } else {
+                    "this session"
+                };
+                let text = if n == 1 {
+                    format!("1 more line in {place} sounds like the same person")
+                } else {
+                    format!("{n} more lines in {place} sound like the same person")
+                };
+                let target = match c.to {
+                    Some(id) => oats_core::SpeakerTarget::Voice(id),
+                    None => oats_core::SpeakerTarget::None,
+                };
+                self.toasts.confirm_action(
+                    text,
+                    now_t,
+                    "Move them too",
+                    ToastAction::ReassignLines {
+                        segments: like.into_iter().map(|(id, _)| id).collect(),
+                        target,
+                    },
+                );
+            }
+            Ok(_) => {}
+            Err(e) => self.store_error(e),
+        }
+        ctx.request_repaint();
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+            crate::toast::CONFIRM_SECS,
+        ));
+    }
+
+    /// The similar-lines pop-up's "Move them too".
+    fn move_similar_lines(&mut self, segments: &[i64], target: oats_core::SpeakerTarget) {
+        let learn = self.pipeline.speakers_enabled();
+        let now = chrono::Utc::now().timestamp_millis();
+        self.correct_lines(segments, target, learn, now);
+    }
+
+    /// Several lines at once (one `segment_speakers` change), with its pop-up.
+    fn correct_lines(
+        &mut self,
+        segments: &[i64],
+        target: oats_core::SpeakerTarget,
+        learn: bool,
+        now: i64,
+    ) {
+        let r = match self
+            .store
+            .correct_segments_speaker(segments, target, learn, now)
+        {
+            Ok(r) => r,
+            Err(e) => return self.store_error(e),
+        };
+        self.speakers_edited();
+        self.reload_rows();
+        let lines = if r.moved == 1 {
+            "1 line".to_owned()
+        } else {
+            format!("{} lines", r.moved)
+        };
+        let bare = r.moved - r.learned;
+        let note = if r.moved == 0 || bare == 0 {
+            String::new()
+        } else if !learn {
+            " (relabelled only: speaker recognition is off)".to_owned()
+        } else {
+            format!(" ({bare} relabelled only: no voiceprint kept)")
+        };
+        let text = match (r.to.map(|id| self.speaker_name(id)), r.new_voice) {
+            _ if r.moved == 0 => "Those lines no longer exist".to_owned(),
+            (Some(who), Some(_)) => format!("New voice from {lines}: {who}{note}"),
+            (Some(who), None) => format!("Moved {lines} to {who}{note}"),
+            (None, _) => format!("Speaker cleared on {lines}"),
+        };
+        self.pending_toasts.push((text, r.moved == 0));
     }
 
     fn forget_speaker(&mut self, id: i64) {
@@ -3562,6 +3718,10 @@ impl OatsApp {
                     self.close_search();
                     self.topic = None;
                     self.set_view(View::Todos);
+                    None
+                }
+                ToastAction::ReassignLines { segments, target } => {
+                    self.move_similar_lines(&segments, target);
                     None
                 }
             })
@@ -4379,6 +4539,11 @@ impl OatsApp {
         true
     }
 
+    /// Test hook: speaker recognition on / off in the pipeline (as the Preferences switch).
+    pub fn selftest_set_speakers(&mut self, on: bool) {
+        self.pipeline.set_speakers(on);
+    }
+
     /// Show a node's page (a test hook for `View::Node`).
     pub fn selftest_view_node(&mut self, id: i64) {
         self.set_view(View::Node(id));
@@ -4665,6 +4830,9 @@ impl eframe::App for OatsApp {
         }
 
         let mut transcript_actions = Vec::new();
+        if std::mem::take(&mut self.clear_row_selection) {
+            crate::transcript::clear_row_selection(&ctx);
+        }
         let mut notes_actions = Vec::new();
         let mut calendar_actions = Vec::new();
         let mut todo_actions = Vec::new();
@@ -4969,6 +5137,19 @@ impl eframe::App for OatsApp {
         // prefs.listening keeps the user's choice on record; whether the next launch listens
         // is prefs.listen_at_launch
         self.stop_listening();
+    }
+}
+
+/// Why a corrected line was relabelled only (empty when its voiceprint moved too).
+fn relabel_note(learned: bool, learn: bool, kept: bool) -> &'static str {
+    if learned {
+        ""
+    } else if !learn && kept {
+        " (relabelled only: speaker recognition is off)"
+    } else if !kept {
+        " (relabelled only: no voiceprint kept for this line)"
+    } else {
+        ""
     }
 }
 

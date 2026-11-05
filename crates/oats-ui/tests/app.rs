@@ -3971,3 +3971,230 @@ fn with_animation_off_everything_lands_at_once() {
     assert!(label_top(&rig, "Water the plants") > label_top(&rig, "Completed ("));
     assert_idle(&mut rig);
 }
+
+/// The seeded Transcripts view (`selftest` seed: me / Priya / "them 3" / "voice 4") over a
+/// store at `db`, with the store for the test's own reads and writes.
+fn speakers_rig(db: &Path) -> Harness<'static, OatsApp> {
+    use oats_ui::selftest::SelftestOptions;
+    let store = Store::open(db).unwrap();
+    let pipeline = Pipeline {
+        engine: Box::new(|| Ok(Box::new(NullEngine) as Box<dyn SpeechEngine>)),
+        store_path: db.to_path_buf(),
+        segmenter: Default::default(),
+        wake: Box::new(|| {}),
+    }
+    .spawn();
+    let audio: AudioStarter = Box::new(|_, _| Ok(StartedAudio::mic(Box::new(()))));
+    let mut h =
+        oats_ui::selftest::harness(store, pipeline, audio, &SelftestOptions::default(), false)
+            .unwrap();
+    h.state_mut().run(Command::ShowTranscripts);
+    h.run_steps(4);
+    h
+}
+
+const VENDOR: &str = "Just the vendor contract. Legal wants another pass on the data retention \
+                      clause before we sign, so that probably slips to next week.";
+const BLOCKING: &str = "Nice. Anything blocking?";
+const MORNING: &str = "Morning everyone. Quick stand-up: the sync bug from Friday is fixed and \
+                       deployed, and the crash reports have dropped to almost nothing since the \
+                       patch went out.";
+const OKAY: &str = "Okay, let's get started. The main thing today is the Q4 roadmap and whether \
+                    the export rewrite still fits before the holidays.";
+const FITS: &str = "I think it fits if we drop the PDF templates for now.";
+
+fn seg_by_text(s: &Store, text: &str) -> oats_core::TranscriptRow {
+    s.segments_between(i64::MIN, i64::MAX)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.text == text && r.echo_of.is_none())
+        .unwrap()
+}
+
+fn voice_named(s: &Store, name: &str) -> i64 {
+    s.speakers()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.name.as_deref() == Some(name))
+        .unwrap()
+        .id
+}
+
+fn shows(h: &Harness<'_, OatsApp>, label: &str) -> bool {
+    h.query_all_by_label_contains(label).next().is_some()
+}
+
+#[test]
+fn this_line_was_reassigns_one_line_and_offers_the_lines_that_sound_alike() {
+    let dir = TempDir::new("line-speaker");
+    let mut h = speakers_rig(&dir.db());
+    h.state_mut().selftest_set_speakers(true);
+    let s = Store::open(&dir.db()).unwrap();
+    let priya = voice_named(&s, "Priya");
+    let vendor = seg_by_text(&s, VENDOR);
+    let them3 = vendor.speaker_id.unwrap();
+    // the vendor line and "Nice. Anything blocking?" sound alike (same embedding); the latter
+    // is tagged "them 3" too, by mistake
+    let blocking = seg_by_text(&s, BLOCKING);
+    s.set_segment_speaker(blocking.id, Some(them3)).unwrap();
+    let mut e: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.11).cos()).collect();
+    oats_core::speakers::normalise(&mut e);
+    s.insert_segment_voice(vendor.id, &e, 6_000, chrono::Utc::now().timestamp_millis())
+        .unwrap();
+    s.insert_segment_voice(
+        blocking.id,
+        &e,
+        4_000,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap();
+    let centroid_before = s.speaker(priya).unwrap().unwrap().centroid;
+    h.state_mut().run(Command::ShowNotes);
+    h.run_steps(2);
+    h.state_mut().run(Command::ShowTranscripts);
+    h.run_steps(4);
+
+    h.get_by_label(VENDOR).click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Speaker: them 3 ⏵").click();
+    h.run_steps(2);
+    h.get_by_label("This line was ⏵").click();
+    h.run_steps(3);
+    // the search field is focused on open: typing narrows the voices
+    // (an anonymous voice reads as the clicked line's lane: "them 4" on system audio)
+    assert!(shows(&h, "them 4"), "every voice listed before typing");
+    h.get_by_role(egui::accesskit::Role::TextInput)
+        .type_text("pri");
+    h.run_steps(2);
+    assert!(h.query_by_label("Priya").is_some());
+    assert!(h.query_by_label("them 4").is_none(), "filtered out");
+    // Enter with one match picks it
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(seg_by_text(&s, VENDOR).speaker_id, Some(priya));
+    assert!(shows(&h, "Line moved to Priya"));
+    assert!(
+        !shows(&h, "relabelled only"),
+        "the embedding was kept: learned"
+    );
+    assert_ne!(
+        s.speaker(priya).unwrap().unwrap().centroid,
+        centroid_before,
+        "Priya's voiceprint learned the line"
+    );
+    let c = s.changes(1).unwrap().remove(0);
+    assert_eq!(c.kind, "segment_speaker");
+    // the similar line is offered
+    assert!(shows(
+        &h,
+        "1 more line in this session sounds like the same person"
+    ));
+    h.get_by_label("Move them too").click();
+    h.run_steps(3);
+    assert_eq!(seg_by_text(&s, BLOCKING).speaker_id, Some(priya));
+    assert!(shows(&h, "Moved 1 line to Priya"));
+    assert_eq!(s.changes(1).unwrap().remove(0).kind, "segment_speakers");
+    // the row now reads as Priya
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.get_by_label(VENDOR).click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("Speaker: Priya ⏵").is_some());
+}
+
+#[test]
+fn a_line_with_no_voiceprint_is_relabelled_only_and_nobody_clears_it() {
+    let dir = TempDir::new("line-speaker-bare");
+    let mut h = speakers_rig(&dir.db());
+    let s = Store::open(&dir.db()).unwrap();
+    let priya = voice_named(&s, "Priya");
+    h.get_by_label(VENDOR).click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Speaker: them 3 ⏵").click();
+    h.run_steps(2);
+    h.get_by_label("This line was ⏵").click();
+    h.run_steps(3);
+    h.get_by_label("Priya").click();
+    h.run_steps(3);
+    assert_eq!(seg_by_text(&s, VENDOR).speaker_id, Some(priya));
+    assert!(shows(
+        &h,
+        "Line moved to Priya (relabelled only: no voiceprint kept for this line)"
+    ));
+    assert!(!shows(&h, "sound like the same person"));
+    h.get_by_label(VENDOR).click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Speaker: Priya ⏵").click();
+    h.run_steps(2);
+    h.get_by_label("This line was ⏵").click();
+    h.run_steps(3);
+    h.get_by_label("Nobody").click();
+    h.run_steps(3);
+    assert_eq!(seg_by_text(&s, VENDOR).speaker_id, None);
+    assert!(shows(&h, "Speaker cleared"));
+}
+
+#[test]
+fn option_and_shift_clicks_select_rows_and_the_batch_menu_retags_them() {
+    let dir = TempDir::new("row-select");
+    let mut h = speakers_rig(&dir.db());
+    let s = Store::open(&dir.db()).unwrap();
+    let priya = voice_named(&s, "Priya");
+    let picked = |h: &Harness<'_, OatsApp>| {
+        oats_ui::transcript::row_selection(&h.ctx)
+            .selected
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    // ⌥-click two rows, ⇧-click a third: the range from the anchor
+    h.get_by_label(BLOCKING)
+        .click_modifiers(egui::Modifiers::ALT);
+    h.run_steps(2);
+    h.get_by_label(MORNING)
+        .click_modifiers(egui::Modifiers::ALT);
+    h.run_steps(2);
+    h.get_by_label(VENDOR)
+        .click_modifiers(egui::Modifiers::SHIFT);
+    h.run_steps(2);
+    let ids: Vec<i64> = [MORNING, BLOCKING, VENDOR]
+        .iter()
+        .map(|t| seg_by_text(&s, t).id)
+        .collect();
+    let mut want = ids.clone();
+    want.sort();
+    assert_eq!(picked(&h), want);
+    h.get_by_label(BLOCKING).click_secondary();
+    h.run_steps(2);
+    h.get_by_label("These 3 lines were ⏵").click();
+    h.run_steps(3);
+    h.get_by_label("Priya").click();
+    h.run_steps(3);
+    for t in [MORNING, BLOCKING, VENDOR] {
+        assert_eq!(seg_by_text(&s, t).speaker_id, Some(priya), "{t}");
+    }
+    assert!(shows(&h, "Moved 3 lines to Priya"));
+    assert!(picked(&h).is_empty(), "the selection is cleared after");
+    let c = s.changes(1).unwrap().remove(0);
+    assert_eq!(c.kind, "segment_speakers");
+    // the rows read as Priya now
+    h.get_by_label(VENDOR).click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("Speaker: Priya ⏵").is_some());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    // a plain click clears a selection
+    h.get_by_label(OKAY).click_modifiers(egui::Modifiers::ALT);
+    h.run_steps(2);
+    assert_eq!(picked(&h).len(), 1);
+    h.get_by_label(FITS).click();
+    h.run_steps(2);
+    assert!(picked(&h).is_empty());
+    // and so does Escape
+    h.get_by_label(OKAY).click_modifiers(egui::Modifiers::ALT);
+    h.run_steps(2);
+    assert_eq!(picked(&h).len(), 1);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(picked(&h).is_empty());
+}
