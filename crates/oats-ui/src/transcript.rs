@@ -549,13 +549,18 @@ fn transcript_row(
                 // to the end of the text, so dragging from there selects from the line's end,
                 // as in any text view. The layout is untouched (nothing is allocated), and the
                 // focus bit is left off like the label's own sense.
+                // The union keeps the label's own rect inside the wide one: a wrapped label's
+                // galley is rounded to whole pixels and can run a fraction past `w`, and a
+                // re-registered rect that neither contains nor sits inside the first is what
+                // egui's debug "Double use of widget ID" check draws.
                 let wide = Rect::from_min_max(
                     pos2(text.rect.left(), time_rect.top() - 2.0),
                     pos2(
                         text.rect.left() + w,
                         text.rect.bottom().max(time_rect.bottom()) + 2.0,
                     ),
-                );
+                )
+                .union(text.rect);
                 ui.interact(wide, text.id, Sense::CLICK | Sense::DRAG);
                 labels = Some(time_label.union(text));
             });
