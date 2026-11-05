@@ -301,6 +301,14 @@ pub fn install_tokens(ctx: &egui::Context, t: Tokens) {
         o.zoom_with_keyboard = false;
         // A wheel notch scrolls the transcript a comfortable distance.
         o.input_options.line_scroll_speed = 60.0;
+        // eframe persists egui's `Options` with the rest of its memory, and these debug
+        // switches ride along: one debug launch saved `warn_on_id_clash: true`, and every
+        // release build after it drew the red "Double use of widget ID" overlay. Pin them to
+        // this build (`install_tokens` runs in the creator, after the memory is loaded).
+        o.warn_on_id_clash = cfg!(debug_assertions);
+        o.tessellation_options.debug_paint_clip_rects = false;
+        o.tessellation_options.debug_paint_text_rects = false;
+        o.tessellation_options.debug_ignore_clip_rects = false;
     });
     ctx.data_mut(|d| d.insert_temp(egui::Id::NULL, t));
     let mut v = if t.dark {
