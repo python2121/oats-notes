@@ -13,6 +13,7 @@ pub mod calendar;
 pub mod media;
 pub mod menu_events;
 pub mod merge;
+pub mod motion;
 pub mod move_to;
 #[cfg(target_os = "macos")]
 pub mod native_menu;

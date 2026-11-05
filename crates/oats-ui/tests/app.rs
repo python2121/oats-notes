@@ -81,6 +81,18 @@ fn build(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>) -> Rig {
 
 /// [`build`]; `system`: the starter reports system audio running next to the microphone.
 fn build_with(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>, system: bool) -> Rig {
+    build_stepped(db, item, brain, system, None)
+}
+
+/// [`build_with`]; `step_dt`: the harness's frame time (default kittest's 0.25 s, which runs
+/// any of the app's animations to their end in one step), with room for a long run of steps.
+fn build_stepped(
+    db: &Path,
+    item: Option<FakeItem>,
+    brain: Option<BrainHandle>,
+    system: bool,
+    step_dt: Option<f32>,
+) -> Rig {
     let store = Store::open(db).unwrap();
     let pipeline = Pipeline {
         engine: Box::new(|| Ok(Box::new(NullEngine) as Box<dyn SpeechEngine>)),
@@ -101,24 +113,26 @@ fn build_with(db: &Path, item: Option<FakeItem>, brain: Option<BrainHandle>, sys
             ..StartedAudio::mic(Box::new(()))
         })
     });
-    let harness = Harness::builder()
-        .with_size(egui::vec2(1100.0, 720.0))
-        .build_eframe(move |cc| {
-            OatsApp::new(
-                cc,
-                AppOptions {
-                    native_menu: false,
-                    system_font: false,
-                    persist: false,
-                    start_listening: false,
-                },
-                pipeline,
-                audio,
-                store,
-                item.map(|i| Box::new(i) as Box<dyn StatusItem>),
-                brain,
-            )
-        });
+    let mut builder = Harness::builder().with_size(egui::vec2(1100.0, 720.0));
+    if let Some(dt) = step_dt {
+        builder = builder.with_step_dt(dt).with_max_steps(200);
+    }
+    let harness = builder.build_eframe(move |cc| {
+        OatsApp::new(
+            cc,
+            AppOptions {
+                native_menu: false,
+                system_font: false,
+                persist: false,
+                start_listening: false,
+            },
+            pipeline,
+            audio,
+            store,
+            item.map(|i| Box::new(i) as Box<dyn StatusItem>),
+            brain,
+        )
+    });
     let mut rig = Rig {
         harness,
         mic,
@@ -3725,4 +3739,235 @@ fn split_asks_before_replacing_edits_then_splits_the_note_in_two() {
         !rig.shows("what goes into the new note"),
         "the field closed"
     );
+}
+
+// ---- motion: the completion transition, the reveal slots, the idle rule ------------------------
+
+/// The top of the (one) label containing `text`.
+fn label_top(rig: &Rig, text: &str) -> f32 {
+    rig.harness.get_by_label_contains(text).rect().top()
+}
+
+/// The app's own animation time (kittest zeroes egui's after the app installed its theme, so
+/// every other test runs without motion).
+fn with_motion(rig: &mut Rig) {
+    rig.harness.ctx.all_styles_mut(|s| s.animation_time = 0.12);
+}
+
+/// Settled: one frame and no immediate repaint asked for (only the scheduled ones — midnight,
+/// a reminder — remain), so the app idles.
+fn assert_idle(rig: &mut Rig) {
+    assert_eq!(rig.harness.run_ok(), Some(1), "something keeps repainting");
+}
+
+/// A todo ticked in the Todos view stays in its old place, ticked, for the hold; then moves
+/// under "Completed"; then nothing repaints.
+#[test]
+fn a_ticked_todo_holds_its_place_then_moves_under_completed() {
+    use egui::accesskit::Role;
+    let dir = TempDir::new("motion-todo");
+    let done = add_todo(&dir.db(), "Already done", None);
+    Store::open(&dir.db())
+        .unwrap()
+        .complete_todo(done, now_ms())
+        .unwrap();
+    let id = add_todo(&dir.db(), "Water the plants", None);
+    add_todo(&dir.db(), "Call the landlord", None);
+    let mut rig = build(&dir.db(), None, None);
+    with_motion(&mut rig);
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    assert!(label_top(&rig, "Water the plants") < label_top(&rig, "Completed ("));
+    rig.harness
+        .get_all_by_role(Role::CheckBox)
+        .next()
+        .unwrap()
+        .click();
+    // the click's frame and one more (0.25 s each): the store has it, the row is still up top
+    rig.harness.run_steps(2);
+    assert!(
+        Store::open(&dir.db())
+            .unwrap()
+            .todo(id)
+            .unwrap()
+            .unwrap()
+            .done()
+    );
+    assert_eq!(
+        rig.harness
+            .query_all_by_label_contains("Water the plants")
+            .count(),
+        1,
+        "one copy during the hold"
+    );
+    assert!(
+        label_top(&rig, "Water the plants") < label_top(&rig, "Call the landlord"),
+        "held in its old place"
+    );
+    // hold + move: under the heading, after the open one
+    rig.harness.run_steps(6);
+    assert!(label_top(&rig, "Water the plants") > label_top(&rig, "Completed ("));
+    assert!(label_top(&rig, "Water the plants") > label_top(&rig, "Call the landlord"));
+    assert_eq!(
+        rig.harness
+            .query_all_by_label_contains("Water the plants")
+            .count(),
+        1
+    );
+    assert_idle(&mut rig);
+}
+
+/// Unticking during the hold cancels the move: the row simply stays where it was.
+#[test]
+fn unticking_during_the_hold_keeps_the_row_in_place() {
+    use egui::accesskit::Role;
+    let dir = TempDir::new("motion-cancel");
+    let id = add_todo(&dir.db(), "Water the plants", None);
+    add_todo(&dir.db(), "Call the landlord", None);
+    let mut rig = build(&dir.db(), None, None);
+    with_motion(&mut rig);
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    let top = label_top(&rig, "Water the plants");
+    let first = |rig: &mut Rig| {
+        rig.harness
+            .get_all_by_role(Role::CheckBox)
+            .next()
+            .unwrap()
+            .click();
+    };
+    first(&mut rig);
+    rig.harness.run_steps(1);
+    first(&mut rig);
+    rig.harness.run_steps(8);
+    assert!(
+        !Store::open(&dir.db())
+            .unwrap()
+            .todo(id)
+            .unwrap()
+            .unwrap()
+            .done()
+    );
+    assert_eq!(label_top(&rig, "Water the plants"), top);
+    assert!(!rig.shows("Completed ("));
+    assert_idle(&mut rig);
+}
+
+/// The checkbox (and label) of the action item `text` inside the open note card (the lowest
+/// of its copies: the Next steps list it first).
+fn card_item(rig: &Rig, text: &str) -> (egui::Rect, egui::Rect) {
+    use egui::accesskit::Role;
+    let label = rig
+        .harness
+        .get_all_by_label_contains(text)
+        .map(|n| n.rect())
+        .max_by(|a, b| a.top().total_cmp(&b.top()))
+        .unwrap();
+    let boxr = rig
+        .harness
+        .get_all_by_role(Role::CheckBox)
+        .map(|n| n.rect())
+        .min_by(|a, b| {
+            (a.center().y - label.center().y)
+                .abs()
+                .total_cmp(&(b.center().y - label.center().y).abs())
+        })
+        .unwrap();
+    (boxr, label)
+}
+
+/// An action item ticked on a note card holds its place in the card, then moves after the
+/// card's open items.
+#[test]
+fn a_ticked_action_item_holds_then_moves_down_the_card() {
+    let dir = TempDir::new("motion-item");
+    let (commerce, pricing, _launch) = seed_project_notes(&dir.db());
+    let mut rig = build(&dir.db(), None, None);
+    with_motion(&mut rig);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(3);
+    rig.harness.get_by_label("Note: Pricing sync").click();
+    rig.harness.run_steps(3);
+    assert!(rig.app().open_notes().contains(&pricing));
+    let (_, draft) = card_item(&rig, "Draft the price table");
+    let (_, vat) = card_item(&rig, "Check VAT rules");
+    assert!(draft.top() < vat.top());
+    let (boxr, _) = card_item(&rig, "Draft the price table");
+    rig.click_at(boxr.center());
+    // click_at ran two frames: held
+    let (_, draft) = card_item(&rig, "Draft the price table");
+    let (_, vat) = card_item(&rig, "Check VAT rules");
+    assert!(draft.top() < vat.top(), "held in its old place");
+    let e = Store::open(&dir.db())
+        .unwrap()
+        .episode(pricing)
+        .unwrap()
+        .unwrap();
+    assert!(
+        e.action_items
+            .iter()
+            .any(|a| a.text == "Draft the price table" && a.done_at.is_some())
+    );
+    rig.harness.run_steps(6);
+    let (_, draft) = card_item(&rig, "Draft the price table");
+    let (_, vat) = card_item(&rig, "Check VAT rules");
+    assert!(draft.top() > vat.top(), "moved after the open item");
+    assert_idle(&mut rig);
+}
+
+/// A note row's card slides open: the rows below move down over several frames (not at once),
+/// the card is laid out from the first, and it all settles with nothing left repainting.
+#[test]
+fn a_note_card_expands_over_a_few_frames_and_settles() {
+    let dir = TempDir::new("motion-reveal");
+    let (commerce, _pricing, _launch) = seed_project_notes(&dir.db());
+    let mut rig = build_stepped(&dir.db(), None, None, false, Some(1.0 / 60.0));
+    with_motion(&mut rig);
+    rig.app().selftest_view_node(commerce);
+    rig.harness.run_steps(3);
+    let below = |rig: &Rig| label_top(rig, "Show transcript (");
+    let rest = below(&rig);
+    rig.harness.get_by_label("Note: Pricing sync").click();
+    rig.harness.run_steps(3);
+    assert!(rig.shows("pricing detail alpha"), "laid out while it opens");
+    let early = below(&rig);
+    let steps = rig.harness.run_ok().expect("the animation ends");
+    let open = below(&rig);
+    assert!(rest < early && early < open, "{rest} < {early} < {open}");
+    assert!(steps > 1, "it took frames, not one jump");
+    assert_idle(&mut rig);
+    // and closes again
+    rig.harness.get_by_label("Note: Pricing sync").click();
+    rig.harness.run_ok().expect("the animation ends");
+    assert!(!rig.shows("pricing detail alpha"));
+    assert_eq!(below(&rig), rest);
+    assert_idle(&mut rig);
+}
+
+/// With egui's animation time at 0 nothing moves: the ticked todo is in the completed block
+/// on the next frame and a card opens in one.
+#[test]
+fn with_animation_off_everything_lands_at_once() {
+    use egui::accesskit::Role;
+    let dir = TempDir::new("motion-off");
+    let done = add_todo(&dir.db(), "Already done", None);
+    Store::open(&dir.db())
+        .unwrap()
+        .complete_todo(done, now_ms())
+        .unwrap();
+    add_todo(&dir.db(), "Water the plants", None);
+    add_todo(&dir.db(), "Call the landlord", None);
+    let mut rig = build_stepped(&dir.db(), None, None, false, Some(1.0 / 60.0));
+    with_motion(&mut rig);
+    rig.harness.ctx.all_styles_mut(|s| s.animation_time = 0.0);
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    rig.harness
+        .get_all_by_role(Role::CheckBox)
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(2);
+    assert!(label_top(&rig, "Water the plants") > label_top(&rig, "Completed ("));
+    assert_idle(&mut rig);
 }

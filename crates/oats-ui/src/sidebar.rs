@@ -658,46 +658,51 @@ pub fn sidebar_panel(
                 if n.parent_id.is_none() && !has_children(nodes, n.id) {
                     empty_row(ui, &t, "No projects yet");
                 }
-                if is_project && state.episodes_open.contains(&n.id) {
-                    for ep in project_eps {
-                        let r = episode_row(
-                            ui,
-                            &t,
-                            ep,
-                            focus_episode == Some(ep.id),
-                            depth + 1,
-                            today.episode_mark(ep),
-                        );
-                        let row = SidebarRow::Episode {
-                            episode: ep.id,
-                            project: n.id,
-                        };
-                        reveal(ui, state, &row, &r, focus_episode == Some(ep.id));
-                        if r.clicked() {
-                            actions.push(SidebarAction::SelectEpisode(ep.id, n.id));
-                        }
-                        crate::merge::drag_source(ui, &t, &r, ep.id, &ep.title);
-                        if let Some(dragged) = crate::merge::drop_zone(ui, &t, r.rect, ep.id) {
-                            let at = ui.ctx().pointer_latest_pos().unwrap_or(r.rect.center());
-                            actions.push(SidebarAction::MergeDrop {
-                                dragged,
-                                into: ep.id,
-                                at,
-                            });
-                        }
-                        r.context_menu(|ui| {
-                            episode_menu(ui, ep, move_draft, &mut actions);
-                        });
-                        let target = oats_brain::MoveTarget::Episode(ep.id);
-                        if let Some(text) =
-                            crate::move_to::move_field_in(ui, &t, move_draft, target, true)
-                        {
-                            actions.push(SidebarAction::MoveEpisode {
+                // the project's notes layer slides open under its row and closed into it
+                let layer_open = is_project && state.episodes_open.contains(&n.id);
+                let layer = egui::Id::new(("sidebar-notes", n.id));
+                if is_project && !project_eps.is_empty() {
+                    crate::widgets::reveal(ui, layer, layer_open, |ui| {
+                        for ep in project_eps {
+                            let r = episode_row(
+                                ui,
+                                &t,
+                                ep,
+                                focus_episode == Some(ep.id),
+                                depth + 1,
+                                today.episode_mark(ep),
+                            );
+                            let row = SidebarRow::Episode {
                                 episode: ep.id,
-                                text,
+                                project: n.id,
+                            };
+                            reveal(ui, state, &row, &r, focus_episode == Some(ep.id));
+                            if r.clicked() {
+                                actions.push(SidebarAction::SelectEpisode(ep.id, n.id));
+                            }
+                            crate::merge::drag_source(ui, &t, &r, ep.id, &ep.title);
+                            if let Some(dragged) = crate::merge::drop_zone(ui, &t, r.rect, ep.id) {
+                                let at = ui.ctx().pointer_latest_pos().unwrap_or(r.rect.center());
+                                actions.push(SidebarAction::MergeDrop {
+                                    dragged,
+                                    into: ep.id,
+                                    at,
+                                });
+                            }
+                            r.context_menu(|ui| {
+                                episode_menu(ui, ep, move_draft, &mut actions);
                             });
+                            let target = oats_brain::MoveTarget::Episode(ep.id);
+                            if let Some(text) =
+                                crate::move_to::move_field_in(ui, &t, move_draft, target, true)
+                            {
+                                actions.push(SidebarAction::MoveEpisode {
+                                    episode: ep.id,
+                                    text,
+                                });
+                            }
                         }
-                    }
+                    });
                 }
             }
             if let Some(id) = toggle {

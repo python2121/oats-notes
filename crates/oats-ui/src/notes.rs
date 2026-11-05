@@ -416,6 +416,10 @@ pub struct NotesState {
     pub confirm_merge: Option<crate::merge::MergeConfirm>,
     /// A note whose Delete was clicked in the edit view: (episode id, title, popup anchor).
     pub confirm_delete: Option<(i64, String, egui::Pos2)>,
+    /// Action items ticked or unticked a moment ago (episode id, item text), held in their
+    /// old place on the cards and the Next steps, then moving ([`crate::motion`]; started by
+    /// the app, which sees every `SetActionItemDone`).
+    pub moves: crate::motion::Moves<(i64, String)>,
 }
 
 /// What a "Replace your edits?" question in a hand-edited note's header confirms.
@@ -1393,36 +1397,52 @@ pub(crate) fn episode_card(
                                     .font(crate::theme::font_medium(ui.ctx(), 12.0))
                                     .color(t.text_secondary),
                             );
-                            for a in card_item_order(&e.action_items) {
-                                ui.horizontal_top(|ui| {
-                                    ui.set_min_height(ui.spacing().interact_size.y);
-                                    ui.add_space(6.0);
-                                    let mut done = a.done_at.is_some();
-                                    if action_checkbox(ui, &mut done) {
-                                        actions.push(NotesAction::SetActionItemDone {
-                                            episode_id: e.id,
-                                            text: a.text.clone(),
-                                            done,
-                                        });
-                                    }
-                                    let mut text = a.text.clone();
-                                    if let Some(o) = &a.owner {
-                                        text.push_str(&format!(" — **{o}**"));
-                                    }
-                                    if let Some(d) = &a.due {
-                                        text.push_str(&format!(" (due {d})"));
-                                    }
-                                    item_line(
-                                        ui,
-                                        t,
-                                        &text,
-                                        hl,
-                                        (a.segment_id, a.at_ms),
-                                        a.node_id.filter(|n| Some(*n) != e.node_id),
-                                        a.done_at.is_some(),
-                                        nodes,
-                                        actions,
-                                    );
+                            let items = card_item_order(&e.action_items);
+                            let keys: Vec<((i64, String), bool)> = items
+                                .iter()
+                                .map(|a| ((e.id, a.text.clone()), a.done_at.is_some()))
+                                .collect();
+                            state.moves.drop_mismatched(keys.iter().cloned());
+                            state.moves.tick(ui.ctx());
+                            let entries = crate::motion::arrange(
+                                ui.ctx(),
+                                egui::Id::new(("card-items", e.id)),
+                                &keys,
+                                &state.moves,
+                            );
+                            for (i, slot) in entries {
+                                let a = items[i];
+                                slot.show(ui, ("card-item", e.id), |ui| {
+                                    ui.horizontal_top(|ui| {
+                                        ui.set_min_height(ui.spacing().interact_size.y);
+                                        ui.add_space(6.0);
+                                        let mut done = a.done_at.is_some();
+                                        if action_checkbox(ui, &mut done) {
+                                            actions.push(NotesAction::SetActionItemDone {
+                                                episode_id: e.id,
+                                                text: a.text.clone(),
+                                                done,
+                                            });
+                                        }
+                                        let mut text = a.text.clone();
+                                        if let Some(o) = &a.owner {
+                                            text.push_str(&format!(" — **{o}**"));
+                                        }
+                                        if let Some(d) = &a.due {
+                                            text.push_str(&format!(" (due {d})"));
+                                        }
+                                        item_line(
+                                            ui,
+                                            t,
+                                            &text,
+                                            hl,
+                                            (a.segment_id, a.at_ms),
+                                            a.node_id.filter(|n| Some(*n) != e.node_id),
+                                            a.done_at.is_some(),
+                                            nodes,
+                                            actions,
+                                        );
+                                    });
                                 });
                             }
                         }
@@ -1923,7 +1943,17 @@ pub fn node_view(
             let is_project = node.kind == oats_core::NodeKind::Project;
             let is_category = node.kind == oats_core::NodeKind::Category;
             if is_project {
-                next_steps(ui, &t, state, episodes, filed, nodes, false, &mut out.notes);
+                next_steps(
+                    ui,
+                    &t,
+                    state,
+                    episodes,
+                    filed,
+                    nodes,
+                    false,
+                    node.id,
+                    &mut out.notes,
+                );
                 project_notes(ui, &t, state, episodes, nodes, &mut out.notes);
                 children_section(ui, &t, node, &children, &mut out);
             } else {
@@ -1935,6 +1965,7 @@ pub fn node_view(
                     filed,
                     nodes,
                     is_category,
+                    node.id,
                     &mut out.notes,
                 );
                 children_section(ui, &t, node, &children, &mut out);
@@ -1959,9 +1990,18 @@ pub fn node_view(
                     state.show_transcript = !state.show_transcript;
                 }
             });
-            if state.show_transcript {
-                ui.add_space(4.0);
-                out.transcript = transcript_rows(ui, rows, &mut state.move_draft);
+            let shown = state.show_transcript;
+            let draft = &mut state.move_draft;
+            if let Some(a) = crate::widgets::reveal(
+                ui,
+                egui::Id::new(("node-transcript", node.id)),
+                shown,
+                |ui| {
+                    ui.add_space(4.0);
+                    transcript_rows(ui, rows, draft)
+                },
+            ) {
+                out.transcript = a;
             }
             ui.add_space(12.0);
         });
@@ -2169,6 +2209,7 @@ fn next_steps(
     filed: &[(Episode, NoteItem)],
     nodes: &[Node],
     chips: bool,
+    salt: i64,
     actions: &mut Vec<NotesAction>,
 ) {
     let steps = collect_next_steps(episodes, filed, nodes);
@@ -2188,123 +2229,163 @@ fn next_steps(
         ui.add_space(8.0);
         return;
     }
-    let (shown, show_link) = next_steps_shown(&steps, state.show_all_steps);
-    // where "Show all" sat: expanded, a "Show fewer" is drawn there too, so the list can be
-    // toggled back without moving the pointer (and again at the bottom after a long scroll)
-    let collapsed = next_steps_shown(&steps, false).0;
-    for (i, s) in steps[..shown].iter().enumerate() {
-        if state.show_all_steps && show_link && i == collapsed && i > 0 {
-            next_steps_link(ui, t, state, steps.len());
-            ui.add_space(2.0);
-        }
-        ui.horizontal_top(|ui| {
-            // The row pitch egui's own checkbox gave; the box is centred on the text anyway.
-            ui.set_min_height(ui.spacing().interact_size.y);
-            ui.add_space(10.0);
-            let mut done = s.done_at.is_some();
-            if action_checkbox(ui, &mut done) {
-                actions.push(NotesAction::SetActionItemDone {
-                    episode_id: s.episode_id,
-                    text: s.text.clone(),
-                    done,
+    let (_, show_link) = next_steps_shown(&steps, state.show_all_steps);
+    let keys: Vec<((i64, String), bool)> = steps
+        .iter()
+        .map(|s| ((s.episode_id, s.text.clone()), s.done_at.is_some()))
+        .collect();
+    state.moves.drop_mismatched(keys.iter().cloned());
+    state.moves.tick(ui.ctx());
+    let entries = crate::motion::arrange(
+        ui.ctx(),
+        egui::Id::new(("next-steps", salt)),
+        &keys,
+        &state.moves,
+    );
+    // Collapsed, the list shows the open items up to the cap ([`next_steps_shown`]; an item
+    // held in its old place still counts as open); the rest is revealed by "Show all".
+    let collapsed = entries
+        .iter()
+        .take_while(|(i, slot)| !slot.shows_done(keys[*i].1))
+        .count()
+        .min(NEXT_STEPS_CAP);
+    let (head, rest) = entries.split_at(collapsed);
+    for &(i, slot) in head {
+        slot.show(ui, ("next-step", salt), |ui| {
+            next_step_row(ui, t, &steps[i], nodes, chips, actions);
+        });
+    }
+    let more = egui::Id::new(("next-steps-more", salt));
+    if !rest.is_empty() {
+        crate::widgets::reveal(ui, more, state.show_all_steps, |ui| {
+            // where "Show all" sat: expanded, a "Show fewer" is drawn there too, so the list
+            // can be toggled back without moving the pointer (and again at the bottom)
+            if show_link && collapsed > 0 {
+                next_steps_link(ui, t, state, steps.len());
+                ui.add_space(2.0);
+            }
+            for &(i, slot) in rest {
+                slot.show(ui, ("next-step", salt), |ui| {
+                    next_step_row(ui, t, &steps[i], nodes, chips, actions);
                 });
             }
-            let color = if s.done_at.is_some() {
-                t.text_tertiary
-            } else {
-                t.text
-            };
-            let mut text = s.text.clone();
-            if let Some(o) = &s.owner {
-                text.push_str(&format!(" — **{o}**"));
-            }
-            if let Some(d) = &s.due {
-                text.push_str(&format!(" (due {d})"));
-            }
-            let mut job = egui::text::LayoutJob::default();
-            for (span, bold) in bold_spans(&text) {
-                job.append(
-                    &span,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: if bold {
-                            crate::theme::font_medium(ui.ctx(), 12.5)
-                        } else {
-                            t.font(12.5)
-                        },
-                        color,
-                        ..Default::default()
-                    },
-                );
-            }
-            // the text wraps in what is left of the row (14 pt short of its right edge); the
-            // project chip follows its last line, or takes the next one when it doesn't fit
-            let w = (ui.available_width() - 14.0).max(40.0);
-            ui.allocate_ui_with_layout(
-                vec2(w, 0.0),
-                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
-                |ui| {
-                    ui.set_max_width(w);
-                    let bg = ui.painter().add(egui::Shape::Noop);
-                    let resp = ui
-                        .add(
-                            egui::Label::new(job)
-                                .wrap()
-                                .sense(Sense::click())
-                                .selectable(false),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(format!(
-                            "from {} · {}",
-                            s.episode_title,
-                            short_date(s.started_at)
-                        ));
-                    if resp.hovered() {
-                        ui.painter().set(
-                            bg,
-                            egui::Shape::rect_filled(
-                                resp.rect.expand2(vec2(4.0, 1.0)),
-                                4.0,
-                                t.hover,
-                            ),
-                        );
-                    }
-                    if resp.clicked() {
-                        actions.push(NotesAction::GoToNote(s.episode_id));
-                    }
-                    if chips
-                        && let Some(p) = s
-                            .project_id
-                            .and_then(|id| nodes.iter().find(|n| n.id == id))
-                    {
-                        let r = ui
-                            .add(
-                                // one piece: on the next line when it doesn't fit after
-                                // the text (cut with … only past the whole width)
-                                egui::Label::new(
-                                    RichText::new(format!("→ {}", p.name))
-                                        .color(t.accent)
-                                        .size(11.0),
-                                )
-                                .truncate()
-                                .sense(Sense::click())
-                                .selectable(false),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(format!("Filed under {}", node_path(nodes, p.id)));
-                        if r.clicked() {
-                            actions.push(NotesAction::SelectNode(p.id));
-                        }
-                    }
-                },
-            );
         });
-        ui.add_space(2.0);
     }
     if show_link {
         next_steps_link(ui, t, state, steps.len());
     }
     ui.add_space(8.0);
+}
+
+/// One next step: checkbox, text (a link to its note) and, on a category page (`chips`), the
+/// chip naming its project.
+fn next_step_row(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    s: &NextStep,
+    nodes: &[Node],
+    chips: bool,
+    actions: &mut Vec<NotesAction>,
+) {
+    ui.horizontal_top(|ui| {
+        // The row pitch egui's own checkbox gave; the box is centred on the text anyway.
+        ui.set_min_height(ui.spacing().interact_size.y);
+        ui.add_space(10.0);
+        let mut done = s.done_at.is_some();
+        if action_checkbox(ui, &mut done) {
+            actions.push(NotesAction::SetActionItemDone {
+                episode_id: s.episode_id,
+                text: s.text.clone(),
+                done,
+            });
+        }
+        let color = if s.done_at.is_some() {
+            t.text_tertiary
+        } else {
+            t.text
+        };
+        let mut text = s.text.clone();
+        if let Some(o) = &s.owner {
+            text.push_str(&format!(" — **{o}**"));
+        }
+        if let Some(d) = &s.due {
+            text.push_str(&format!(" (due {d})"));
+        }
+        let mut job = egui::text::LayoutJob::default();
+        for (span, bold) in bold_spans(&text) {
+            job.append(
+                &span,
+                0.0,
+                egui::TextFormat {
+                    font_id: if bold {
+                        crate::theme::font_medium(ui.ctx(), 12.5)
+                    } else {
+                        t.font(12.5)
+                    },
+                    color,
+                    ..Default::default()
+                },
+            );
+        }
+        // the text wraps in what is left of the row (14 pt short of its right edge); the
+        // project chip follows its last line, or takes the next one when it doesn't fit
+        let w = (ui.available_width() - 14.0).max(40.0);
+        ui.allocate_ui_with_layout(
+            vec2(w, 0.0),
+            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+            |ui| {
+                ui.set_max_width(w);
+                let bg = ui.painter().add(egui::Shape::Noop);
+                let resp = ui
+                    .add(
+                        egui::Label::new(job)
+                            .wrap()
+                            .sense(Sense::click())
+                            .selectable(false),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(format!(
+                        "from {} · {}",
+                        s.episode_title,
+                        short_date(s.started_at)
+                    ));
+                if resp.hovered() {
+                    ui.painter().set(
+                        bg,
+                        egui::Shape::rect_filled(resp.rect.expand2(vec2(4.0, 1.0)), 4.0, t.hover),
+                    );
+                }
+                if resp.clicked() {
+                    actions.push(NotesAction::GoToNote(s.episode_id));
+                }
+                if chips
+                    && let Some(p) = s
+                        .project_id
+                        .and_then(|id| nodes.iter().find(|n| n.id == id))
+                {
+                    let r = ui
+                        .add(
+                            // one piece: on the next line when it doesn't fit after
+                            // the text (cut with … only past the whole width)
+                            egui::Label::new(
+                                RichText::new(format!("→ {}", p.name))
+                                    .color(t.accent)
+                                    .size(11.0),
+                            )
+                            .truncate()
+                            .sense(Sense::click())
+                            .selectable(false),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(format!("Filed under {}", node_path(nodes, p.id)));
+                    if r.clicked() {
+                        actions.push(NotesAction::SelectNode(p.id));
+                    }
+                }
+            },
+        );
+    });
+    ui.add_space(2.0);
 }
 
 /// The "Show all N" / "Show fewer" link of the next steps.
@@ -2470,9 +2551,15 @@ fn note_list(
                 open_note(state, e);
             }
         }
-        if open {
-            episode_card(ui, t, state, e, nodes, actions, "", None);
+        // the card expands under its row and retracts into it (a jump to it shows it at once,
+        // so its rect is whole when it is scrolled to)
+        let slot = egui::Id::new(("note-card", e.id));
+        if open && state.pending_focus == Some(e.id) {
+            crate::widgets::reveal_snap(ui.ctx(), slot, true);
         }
+        crate::widgets::reveal(ui, slot, open, |ui| {
+            episode_card(ui, t, state, e, nodes, actions, "", None);
+        });
     }
 }
 

@@ -1571,6 +1571,8 @@ impl OatsApp {
             self.notes_state.show_transcript = false;
             self.notes_state.show_all_steps = false;
             self.notes_state.show_low_signal = false;
+            self.notes_state.moves.clear();
+            self.todos_state.moves.clear();
             self.reload_rows();
             self.reload_brain_data();
         }
@@ -3129,6 +3131,11 @@ impl OatsApp {
                     text,
                     done,
                 } => {
+                    // the lists hold the item in place, then move it (an untick during the
+                    // hold cancels that)
+                    self.notes_state
+                        .moves
+                        .toggle((episode_id, text.clone()), done);
                     let now = chrono::Local::now().timestamp_millis();
                     // unticking: its completion time, so an undo puts the same one back
                     let stamp = if done {
@@ -3500,6 +3507,16 @@ impl OatsApp {
                     )
                     .map(|_| ()),
                 TodoAction::SetDue(id, due) => self.store.set_todo_due(id, due),
+                TodoAction::SetDone(id, done) if self.prefs.view == View::Todos => {
+                    // the Todos view holds the row in place, then moves it (or an untick
+                    // during the hold cancels that)
+                    self.todos_state.moves.toggle(id, done);
+                    if done {
+                        self.store.complete_todo(id, now)
+                    } else {
+                        self.store.reopen_todo(id)
+                    }
+                }
                 TodoAction::SetDone(id, true) => self.store.complete_todo(id, now),
                 TodoAction::SetDone(id, false) => self.store.reopen_todo(id),
                 TodoAction::Snooze { id, until } => self.store.snooze_todo(id, until),

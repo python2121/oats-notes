@@ -115,6 +115,9 @@ pub struct TodosState {
     pub editing: Option<(i64, String)>,
     /// Give the open edit field keyboard focus this frame.
     pub focus_edit: bool,
+    /// Todos ticked or unticked a moment ago, held in their old place, then moving to their
+    /// new one ([`crate::motion`]; started by the app, which sees every `SetDone`).
+    pub moves: crate::motion::Moves<i64>,
 }
 
 /// "Thu 12 Dec, 09:00" (the year added when it isn't `now`'s).
@@ -266,6 +269,13 @@ pub fn todos_view(
     let mut actions = Vec::new();
     let now = Local::now();
     let open = todos.iter().filter(|x| !x.done()).count();
+    // the rows in transition: only those the data still agrees with, and still there
+    let keys: Vec<(i64, bool)> = todos.iter().map(|x| (x.id, x.done())).collect();
+    state.moves.drop_mismatched(keys.iter().copied());
+    state
+        .moves
+        .retain_keys(&keys.iter().map(|k| k.0).collect::<Vec<_>>());
+    state.moves.tick(ui.ctx());
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add_space(14.0);
@@ -358,8 +368,11 @@ pub fn todos_view(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let mut completed_heading = false;
-            for todo in todos {
-                if todo.done() && !completed_heading {
+            let entries =
+                crate::motion::arrange(ui.ctx(), egui::Id::new("todos-list"), &keys, &state.moves);
+            for (i, slot) in entries {
+                let todo = &todos[i];
+                if slot.shows_done(todo.done()) && !completed_heading {
                     completed_heading = true;
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -375,7 +388,9 @@ pub fn todos_view(
                     });
                     ui.add_space(2.0);
                 }
-                todo_row(ui, &t, state, todo, nodes, &now, &mut actions);
+                slot.show(ui, "todo-row", |ui| {
+                    todo_row(ui, &t, state, todo, nodes, &now, &mut actions);
+                });
             }
             ui.add_space(10.0);
         });
