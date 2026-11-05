@@ -242,7 +242,7 @@ impl Store {
     pub fn forget_speaker(&self, id: i64) -> Result<bool, StoreError> {
         let gone = self.with_savepoint(|s| {
             s.conn.execute(
-                "UPDATE segments SET speaker_id = NULL WHERE speaker_id = ?1",
+                "UPDATE segments SET speaker_id = NULL, speaker_sure = NULL WHERE speaker_id = ?1",
                 [id],
             )?;
             Ok(s.conn.execute("DELETE FROM speakers WHERE id = ?1", [id])? > 0)
@@ -366,7 +366,9 @@ mod tests {
             AudioSourceKind::System,
             None,
             Some(b),
+            Some(false),
         )?;
+        assert_eq!(row.speaker_sure, Some(false));
         assert_eq!(row.speaker_id, Some(b));
         let back = s.segment(row.id)?;
         assert_eq!(back.and_then(|r| r.speaker_id), Some(b));
@@ -425,6 +427,7 @@ mod tests {
                 AudioSourceKind::Mic,
                 None,
                 Some(sp),
+                None,
             )
         };
         let s1 = seg(a)?;

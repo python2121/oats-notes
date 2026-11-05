@@ -1408,7 +1408,7 @@ pub(crate) fn episode_card(
                                 ui.ctx(),
                                 egui::Id::new(("card-items", e.id)),
                                 &keys,
-                                &state.moves,
+                                &mut state.moves,
                             );
                             for (i, slot) in entries {
                                 let a = items[i];
@@ -1417,7 +1417,7 @@ pub(crate) fn episode_card(
                                         ui.set_min_height(ui.spacing().interact_size.y);
                                         ui.add_space(6.0);
                                         let mut done = a.done_at.is_some();
-                                        if action_checkbox(ui, &mut done) {
+                                        if action_checkbox(ui, &mut done, (e.id, &a.text)) {
                                             actions.push(NotesAction::SetActionItemDone {
                                                 episode_id: e.id,
                                                 text: a.text.clone(),
@@ -2184,9 +2184,9 @@ pub fn next_steps_shown(steps: &[NextStep], show_all: bool) -> (usize, bool) {
 
 /// An action item's checkbox (the todos' look), centred on the first line of its 12.5-pt
 /// text. True when the user toggled it.
-fn action_checkbox(ui: &mut egui::Ui, done: &mut bool) -> bool {
+fn action_checkbox(ui: &mut egui::Ui, done: &mut bool, key: (i64, &str)) -> bool {
     let was = *done;
-    crate::widgets::check_box(ui, done, &egui::FontId::proportional(12.5))
+    crate::widgets::check_box(ui, done, &egui::FontId::proportional(12.5), ("item", key))
         .on_hover_text(if was { "Mark not done" } else { "Mark done" })
         .changed()
 }
@@ -2240,7 +2240,7 @@ fn next_steps(
         ui.ctx(),
         egui::Id::new(("next-steps", salt)),
         &keys,
-        &state.moves,
+        &mut state.moves,
     );
     // Collapsed, the list shows the open items up to the cap ([`next_steps_shown`]; an item
     // held in its old place still counts as open); the rest is revealed by "Show all".
@@ -2292,7 +2292,7 @@ fn next_step_row(
         ui.set_min_height(ui.spacing().interact_size.y);
         ui.add_space(10.0);
         let mut done = s.done_at.is_some();
-        if action_checkbox(ui, &mut done) {
+        if action_checkbox(ui, &mut done, (s.episode_id, &s.text)) {
             actions.push(NotesAction::SetActionItemDone {
                 episode_id: s.episode_id,
                 text: s.text.clone(),

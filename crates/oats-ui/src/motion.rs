@@ -192,11 +192,16 @@ pub fn arrange<K: Clone + PartialEq + Send + Sync + 'static>(
     ctx: &Context,
     list: Id,
     keys: &[(K, bool)],
-    moves: &Moves<K>,
+    moves: &mut Moves<K>,
 ) -> Vec<(usize, Slot)> {
     let now = ctx.input(|i| i.time);
     let prev = drawn::<K>(ctx, list);
-    let out = arrange_with(keys, moves, prev.as_deref(), now);
+    let mut out = arrange_with(keys, moves, prev.as_deref(), now);
+    // a row whose old and new places are next to each other does not move: no hold, no
+    // retract-and-grow (the user's rule) — it is drawn plainly and its transition ends
+    for i in settle_unmoved(&mut out) {
+        moves.items.retain(|m| m.key != keys[i].0);
+    }
     let record: Vec<(K, bool)> = out
         .iter()
         .filter_map(|(i, s)| match s {
@@ -208,6 +213,31 @@ pub fn arrange<K: Clone + PartialEq + Send + Sync + 'static>(
     let frame = ctx.cumulative_frame_nr();
     ctx.data_mut(|d| d.insert_temp::<Drawn<K>>(list, (frame, record)));
     out
+}
+
+/// Collapse the transitions whose `Old` copy sits right next to their `New` place (the row
+/// would stay where it is): both become one `Plain` entry at the data's place. Returns the
+/// indices (into the list's keys) of the transitions to end. Pure.
+pub fn settle_unmoved(out: &mut Vec<(usize, Slot)>) -> Vec<usize> {
+    let mut settled = Vec::new();
+    let mut j = 0;
+    while j + 1 < out.len() {
+        let pair = match (out[j], out[j + 1]) {
+            ((a, Slot::Old { .. }), (b, Slot::New { .. })) if a == b => Some(j),
+            ((a, Slot::New { .. }), (b, Slot::Old { .. })) if a == b => Some(j + 1),
+            _ => None,
+        };
+        if let Some(old_at) = pair {
+            let i = out[old_at].0;
+            out.remove(old_at);
+            // whichever of the pair was removed, the other now sits at j
+            out[j] = (i, Slot::Plain);
+            settled.push(i);
+        } else {
+            j += 1;
+        }
+    }
+    settled
 }
 
 /// [`arrange`]'s pure part (`prev`: what the list drew last frame).
@@ -311,6 +341,75 @@ mod tests {
         let prev2 = [(1, false), (2, true), (3, false), (9, false)];
         let out2 = arrange_with(&keys, &m, Some(&prev2), 5.0);
         assert_eq!(out2, out);
+    }
+
+    #[test]
+    fn a_row_whose_old_and_new_places_touch_does_not_move() {
+        // keys: [a open, b done] — b was drawn at index 1 (plain) last frame and now
+        // completes: its old place (1) and new place (after a) are the same spot
+        let mut out = vec![
+            (0, Slot::Plain),
+            (
+                1,
+                Slot::Old {
+                    serial: 1,
+                    moving: false,
+                },
+            ),
+            (
+                1,
+                Slot::New {
+                    serial: 1,
+                    moving: false,
+                },
+            ),
+            (2, Slot::Plain),
+        ];
+        assert_eq!(settle_unmoved(&mut out), vec![1]);
+        assert_eq!(
+            out,
+            vec![(0, Slot::Plain), (1, Slot::Plain), (2, Slot::Plain)]
+        );
+        // the other order (reopening upward) too
+        let mut out = vec![
+            (
+                1,
+                Slot::New {
+                    serial: 1,
+                    moving: true,
+                },
+            ),
+            (
+                1,
+                Slot::Old {
+                    serial: 1,
+                    moving: true,
+                },
+            ),
+            (0, Slot::Plain),
+        ];
+        assert_eq!(settle_unmoved(&mut out), vec![1]);
+        assert_eq!(out, vec![(1, Slot::Plain), (0, Slot::Plain)]);
+        // a real move (something in between) is left alone
+        let mut out = vec![
+            (
+                1,
+                Slot::Old {
+                    serial: 1,
+                    moving: false,
+                },
+            ),
+            (0, Slot::Plain),
+            (
+                1,
+                Slot::New {
+                    serial: 1,
+                    moving: false,
+                },
+            ),
+        ];
+        assert!(settle_unmoved(&mut out).is_empty());
+        assert_eq!(out.len(), 3);
     }
 
     #[test]

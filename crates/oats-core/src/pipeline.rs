@@ -1299,10 +1299,10 @@ impl Session<'_> {
         } else {
             None
         };
-        let (speaker_id, voice) = if echo_of.is_none() {
+        let (speaker_id, voice, speaker_sure) = if echo_of.is_none() {
             self.identify_speaker(source, seg, ended_at, t.processing_ms)
         } else {
-            (None, None)
+            (None, None, None)
         };
         let mut row = match self.store.insert_segment_full(
             session_id,
@@ -1313,6 +1313,7 @@ impl Session<'_> {
             source,
             echo_of,
             speaker_id,
+            speaker_sure,
         ) {
             Ok(row) => row,
             Err(e) => {
@@ -1366,10 +1367,10 @@ impl Session<'_> {
         seg: &Segment,
         ended_at: i64,
         transcribe_ms: f64,
-    ) -> (Option<i64>, Option<(Vec<f32>, i64)>) {
+    ) -> (Option<i64>, Option<(Vec<f32>, i64)>, Option<bool>) {
         if !self.out.speakers.load(Ordering::Relaxed) || seg.duration_ms() < SPEAKER_MIN_SEGMENT_MS
         {
-            return (None, None);
+            return (None, None, None);
         }
         // system audio: media (a video, music) gets no speaker pass at all, and only a CALL
         // (a meeting app / page, or "On a call") may create NEW voices — a film clip in a
@@ -1378,7 +1379,7 @@ impl Session<'_> {
         let may_create = match source {
             AudioSourceKind::Mic => true,
             AudioSourceKind::System => match self.stamp_now() {
-                Some(m) if m.is_media() => return (None, None),
+                Some(m) if m.is_media() => return (None, None, None),
                 Some(m) => m.class == MediaClass::Meeting,
                 None => false,
             },
@@ -1397,7 +1398,7 @@ impl Session<'_> {
                 }
                 Err(e) => {
                     log::warn!("speakers: could not load the voices: {e}");
-                    return (None, None);
+                    return (None, None, None);
                 }
             }
         }
@@ -1411,13 +1412,13 @@ impl Session<'_> {
                     source.as_str(),
                     seg.duration_ms()
                 );
-                return (None, None);
+                return (None, None, None);
             }
         };
         let model_ms = t.elapsed().as_millis() as u64;
         if spans.is_empty() && model_ms == 0 {
             // an engine without speaker models: nothing ran, nothing to count
-            return (None, None);
+            return (None, None, None);
         }
         self.speakers.stats.speaker_segments += 1;
         self.speakers.stats.speaker_ms += model_ms;
@@ -1427,11 +1428,12 @@ impl Session<'_> {
         let mut assigned = Vec::with_capacity(spans.len());
         let mut created = 0u32;
         let Some(book) = self.speakers.book.as_mut() else {
-            return (None, None);
+            return (None, None, None);
         };
         // per span: the voice it was assigned to (index into `spans`)
         let mut span_voice: Vec<Option<i64>> = Vec::with_capacity(spans.len());
         let mut ambiguous = 0u32;
+        let mut sure: Vec<i64> = Vec::new();
         for span in &spans {
             let secs = span.speech_ms as f64 / 1000.0;
             let a = book.assign(&span.embedding, secs, mic, ended_at, |centroid, secs| {
@@ -1450,6 +1452,10 @@ impl Session<'_> {
             if let Some(a) = a {
                 if a.ambiguous {
                     ambiguous += 1;
+                }
+                // a sure match: the span taught the voice (or opened it)
+                if a.updated || a.created {
+                    sure.push(a.speaker_id);
                 }
                 if a.created {
                     created += 1;
@@ -1545,7 +1551,9 @@ impl Session<'_> {
             self.flush_speakers();
         }
         self.publish_speaker_stats();
-        (dominant, voice)
+        // sure when the dominant voice learned from (or was opened by) one of its spans
+        let speaker_sure = dominant.map(|d| sure.contains(&d));
+        (dominant, voice, speaker_sure)
     }
 
     /// Write the changed voiceprints back (one transaction).

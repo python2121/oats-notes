@@ -52,7 +52,12 @@ pub fn paint_glyph_centered(
 /// The tick pops: on the change to checked the check mark scales in over [`TICK_POP`] with a
 /// slight overshoot (`back_out`) and settles; unchecking fades it out over [`TICK_FADE`]. At
 /// rest (and with motion off) it is egui's own `Checkbox`, pixel for pixel.
-pub fn check_box(ui: &mut Ui, checked: &mut bool, font: &FontId) -> Response {
+pub fn check_box(
+    ui: &mut Ui,
+    checked: &mut bool,
+    font: &FontId,
+    key: impl std::hash::Hash + std::fmt::Debug,
+) -> Response {
     let row_h = ui.ctx().fonts_mut(|f| f.row_height(font));
     let cap = cap_center(ui, font);
     let side = ui.spacing().interact_size.y;
@@ -86,8 +91,11 @@ pub fn check_box(ui: &mut Ui, checked: &mut bool, font: &FontId) -> Response {
         (true, true) => TICK_POP,
         (true, false) => TICK_FADE,
     };
-    // linear progress; the easing is applied when painting (`back_out` overshoots past 1)
-    let p = ctx.animate_bool_with_time(resp.id.with("tick-pop"), *checked, time);
+    // linear progress; the easing is applied when painting (`back_out` overshoots past 1).
+    // Keyed on the ITEM (`key`), not on the widget's positional id: when a row's slot goes
+    // away every checkbox below it takes the next id, and an unchecked box inheriting a
+    // checked one's state flashed a fading mark.
+    let p = ctx.animate_bool_with_time(egui::Id::new(("tick-pop", key)), *checked, time);
     if !child.is_rect_visible(rect) {
         return resp;
     }
@@ -338,7 +346,7 @@ mod tests {
                     };
                     ui.with_layout(layout, |ui| {
                         let mut on = true;
-                        let b = check_box(ui, &mut on, &font);
+                        let b = check_box(ui, &mut on, &font, 1);
                         let l = ui.label(egui::RichText::new("Hello").font(font.clone()));
                         let cap = cap_center(ui, &font);
                         out = Some((b.rect.center().y, l.rect.top() + cap));
@@ -377,7 +385,7 @@ mod tests {
         let mut on = true;
         for i in 0..3 {
             frame(&ctx, f64::from(i) / 60.0, |ui| {
-                check_box(ui, &mut on, &font);
+                check_box(ui, &mut on, &font, 1);
             });
         }
         assert!(!ctx.has_requested_repaint(), "first sight: at rest");
@@ -387,7 +395,7 @@ mod tests {
         let mut t = 0.1;
         for _ in 0..20 {
             frame(&ctx, t, |ui| {
-                check_box(ui, &mut on, &font);
+                check_box(ui, &mut on, &font, 1);
             });
             t += 1.0 / 60.0;
         }
@@ -396,7 +404,7 @@ mod tests {
         let mut moving = 0;
         for _ in 0..30 {
             let out = frame(&ctx, t, |ui| {
-                check_box(ui, &mut on, &font);
+                check_box(ui, &mut on, &font, 1);
             });
             if out.viewport_output[&egui::ViewportId::ROOT].repaint_delay
                 == std::time::Duration::ZERO

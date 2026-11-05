@@ -368,8 +368,12 @@ pub fn todos_view(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let mut completed_heading = false;
-            let entries =
-                crate::motion::arrange(ui.ctx(), egui::Id::new("todos-list"), &keys, &state.moves);
+            let entries = crate::motion::arrange(
+                ui.ctx(),
+                egui::Id::new("todos-list"),
+                &keys,
+                &mut state.moves,
+            );
             for (i, slot) in entries {
                 let todo = &todos[i];
                 if slot.shows_done(todo.done()) && !completed_heading {
@@ -409,7 +413,7 @@ fn todo_row(
     ui.horizontal_top(|ui| {
         ui.add_space(12.0);
         let mut done = todo.done();
-        if crate::widgets::check_box(ui, &mut done, &t.font(13.0))
+        if crate::widgets::check_box(ui, &mut done, &t.font(13.0), ("todo", todo.id))
             .on_hover_text(if todo.done() {
                 "Mark not done"
             } else {

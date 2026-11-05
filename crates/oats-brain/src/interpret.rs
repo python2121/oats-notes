@@ -2909,6 +2909,7 @@ mod tests {
                 mic,
                 None,
                 Some(me),
+                None,
             )
             .unwrap(),
             s.insert_segment_full(
@@ -2920,6 +2921,7 @@ mod tests {
                 src,
                 None,
                 Some(anon),
+                None,
             )
             .unwrap(),
             s.insert_segment_full(
@@ -2931,6 +2933,7 @@ mod tests {
                 src,
                 None,
                 Some(priya),
+                None,
             )
             .unwrap(),
         ];

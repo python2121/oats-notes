@@ -100,6 +100,11 @@ pub struct TranscriptRow {
     /// The dominant voice of the segment (v10: `segments.speaker_id`; see
     /// [`crate::speakers`]), `None` when speaker recognition is off or nobody could be told.
     pub speaker_id: Option<i64>,
+    /// v12: whether the voice is a sure match — the line taught the voice (or was a user's
+    /// correction, or opened the voice); `Some(false)` = tagged on a loose or ambiguous match
+    /// that taught nothing (the UI shows the name without its pill); `None` = unknown (older
+    /// rows, no voice).
+    pub speaker_sure: Option<bool>,
 }
 
 /// What [`Store::search`] found.
@@ -595,7 +600,7 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// At most this many tags in a search's Tags section.
 pub const TAG_LIMIT: usize = 40;
@@ -753,7 +758,7 @@ ALTER TABLE segments ADD COLUMN source TEXT NOT NULL DEFAULT 'mic';
 ALTER TABLE segments ADD COLUMN echo_of INTEGER;
 ";
 
-const SEGMENT_COLUMNS: &str = "id, session_id, started_at, ended_at, text, confidence, node_id, episode_id, interpreted_at, categorised, source, echo_of, media_kind, media_ref, speaker_id";
+const SEGMENT_COLUMNS: &str = "id, session_id, started_at, ended_at, text, confidence, node_id, episode_id, interpreted_at, categorised, source, echo_of, media_kind, media_ref, speaker_id, speaker_sure";
 
 /// Longer than any stored segment (the segmenter caps them at 30 s): how far before a
 /// window [`Store::segments_near`] looks for segments reaching into it.
@@ -785,6 +790,7 @@ fn row_to_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRow> {
             .and_then(crate::media::MediaClass::parse),
         media_ref: row.get(13)?,
         speaker_id: row.get(14)?,
+        speaker_sure: row.get::<_, Option<i64>>(15)?.map(|v| v != 0),
     })
 }
 
@@ -1223,6 +1229,13 @@ impl Store {
                 conn.execute_batch(SCHEMA)?;
                 conn.execute_batch(SCHEMA_REST)?;
             }
+            Some(11) => {
+                // v11 → v12 is `segments.speaker_sure`, added by `ensure_speaker_sure_column`
+                // below
+                log::info!("migrating the database from schema 11 to {SCHEMA_VERSION}");
+                conn.execute_batch(SCHEMA)?;
+                conn.execute_batch(SCHEMA_REST)?;
+            }
             Some(5) => {
                 // v5 → v6 is the event re-key + orphan cleanup, `migrate_event_keys` below
                 log::info!("migrating the database from schema 5 to {SCHEMA_VERSION}");
@@ -1243,6 +1256,7 @@ impl Store {
         Self::ensure_media_schema(conn)?;
         Self::ensure_speakers_schema(conn)?;
         Self::ensure_voices_schema(conn)?;
+        Self::ensure_speaker_sure_column(conn)?;
         if from_version.is_some_and(|v| v < 6) {
             Self::migrate_event_keys(conn)?;
         }
@@ -1613,8 +1627,21 @@ impl Store {
         echo_of: Option<i64>,
     ) -> Result<TranscriptRow, StoreError> {
         self.insert_segment_full(
-            session_id, started_at, ended_at, text, confidence, source, echo_of, None,
+            session_id, started_at, ended_at, text, confidence, source, echo_of, None, None,
         )
+    }
+
+    /// v12: `segments.speaker_sure` (see [`TranscriptRow::speaker_sure`]), added in place.
+    fn ensure_speaker_sure_column(conn: &rusqlite::Connection) -> Result<(), StoreError> {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('segments') WHERE name = 'speaker_sure'",
+            [],
+            |r| r.get(0),
+        )?;
+        if n == 0 {
+            conn.execute_batch("ALTER TABLE segments ADD COLUMN speaker_sure INTEGER;")?;
+        }
+        Ok(())
     }
 
     /// [`Self::insert_segment_from`] with the segment's voice (`speakers.id`), in the same
@@ -1630,10 +1657,11 @@ impl Store {
         source: AudioSourceKind,
         echo_of: Option<i64>,
         speaker_id: Option<i64>,
+        speaker_sure: Option<bool>,
     ) -> Result<TranscriptRow, StoreError> {
         self.conn.execute(
-            "INSERT INTO segments(session_id, started_at, ended_at, text, confidence, source, echo_of, speaker_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO segments(session_id, started_at, ended_at, text, confidence, source, echo_of, speaker_id, speaker_sure)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 session_id,
                 started_at,
@@ -1642,7 +1670,8 @@ impl Store {
                 confidence.map(f64::from),
                 source.as_str(),
                 echo_of,
-                speaker_id
+                speaker_id,
+                speaker_sure.map(i64::from)
             ],
         )?;
         Ok(TranscriptRow {
@@ -1661,6 +1690,7 @@ impl Store {
             media_kind: None,
             media_ref: None,
             speaker_id,
+            speaker_sure,
         })
     }
 

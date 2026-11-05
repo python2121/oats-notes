@@ -44,6 +44,7 @@ pub fn me_label(map: &SpeakerMap) -> RowLabel {
         text: "me".to_owned(),
         voice: map.values().find(|s| s.is_me).map(|s| s.id),
         hover: "me (microphone)".to_owned(),
+        tentative: false,
     }
 }
 
@@ -54,6 +55,9 @@ pub struct RowLabel {
     /// The voice's colour (`None` = the lane tag's accent).
     pub voice: Option<i64>,
     pub hover: String,
+    /// A loose or ambiguous match that taught the voice nothing
+    /// (`TranscriptRow::speaker_sure == Some(false)`): the name without its pill.
+    pub tentative: bool,
 }
 
 /// The tag under a row's time: `None` for the user's own lines (microphone, no voice or the
@@ -67,6 +71,7 @@ pub fn row_label(row: &TranscriptRow, map: &SpeakerMap) -> Option<RowLabel> {
             text: tag.to_owned(),
             voice: None,
             hover: "media — a video or music on system audio".to_owned(),
+            tentative: false,
         });
     }
     let speaker = row.speaker_id.and_then(|id| map.get(&id));
@@ -78,17 +83,22 @@ pub fn row_label(row: &TranscriptRow, map: &SpeakerMap) -> Option<RowLabel> {
                 AudioSourceKind::Mic => "microphone",
                 AudioSourceKind::System => "system audio",
             };
-            let hover = if s.brain_named() {
+            let tentative = row.speaker_sure == Some(false);
+            let mut hover = if s.brain_named() {
                 format!("{text} — named from the conversation — right-click to correct")
             } else if s.name.is_some() || s.is_me {
                 format!("{text} ({lane})")
             } else {
                 format!("{text} — an unnamed voice ({lane}); right-click ▸ Speaker to name it")
             };
+            if tentative {
+                hover.push_str(" — a tentative match (too loose to learn from); right-click ▸ This line was to confirm");
+            }
             Some(RowLabel {
                 text,
                 voice: Some(s.id),
                 hover,
+                tentative,
             })
         }
         None => match row.source {
@@ -97,6 +107,7 @@ pub fn row_label(row: &TranscriptRow, map: &SpeakerMap) -> Option<RowLabel> {
                 text: "them".to_owned(),
                 voice: None,
                 hover: "them — system audio (what the computer played)".to_owned(),
+                tentative: false,
             }),
         },
     }
@@ -119,7 +130,10 @@ pub fn paint_tag(ui: &egui::Ui, t: &Tokens, at: egui::Pos2, label: &RowLabel, ma
         galley = p.layout_no_wrap(cut, t.mono(8.5), colour);
     }
     let rect = Rect::from_min_size(at, galley.size() + vec2(8.0, 2.0));
-    p.rect_filled(rect, 3.0, colour.gamma_multiply(0.16));
+    // a tentative match keeps the name and colour but loses the pill
+    if !label.tentative {
+        p.rect_filled(rect, 3.0, colour.gamma_multiply(0.16));
+    }
     p.galley(at + vec2(4.0, 1.0), galley, colour);
 }
 
@@ -149,7 +163,7 @@ fn open_draft(ui: &egui::Ui, d: SpeakerDraft) {
 }
 
 /// At most this many voices are listed in "This line was ▸" (type to narrow the rest).
-pub const PICKER_ROWS: usize = 12;
+pub const PICKER_ROWS: usize = 8;
 
 /// The voices "This line was ▸" lists for the search `text`: a case-insensitive substring of
 /// the name or the label ("them 3", "voice 4", "me"; empty = all), the most recently heard
@@ -180,6 +194,13 @@ pub fn picker_voices<'a>(
 struct PickerState {
     text: String,
     drawn_pass: u64,
+    /// The list's height in rows, fixed when the submenu opened (the unfiltered count, at
+    /// most [`PICKER_ROWS`]): a submenu that changes height is re-anchored by egui and jumps
+    /// about under the pointer, and a list that reserves rows it never fills reads as blank
+    /// space. While a filter leaves fewer rows, the rest stays empty.
+    rows: usize,
+    /// More voices than [`PICKER_ROWS`] when it opened: a "type to narrow" line is kept.
+    more: bool,
 }
 
 fn picker_id() -> egui::Id {
@@ -207,6 +228,9 @@ fn voice_picker(
     let opened = st.drawn_pass + 1 < pass;
     if opened {
         st.text.clear();
+        let all = picker_voices(map, "", row.source).len();
+        st.rows = all.min(PICKER_ROWS);
+        st.more = all > PICKER_ROWS;
     }
     st.drawn_pass = pass;
     let mut action = None;
@@ -240,8 +264,7 @@ fn voice_picker(
     if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.close();
     }
-    // The list keeps the height of PICKER_ROWS rows whatever the filter leaves (a submenu
-    // that shrinks is re-anchored by egui and jumps about under the pointer).
+    // the list keeps the height it opened with (`PickerState::rows`)
     let mut row_h = None;
     for s in voices.iter().take(PICKER_ROWS) {
         let label = speaker_label(Some(s), row.source);
@@ -253,22 +276,27 @@ fn voice_picker(
         }
     }
     let shown = voices.len().min(PICKER_ROWS);
-    if shown < PICKER_ROWS {
+    if voices.is_empty() {
+        ui.label(RichText::new("No voice matches").size(11.0).weak());
+    }
+    if shown < st.rows {
         let row_h = row_h.unwrap_or_else(|| {
             let text = ui.text_style_height(&egui::TextStyle::Button);
             (text + 2.0 * ui.spacing().button_padding.y).max(ui.spacing().interact_size.y)
         });
         let gap = ui.spacing().item_spacing.y;
-        ui.add_space((PICKER_ROWS - shown) as f32 * (row_h + gap) - gap);
+        // the "No voice matches" line stands in for one row
+        let blank = st.rows - shown - usize::from(voices.is_empty());
+        ui.add_space(blank as f32 * (row_h + gap) - gap);
     }
-    let note = if voices.len() > PICKER_ROWS {
-        format!("and {} more — type to narrow", voices.len() - PICKER_ROWS)
-    } else if voices.is_empty() {
-        "No voice matches".to_owned()
-    } else {
-        " ".to_owned() // the line is kept, so the height is
-    };
-    ui.label(RichText::new(note).size(11.0).weak());
+    if st.more {
+        let note = if voices.len() > PICKER_ROWS {
+            format!("and {} more — type to narrow", voices.len() - PICKER_ROWS)
+        } else {
+            " ".to_owned() // the line is kept, so the height is
+        };
+        ui.label(RichText::new(note).size(11.0).weak());
+    }
     ui.separator();
     if ui
         .button("Someone new…")
@@ -567,6 +595,7 @@ mod tests {
         let row = |source, speaker_id| TranscriptRow {
             source,
             speaker_id,
+            speaker_sure: None,
             ..TranscriptRow::default()
         };
         assert_eq!(row_label(&row(AudioSourceKind::Mic, None), &m), None);

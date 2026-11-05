@@ -139,7 +139,9 @@ impl Store {
         speaker: Option<i64>,
     ) -> Result<bool, StoreError> {
         Ok(self.conn.execute(
-            "UPDATE segments SET speaker_id = ?2 WHERE id = ?1",
+            "UPDATE segments SET speaker_id = ?2,
+                 speaker_sure = CASE WHEN ?2 IS NULL THEN NULL ELSE 1 END
+             WHERE id = ?1",
             rusqlite::params![segment, speaker],
         )? > 0)
     }
@@ -393,7 +395,7 @@ mod tests {
     }
 
     fn line(s: &Store, session: i64, source: AudioSourceKind, voice: Option<i64>) -> i64 {
-        s.insert_segment_full(session, 0, 5000, "words", None, source, None, voice)
+        s.insert_segment_full(session, 0, 5000, "words", None, source, None, voice, None)
             .map(|r| r.id)
             .unwrap_or(-1)
     }

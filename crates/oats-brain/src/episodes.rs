@@ -540,6 +540,7 @@ mod tests {
         .collect();
         let with = |r: TranscriptRow, sp: i64| TranscriptRow {
             speaker_id: Some(sp),
+            speaker_sure: None,
             ..r
         };
         let rows = [

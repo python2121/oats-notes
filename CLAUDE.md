@@ -986,6 +986,14 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   so every segment delete (user delete, `purge_transcripts`, media deletes) takes its row.
   Kept `VOICE_EMBEDDING_KEEP_DAYS` = 30 (a correction is made soon after the fact):
   `Store::prune_segment_voices(now)` at every `Store::open` and at each session end.
+- **Store v12**: `segments.speaker_sure INTEGER NULL` (`TranscriptRow::speaker_sure`, added
+  in place by `ensure_speaker_sure_column`; a v11 binary refuses v12): 1 when the line's
+  dominant voice learned from one of its spans or was opened by it (`Assignment::updated |
+  created`), 0 when it was tagged on a match too loose / ambiguous / short to learn from,
+  NULL for older rows and lines without a voice; a user's correction sets 1, Forget / Nobody
+  NULL. **The UI** draws a `speaker_sure == Some(false)` tag as the name in the voice's colour
+  WITHOUT its pill (`RowLabel::tentative`, `paint_tag`; the hover says "a tentative match")
+  — the user's rule: a match too weak to teach the voiceprint is shown as a guess.
 - **Correcting a line**: the row menu's FIRST entry (every non-media row, with or without a
   voice) is **"This line was ▸"**: a search field (focused on open,
   "name…"; a case-insensitive substring of the name or the label, e.g. "them 3"), the matching
@@ -1071,7 +1079,7 @@ nested transaction (`Store::with_savepoint`; outermost `BEGIN IMMEDIATE`, inner 
 `SAVEPOINT`, rolled back on error or panic). `episodes.id` is `AUTOINCREMENT` (an older table
 is rebuilt in place on open, same schema version), so a reset or merged episode's id is never
 handed to a later episode that would adopt its events.
-Schema version 11 (`meta.schema_version`; v11 added `segment_voices` (each line's own
+Schema version 12 (`meta.schema_version`; v12 added `segments.speaker_sure` (see Speakers); v11 added `segment_voices` (each line's own
 speaker embedding, 30 days) and v10 `speakers` + `segments.speaker_id` — see "Speakers" —, v9 removed the Media category — see "Media on the
 system lane" —, v7/v8 added the media tables, v6 re-keyed events; v5 added `episodes.user_edited_at`; a v1 file is migrated on open — `categories` become
 the root `nodes` with the same ids, `segments` is rebuilt — a v2 file gets two columns

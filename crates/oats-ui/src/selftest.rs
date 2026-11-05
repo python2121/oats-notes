@@ -495,6 +495,8 @@ fn seed(store: &Store, due_now: bool) -> Result<(), oats_core::StoreError> {
             source,
             None,
             Some(voice_of(i)),
+            // one tentative match (the name without its pill) for the render
+            Some(i != 3),
         )?;
         if i == 6 {
             store.insert_segment_from(
