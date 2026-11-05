@@ -3,7 +3,7 @@
 //! grouped under a heading whenever the local day changes).
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
-use egui::{Align2, Rect, Sense, pos2, vec2};
+use egui::{Align2, Rect, Sense, Vec2, pos2, vec2};
 use oats_core::{AudioSourceKind, TranscriptRow};
 
 use crate::move_to::{MoveDraft, move_field};
@@ -495,6 +495,18 @@ fn transcript_row(
     let left = ui.max_rect().left();
     let right = ui.max_rect().right();
     let voices = crate::speakers::map(ui.ctx());
+    // The row's own click target (hover fill, right-click menu) is registered BEFORE its labels
+    // with a placeholder rect, and given its real rect after them (egui keeps a widget's place
+    // in the hit-test order on re-registration): the selectable labels are then ON TOP of it,
+    // so a press on the text starts a text selection (click_and_drag) that can run across rows,
+    // instead of the row taking the press. The labels' right-clicks open the row's menu too.
+    let row_id = ui.id().with(("segment", row.id));
+    ui.interact(
+        Rect::from_min_size(pos2(left + 4.0, ui.cursor().top() - 2.0), Vec2::ZERO),
+        row_id,
+        Sense::CLICK,
+    );
+    let mut labels: Option<egui::Response> = None;
     let inner = ui
         .horizontal_top(|ui| {
             ui.add_space(8.0);
@@ -502,8 +514,8 @@ fn transcript_row(
             let tag = crate::speakers::row_label(row, &voices)
                 .unwrap_or_else(|| crate::speakers::me_label(&voices));
             let (time_rect, time_resp) = ui.allocate_exact_size(vec2(TIME_W, 32.0), Sense::hover());
-            // a real (non-selectable) label so the time is also in the accessibility tree
-            ui.put(
+            // a real label: in the accessibility tree, and selectable with the row's text
+            let time_label = ui.put(
                 Rect::from_min_size(
                     pos2(time_rect.left() + 4.0, time_rect.top() + 3.0),
                     vec2(TIME_W - 4.0, 14.0),
@@ -513,21 +525,23 @@ fn transcript_row(
                         .font(t.mono(10.5))
                         .color(t.text_tertiary),
                 )
-                .selectable(false)
+                .selectable(true)
                 .wrap_mode(egui::TextWrapMode::Extend),
             );
             let (at, max_w) = crate::speakers::tag_pos(time_rect);
             crate::speakers::paint_tag(ui, t, at, &tag, max_w);
-            time_resp.on_hover_text(tag.hover);
+            // the speaker's hover text over the time too (the label sits on top of the slot)
+            time_resp.union(time_label.clone()).on_hover_text(tag.hover);
             let w = (ui.available_width() - 44.0).max(60.0);
             ui.vertical(|ui| {
                 ui.set_width(w);
                 ui.add_space(1.0);
-                ui.add(
+                let text = ui.add(
                     egui::Label::new(egui::RichText::new(&row.text).color(t.text).size(13.0))
                         .wrap()
-                        .selectable(false),
+                        .selectable(true),
                 );
+                labels = Some(time_label.union(text));
             });
         })
         .response;
@@ -535,8 +549,13 @@ fn transcript_row(
         pos2(left + 4.0, inner.rect.top() - 2.0),
         pos2(right - 4.0, inner.rect.bottom() + 2.0),
     );
-    let resp = ui.interact(rect, ui.id().with(("segment", row.id)), Sense::click());
-    if resp.hovered() || resp.context_menu_opened() {
+    let mut resp = ui.interact(rect, row_id, Sense::click());
+    if let Some(labels) = labels {
+        // keeps the row's id (the menu's state) and adds the labels' clicks
+        resp = resp.union(labels);
+    }
+    // `contains_pointer`, not `hovered`: over the text the label on top is the hovered widget
+    if resp.contains_pointer() || resp.context_menu_opened() {
         ui.painter().set(
             fill,
             egui::Shape::rect_filled(rect, 4.0, t.hover.gamma_multiply(0.6)),
@@ -725,5 +744,83 @@ mod tests {
         assert!(!p.armed && !p.has_earlier, "a short page ends the history");
         assert!(p.contains_row(6) && p.remove_row(6) && !p.remove_row(6));
         assert_eq!(p.rows.len(), 4);
+    }
+
+    /// A drag from the first row's text into the second's selects across both rows (the row's
+    /// own click target sits under the labels), ⌘C copies them in reading order, and a
+    /// right-click on the text still opens the row's menu.
+    #[cfg(feature = "selftest")]
+    #[test]
+    fn transcript_text_is_selectable_across_rows_and_keeps_the_row_menu() {
+        use egui_kittest::kittest::Queryable;
+        let rows = vec![
+            TranscriptRow {
+                text: "alpha bravo charlie".to_owned(),
+                ..row(1, 1_700_000_000_000)
+            },
+            TranscriptRow {
+                text: "delta echo foxtrot".to_owned(),
+                ..row(2, 1_700_000_060_000)
+            },
+        ];
+        let mut draft = None;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(600.0, 300.0))
+            .build_ui(move |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    transcript_rows(ui, &rows, &mut draft);
+                });
+            });
+        harness.run();
+        let first = harness.get_by_label("alpha bravo charlie").rect();
+        let second = harness.get_by_label("delta echo foxtrot").rect();
+        assert!(first.bottom() <= second.top());
+
+        let start = pos2(first.left() + 1.0, first.center().y);
+        let end = pos2(second.right() - 1.0, second.center().y);
+        harness.hover_at(start);
+        harness.run();
+        harness.drag_at(start);
+        harness.run();
+        harness.hover_at(pos2(start.x + 20.0, start.y + 10.0));
+        harness.run();
+        harness.hover_at(end);
+        harness.run();
+        harness.drop_at(end);
+        harness.run();
+        harness.event(egui::Event::Copy);
+        harness.step();
+        let copied = harness
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                egui::OutputCommand::CopyText(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("⌘C copied the selection");
+        let a = copied
+            .find("alpha bravo charlie")
+            .expect("first row copied");
+        let d = copied
+            .find("delta echo foxtrot")
+            .expect("second row copied");
+        assert!(a < d, "reading order: {copied:?}");
+
+        // right-click on the text: the row's menu
+        let at = second.center();
+        harness.hover_at(at);
+        harness.run();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+        assert!(harness.query_by_label("Copy Text").is_some());
     }
 }
