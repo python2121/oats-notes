@@ -216,13 +216,21 @@ fn card_frame(t: &Tokens, shadow: egui::epaint::Shadow, light: bool) -> egui::Fr
 
 /// The × in a card's top-right corner, its ink centred on the capitals of the first line of
 /// text set in `line` that starts at the row's top (the card's title / message).
-fn close_button(ui: &mut egui::Ui, t: &Tokens, tip: &str, line: &egui::FontId) -> bool {
+/// The × of a card. `salt` is the card's own id: sibling cards share the child ui's stable
+/// `ui.id()`, so a bare `ui.id().with("close")` was one widget id for every card on screen.
+fn close_button(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    tip: &str,
+    line: &egui::FontId,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+) -> bool {
     let top = ui.cursor().top();
     let (slot, _) = ui.allocate_exact_size(vec2(CLOSE_W, 18.0), Sense::hover());
     let center = pos2(slot.center().x, top + crate::widgets::cap_center(ui, line));
     let hit = egui::Rect::from_center_size(center, vec2(18.0, 18.0));
     let resp = ui
-        .interact(hit, ui.id().with("close"), Sense::click())
+        .interact(hit, ui.id().with(("close", salt)), Sense::click())
         .on_hover_text(tip);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "×"));
     crate::widgets::paint_glyph_centered(
@@ -274,7 +282,7 @@ fn confirmation_card(
                     );
                 },
             );
-            if close_button(ui, t, "Dismiss", &font) {
+            if close_button(ui, t, "Dismiss", &font, c.id) {
                 dismissed.push(c.id);
             }
         });
@@ -311,7 +319,7 @@ fn reminder_card(
                 ui.label(RichText::new(when).color(t.text_secondary).size(11.5));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                if close_button(ui, t, "Done — mark complete", &title) {
+                if close_button(ui, t, "Done — mark complete", &title, todo.id) {
                     actions.push(ToastAction::Done(todo.id));
                 }
             });
@@ -434,6 +442,49 @@ mod tests {
         assert_eq!(s.confirmations.len(), 2);
         assert_eq!(s.expire(8.0), None);
         assert!(s.confirmations.is_empty());
+    }
+
+    /// Runs one frame of the stack with egui's id-clash check on and returns whether egui
+    /// painted a "Double use of widget ID" warning (anything on its debug layer).
+    fn clash_painted(due: &[Todo], confirmations: usize) -> bool {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        ctx.options_mut(|o| o.warn_on_id_clash = true);
+        let mut state = ToastState::default();
+        for i in 0..confirmations {
+            state.confirm(format!("Moved to Work › Project {i}"), 0.0);
+        }
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                vec2(1100.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        ctx.begin_pass(raw);
+        let content = egui::Rect::from_min_max(pos2(260.0, 60.0), pos2(1100.0, 700.0));
+        toasts(&ctx, content, due, &mut state);
+        let painted =
+            ctx.graphics(|g| g.get(egui::LayerId::debug()).is_some_and(|l| !l.is_empty()));
+        ctx.end_pass().textures_delta.clear();
+        painted
+    }
+
+    #[test]
+    fn several_cards_at_once_do_not_reuse_a_widget_id() {
+        // the × of every card used the child ui's stable id (the same for sibling cards), so
+        // a second confirmation or a reminder under a confirmation drew egui's red
+        // "Double use of widget ID" at the × — off the right edge of the window
+        assert!(
+            !clash_painted(&[], 2),
+            "two confirmations share a close-button id"
+        );
+        let due = [todo(1, Some(100), None), todo(2, Some(300), None)];
+        assert!(
+            !clash_painted(&due, 1),
+            "a confirmation over reminders shares a close-button id"
+        );
+        assert!(!clash_painted(&due, 0), "two reminders share ids");
     }
 
     #[test]
