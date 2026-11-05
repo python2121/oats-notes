@@ -935,6 +935,68 @@ pub fn name_key(name: &str) -> String {
         .to_lowercase()
 }
 
+/// What may follow a project's name in a title before the note's own subject: "Project: …",
+/// "Project - …", "Project – …", "Project — …".
+const TITLE_SEPARATORS: [&str; 4] = [":", " - ", " – ", " — "];
+
+/// A note's title without the name of the place it is filed under: "Development team call:
+/// Commerce, Delamar" under the project "Development team call" is "Commerce, Delamar". The
+/// prefix is one of `names` (case- and whitespace-insensitive, at a word boundary), at most
+/// two more words ("… call", "… status", "… weekly sync") and a [`TITLE_SEPARATORS`]
+/// separator, with something left after it. `None` when nothing is to strip.
+pub fn strip_title_prefix(title: &str, names: &[&str]) -> Option<String> {
+    let t = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = t.to_lowercase();
+    if lower.chars().count() != t.chars().count() {
+        return None;
+    }
+    for name in names {
+        let key = name_key(name);
+        if key.is_empty() || !lower.starts_with(&key) {
+            continue;
+        }
+        let rest: String = t.chars().skip(key.chars().count()).collect();
+        let Some((at, sep)) = TITLE_SEPARATORS
+            .iter()
+            .filter_map(|s| rest.find(s).map(|i| (i, *s)))
+            .min_by_key(|(i, _)| *i)
+        else {
+            continue;
+        };
+        let between = &rest[..at];
+        if !between.is_empty() && !between.starts_with(' ') {
+            continue; // "Commerce projects: …" under "Commerce project"
+        }
+        if between.split_whitespace().count() > 2 {
+            continue;
+        }
+        let after = rest[at + sep.len()..].trim();
+        let mut chars = after.chars();
+        let Some(first) = chars.next() else {
+            continue;
+        };
+        let mut out: String = first.to_uppercase().collect();
+        out.push_str(chars.as_str());
+        return Some(out);
+    }
+    None
+}
+
+/// The names a note filed under `node_id` must not repeat in its title: the node's own and,
+/// for a topic, its project's.
+pub fn home_names(nodes: &[Node], node_id: i64) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(n) = nodes.iter().find(|n| n.id == node_id) {
+        out.push(n.name.clone());
+        if n.kind == NodeKind::Topic
+            && let Some(p) = n.parent_id.and_then(|p| nodes.iter().find(|m| m.id == p))
+        {
+            out.push(p.name.clone());
+        }
+    }
+    out
+}
+
 /// The `dedupe_key` of an event the brain's interpretation proposed: `ev:<local date
 /// YYYY-MM-DD>:<name_key(title)>`. It carries no episode id, so a re-interpretation, a revision
 /// or a second meeting that mentions the same event on the same day all land on one row.
@@ -1180,6 +1242,7 @@ impl Store {
         if from_version.is_some_and(|v| v < 9) {
             self.migrate_media_category()?;
         }
+        self.strip_project_prefixes_once()?;
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -1399,6 +1462,42 @@ impl Store {
     }
 
     // ---- meta -------------------------------------------------------------------------
+
+    /// Once per database (`meta.titles_stripped`): every conversation note the user has not
+    /// edited loses its home's name as a title prefix ([`strip_title_prefix`]) — the brain
+    /// used to title series notes "Development team call: …" under that very project.
+    pub fn strip_project_prefixes_once(&self) -> Result<usize, StoreError> {
+        const KEY: &str = "titles_stripped";
+        if self.meta(KEY)?.is_some() {
+            return Ok(0);
+        }
+        let nodes = self.nodes()?;
+        let rows: Vec<(i64, String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, title, node_id FROM episodes
+                 WHERE kind = 'conversation' AND node_id IS NOT NULL AND user_edited_at IS NULL",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut n = 0;
+        for (id, title, node) in rows {
+            let names = home_names(&nodes, node);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            if let Some(t) = strip_title_prefix(&title, &names) {
+                self.conn.execute(
+                    "UPDATE episodes SET title = ?1 WHERE id = ?2",
+                    rusqlite::params![t, id],
+                )?;
+                n += 1;
+            }
+        }
+        self.set_meta(KEY, "1")?;
+        if n > 0 {
+            log::info!("{n} note title(s) lost their project's name as a prefix");
+        }
+        Ok(n)
+    }
 
     pub fn meta(&self, key: &str) -> Result<Option<String>, StoreError> {
         use rusqlite::OptionalExtension;
@@ -3382,6 +3481,70 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_title_loses_its_projects_name_as_a_prefix() {
+        let s = |t: &str, n: &[&str]| strip_title_prefix(t, n);
+        assert_eq!(
+            s(
+                "Development team call: Commerce, Delamar, project spreadsheet",
+                &["Development team call"]
+            )
+            .as_deref(),
+            Some("Commerce, Delamar, project spreadsheet")
+        );
+        // up to two words between the name and the separator
+        assert_eq!(
+            s(
+                "Battery supply call: Ford and SK agreements",
+                &["Battery supply"]
+            )
+            .as_deref(),
+            Some("Ford and SK agreements")
+        );
+        assert_eq!(
+            s(
+                "Commerce project status - mobilization",
+                &["Commerce project"]
+            )
+            .as_deref(),
+            Some("Mobilization")
+        );
+        assert_eq!(
+            s(
+                "energy  management CALL — certificates",
+                &["Energy Management"]
+            )
+            .as_deref(),
+            Some("Certificates")
+        );
+        // the second name (a topic's project) counts too
+        assert_eq!(
+            s(
+                "Commerce project: safe harbor",
+                &["Tax", "Commerce project"]
+            )
+            .as_deref(),
+            Some("Safe harbor")
+        );
+        // untouched: no separator, a different word, too many words between, nothing after,
+        // the name only as part of a word
+        assert_eq!(
+            s("Overton land, interconnection", &["Overton project"]),
+            None
+        );
+        assert_eq!(s("Commerce projects: foo", &["Commerce project"]), None);
+        assert_eq!(
+            s(
+                "Commerce project weekly status call: foo",
+                &["Commerce project"]
+            ),
+            None
+        );
+        assert_eq!(s("Commerce project:", &["Commerce project"]), None);
+        assert_eq!(s("Pipeline, board approvals", &["1:1 with Cody"]), None);
+        assert_eq!(s("Anything", &[""]), None);
+    }
 
     type R = Result<(), StoreError>;
 

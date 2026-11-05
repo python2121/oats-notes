@@ -50,5 +50,6 @@ pub use speakers::{Assignment, NameSource, Speaker, SpeakerBook, SpeakerEntry, s
 pub use store::{
     ActionItem, BrainRun, Change, Decision, Episode, EpisodeContent, Event, NewEvent, NewTodo,
     Node, NodeKind, Note, NoteItem, Origin, RunOutcome, SearchResults, Session, Store, StoreError,
-    Todo, TodoFilter, TodoState, TranscriptPurge, TranscriptRow, View,
+    Todo, TodoFilter, TodoState, TranscriptPurge, TranscriptRow, View, home_names,
+    strip_title_prefix,
 };

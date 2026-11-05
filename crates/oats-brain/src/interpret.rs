@@ -1065,6 +1065,24 @@ pub fn apply_interpretation(
     })
 }
 
+/// `title` without the name of its home (and a topic's project) as a prefix — the nodes
+/// created in this run count too (`oats_core::strip_title_prefix`).
+pub(crate) fn strip_home_prefix(
+    title: &str,
+    tree: &[Node],
+    new_nodes: &[Node],
+    node_id: Option<i64>,
+) -> String {
+    let Some(node) = node_id else {
+        return title.to_owned();
+    };
+    let mut nodes: Vec<Node> = tree.to_vec();
+    nodes.extend(new_nodes.iter().cloned());
+    let names = oats_core::home_names(&nodes, node);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    oats_core::strip_title_prefix(title, &names).unwrap_or_else(|| title.to_owned())
+}
+
 fn apply_interpretation_in_tx(
     store: &Store,
     tree: &[Node],
@@ -1101,6 +1119,9 @@ fn apply_interpretation_in_tx(
     } else {
         interp.title.trim().to_owned()
     };
+    // "Development team call: Commerce, Delamar" filed under Development team call reads
+    // "Commerce, Delamar": the path above the note already says where it is
+    let title = strip_home_prefix(&title, tree, &new_nodes, node_id);
     let content = EpisodeContent {
         title,
         summary: interp.summary.trim().to_owned(),
@@ -2269,6 +2290,28 @@ mod tests {
             .map(|a| a.done_at)
             .collect();
         assert_eq!(done, vec![Some(2_000), None]);
+    }
+
+    #[test]
+    fn a_title_repeating_the_notes_home_is_stored_without_it() {
+        // the home is the project created in this very run
+        let (s, tree, chunk) = seeded();
+        let work = s.categories().unwrap()[0].id;
+        let v = json!({
+            "title": "Exporter: the launch checklist",
+            "summary": "- checklist",
+            "low_signal": false,
+            "node_id": work,
+            "new_project": {"parent_id": work, "name": "Exporter", "description": ""},
+            "new_topic": null, "decisions": [], "action_items": [], "topics": [], "events": []
+        });
+        let interp = parse_interpretation(&v).unwrap();
+        let applied = apply_interpretation(
+            &s, &tree, &chunk, &interp, None, "sonnet", None, None, 3, 20_000,
+        )
+        .unwrap();
+        assert_eq!(applied.new_nodes[0].name, "Exporter");
+        assert_eq!(applied.episode.title, "The launch checklist");
     }
 
     #[test]

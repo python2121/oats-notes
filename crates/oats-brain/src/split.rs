@@ -231,12 +231,13 @@ fn content_of(
         segments: rows.to_vec(),
     };
     let title = note.title.trim();
+    let title: String = if title.is_empty() {
+        "Untitled".to_owned()
+    } else {
+        title.chars().take(200).collect()
+    };
     EpisodeContent {
-        title: if title.is_empty() {
-            "Untitled".to_owned()
-        } else {
-            title.chars().take(200).collect()
-        },
+        title: crate::interpret::strip_home_prefix(&title, tree, &[], home),
         summary: note.summary.trim().to_owned(),
         node_id: home,
         decisions: decisions_of(tree, &chunk, &note.decisions, home),
