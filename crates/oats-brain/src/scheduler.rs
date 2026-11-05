@@ -423,6 +423,9 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(15 * 60);
 const TIER0_WAIT: Duration = Duration::from_secs(5 * 60);
 /// How long the thread waits before restarting after a panic outside a job.
 const RESTART_PAUSE: Duration = Duration::from_secs(60);
+/// A spoken split waiting for the speech before it to be interpreted is dropped (with a
+/// warning) after this long.
+const DEFERRED_SPLIT_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// What one chunk of an interpretation run came to.
 enum ChunkStep {
@@ -534,6 +537,20 @@ enum Avail {
     },
 }
 
+/// "hey computer, split the last note…" said before the speech it means was interpreted
+/// (`hotword::Executed::SplitDeferred`): resolved and run after the forced interpretation.
+#[derive(Clone, Debug)]
+struct DeferredSplit {
+    note_ref: Option<String>,
+    text: String,
+    /// The latest note's `ended_at` when it was said.
+    newer_than: i64,
+    since: Instant,
+    /// The command's segment, and when it was spoken (only speech before it counts).
+    segment_id: i64,
+    spoken_at: i64,
+}
+
 /// A hotword segment waiting to be run as a command.
 #[derive(Clone, Debug)]
 struct PendingCommand {
@@ -564,6 +581,7 @@ struct Worker {
     rewrite: VecDeque<i64>,
     moves: VecDeque<(crate::moveto::MoveTarget, String, Option<i64>)>,
     splits: VecDeque<(i64, String)>,
+    deferred_splits: VecDeque<DeferredSplit>,
     undo: VecDeque<i64>,
     categorise_due: Option<Instant>,
     interpret_due: Option<Instant>,
@@ -667,6 +685,7 @@ impl Worker {
             rewrite: VecDeque::new(),
             moves: VecDeque::new(),
             splits: VecDeque::new(),
+            deferred_splits: VecDeque::new(),
             undo: VecDeque::new(),
             categorise_due: None,
             interpret_due: None,
@@ -860,6 +879,7 @@ impl Worker {
             if self.cancel.load(Ordering::Relaxed) {
                 return;
             }
+            self.expire_deferred_splits();
             let now = Instant::now();
             let due = |t: Option<Instant>| t.is_some_and(|t| t <= now);
             let up = self.cli_ready();
@@ -955,6 +975,7 @@ impl Worker {
                     let force = std::mem::take(&mut self.interpret_force);
                     self.run_interpret(force);
                     self.settled("interpret", None);
+                    self.run_deferred_splits();
                     continue;
                 }
                 if due(self.review_due) {
@@ -981,10 +1002,22 @@ impl Worker {
                 ]
                 .into_iter()
                 .chain(self.pending_commands.iter().map(|p| p.not_before))
+                .chain(
+                    self.deferred_splits
+                        .iter()
+                        .map(|d| Some(d.since + DEFERRED_SPLIT_MAX)),
+                )
                 .flatten()
                 .min()
             } else {
                 self.probe_due()
+                    .into_iter()
+                    .chain(
+                        self.deferred_splits
+                            .iter()
+                            .map(|d| d.since + DEFERRED_SPLIT_MAX),
+                    )
+                    .min()
             };
             let cmd = match next {
                 Some(t) => match cmd_rx.recv_timeout(t.saturating_duration_since(Instant::now())) {
@@ -1319,6 +1352,9 @@ impl Worker {
         let spoken = local_at(seg.started_at);
         let max_new_nodes = self.cfg.max_new_nodes_per_run;
         let job_seg = seg.clone();
+        // spoken splits: only resolved inside the command; each runs as its own job after it
+        let mut spoken_splits: Vec<hotword::Executed> = Vec::new();
+        let splits_out = &mut spoken_splits;
         let r = self.run_job(Tier::Reactive, "command", move |w, _run_id| {
             let seg = job_seg;
             let tree = w.store.nodes().map_err(|e| e.to_string())?;
@@ -1369,6 +1405,17 @@ impl Worker {
                     cost_usd: resp.cost_usd,
                     ..JobError::from(e.to_string())
                 })?;
+            splits_out.extend(
+                done.iter()
+                    .filter(|d| {
+                        matches!(
+                            d,
+                            hotword::Executed::SplitQueued { .. }
+                                | hotword::Executed::SplitDeferred { .. }
+                        )
+                    })
+                    .cloned(),
+            );
             let lines: Vec<String> = done.iter().map(|d| d.describe(&Local)).collect();
             w.out.send(BrainEvent::Command {
                 segment_id: seg.id,
@@ -1385,7 +1432,7 @@ impl Worker {
             })
         });
         match r {
-            Ok(()) => {}
+            Ok(()) => self.start_spoken_splits(spoken_splits, &seg),
             // claude went away: the command waits for it, untried
             Err(e) if e.unavailable => self.pending_commands.push_front(cmd),
             Err(e) => {
@@ -1400,6 +1447,93 @@ impl Worker {
             }
         }
         self.report_backlog();
+    }
+
+    /// The splits a voice command asked for: a resolved one runs now (its own tier-1 job,
+    /// shown pending on the note's Split… button by `Queued` … `Settled` as a click would);
+    /// a deferred one forces an interpretation run and waits in `deferred_splits`.
+    fn start_spoken_splits(&mut self, splits: Vec<hotword::Executed>, seg: &TranscriptRow) {
+        for d in splits {
+            match d {
+                hotword::Executed::SplitQueued { episode, text, .. } => {
+                    self.run_spoken_split(episode, &text);
+                }
+                hotword::Executed::SplitDeferred {
+                    note_ref,
+                    text,
+                    newer_than,
+                } => {
+                    self.deferred_splits.push_back(DeferredSplit {
+                        note_ref,
+                        text,
+                        newer_than,
+                        since: Instant::now(),
+                        segment_id: seg.id,
+                        spoken_at: seg.started_at,
+                    });
+                    self.interpret_force = true;
+                    self.interpret_due = Some(Instant::now());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn run_spoken_split(&mut self, id: i64, text: &str) {
+        self.queued("split", Some(id));
+        self.run_split(id, text);
+        self.settled("split", Some(id));
+    }
+
+    /// After an interpretation run: each deferred split whose speech is interpreted now is
+    /// resolved and run; one still waiting stays (until [`DEFERRED_SPLIT_MAX`]); one that
+    /// resolves to nothing is dropped with a warning.
+    fn run_deferred_splits(&mut self) {
+        self.expire_deferred_splits();
+        let waiting = std::mem::take(&mut self.deferred_splits);
+        for d in waiting {
+            let warn =
+                |w: &Worker, why: &str| w.out.send(BrainEvent::Warning(format!("split: {why}")));
+            match hotword::split_waits_for_speech(&self.store, d.spoken_at) {
+                Ok(Some(_)) => {
+                    self.deferred_splits.push_back(d);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn(self, &e.to_string());
+                    continue;
+                }
+            }
+            match hotword::resolve_deferred_split(
+                &self.store,
+                d.note_ref.as_deref(),
+                d.newer_than,
+                d.spoken_at,
+            ) {
+                Ok(Ok(ep)) => {
+                    log::info!(
+                        "brain: running the split spoken in segment {}",
+                        d.segment_id
+                    );
+                    self.run_spoken_split(ep.id, &d.text);
+                }
+                Ok(Err(why)) => warn(self, &why),
+                Err(e) => warn(self, &e.to_string()),
+            }
+        }
+    }
+
+    /// Drop deferred splits older than [`DEFERRED_SPLIT_MAX`] with a warning.
+    fn expire_deferred_splits(&mut self) {
+        let before = self.deferred_splits.len();
+        self.deferred_splits
+            .retain(|d| d.since.elapsed() < DEFERRED_SPLIT_MAX);
+        for _ in self.deferred_splits.len()..before {
+            self.out.send(BrainEvent::Warning(
+                "split: the latest note never appeared".to_owned(),
+            ));
+        }
     }
 
     /// "Move to…": one tier-0 call picks an existing node or proposes one new project for
@@ -2255,17 +2389,26 @@ mod tests {
         assert_eq!(c.interpret_every, Duration::from_secs(900));
     }
 
-    /// A fake `claude` that answers by schema: an interpretation, a categorisation or a
-    /// command, so one script serves every job.
+    /// A fake `claude` that answers by schema: an interpretation, a categorisation, a split
+    /// (line 2 goes to a new "To-dos" note) or a command (a spoken "split the last note" is
+    /// a `split_note`, anything else the property-taxes example), so one script serves every
+    /// job.
     fn fake_cli(dir: &std::path::Path) -> ClaudeCli {
         let script = dir.join("claude");
         let body = r#"#!/bin/sh
 ARGS="$*"
-cat > /dev/null
 case "$ARGS" in
   *--version*) echo "2.1.312 (Claude Code)"; exit 0;;
+esac
+INPUT=$(cat)
+case "$ARGS" in
+  *new_lines*) echo '{"type":"result","is_error":false,"result":"","total_cost_usd":0.02,"duration_ms":700,"structured_output":{"keep":{"title":"Exporter planning","summary":"- ship Friday","decisions":[],"action_items":[],"topics":["exporter"],"node_id":null},"new":{"title":"To-dos","summary":"- tests","decisions":[],"action_items":[],"topics":["to-dos"],"node_id":null},"new_lines":[2]}}';;
   *low_signal*) echo '{"type":"result","is_error":false,"result":"","total_cost_usd":0.011,"duration_ms":900,"structured_output":{"title":"Exporter planning","summary":"- ship Friday","low_signal":false,"node_id":1,"new_project":{"parent_id":1,"name":"Exporter","description":"csv"},"new_topic":null,"decisions":[],"action_items":[{"text":"tests","owner":"Sam","due":null}],"topics":["exporter"],"events":[]}}';;
-  *intent*) echo '{"type":"result","is_error":false,"result":"","total_cost_usd":0.002,"duration_ms":300,"structured_output":{"actions":[{"intent":"add_event","title":"Property taxes due","date":"2026-12-12","time":null,"all_day":true,"relative_to_event":false,"offset_days":null,"text":null,"details":"","node_name":null,"category_name":null},{"intent":"add_reminder","title":null,"date":null,"time":null,"all_day":true,"relative_to_event":true,"offset_days":-7,"text":null,"details":null,"node_name":null,"category_name":null}]}}';;
+  *intent*)
+    case "$INPUT" in
+      *"split the last note"*) echo '{"type":"result","is_error":false,"result":"","total_cost_usd":0.002,"duration_ms":300,"structured_output":{"actions":[{"intent":"split_note","title":null,"date":null,"time":null,"all_day":false,"relative_to_event":false,"offset_days":null,"in_minutes":null,"text":"the to-dos","details":null,"node_name":null,"category_name":null,"note_ref":null}]}}';;
+      *) echo '{"type":"result","is_error":false,"result":"","total_cost_usd":0.002,"duration_ms":300,"structured_output":{"actions":[{"intent":"add_event","title":"Property taxes due","date":"2026-12-12","time":null,"all_day":true,"relative_to_event":false,"offset_days":null,"text":null,"details":"","node_name":null,"category_name":null},{"intent":"add_reminder","title":null,"date":null,"time":null,"all_day":true,"relative_to_event":true,"offset_days":-7,"text":null,"details":null,"node_name":null,"category_name":null}]}}';;
+    esac;;
   *segment_id*) echo '{"type":"result","is_error":false,"result":"","total_cost_usd":0.001,"duration_ms":200,"structured_output":{"items":[]}}';;
   *) echo '{"type":"result","is_error":true,"result":"unexpected request"}';;
 esac
@@ -2936,6 +3079,219 @@ esac
             ]
         );
         assert!(w.store.runs(5).unwrap().is_empty(), "no call was made");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An interpreted two-line note, `t` .. `t + 3 min`.
+    fn two_line_note(store: &Store, t: i64) -> (oats_core::Episode, Vec<i64>) {
+        let sid = store.begin_session(0, "e").unwrap();
+        let segs: Vec<i64> = [
+            LONG_TEXT,
+            "and Sam writes the tests before the review on Monday",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let at = t + i as i64 * 180_000;
+            store
+                .insert_segment(sid, at, at + 5_000, text, None)
+                .unwrap()
+                .id
+        })
+        .collect();
+        let ep = store
+            .insert_episode(
+                t,
+                t + 185_000,
+                &EpisodeContent {
+                    title: "Exporter planning".into(),
+                    ..Default::default()
+                },
+                t,
+            )
+            .unwrap();
+        store.mark_segments_interpreted(&segs, ep.id, t).unwrap();
+        (ep, segs)
+    }
+
+    /// "hey computer, split the last note, the to-dos go in their own note": one command
+    /// run resolves the latest note, then a split run of its own splits it; the note's
+    /// Split… button goes pending (`Queued` … `Settled`) as if clicked.
+    #[test]
+    fn a_spoken_split_splits_the_latest_note() {
+        let dir = temp_dir("spoken-split");
+        let (mut w, events) = bare_worker_with_events(fake_cli(&dir));
+        let t = now_ms() - 3_600_000;
+        let (note, segs) = two_line_note(&w.store, t);
+        let sid = w.store.begin_session(0, "e").unwrap();
+        let cmd = w
+            .store
+            .insert_segment(
+                sid,
+                t + 600_000,
+                t + 604_000,
+                "hey computer, split the last note, the to-dos go in their own note",
+                None,
+            )
+            .unwrap();
+        assert!(w.queue_command(cmd.clone()));
+        let pending = w.pending_commands.pop_front().unwrap();
+        w.run_command(pending);
+
+        let all = w.store.episodes(10).unwrap();
+        assert_eq!(all.len(), 2, "{all:?}");
+        let new = all.iter().find(|e| e.id != note.id).unwrap();
+        assert_eq!(new.title, "To-dos");
+        let ids = |id: i64| -> Vec<i64> {
+            w.store
+                .segments_of_episode(id)
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        assert_eq!(ids(note.id), vec![segs[0]]);
+        assert_eq!(ids(new.id), vec![segs[1]]);
+        let seg = w.store.segment(cmd.id).unwrap().unwrap();
+        assert!(
+            seg.interpreted_at.is_some() && seg.episode_id.is_none(),
+            "consumed"
+        );
+        let mut runs: Vec<(String, bool)> = w
+            .store
+            .runs(10)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.kind, r.ok))
+            .collect();
+        runs.reverse();
+        assert_eq!(
+            runs,
+            vec![("command".to_owned(), true), ("split".to_owned(), true)]
+        );
+        let evs: Vec<BrainEvent> = events.try_iter().collect();
+        let confirmations: Vec<String> = evs
+            .iter()
+            .filter_map(|e| match e {
+                BrainEvent::Command { confirmations, .. } => Some(confirmations.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            confirmations,
+            vec!["Splitting “Exporter planning”…", "Split off “To-dos”"]
+        );
+        let at = |want: &BrainEvent| evs.iter().position(|e| e == want).unwrap();
+        let queued = at(&BrainEvent::Queued {
+            kind: "split".into(),
+            id: Some(note.id),
+        });
+        let split = at(&BrainEvent::Split {
+            episode: note.id,
+            new_episode: new.id,
+        });
+        let settled = at(&BrainEvent::Settled {
+            kind: "split".into(),
+            id: Some(note.id),
+        });
+        assert!(queued < split && split < settled, "{evs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Said right after dictating, before the dictation is a note: the command defers the
+    /// split, forces an interpretation run (no InterpretNow needed), and the note that run
+    /// creates is the one split — not the older note.
+    #[test]
+    fn a_spoken_split_waits_for_the_dictation_to_become_a_note() {
+        let dir = temp_dir("deferred-split");
+        let db = dir.join("oats.sqlite");
+        let t = now_ms() - 3 * 3_600_000;
+        let (older, cmd, dictated) = {
+            let s = Store::open(&db).unwrap();
+            let (older, _) = two_line_note(&s, t);
+            let sid = s.begin_session(0, "e").unwrap();
+            let now = now_ms();
+            let dictated: Vec<i64> = [
+                LONG_TEXT,
+                "to-do: book the van and call the printer about the labels",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let at = now - 240_000 + i as i64 * 60_000;
+                s.insert_segment(sid, at, at + 5_000, text, None)
+                    .unwrap()
+                    .id
+            })
+            .collect();
+            let cmd = s
+                .insert_segment(
+                    sid,
+                    now - 30_000,
+                    now - 26_000,
+                    "hey computer, split the last note, the to-dos go in their own note",
+                    None,
+                )
+                .unwrap();
+            (older, cmd, dictated)
+        };
+        let h = Brain {
+            config: BrainConfig {
+                cli: fake_cli(&dir),
+                ..BrainConfig::default()
+            },
+            store_path: db.clone(),
+            wake: Box::new(|| {}),
+        }
+        .spawn();
+        wait_for(&h, "availability", |e| {
+            matches!(e, BrainEvent::Availability(Ok(_)))
+        });
+        h.segment_arrived(cmd.clone());
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !seen
+            .iter()
+            .any(|e| matches!(e, BrainEvent::Settled { kind, .. } if kind == "split"))
+        {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            match h.recv_timeout(left) {
+                Some(ev) => seen.push(ev),
+                None => unreachable!("timed out: {seen:?}"),
+            }
+        }
+        drop(h);
+        let kinds: Vec<&str> = seen
+            .iter()
+            .filter_map(|e| match e {
+                BrainEvent::RunFinished(r) if r.ok => Some(r.kind.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec!["command", "interpret", "split"], "{seen:?}");
+        assert!(seen.iter().any(|e| matches!(e,
+            BrainEvent::Command { confirmations, .. }
+                if confirmations == &vec!["Will split the latest note once it is interpreted".to_owned()])));
+        assert!(seen.iter().any(|e| matches!(e,
+            BrainEvent::Command { confirmations, .. }
+                if confirmations == &vec!["Split off “To-dos”".to_owned()])));
+
+        let s = Store::open(&db).unwrap();
+        let eps = s.episodes(10).unwrap();
+        assert_eq!(eps.len(), 3, "{eps:?}");
+        let made = s.segment(dictated[0]).unwrap().unwrap().episode_id.unwrap();
+        assert_ne!(made, older.id);
+        let split_off = s.segment(dictated[1]).unwrap().unwrap().episode_id.unwrap();
+        assert_ne!(split_off, made, "the dictation's second line moved");
+        assert_eq!(s.episode(split_off).unwrap().unwrap().title, "To-dos");
+        assert_eq!(
+            s.segments_of_episode(older.id).unwrap().len(),
+            2,
+            "the older note is untouched"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

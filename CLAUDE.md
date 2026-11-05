@@ -617,7 +617,7 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   `command.*` (haiku) → actions
   `add_event` / `add_todo` / `add_reminder` (relative offsets: "one week ahead" =
   `offset_days: -7` from the event in the same command) / `add_note` / `create_project` /
-  `unknown`, executed with `source = hotword` and the source segment id. TODOS: a reminder is
+  `split_note` (below) / `unknown`, executed with `source = hotword` and the source segment id. TODOS: a reminder is
   a todo with a due time — `add_todo` and its alias `add_reminder` both write a todo
   (`Executed::Todo`, "Todo: … · due …"). Due times: `in_minutes` ("in 2 hours / 2 days / 3
   weeks", counted from when the command was SPOKEN; whole days keep the clock time across
@@ -640,6 +640,36 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   respects the per-run new-node cap (`execute_capped`). The prompt's "now" is when the
   command was SPOKEN (the segment's timestamp), so a command worked off a backlog still dates
   "tomorrow" from that day.
+  **`split_note`** ("hey computer, split the last note, the to-dos go in their own note",
+  "take the shopping list out of the Room Service note"): fields `note_ref` (≤ 200 chars;
+  how the note was named, null = the most recent) and `text` (what goes into the NEW note;
+  none = `unknown` "split without saying what goes into the new note"). The executor never
+  splits inside `execute_capped`'s savepoint — it only resolves and reports.
+  `hotword::resolve_note_ref(store, note_ref, before)` (pure, tested): null / "last" /
+  "latest" / "most recent" / "that" / "this" (a leading the/my/that/this and a trailing
+  "note"/"one" dropped: "the last note", "that note") → the newest non-low-signal
+  conversation note that started before the command (`Store::latest_note`'s rule, any day);
+  else a `name_key` substring of the titles of `Store::conversations(100)` (newest wins,
+  media never), else of their topics; nothing → `Unknown` "no note called “…”" (or "no note
+  to split"). **Deferral**: the user usually says it right after dictating, before that
+  speech is a note, so when segments that started between the latest note's `ended_at` and
+  the command are still uninterpreted (non-echo, non-media; consumed commands count as
+  interpreted: `Store::uninterpreted_segments_after(after, before)`,
+  `hotword::split_waits_for_speech`) the result is `Executed::SplitDeferred { note_ref, text,
+  newer_than }` ("Split deferred until the latest speech is interpreted"; pop-up "Will split
+  the latest note once it is interpreted"), else `Executed::SplitQueued { episode, title,
+  text }` ("Split queued: <title>"; pop-up "Splitting “<title>”…"). Scheduler: after the
+  command job returns Ok, each queued split runs at once as its own tier-1 `run_split` job
+  (own `brain_runs` row, budget and refusals), wrapped in `BrainEvent::Queued { kind: "split",
+  id }` … `Settled` so the note's Split… button greys with its spinner as for a click; a
+  deferred one sets `interpret_force` + `interpret_due = now` and waits in
+  `Worker::deferred_splits`; after every interpretation run (`run_deferred_splits`) each is
+  re-checked: still waiting → kept; else `hotword::resolve_deferred_split` (for "the last
+  note" the note found must end after `newer_than`, i.e. be new or revised — speech that only
+  became a low-signal fragment = "split: the latest note never appeared"; a named note not
+  found = "split: no note called “…”") and run like a queued one. A deferred split older than
+  30 min (`DEFERRED_SPLIT_MAX`, checked every loop pass, its expiry a wake-up) is dropped with
+  "split: the latest note never appeared".
 - `moveto` ("Move to…" on a note card / single-note view / project-page note row, and on
   transcript rows): right-click → "Move to…" (or the card header's "Move to…" button, leftmost
   of Move to… · Edit · Re-interpret, which toggles it) opens an inline field (placeholder
@@ -715,7 +745,11 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   original) → an `episode_split` change (`by: user`; before = the original's id, content and
   `moved_segment_ids`, after = both ids; recorded, NOT undoable). Success sends
   `BrainEvent::Split { episode, new_episode }`, a `Command` confirmation "Split off “<title>”"
-  (toast + ding), `Changed` and `Settled("split", id)`. The app (`settle_split_draft`) then
+  (toast + ding), `Changed` and `Settled("split", id)`. **Spoken form**: "hey computer, split
+  the last note, the to-dos go in their own note" — the `split_note` voice intent (see
+  `hotword`) resolves the note (or defers until the dictation is interpreted) and the
+  scheduler runs the same `run_split`, sending `Queued("split", id)` itself first so the
+  card's button shows the run pending; with no field open the app only shows the toasts. The app (`settle_split_draft`) then
   closes the field, leaves a single-note view of the original for its project page and flashes
   the new note there (`pending_focus`, when it shows on the current page); on failure the field
   reopens with its text and a "Couldn't split it: <reason>" danger toast (the split run itself

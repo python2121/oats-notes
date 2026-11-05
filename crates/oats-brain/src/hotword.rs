@@ -14,7 +14,8 @@
 use chrono::{DateTime, TimeZone};
 use oats_core::store::name_key;
 use oats_core::{
-    Event, NewEvent, NewTodo, Node, NodeKind, Note, Origin, Store, StoreError, Todo, TranscriptRow,
+    Episode, Event, NewEvent, NewTodo, Node, NodeKind, Note, Origin, Store, StoreError, Todo,
+    TranscriptRow,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -163,6 +164,10 @@ pub struct CommandAction {
     pub node_name: Option<String>,
     #[serde(default)]
     pub category_name: Option<String>,
+    /// `split_note`: how the user referred to the note ("Room Service"); `None` = the most
+    /// recent note.
+    #[serde(default)]
+    pub note_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -183,7 +188,7 @@ pub fn command_schema() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "intent": { "type": "string", "enum": ["add_event", "add_todo", "add_reminder", "add_note", "create_project", "unknown"] },
+                        "intent": { "type": "string", "enum": ["add_event", "add_todo", "add_reminder", "add_note", "create_project", "split_note", "unknown"] },
                         "title": short,
                         "date": { "type": ["string", "null"], "description": "YYYY-MM-DD", "maxLength": 32 },
                         "time": { "type": ["string", "null"], "description": "HH:MM", "maxLength": 32 },
@@ -202,9 +207,14 @@ pub fn command_schema() -> Value {
                         "text": long,
                         "details": long,
                         "node_name": short,
-                        "category_name": short
+                        "category_name": short,
+                        "note_ref": {
+                            "type": ["string", "null"],
+                            "maxLength": MAX_TITLE_CHARS,
+                            "description": "split_note: how the user referred to the note (a title fragment); null = the most recent note"
+                        }
                     },
-                    "required": ["intent", "title", "date", "time", "all_day", "relative_to_event", "offset_days", "in_minutes", "text", "details", "node_name", "category_name"],
+                    "required": ["intent", "title", "date", "time", "all_day", "relative_to_event", "offset_days", "in_minutes", "text", "details", "node_name", "category_name", "note_ref"],
                     "additionalProperties": false
                 }
             }
@@ -260,6 +270,7 @@ pub fn parse_command(v: &Value) -> Result<CommandResult, serde_json::Error> {
             &mut a.time,
             &mut a.node_name,
             &mut a.category_name,
+            &mut a.note_ref,
         ] {
             cut(s, MAX_TITLE_CHARS);
         }
@@ -281,6 +292,22 @@ pub enum Executed {
     Todo(Todo),
     Note(Note),
     Project(Node),
+    /// `split_note` on a note that exists now: the scheduler runs the split (a tier-1 job of
+    /// its own) right after the command. Nothing is split inside the command.
+    SplitQueued {
+        episode: i64,
+        title: String,
+        text: String,
+    },
+    /// `split_note` said while newer speech is still waiting for interpretation (the note it
+    /// means may not exist yet): the scheduler forces an interpretation run and resolves
+    /// `note_ref` after it. `newer_than` = the latest note's `ended_at` when it was said (for
+    /// "the last note", the note found then must end later: a new or revised note).
+    SplitDeferred {
+        note_ref: Option<String>,
+        text: String,
+        newer_than: i64,
+    },
     /// Not understood, or missing what it needed (the text says what).
     Unknown(String),
 }
@@ -314,6 +341,10 @@ impl Executed {
             },
             Executed::Note(n) => format!("Note: {}", n.text),
             Executed::Project(p) => format!("Project: {}", p.name),
+            Executed::SplitQueued { title, .. } => format!("Split queued: {title}"),
+            Executed::SplitDeferred { .. } => {
+                "Split deferred until the latest speech is interpreted".to_owned()
+            }
             Executed::Unknown(t) => format!("Not understood: {t}"),
         }
     }
@@ -360,6 +391,13 @@ impl Executed {
                 format!("Note filed: {text}")
             }
             Executed::Project(p) => format!("Project created: {}", p.name),
+            Executed::SplitQueued { title, .. } => format!("Splitting “{title}”…"),
+            Executed::SplitDeferred { note_ref: None, .. } => {
+                "Will split the latest note once it is interpreted".to_owned()
+            }
+            Executed::SplitDeferred {
+                note_ref: Some(r), ..
+            } => format!("Will split “{r}” once the latest speech is interpreted"),
             Executed::Unknown(_) => return None,
         })
     }
@@ -422,6 +460,97 @@ where
         )?;
     }
     Ok(todo)
+}
+
+/// The words a `note_ref` is reduced to: lower case, single spaces, a leading "the" / "my" /
+/// "that" / "this" and a trailing "note" / "one" dropped ("the Room Service note" → "room service").
+fn note_ref_key(r: &str) -> String {
+    let mut words: Vec<String> = name_key(r)
+        .split(' ')
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_owned())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.len() > 1 && ["the", "my", "that", "this"].contains(&words[0].as_str()) {
+        words.remove(0);
+    }
+    if words.len() > 1 && words.last().is_some_and(|w| w == "note" || w == "one") {
+        words.pop();
+    }
+    words.join(" ")
+}
+
+/// Whether a `note_ref` means "the most recent note".
+fn means_latest(key: &str) -> bool {
+    matches!(
+        key,
+        "" | "last" | "latest" | "most recent" | "that" | "this" | "it" | "note" | "recent"
+    )
+}
+
+/// Whether a `note_ref` means "the most recent note" (`None`, "last", "the latest note",
+/// "that", …).
+pub fn refers_to_latest(note_ref: Option<&str>) -> bool {
+    means_latest(&note_ref.map(note_ref_key).unwrap_or_default())
+}
+
+/// The note a spoken `split_note` means. `None` / "last" / "latest" / "most recent" /
+/// "that" (also "the last note", "that note") → the newest non-low-signal conversation note
+/// (any day, as [`Store::latest_note`]) that started before `before` (the command; a
+/// command worked off a backlog never means speech that came after it); else the newest of
+/// the last 100 conversation notes (media never) whose title contains the words
+/// (`name_key`: case and spacing insensitive), else the newest whose topics do. `Ok(None)` =
+/// no such note.
+pub fn resolve_note_ref(
+    store: &Store,
+    note_ref: Option<&str>,
+    before: i64,
+) -> Result<Option<Episode>, StoreError> {
+    let key = note_ref.map(note_ref_key).unwrap_or_default();
+    if means_latest(&key) {
+        return Ok(store
+            .conversations(LATEST_NOTE_SCAN)?
+            .into_iter()
+            .find(|e| !e.low_signal && e.started_at < before));
+    }
+    let notes = store.conversations(100)?;
+    if let Some(e) = notes.iter().find(|e| name_key(&e.title).contains(&key)) {
+        return Ok(Some(e.clone()));
+    }
+    Ok(notes
+        .into_iter()
+        .find(|e| e.topics.iter().any(|t| name_key(t).contains(&key))))
+}
+
+/// How far back "the latest note" is looked for among the conversation notes.
+const LATEST_NOTE_SCAN: i64 = 500;
+
+/// Whether a split spoken at `before` must wait: speech that started between the end of the
+/// latest note and the command is still uninterpreted (not echoes, not media), so "the last
+/// note" may not exist yet. `Some(that note's ended_at)` (`i64::MIN` with no note at all) =
+/// wait; `None` = resolve now.
+pub fn split_waits_for_speech(store: &Store, before: i64) -> Result<Option<i64>, StoreError> {
+    let newer_than = resolve_note_ref(store, None, before)?
+        .map(|e| e.ended_at)
+        .unwrap_or(i64::MIN);
+    Ok((store.uninterpreted_segments_after(newer_than, before)? > 0).then_some(newer_than))
+}
+
+/// A deferred split, once the speech before it is interpreted: the note it means, or the
+/// warning why there is none ("the latest note never appeared": for "the last note" the
+/// note found must end after `newer_than`, i.e. be new or revised since the command;
+/// "no note called “…”").
+pub fn resolve_deferred_split(
+    store: &Store,
+    note_ref: Option<&str>,
+    newer_than: i64,
+    before: i64,
+) -> Result<Result<Episode, String>, StoreError> {
+    let latest = refers_to_latest(note_ref);
+    Ok(match resolve_note_ref(store, note_ref, before)? {
+        Some(e) if !latest || e.ended_at > newer_than => Ok(e),
+        Some(_) | None if latest => Err("the latest note never appeared".to_owned()),
+        _ => Err(format!("no note called “{}”", note_ref.unwrap_or_default())),
+    })
 }
 
 fn find_by_name(tree: &[Node], name: &str) -> Option<Node> {
@@ -694,6 +823,44 @@ where
                 }
                 out.push(Executed::Project(p));
             }
+            // only resolved and reported here: the split is a tier-1 job of its own, run by
+            // the scheduler after this command (never inside the command's savepoint)
+            "split_note" => {
+                let text = text_of(a);
+                if text.is_empty() {
+                    out.push(Executed::Unknown(
+                        "split without saying what goes into the new note".into(),
+                    ));
+                    continue;
+                }
+                let note_ref = a
+                    .note_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_owned);
+                if let Some(newer_than) = split_waits_for_speech(store, segment.started_at)? {
+                    out.push(Executed::SplitDeferred {
+                        note_ref,
+                        text,
+                        newer_than,
+                    });
+                    continue;
+                }
+                match resolve_note_ref(store, note_ref.as_deref(), segment.started_at)? {
+                    Some(ep) => out.push(Executed::SplitQueued {
+                        episode: ep.id,
+                        title: ep.title,
+                        text,
+                    }),
+                    None => out.push(Executed::Unknown(match note_ref {
+                        Some(r) if !refers_to_latest(Some(&r)) => {
+                            format!("no note called “{r}”")
+                        }
+                        _ => "no note to split".into(),
+                    })),
+                }
+            }
             _ => out.push(Executed::Unknown(text_of(a))),
         }
     }
@@ -950,6 +1117,15 @@ mod tests {
             Some(MAX_TEXT_CHARS)
         );
         assert_eq!(a.offset_days, Some(dates::MAX_OFFSET_DAYS));
+        let with_ref =
+            json!({"actions": [{"intent": "split_note", "note_ref": "y".repeat(5_000)}]});
+        assert_eq!(
+            parse_command(&with_ref).unwrap().actions[0]
+                .note_ref
+                .as_ref()
+                .map(|t| t.chars().count()),
+            Some(MAX_TITLE_CHARS)
+        );
         let schema = command_schema();
         assert_eq!(
             schema["properties"]["actions"]["maxItems"],
@@ -1155,6 +1331,231 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&json!("in_minutes"))
+        );
+    }
+
+    /// Two interpreted notes (the older one tagged "hotel"), then a command spoken after them.
+    fn split_store() -> (Store, oats_core::Episode, oats_core::Episode, TranscriptRow) {
+        let s = Store::open_in_memory().unwrap();
+        let sid = s.begin_session(0, "e").unwrap();
+        let note = |start: i64, title: &str, topics: &[&str]| {
+            let a = s
+                .insert_segment(sid, start, start + 5_000, "first line", None)
+                .unwrap();
+            let b = s
+                .insert_segment(sid, start + 10_000, start + 15_000, "second line", None)
+                .unwrap();
+            let ep = s
+                .insert_episode(
+                    start,
+                    start + 15_000,
+                    &oats_core::EpisodeContent {
+                        title: title.into(),
+                        topics: topics.iter().map(|t| (*t).to_owned()).collect(),
+                        ..Default::default()
+                    },
+                    start,
+                )
+                .unwrap();
+            s.mark_segments_interpreted(&[a.id, b.id], ep.id, start)
+                .unwrap();
+            ep
+        };
+        let room = note(1_000_000, "Room Service plans", &["hotel"]);
+        let groceries = note(2_000_000, "Weekly groceries", &["shopping"]);
+        let cmd = s
+            .insert_segment(
+                sid,
+                3_000_000,
+                3_004_000,
+                "hey computer, split the last note, the to-dos go in their own note",
+                None,
+            )
+            .unwrap();
+        (s, room, groceries, cmd)
+    }
+
+    fn split_action(note_ref: Option<&str>, text: Option<&str>) -> CommandAction {
+        CommandAction {
+            intent: "split_note".into(),
+            note_ref: note_ref.map(str::to_owned),
+            text: text.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    /// A spoken split only resolves the note and reports it: "the last note" (or nothing
+    /// said) is the latest note, a title fragment or a topic names one, an unknown name or a
+    /// missing "what goes into the new note" is not understood. Nothing is written.
+    #[test]
+    fn split_note_resolves_the_note_it_means() {
+        let (s, room, groceries, cmd) = split_store();
+        let tree = s.nodes().unwrap();
+        let tz = FixedOffset::east_opt(0).unwrap();
+        let result = CommandResult {
+            actions: vec![
+                split_action(None, Some("the to-dos")),
+                split_action(Some("the last note"), Some("the to-dos")),
+                split_action(Some("Room  service"), Some("the shopping list")),
+                split_action(Some("the hotel note"), Some("the shopping list")),
+                split_action(Some("Budget review"), Some("the rest")),
+                split_action(None, Some("  ")),
+            ],
+        };
+        let done = execute(&s, &tree, &cmd, &result, 3_005_000, &tz).unwrap();
+        let queued = |i: usize| match &done[i] {
+            Executed::SplitQueued { episode, text, .. } => (*episode, text.as_str()),
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(queued(0), (groceries.id, "the to-dos"));
+        assert_eq!(queued(1).0, groceries.id, "\"the last note\"");
+        assert_eq!(queued(2), (room.id, "the shopping list"));
+        assert_eq!(queued(3).0, room.id, "by its topic");
+        assert_eq!(
+            done[4],
+            Executed::Unknown("no note called “Budget review”".into())
+        );
+        assert_eq!(
+            done[5],
+            Executed::Unknown("split without saying what goes into the new note".into())
+        );
+        assert_eq!(done[0].describe(&tz), "Split queued: Weekly groceries");
+        assert_eq!(
+            done[0].confirmation(&tz).as_deref(),
+            Some("Splitting “Weekly groceries”…")
+        );
+        assert!(s.changes(10).unwrap().is_empty(), "nothing was written");
+        assert_eq!(s.episodes(10).unwrap().len(), 2);
+        // the schema offers the intent and the field
+        let schema = command_schema();
+        let item = &schema["properties"]["actions"]["items"];
+        assert!(
+            item["properties"]["intent"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("split_note"))
+        );
+        assert!(
+            item["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("note_ref"))
+        );
+        assert_eq!(
+            item["properties"]["note_ref"]["maxLength"],
+            json!(MAX_TITLE_CHARS)
+        );
+    }
+
+    /// Said right after dictating, before that speech is a note: deferred. Speech after the
+    /// command, echoes and media don't count; once the speech is a note it is the one meant,
+    /// and if it only became a low-signal fragment the latest note "never appeared".
+    #[test]
+    fn a_split_said_before_the_speech_is_interpreted_is_deferred() {
+        let (s, room, groceries, _) = split_store();
+        let tree = s.nodes().unwrap();
+        let tz = FixedOffset::east_opt(0).unwrap();
+        let sid = s.begin_session(0, "e").unwrap();
+        // speech after the command never defers it
+        let cmd_at = 3_000_000;
+        s.insert_segment(sid, cmd_at + 60_000, cmd_at + 65_000, "later", None)
+            .unwrap();
+        // an echo of system audio before it doesn't either
+        let them = s
+            .insert_segment_from(
+                sid,
+                2_500_000,
+                2_505_000,
+                "on the radio",
+                None,
+                oats_core::AudioSourceKind::System,
+                None,
+            )
+            .unwrap();
+        s.insert_segment_from(
+            sid,
+            2_500_100,
+            2_505_000,
+            "on the radio",
+            None,
+            oats_core::AudioSourceKind::Mic,
+            Some(them.id),
+        )
+        .unwrap();
+        s.mark_segments_interpreted(&[them.id], groceries.id, 1)
+            .unwrap();
+        assert_eq!(split_waits_for_speech(&s, cmd_at).unwrap(), None);
+        // the dictated to-dos, not interpreted yet
+        let dictated = s
+            .insert_segment(sid, 2_600_000, 2_640_000, "to-do: book the van", None)
+            .unwrap();
+        let cmd = s
+            .insert_segment(sid, cmd_at, cmd_at + 4_000, "hey computer split", None)
+            .unwrap();
+        let result = CommandResult {
+            actions: vec![
+                split_action(None, Some("the to-dos")),
+                split_action(Some("Room Service"), Some("the to-dos")),
+            ],
+        };
+        let done = execute(&s, &tree, &cmd, &result, cmd_at + 5_000, &tz).unwrap();
+        assert_eq!(
+            done[0],
+            Executed::SplitDeferred {
+                note_ref: None,
+                text: "the to-dos".into(),
+                newer_than: groceries.ended_at,
+            }
+        );
+        assert!(
+            matches!(&done[1], Executed::SplitDeferred { note_ref: Some(r), .. } if r == "Room Service")
+        );
+        assert_eq!(
+            done[0].describe(&tz),
+            "Split deferred until the latest speech is interpreted"
+        );
+        assert_eq!(
+            done[0].confirmation(&tz).as_deref(),
+            Some("Will split the latest note once it is interpreted")
+        );
+        assert!(split_waits_for_speech(&s, cmd_at).unwrap().is_some());
+        // interpreted into a low-signal fragment only: the latest note never appeared
+        let frag = s
+            .insert_episode(
+                2_600_000,
+                2_640_000,
+                &oats_core::EpisodeContent {
+                    title: "Fragments".into(),
+                    low_signal: true,
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+        s.mark_segments_interpreted(&[dictated.id], frag.id, 2)
+            .unwrap();
+        assert_eq!(split_waits_for_speech(&s, cmd_at).unwrap(), None);
+        assert_eq!(
+            resolve_deferred_split(&s, None, groceries.ended_at, cmd_at).unwrap(),
+            Err("the latest note never appeared".to_owned())
+        );
+        assert_eq!(
+            resolve_deferred_split(&s, Some("Room Service"), groceries.ended_at, cmd_at)
+                .unwrap()
+                .map(|e| e.id),
+            Ok(room.id)
+        );
+        assert_eq!(
+            resolve_deferred_split(&s, Some("Budget"), groceries.ended_at, cmd_at).unwrap(),
+            Err("no note called “Budget”".to_owned())
+        );
+        // interpreted into a real note: that is the one
+        s.set_episode_low_signal(frag.id, false).unwrap();
+        assert_eq!(
+            resolve_deferred_split(&s, Some("that note"), groceries.ended_at, cmd_at)
+                .unwrap()
+                .map(|e| e.id),
+            Ok(frag.id)
         );
     }
 }

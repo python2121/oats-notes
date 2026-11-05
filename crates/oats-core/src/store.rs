@@ -1757,6 +1757,23 @@ impl Store {
         )?)
     }
 
+    /// How many segments that started strictly between `after` and `before` are still
+    /// waiting for interpretation: uninterpreted (a voice command's segment is consumed, i.e.
+    /// interpreted), not echoes, not media rows. A spoken "split the last note" waits for
+    /// these (`after` = the latest note's end, `before` = the command): the speech it means
+    /// may not be a note yet.
+    pub fn uninterpreted_segments_after(&self, after: i64, before: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM segments
+                 WHERE interpreted_at IS NULL AND {NOT_ECHO} AND {NOT_MEDIA}
+                   AND started_at > ?1 AND started_at < ?2"
+            ),
+            rusqlite::params![after, before],
+            |r| r.get(0),
+        )?)
+    }
+
     /// File a segment under a node (`None` = unfiled). Marks it categorised either way (the
     /// user decided), so the automatic pass leaves it alone.
     pub fn set_segment_node(
@@ -3832,6 +3849,10 @@ mod tests {
         );
         assert_eq!(s.uninterpreted_count()?, 3);
         assert_eq!(s.segment_count_since(0)?, 3);
+        // between two moments, echoes left out
+        assert_eq!(s.uninterpreted_segments_after(1_000, i64::MAX)?, 2);
+        assert_eq!(s.uninterpreted_segments_after(1_000, 5_000)?, 1);
+        assert_eq!(s.uninterpreted_segments_after(5_000, i64::MAX)?, 0);
         assert_eq!(ids(s.echoes_of(them.id)?), vec![echo.id]);
         assert_eq!(s.segment(echo.id)?.and_then(|r| r.echo_of), Some(them.id));
         // the echo-rule candidates: system rows reaching into the window, no echoes
