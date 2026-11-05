@@ -1367,8 +1367,8 @@ pub(crate) fn episode_card(
 /// The narrowest a card's title gets beside its buttons before they move to their own row.
 const CARD_TITLE_MIN: f32 = 150.0;
 
-/// A card's buttons (Edit, Re-interpret, Summarise on a media note; or the "Replace your
-/// edits?" question), added right to left.
+/// A card's buttons (Move to…, Edit, Re-interpret, Summarise on a media note; or the "Replace
+/// your edits?" question), added right to left.
 fn card_buttons(
     ui: &mut egui::Ui,
     t: &Tokens,
@@ -1411,6 +1411,15 @@ fn card_buttons(
         if small_button(ui, "Edit", true) {
             state.editing = Some(EditDraft::from_episode(e));
         }
+        // leftmost: toggles the inline "Move to" field (the title's context menu opens it too)
+        if small_button(ui, "Move to…", true) {
+            let target = oats_brain::MoveTarget::Episode(e.id);
+            let open = state
+                .move_draft
+                .as_ref()
+                .is_some_and(|d| d.target == target && !d.sidebar);
+            state.move_draft = (!open).then(|| crate::move_to::MoveDraft::new(target, e.node_id));
+        }
     }
 }
 
@@ -1449,6 +1458,7 @@ fn card_buttons_width(ui: &egui::Ui, state: &NotesState, e: &Episode) -> f32 {
         let mut w = vec![
             brain("reinterpret", Some(e.id), "Re-interpret"),
             crate::widgets::button_width(ui, "Edit", 11.5),
+            crate::widgets::button_width(ui, "Move to…", 11.5),
         ];
         if e.is_media() {
             w.push(brain("summarise", Some(e.id), "Summarise"));

@@ -640,8 +640,14 @@ scheduler, all platform-neutral, all testable without the CLI (a fake `claude` s
   command was SPOKEN (the segment's timestamp), so a command worked off a backlog still dates
   "tomorrow" from that day.
 - `moveto` ("Move to…" on a note card / single-note view / project-page note row, and on
-  transcript rows): right-click → "Move to…" opens an inline field (placeholder "project or
-  topic name, or describe a new one…"; Enter submits, Escape cancels; `oats-ui::move_to`).
+  transcript rows): right-click → "Move to…" (or the card header's "Move to…" button, leftmost
+  of Move to… · Edit · Re-interpret, which toggles it) opens an inline field (placeholder
+  "project or topic name, or describe a new one…"; Enter submits, Escape cancels;
+  `oats-ui::move_to`). A card's or row's field that is no longer drawn (the user navigated
+  away, collapsed the row) is dropped at the start of the next frame
+  (`move_to::drop_stale`: `MoveDraft::shown` / `seen`); a sidebar row's field and one the
+  brain is still answering stay. A move the model resolves to the item's current home changes
+  nothing and confirms "Already in …" (the field then reopens with the usual warning).
   The tree submenu and "New project…" are gone. The app first resolves the text locally with
   no model call (`oats_brain::resolve_local`, pure: a full path "Work › Commerce project" /
   "work/commerce", else an exact name, else a unique prefix, else a unique substring among

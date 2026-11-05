@@ -325,17 +325,19 @@ pub fn execute_move(
             }
             other => return Ok(Err(format!("unknown action '{other}'"))),
         };
-        match target {
-            MoveTarget::Episode(id) => {
-                s.move_episode(id, dest.id, now)?;
-            }
+        let moved = match target {
+            MoveTarget::Episode(id) => s.move_episode(id, dest.id, now)?,
             MoveTarget::Segment(id) => {
                 s.set_segment_node(id, Some(dest.id))?;
+                true
             }
-        }
+        };
         let path = node_path(&s.nodes()?, dest.id);
         let confirmation = if created {
             format!("Created {path} and moved the {}", target.noun())
+        } else if !moved {
+            // the model picked the note's own home: nothing changed, say so
+            format!("Already in {path}")
         } else {
             format!("Moved to {path}")
         };

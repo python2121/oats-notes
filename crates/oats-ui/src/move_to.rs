@@ -23,6 +23,10 @@ pub struct MoveDraft {
     pub from: Option<i64>,
     /// Opened from the sidebar: the field shows under the sidebar row, not on the card.
     pub sidebar: bool,
+    /// The field has been drawn at least once.
+    pub shown: bool,
+    /// The field was drawn this frame (reset by [`drop_stale`]).
+    pub seen: bool,
 }
 
 impl MoveDraft {
@@ -34,6 +38,8 @@ impl MoveDraft {
             sent: false,
             from,
             sidebar: false,
+            shown: false,
+            seen: false,
         }
     }
 
@@ -55,6 +61,21 @@ pub fn move_field(
     move_field_in(ui, t, draft, target, false)
 }
 
+/// Once per frame, before anything is drawn: a card's (or transcript row's) "Move to" field
+/// that was on screen and no longer is — the user navigated away, collapsed the row, the card
+/// is gone — is dropped, so it is not still waiting when they come back (after a failed move
+/// the field reopens with its text; it must not outlive its card). A field the brain is still
+/// answering (`sent`) and a sidebar row's field stay.
+pub fn drop_stale(draft: &mut Option<MoveDraft>) {
+    if let Some(d) = draft {
+        if d.shown && !d.seen && !d.sent && !d.sidebar {
+            *draft = None;
+        } else {
+            d.seen = false;
+        }
+    }
+}
+
 /// [`move_field`] for the card (`sidebar = false`) or for a sidebar row (`true`: narrower,
 /// only a draft opened from the sidebar).
 pub fn move_field_in(
@@ -67,6 +88,8 @@ pub fn move_field_in(
     let d = draft
         .as_mut()
         .filter(|d| d.target == target && d.sidebar == sidebar)?;
+    d.shown = true;
+    d.seen = true;
     let mut submit = None;
     let mut cancel = false;
     ui.horizontal(|ui| {

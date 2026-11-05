@@ -4450,6 +4450,7 @@ impl eframe::App for OatsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let t = Tokens::get(&ctx);
+        crate::move_to::drop_stale(&mut self.notes_state.move_draft);
         crate::speakers::publish(&ctx, self.speakers.clone());
         let mut cmds = self.handle_keys(&ctx);
         cmds.extend(self.undo_keys(&ctx));
