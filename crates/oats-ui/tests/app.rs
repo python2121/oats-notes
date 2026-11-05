@@ -4003,6 +4003,49 @@ const OKAY: &str = "Okay, let's get started. The main thing today is the Q4 road
                     the export rewrite still fits before the holidays.";
 const FITS: &str = "I think it fits if we drop the PDF templates for now.";
 
+/// A click as a real pointer makes it: the press and the release in different frames, the
+/// pointer a pixel off between them, Option held throughout (the harness's `click_modifiers`
+/// does it all in one go).
+#[test]
+fn an_option_click_over_separate_frames_picks_the_row() {
+    let dir = TempDir::new("select-real");
+    let mut h = speakers_rig(&dir.db());
+    let picked = |h: &Harness<'_, OatsApp>| oats_ui::transcript::row_selection(&h.ctx).selected;
+    let at = h.get_by_label(OKAY).rect().center();
+    let button = |h: &mut Harness<'_, OatsApp>, pressed: bool, pos: egui::Pos2| {
+        let input = h.input_mut();
+        input
+            .events
+            .push(egui::Event::ModifiersChanged(egui::Modifiers::ALT));
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::ALT,
+        });
+    };
+    button(&mut h, true, at);
+    h.step();
+    h.input_mut()
+        .events
+        .push(egui::Event::PointerMoved(at + egui::vec2(1.0, 0.0)));
+    h.step();
+    button(&mut h, false, at + egui::vec2(1.0, 0.0));
+    h.step();
+    h.input_mut()
+        .events
+        .push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(2);
+    assert_eq!(picked(&h).len(), 1, "the row is picked");
+    // ⌘ works the same way
+    let at2 = h.get_by_label(FITS).rect().center();
+    h.get_by_label(FITS)
+        .click_modifiers(egui::Modifiers::COMMAND);
+    h.run_steps(2);
+    assert_eq!(picked(&h).len(), 2, "⌘-click adds a row ({at2:?})");
+}
+
 fn seg_by_text(s: &Store, text: &str) -> oats_core::TranscriptRow {
     s.segments_between(i64::MIN, i64::MAX)
         .unwrap()

@@ -65,57 +65,56 @@ pub fn check_box(ui: &mut Ui, checked: &mut bool, font: &FontId) -> Response {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     child.spacing_mut().interact_size.y = side;
-    // the checkbox's own id (egui's `Checkbox` takes the next auto id): the pop is keyed on it
-    let tick_id = child.next_auto_id().with("tick-pop");
+    // What egui's `Checkbox::without_text` allocates (an `interact_size` square, the icon at
+    // its left) and paints (its `checkbox_style`), drawn here by hand from the same style
+    // values, so ONE painting path serves rest and motion: the mark is scaled in / faded out
+    // in place, with nothing swapped underneath it (a second, bare checkbox under a painted
+    // mark flickered at both ends and the mark landed elsewhere).
+    let (rect, mut resp) = child.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
+    if resp.clicked() {
+        *checked = !*checked;
+        resp.mark_changed();
+    }
+    let enabled = child.is_enabled();
+    let now_checked = *checked;
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, now_checked, "")
+    });
     let ctx = child.ctx().clone();
-    let on = motion(&ctx);
-    // linear progress (the easing is applied when painting: `back_out` overshoots past 1)
-    let pop = |target: bool| {
-        let time = match (on, target) {
-            (false, _) => 0.0,
-            (true, true) => TICK_POP,
-            (true, false) => TICK_FADE,
-        };
-        ctx.animate_bool_with_time(tick_id, target, time)
+    let time = match (motion(&ctx), *checked) {
+        (false, _) => 0.0,
+        (true, true) => TICK_POP,
+        (true, false) => TICK_FADE,
     };
-    let p = pop(*checked);
-    let settled = if *checked { p >= 1.0 } else { p <= 0.0 };
-    if settled {
-        let resp = child.add(egui::Checkbox::without_text(checked));
-        if resp.changed() && on {
-            // the change starts the pop / fade (registered this frame, shown from the next)
-            pop(*checked);
-            ctx.request_repaint();
-        }
+    // linear progress; the easing is applied when painting (`back_out` overshoots past 1)
+    let p = ctx.animate_bool_with_time(resp.id.with("tick-pop"), *checked, time);
+    if !child.is_rect_visible(rect) {
         return resp;
     }
-    // Moving: egui draws the bare box (a copy that is never checked, so it paints no mark),
-    // and the mark is painted over it, scaled (popping in) or faded (going out).
-    let was = *checked;
-    let mut bare = false;
-    let resp = child.add(egui::Checkbox::without_text(&mut bare));
-    if resp.clicked() {
-        *checked = !was;
-    } else {
-        // the box reads as the real state to AccessKit, not the bare copy's
-        resp.widget_info(|| {
-            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, child.is_enabled(), was, "")
-        });
-    }
-    let p = pop(*checked);
+    let cs = child
+        .style()
+        .checkbox_style(&egui::widget_style::Classes::default(), resp.widget_state());
+    let big = Rect::from_center_size(
+        pos2(rect.left() + cs.checkbox_size / 2.0, rect.center().y),
+        egui::Vec2::splat(cs.checkbox_size),
+    );
+    let small = Rect::from_center_size(big.center(), egui::Vec2::splat(cs.check_size));
+    child.painter().add(egui::epaint::RectShape::new(
+        big.expand(cs.checkbox_frame.inner_margin.left.into()),
+        cs.checkbox_frame.corner_radius,
+        cs.checkbox_frame.fill,
+        cs.checkbox_frame.stroke,
+        egui::StrokeKind::Inside,
+    ));
     let (scale, alpha) = if *checked {
         (egui::emath::easing::back_out(p), 1.0)
     } else {
         (1.0, p)
     };
     if scale > 0.0 && alpha > 0.0 {
-        let style = child.style();
-        let size = style.spacing.icon_width;
-        let inner = style.spacing.icon_width_inner;
-        let mut stroke = style.visuals.widgets.style(&resp).fg_stroke;
+        let mut stroke = cs.check_stroke;
         stroke.color = stroke.color.gamma_multiply(alpha);
-        let center = pos2(resp.rect.left() + size / 2.0, resp.rect.center().y);
-        let small = Rect::from_center_size(center, vec2(inner, inner) * scale);
+        let small = Rect::from_center_size(small.center(), small.size() * scale);
         child.painter().add(egui::Shape::line(
             vec![
                 pos2(small.left(), small.center().y),

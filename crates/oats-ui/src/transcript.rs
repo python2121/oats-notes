@@ -686,14 +686,24 @@ fn transcript_row(
                 .unwrap_or(i.modifiers)
         });
         let sel = row_selection(ui.ctx());
-        if mods.alt || mods.shift || !sel.selected.is_empty() {
+        // ⌘ too: the platform's usual multi-select modifier
+        let pick = mods.alt || mods.command;
+        log::debug!(
+            "row {} clicked: alt {} cmd {} shift {} (picked before: {})",
+            row.id,
+            mods.alt,
+            mods.command,
+            mods.shift,
+            sel.selected.len()
+        );
+        if pick || mods.shift || !sel.selected.is_empty() {
             let order: Vec<i64> = rows.iter().map(|r| r.id).collect();
             set_row_selection(
                 ui.ctx(),
-                click_selection(sel, row.id, &order, mods.alt, mods.shift),
+                click_selection(sel, row.id, &order, pick, mods.shift),
             );
         }
-        if mods.alt || mods.shift {
+        if pick || mods.shift {
             // a modified click picks the row; it must not leave a text selection behind
             ui.ctx()
                 .plugin::<egui::text_selection::LabelSelectionState>()
