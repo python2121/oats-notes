@@ -1911,9 +1911,17 @@ fn propose(
     Ok(d)
 }
 
+/// A line's former voice, if it still exists (forgotten / merged away: none).
+fn restorable_voice(store: &Store, voice: Option<i64>) -> Result<Option<i64>, StoreError> {
+    Ok(match voice {
+        Some(v) if store.speaker(v)?.is_some() => Some(v),
+        _ => None,
+    })
+}
+
 /// Reverse a recorded change where that is possible (rename, move, archive, description,
-/// episode filing / low-signal). Returns `false` for kinds that can't be undone (merges,
-/// drops, creations).
+/// episode filing / low-signal, a corrected line's speaker — the label only). Returns `false`
+/// for kinds that can't be undone (merges, drops, creations).
 pub fn undo_change(store: &Store, change_id: i64) -> Result<bool, StoreError> {
     let Some(c) = store.change(change_id)? else {
         return Ok(false);
@@ -2002,6 +2010,31 @@ pub fn undo_change(store: &Store, change_id: i64) -> Result<bool, StoreError> {
                 }
                 _ => false,
             }
+        }
+        // a corrected line's speaker: the label comes back (the voice if it still exists,
+        // else none); the voiceprints the correction moved are not reverted
+        "segment_speaker" => match id("segment") {
+            Some(seg) => {
+                let old = restorable_voice(store, id("speaker"))?;
+                store.set_segment_speaker(seg, old)?
+            }
+            None => false,
+        },
+        "segment_speakers" => {
+            let mut any = false;
+            for line in before
+                .get("segments")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(seg) = line.get("segment").and_then(|v| v.as_i64()) else {
+                    continue;
+                };
+                let old = restorable_voice(store, line.get("speaker").and_then(|v| v.as_i64()))?;
+                any |= store.set_segment_speaker(seg, old)?;
+            }
+            any
         }
         _ => false,
     };
@@ -2963,6 +2996,46 @@ mod tests {
         assert!(undo_change(&s, named[0].id).unwrap());
         assert_eq!(get(anon).name, None);
         assert!(!undo_change(&s, named[0].id).unwrap());
+    }
+
+    #[test]
+    fn undo_restores_a_corrected_lines_label_only() {
+        use oats_core::SpeakerTarget;
+        let (s, _, chunk, _, priya, anon) = speaker_chunk();
+        let line = chunk.segments[1].id;
+        assert_eq!(chunk.segments[1].speaker_id, Some(anon));
+        let e = vec![0.5f32; 8];
+        s.insert_segment_voice(line, &e, 4_000, 0).unwrap();
+        s.correct_segment_speaker(line, SpeakerTarget::Voice(priya), true, 10)
+            .unwrap()
+            .unwrap();
+        let moved = s.speaker(priya).unwrap().unwrap().centroid;
+        let c = s.changes(1).unwrap().remove(0);
+        assert_eq!(c.kind, "segment_speaker");
+        assert!(undo_change(&s, c.id).unwrap());
+        assert_eq!(s.segment(line).unwrap().unwrap().speaker_id, Some(anon));
+        // the centroids stay where the correction moved them
+        assert_eq!(s.speaker(priya).unwrap().unwrap().centroid, moved);
+        assert!(!undo_change(&s, c.id).unwrap(), "once");
+
+        // a group: every line back to its own former voice
+        let (a, b) = (chunk.segments[1].id, chunk.segments[2].id);
+        let before_b = s.segment(b).unwrap().unwrap().speaker_id;
+        s.correct_segments_speaker(&[a, b], SpeakerTarget::None, true, 20)
+            .unwrap();
+        assert_eq!(s.segment(a).unwrap().unwrap().speaker_id, None);
+        let c = s.changes(1).unwrap().remove(0);
+        assert_eq!(c.kind, "segment_speakers");
+        assert!(undo_change(&s, c.id).unwrap());
+        assert_eq!(s.segment(a).unwrap().unwrap().speaker_id, Some(anon));
+        assert_eq!(s.segment(b).unwrap().unwrap().speaker_id, before_b);
+        // a former voice that was forgotten since comes back as none
+        s.correct_segment_speaker(a, SpeakerTarget::Voice(priya), true, 30)
+            .unwrap();
+        s.forget_speaker(anon).unwrap();
+        let c = s.changes(1).unwrap().remove(0);
+        assert!(undo_change(&s, c.id).unwrap());
+        assert_eq!(s.segment(a).unwrap().unwrap().speaker_id, None);
     }
 
     #[test]

@@ -1121,7 +1121,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         assert!(has_column(&s.conn, "segments", "media_app")?);
         assert!(s.producer_overrides()?.is_empty());
         assert!(s.producers_seen()?.is_empty());
@@ -1357,7 +1357,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         let rows = s.segments_between(0, 10_000)?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].media_kind, None);

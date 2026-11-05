@@ -10,7 +10,9 @@
 use std::sync::Arc;
 
 use egui::{Color32, Rect, RichText, pos2, vec2};
-use oats_core::{AudioSourceKind, NameSource, Speaker, TranscriptRow, speaker_label};
+use oats_core::{
+    AudioSourceKind, NameSource, Speaker, SpeakerTarget, TranscriptRow, speaker_label,
+};
 
 use crate::theme::Tokens;
 use crate::transcript::TranscriptAction;
@@ -121,73 +123,270 @@ pub fn paint_tag(ui: &egui::Ui, t: &Tokens, at: egui::Pos2, label: &RowLabel, ma
     p.galley(at + vec2(4.0, 1.0), galley, colour);
 }
 
+/// What an inline field under a row is for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DraftMode {
+    /// "Name…" the voice `speaker`.
+    Name { speaker: i64 },
+    /// "Merge into…": the voice `speaker` into the one typed.
+    Merge { speaker: i64 },
+    /// "This line was ▸ Someone new…": these lines are a new person (an optional name).
+    New { segments: Vec<i64> },
+}
+
 /// The open inline field (one at a time), kept in egui's memory.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpeakerDraft {
+    /// The row it is drawn under.
     pub segment: i64,
-    pub speaker: i64,
-    pub merge: bool,
+    pub mode: DraftMode,
     pub text: String,
     pub focus: bool,
 }
 
-/// The "Speaker ▸" submenu of a row's context menu (rows with a voice only).
+fn open_draft(ui: &egui::Ui, d: SpeakerDraft) {
+    ui.ctx().data_mut(|m| m.insert_temp(draft_id(), Some(d)));
+}
+
+/// At most this many voices are listed in "This line was ▸" (type to narrow the rest).
+pub const PICKER_ROWS: usize = 12;
+
+/// The voices "This line was ▸" lists for the search `text`: a case-insensitive substring of
+/// the name or the label ("them 3", "voice 4", "me"; empty = all), the most recently heard
+/// first. `source` is the clicked line's lane (an anonymous voice's label follows it).
+pub fn picker_voices<'a>(
+    map: &'a SpeakerMap,
+    text: &str,
+    source: AudioSourceKind,
+) -> Vec<&'a Speaker> {
+    let q = text.trim().to_lowercase();
+    let mut v: Vec<&Speaker> = map
+        .values()
+        .filter(|s| {
+            q.is_empty()
+                || speaker_label(Some(s), source).to_lowercase().contains(&q)
+                || s.name
+                    .as_deref()
+                    .is_some_and(|n| n.to_lowercase().contains(&q))
+        })
+        .collect();
+    v.sort_by(|a, b| b.last_heard_at.cmp(&a.last_heard_at).then(a.id.cmp(&b.id)));
+    v
+}
+
+/// The picker's search text, kept while the submenu is open (and the pass it was last drawn
+/// in, so a newly opened submenu starts empty with the field focused).
+#[derive(Clone, Debug, Default)]
+struct PickerState {
+    text: String,
+    drawn_pass: u64,
+}
+
+fn picker_id() -> egui::Id {
+    egui::Id::new("oats-speaker-picker")
+}
+
+/// The body of "This line was ▸" / "These N lines were ▸": a search field (focused on open),
+/// the matching voices (most recently heard first, the lines' current voice greyed, at most
+/// [`PICKER_ROWS`]), "Someone new…" and "Nobody". `segments` are the lines it applies to;
+/// `current` their voice when they share one; `row` the clicked row (its lane, where the
+/// "Someone new…" field opens).
+fn voice_picker(
+    ui: &mut egui::Ui,
+    row: &TranscriptRow,
+    segments: &[i64],
+    current: Option<i64>,
+    map: &SpeakerMap,
+) -> Option<TranscriptAction> {
+    let pass = ui.ctx().cumulative_pass_nr();
+    let mut st: PickerState = ui
+        .ctx()
+        .data(|m| m.get_temp::<PickerState>(picker_id()))
+        .unwrap_or_default();
+    // not drawn in the previous pass: the submenu was just opened
+    let opened = st.drawn_pass + 1 < pass;
+    if opened {
+        st.text.clear();
+    }
+    st.drawn_pass = pass;
+    let mut action = None;
+    let field = ui.add(
+        egui::TextEdit::singleline(&mut st.text)
+            .hint_text("name…")
+            .desired_width(160.0),
+    );
+    // focused on open (and while nothing else has the focus: the submenu's first pass can be
+    // a sizing pass that drops the request)
+    let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if !entered && (opened || ui.ctx().memory(|m| m.focused().is_none())) {
+        field.request_focus();
+    }
+    let voices = picker_voices(map, &st.text, row.source);
+    let reassign = |target: SpeakerTarget| TranscriptAction::SpeakerReassign {
+        segments: segments.to_vec(),
+        target,
+    };
+    if entered {
+        let choices: Vec<i64> = voices
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| Some(*id) != current)
+            .collect();
+        if let [only] = choices.as_slice() {
+            action = Some(reassign(SpeakerTarget::Voice(*only)));
+            ui.close();
+        }
+    }
+    if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.close();
+    }
+    for s in voices.iter().take(PICKER_ROWS) {
+        let label = speaker_label(Some(s), row.source);
+        if ui
+            .add_enabled(Some(s.id) != current, egui::Button::new(label))
+            .clicked()
+        {
+            action = Some(reassign(SpeakerTarget::Voice(s.id)));
+            ui.close();
+        }
+    }
+    if voices.len() > PICKER_ROWS {
+        ui.label(
+            RichText::new(format!(
+                "and {} more — type to narrow",
+                voices.len() - PICKER_ROWS
+            ))
+            .size(11.0)
+            .weak(),
+        );
+    } else if voices.is_empty() {
+        ui.label(RichText::new("No voice matches").size(11.0).weak());
+    }
+    ui.separator();
+    if ui
+        .button("Someone new…")
+        .on_hover_text("A new voice from these lines (a name is optional)")
+        .clicked()
+    {
+        open_draft(
+            ui,
+            SpeakerDraft {
+                segment: row.id,
+                mode: DraftMode::New {
+                    segments: segments.to_vec(),
+                },
+                text: String::new(),
+                focus: true,
+            },
+        );
+        ui.close();
+    }
+    if ui
+        .add_enabled(
+            current.is_some() || segments.len() > 1,
+            egui::Button::new("Nobody"),
+        )
+        .on_hover_text("Clear the voice: the line reads as its lane again (me / them)")
+        .clicked()
+    {
+        action = Some(reassign(SpeakerTarget::None));
+        ui.close();
+    }
+    ui.ctx().data_mut(|m| m.insert_temp(picker_id(), st));
+    action
+}
+
+/// The speaker entries of a row's context menu (rows that aren't media): "Speaker: <label> ▸"
+/// with the voice's own actions (Name… / This is me / Merge into… / Forget, for a row with a
+/// known voice) and "This line was ▸"; with a multi-row `selection` that contains the row,
+/// "These N lines were ▸" at the top level for the whole selection instead (the voice's own
+/// actions still apply to the clicked row's voice). `selection_voice`: the selected lines'
+/// voice when they all share one.
 pub fn speaker_menu(
     ui: &mut egui::Ui,
     row: &TranscriptRow,
     map: &SpeakerMap,
+    selection: &[i64],
+    selection_voice: Option<i64>,
 ) -> Option<TranscriptAction> {
-    let id = row.speaker_id?;
-    let s = map.get(&id)?;
+    if row_label(row, map).is_some_and(|l| l.text == "media") {
+        return None;
+    }
+    let voice = row.speaker_id.and_then(|id| map.get(&id));
+    let batch = selection.len() > 1 && selection.contains(&row.id);
     let mut action = None;
-    let title = format!("Speaker: {}", speaker_label(Some(s), row.source));
+    if batch {
+        ui.menu_button(format!("These {} lines were", selection.len()), |ui| {
+            action = voice_picker(ui, row, selection, selection_voice, map);
+        });
+    }
+    let title = format!("Speaker: {}", speaker_label(voice, row.source));
     ui.menu_button(title, |ui| {
-        let open = |merge: bool| SpeakerDraft {
-            segment: row.id,
-            speaker: id,
-            merge,
-            text: if merge {
-                String::new()
-            } else {
-                s.name.clone().unwrap_or_default()
-            },
-            focus: true,
-        };
-        if ui.button("Name…").clicked() {
-            let d = open(false);
-            ui.ctx().data_mut(|m| m.insert_temp(draft_id(), Some(d)));
-            ui.close();
+        if let Some(s) = voice {
+            let id = s.id;
+            if ui.button("Name…").clicked() {
+                open_draft(
+                    ui,
+                    SpeakerDraft {
+                        segment: row.id,
+                        mode: DraftMode::Name { speaker: id },
+                        text: s.name.clone().unwrap_or_default(),
+                        focus: true,
+                    },
+                );
+                ui.close();
+            }
+            if ui
+                .add_enabled(!s.is_me, egui::Button::new("This is me"))
+                .clicked()
+            {
+                action = Some(TranscriptAction::SpeakerMe { speaker: id });
+                ui.close();
+            }
+            if ui
+                .add_enabled(map.len() > 1, egui::Button::new("Merge into…"))
+                .on_hover_text(
+                    "Same person as another voice: its lines and voiceprint join that one",
+                )
+                .clicked()
+            {
+                open_draft(
+                    ui,
+                    SpeakerDraft {
+                        segment: row.id,
+                        mode: DraftMode::Merge { speaker: id },
+                        text: String::new(),
+                        focus: true,
+                    },
+                );
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .button("Forget this voice")
+                .on_hover_text("Deletes the voiceprint; its lines lose the label")
+                .clicked()
+            {
+                action = Some(TranscriptAction::SpeakerForget { speaker: id });
+                ui.close();
+            }
         }
-        if ui
-            .add_enabled(!s.is_me, egui::Button::new("This is me"))
-            .clicked()
-        {
-            action = Some(TranscriptAction::SpeakerMe { speaker: id });
-            ui.close();
-        }
-        if ui
-            .add_enabled(map.len() > 1, egui::Button::new("Merge into…"))
-            .on_hover_text("Same person as another voice: its lines and voiceprint join that one")
-            .clicked()
-        {
-            let d = open(true);
-            ui.ctx().data_mut(|m| m.insert_temp(draft_id(), Some(d)));
-            ui.close();
-        }
-        ui.separator();
-        if ui
-            .button("Forget this voice")
-            .on_hover_text("Deletes the voiceprint; its lines lose the label")
-            .clicked()
-        {
-            action = Some(TranscriptAction::SpeakerForget { speaker: id });
-            ui.close();
+        if !batch {
+            if voice.is_some() {
+                ui.separator();
+            }
+            ui.menu_button("This line was", |ui| {
+                if let Some(a) = voice_picker(ui, row, &[row.id], row.speaker_id, map) {
+                    action = Some(a);
+                }
+            });
         }
     });
     action
 }
 
-/// The inline Name… / Merge into… field under row `segment`, when it is open there.
+/// The inline Name… / Merge into… / Someone new… field under row `segment`, when it is open
+/// there.
 pub fn speaker_field(ui: &mut egui::Ui, t: &Tokens, segment: i64) -> Option<TranscriptAction> {
     let mut draft: SpeakerDraft = ui
         .ctx()
@@ -196,21 +395,18 @@ pub fn speaker_field(ui: &mut egui::Ui, t: &Tokens, segment: i64) -> Option<Tran
         .filter(|d| d.segment == segment)?;
     let mut out = None;
     let mut close = false;
+    let (label, hint) = match &draft.mode {
+        DraftMode::Name { .. } => ("Name", "their name (empty clears it)"),
+        DraftMode::Merge { .. } => ("Merge into", "another voice: a name, “them 3”, “voice 3”…"),
+        DraftMode::New { .. } => ("New voice", "their name (optional)"),
+    };
     ui.horizontal(|ui| {
         ui.add_space(12.0);
-        ui.label(
-            RichText::new(if draft.merge { "Merge into" } else { "Name" })
-                .color(t.text_secondary)
-                .size(11.5),
-        );
+        ui.label(RichText::new(label).color(t.text_secondary).size(11.5));
         let r = ui.add(
             egui::TextEdit::singleline(&mut draft.text)
                 .desired_width((ui.available_width() - 12.0).clamp(80.0, 280.0))
-                .hint_text(if draft.merge {
-                    "another voice: a name, “them 3”, “voice 3”…"
-                } else {
-                    "their name (empty clears it)"
-                })
+                .hint_text(hint)
                 .font(t.font(12.5)),
         );
         if draft.focus {
@@ -219,16 +415,21 @@ pub fn speaker_field(ui: &mut egui::Ui, t: &Tokens, segment: i64) -> Option<Tran
         }
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             let text = draft.text.trim().to_owned();
-            out = Some(if draft.merge {
-                TranscriptAction::SpeakerMerge {
-                    speaker: draft.speaker,
+            out = Some(match &draft.mode {
+                DraftMode::Merge { speaker } => TranscriptAction::SpeakerMerge {
+                    speaker: *speaker,
                     into: text,
-                }
-            } else {
-                TranscriptAction::SpeakerName {
-                    speaker: draft.speaker,
+                },
+                DraftMode::Name { speaker } => TranscriptAction::SpeakerName {
+                    speaker: *speaker,
                     name: text,
-                }
+                },
+                DraftMode::New { segments } => TranscriptAction::SpeakerReassign {
+                    segments: segments.clone(),
+                    target: SpeakerTarget::New {
+                        name: Some(text).filter(|t| !t.is_empty()),
+                    },
+                },
             });
             close = true;
         }
@@ -388,6 +589,29 @@ mod tests {
         assert_eq!(resolve_voice("me", &m, 3), Some(1));
         assert_eq!(resolve_voice("3", &m, 3), None); // itself
         assert_eq!(resolve_voice("nobody", &m, 3), None);
+    }
+
+    #[test]
+    fn the_picker_filters_by_name_and_label_newest_first() {
+        let mut m = map();
+        for (id, at) in [(1, 10), (2, 40), (3, 30), (4, 20)] {
+            if let Some(s) = m.get_mut(&id) {
+                s.last_heard_at = at;
+            }
+        }
+        let ids = |text: &str, src| {
+            picker_voices(&m, text, src)
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("", AudioSourceKind::System), vec![2, 3, 4, 1]);
+        assert_eq!(ids("pri", AudioSourceKind::System), vec![2]);
+        assert_eq!(ids("PA", AudioSourceKind::System), vec![4]);
+        assert_eq!(ids("them 3", AudioSourceKind::System), vec![3]);
+        assert_eq!(ids("voice", AudioSourceKind::Mic), vec![3]);
+        assert_eq!(ids("me", AudioSourceKind::Mic), vec![1]);
+        assert!(ids("zz", AudioSourceKind::Mic).is_empty());
     }
 
     #[test]

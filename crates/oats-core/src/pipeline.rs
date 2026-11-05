@@ -154,6 +154,9 @@ pub struct SpeakerStats {
     pub speakers_created: u32,
     /// Speaker-model calls that failed (the segment is stored without a voice).
     pub failed: u32,
+    /// Spans close enough to learn from that taught no voice: another voice was within
+    /// [`speakers::UPDATE_MARGIN`] (tagged, not learned from).
+    pub ambiguous: u32,
 }
 
 /// Per-session echo counters (logged at info when the session ends; the last ended session's
@@ -1296,10 +1299,10 @@ impl Session<'_> {
         } else {
             None
         };
-        let speaker_id = if echo_of.is_none() {
+        let (speaker_id, voice) = if echo_of.is_none() {
             self.identify_speaker(source, seg, ended_at, t.processing_ms)
         } else {
-            None
+            (None, None)
         };
         let mut row = match self.store.insert_segment_full(
             session_id,
@@ -1318,6 +1321,14 @@ impl Session<'_> {
                 )));
             }
         };
+        // the line's own embedding, kept for the user's corrections ("This line was ▸")
+        if let Some((embedding, speech_ms)) = voice
+            && let Err(e) = self
+                .store
+                .insert_segment_voice(row.id, &embedding, speech_ms, ended_at)
+        {
+            log::warn!("speakers: could not keep a line's voiceprint: {e}");
+        }
         if let Some(sys) = echo_of {
             self.echo.stats.echo_marked_by_text += 1;
             log::info!(
@@ -1346,17 +1357,19 @@ impl Session<'_> {
     /// The dominant known voice of a transcribed, non-echo segment (see [`crate::speakers`]):
     /// only while recognition is on, for segments of ≥ [`SPEAKER_MIN_SEGMENT_MS`], and never
     /// for media on the system lane (a video's voices are nobody's voiceprint). New voices
-    /// are stored at once; changed voiceprints in batches ([`SPEAKER_FLUSH_EVERY`]).
+    /// are stored at once; changed voiceprints in batches ([`SPEAKER_FLUSH_EVERY`]). With the
+    /// voice, the line's own embedding and its speech (ms) to keep: the span that became the
+    /// line's voice (the longest of them), else the longest span.
     fn identify_speaker(
         &mut self,
         source: AudioSourceKind,
         seg: &Segment,
         ended_at: i64,
         transcribe_ms: f64,
-    ) -> Option<i64> {
+    ) -> (Option<i64>, Option<(Vec<f32>, i64)>) {
         if !self.out.speakers.load(Ordering::Relaxed) || seg.duration_ms() < SPEAKER_MIN_SEGMENT_MS
         {
-            return None;
+            return (None, None);
         }
         // system audio: media (a video, music) gets no speaker pass at all, and only a CALL
         // (a meeting app / page, or "On a call") may create NEW voices — a film clip in a
@@ -1365,7 +1378,7 @@ impl Session<'_> {
         let may_create = match source {
             AudioSourceKind::Mic => true,
             AudioSourceKind::System => match self.stamp_now() {
-                Some(m) if m.is_media() => return None,
+                Some(m) if m.is_media() => return (None, None),
                 Some(m) => m.class == MediaClass::Meeting,
                 None => false,
             },
@@ -1384,7 +1397,7 @@ impl Session<'_> {
                 }
                 Err(e) => {
                     log::warn!("speakers: could not load the voices: {e}");
-                    return None;
+                    return (None, None);
                 }
             }
         }
@@ -1398,13 +1411,13 @@ impl Session<'_> {
                     source.as_str(),
                     seg.duration_ms()
                 );
-                return None;
+                return (None, None);
             }
         };
         let model_ms = t.elapsed().as_millis() as u64;
         if spans.is_empty() && model_ms == 0 {
             // an engine without speaker models: nothing ran, nothing to count
-            return None;
+            return (None, None);
         }
         self.speakers.stats.speaker_segments += 1;
         self.speakers.stats.speaker_ms += model_ms;
@@ -1413,7 +1426,12 @@ impl Session<'_> {
         let store = self.store;
         let mut assigned = Vec::with_capacity(spans.len());
         let mut created = 0u32;
-        let book = self.speakers.book.as_mut()?;
+        let Some(book) = self.speakers.book.as_mut() else {
+            return (None, None);
+        };
+        // per span: the voice it was assigned to (index into `spans`)
+        let mut span_voice: Vec<Option<i64>> = Vec::with_capacity(spans.len());
+        let mut ambiguous = 0u32;
         for span in &spans {
             let secs = span.speech_ms as f64 / 1000.0;
             let a = book.assign(&span.embedding, secs, mic, ended_at, |centroid, secs| {
@@ -1428,7 +1446,11 @@ impl Session<'_> {
                     }
                 }
             });
+            span_voice.push(a.map(|a| a.speaker_id));
             if let Some(a) = a {
+                if a.ambiguous {
+                    ambiguous += 1;
+                }
                 if a.created {
                     created += 1;
                     log::info!(
@@ -1449,6 +1471,11 @@ impl Session<'_> {
             match store.merge_speakers(m.from, m.into) {
                 Ok(_) => {
                     for (id, _) in &mut assigned {
+                        if *id == m.from {
+                            *id = m.into;
+                        }
+                    }
+                    for id in span_voice.iter_mut().flatten() {
                         if *id == m.from {
                             *id = m.into;
                         }
@@ -1491,6 +1518,19 @@ impl Session<'_> {
             seg.duration_ms()
         );
         self.speakers.stats.speakers_created += created;
+        self.speakers.stats.ambiguous += ambiguous;
+        // the line's own embedding: the dominant voice's longest span, else the longest span
+        let longest = |only: Option<i64>| {
+            spans
+                .iter()
+                .zip(&span_voice)
+                .filter(|(_, v)| only.is_none() || **v == only)
+                .max_by_key(|(s, _)| s.speech_ms)
+                .map(|(s, _)| (s.embedding.clone(), s.speech_ms))
+        };
+        let voice = dominant
+            .and_then(|d| longest(Some(d)))
+            .or_else(|| longest(None));
         if dominant.is_some() {
             self.speakers.stats.assigned += 1;
         }
@@ -1505,7 +1545,7 @@ impl Session<'_> {
             self.flush_speakers();
         }
         self.publish_speaker_stats();
-        dominant
+        (dominant, voice)
     }
 
     /// Write the changed voiceprints back (one transaction).
@@ -1533,16 +1573,24 @@ impl Session<'_> {
     /// Flush the voiceprints and log the session's speaker counters.
     fn end_speakers(&mut self, session_id: i64) {
         self.flush_speakers();
+        // the lines' own embeddings are kept for a while only
+        match self.store.prune_segment_voices(now_ms()) {
+            Ok(0) => {}
+            Ok(n) => log::info!("speakers: {n} line voiceprints past retention deleted"),
+            Err(e) => log::warn!("speakers: could not prune the line voiceprints: {e}"),
+        }
         let s = self.speakers.stats;
         if s.speaker_segments > 0 || s.failed > 0 {
             log::info!(
                 "session {session_id} speakers: {} segments in {} ms (transcription of the same \
-                 segments: {} ms), {} with a voice, {} new voices, {} failed",
+                 segments: {} ms), {} with a voice, {} new voices, {} ambiguous (not learned \
+                 from), {} failed",
                 s.speaker_segments,
                 s.speaker_ms,
                 s.transcribe_ms,
                 s.assigned,
                 s.speakers_created,
+                s.ambiguous,
                 s.failed
             );
         }
@@ -2108,9 +2156,10 @@ mod tests {
                 .collect()
         };
         let mut voices = Vec::new();
+        let mut lines = Vec::new();
         for hz in [440.0, 880.0, 440.0] {
-            // 4 s of tone: a NEW voice needs ≥ MIN_NEW_SPEAKER_SECS (3 s) of speech
-            for _ in 0..40 {
+            // 6 s of tone: a NEW voice needs ≥ MIN_NEW_SPEAKER_SECS (5 s) of speech
+            for _ in 0..60 {
                 let _ = audio_tx.send(chunk(hz));
             }
             for _ in 0..15 {
@@ -2122,6 +2171,7 @@ mod tests {
                 unreachable!()
             };
             voices.push(row.speaker_id);
+            lines.push(row.id);
         }
         assert!(voices.iter().all(Option::is_some), "{voices:?}");
         assert_eq!(voices[0], voices[2]);
@@ -2140,6 +2190,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(row.speaker_id, None);
+        let unvoiced = row.id;
         h.stop();
         wait_for(&h, "session end", |e| {
             matches!(e, PipelineEvent::SessionEnded(_))
@@ -2156,6 +2207,25 @@ mod tests {
             _ => unreachable!("store"),
         };
         assert_eq!(speakers.len(), 2);
+        // each assigned line keeps its own embedding (for corrections); none while off
+        let kept = |id| match store.as_ref().map(|s| s.segment_voice(id)) {
+            Ok(Ok(v)) => v,
+            _ => unreachable!("store"),
+        };
+        for id in &lines {
+            let v = kept(*id);
+            assert!(
+                v.as_ref()
+                    .is_some_and(|(e, ms)| e.len() == 8 && *ms >= 3_000),
+                "line {id}: {v:?}"
+            );
+        }
+        assert_eq!(
+            kept(lines[1]).map(|(e, _)| e[1]),
+            Some(1.0),
+            "the 880 Hz voice"
+        );
+        assert!(kept(unvoiced).is_none(), "speakers off: nothing kept");
         // the first voice spoke twice: its seconds were flushed at session end
         let first = speakers.iter().find(|s| Some(s.id) == voices[0]);
         assert!(first.is_some_and(|s| s.speech_secs > 3.0), "{speakers:?}");

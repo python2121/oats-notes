@@ -48,7 +48,8 @@ pub use pipeline::{Pipeline, PipelineEvent, PipelineHandle, PipelineStatus, Spea
 pub use segmenter::{Segment, Segmenter, SegmenterConfig};
 pub use speakers::{Assignment, NameSource, Speaker, SpeakerBook, SpeakerEntry, speaker_label};
 pub use store::{
-    ActionItem, BrainRun, Change, Decision, Episode, EpisodeContent, Event, NewEvent, NewTodo,
-    Node, NodeKind, Note, NoteItem, Origin, RunOutcome, SearchResults, Session, Store, StoreError,
-    Todo, TodoFilter, TodoState, TranscriptPurge, TranscriptRow, View,
+    ActionItem, BrainRun, Change, Correction, Decision, Episode, EpisodeContent, Event, LineScope,
+    LinesCorrection, NewEvent, NewTodo, Node, NodeKind, Note, NoteItem, Origin, RunOutcome,
+    SearchResults, Session, SpeakerTarget, Store, StoreError, Todo, TodoFilter, TodoState,
+    TranscriptPurge, TranscriptRow, View,
 };

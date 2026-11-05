@@ -491,6 +491,7 @@ hotword; hotwords are unchanged.
   todo is folded into the event in the grid (`calendar::items_by_day`). The day panel below
   lists the selected day's events and todos in full with their right-click actions.
 - **Selectable transcript text** (`transcript::transcript_row`, also the notes' "Show transcript" lists): each row's time and text are selectable labels, so a drag selects across rows in reading order and ⌘C copies it (egui's `LabelSelectionState`; there is no Edit ▸ Copy menu item, so no muda accelerator takes ⌘C). The row's own click target is registered BEFORE its labels (a zero-size placeholder, re-registered with the real rect after them — egui keeps the first hit-test position), so the labels sit on top and own presses, double-clicks and drags; the labels' responses are unioned into the row's, so a right-click on the text still opens the row's menu, and the hover fill uses `contains_pointer`. The text label's hit rect is re-registered as the whole text column at the row's full height (the last rect under an id is what the next frame's hit test uses; nothing is allocated), so a press in the empty space right of a line, or below a line that doesn't wrap (beside the speaker tag), anchors the selection at the text's end, as in any text view. Search hits stay non-selectable (a click there jumps).
+- **Selecting rows** (`transcript::RowSelection`, in egui memory: the Transcripts view and a node's "Show transcript" list draw the same rows): ⌥-click toggles a row (and makes it the anchor), ⇧-click selects the range from the anchor in display order (`transcript::click_selection`, pure); a plain click on a row, Escape (no text field focused) or a view change (`OatsApp::clear_row_selection`) clears it, and ids no longer listed are dropped. The modifiers are read from the click's own `PointerButton` event; a modified click clears egui's label text selection. Selected rows keep an accent fill (`t.accent_alpha(0.18)`). A right-click on a selected row offers "These N lines were ▸" (see Speakers ▸ Correcting a line); a right-click on an unselected row clears the selection first.
 - **Transcripts paging** (`transcript::TranscriptPages`, `Store::segments_page(before, limit)` /
   `segments_after(after, limit)`, keyed on `(started_at, id)`): ONE contiguous range of rows,
   paged by row count (`PAGE_ROWS` = 1000; a 1000-row page lays out in ~4 ms per frame in the
@@ -923,16 +924,24 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   `FluidInference/speaker-diarization-coreml` into `~/Library/Application Support/FluidAudio`.
 - **Matching** (`oats_core::speakers`, pure): ONE global `SpeakerBook` (a person is the same on
   either lane). Cosine distance to every centroid (plain f32 loop): ≤ `ASSIGN_THRESHOLD` 0.7 →
-  that voice; else a new voice when the span has ≥ `MIN_NEW_SPEAKER_SECS` 3 s, else none (a
+  that voice; else a new voice when the span has ≥ `MIN_NEW_SPEAKER_SECS` 5 s (a voice is
+  defined by its first line: enrol only from a clip the model embeds well), else none (a
   short unmatched span gets no voice rather than opening a phantom one). **Auto-merge**
   (`SpeakerBook::merge_if_close`, after every centroid update): a voice whose centroid now sits
   within `MERGE_THRESHOLD` 0.3 of another's, both with ≥ `MIN_MERGE_SECS` 30 s of speech, is
   folded into it (the user's voice survives, else a user-named one, else the older; two
   user-named voices are never merged automatically) — the pipeline then calls
   `Store::merge_speakers(from, into)` (one write; logged at info; `SpeakersChanged`). The
-  centroid learns (weighted mean, re-normalised) only at ≤ `UPDATE_THRESHOLD` 0.45 and ≥ 2 s;
-  the history's weight is capped at `MAX_WEIGHT_SECS` 600 (the stored `speech_secs` total is
-  not capped). `dominant` = most speech seconds. Auto-me: with no `is_me` voice, the first with
+  centroid learns (weighted mean, re-normalised) only at ≤ `UPDATE_THRESHOLD` 0.45 and ≥ 2 s,
+  and only when the second-nearest voice is ≥ `UPDATE_MARGIN` 0.15 further away (an ambiguous
+  line is still tagged, but teaches nobody; `Assignment::ambiguous`, counted as
+  `SpeakerStats::ambiguous`; one voice alone always passes); a line's weight is
+  `secs × learn_ramp(secs)` (`LEARN_RAMP_FROM` 2 s → 0, `LEARN_RAMP_TO` 8 s → full: 3 s counts
+  as 0.5 s, 5 s as 2.5 s — short clips embed noisily), times `MATURE_LEARN_RATE` 0.25 once the
+  voice has ≥ `MATURE_SECS` 600 s of speech; the history's weight is capped at
+  `MAX_WEIGHT_SECS` 600 (the stored `speech_secs` total is not capped). The user's corrections
+  (`SpeakerBook::learn` / `unlearn`, below) are exempt from the margin, the ramp and the
+  maturity rate. `dominant` = most speech seconds. Auto-me: with no `is_me` voice, the first with
   ≥ `AUTO_ME_MIC_SECS` 60 s of MIC speech in total (`mic_secs`) becomes "me" (logged).
 - **Pipeline**: after transcription, only for non-echo segments with text, ≥ 1 s, and not
   media on the system lane (a video's voices are nobody's voiceprint); on the system lane a
@@ -948,8 +957,11 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   voice's pending update is a no-op UPDATE). `PipelineEvent::SpeakersChanged` (new voice,
   auto-me) precedes the `Segment`; `Segment` rows carry `speaker_id`. Debug log per segment
   ("speakers: 2 spans in 38 ms (… transcribed in … ms)"); `SpeakerStats` (`speaker_segments`,
-  `speaker_ms`, `transcribe_ms`, `assigned`, `speakers_created`, `failed`) logged at info at
-  session end, `PipelineHandle::speaker_stats()`.
+  `speaker_ms`, `transcribe_ms`, `assigned`, `speakers_created`, `ambiguous`, `failed`) logged
+  at info at session end, `PipelineHandle::speaker_stats()`. Right after the segment's insert
+  the line's OWN embedding is kept (`Store::insert_segment_voice`: the longest span of the
+  line's voice, else the longest span — so an untagged line can still be corrected or enrol
+  someone new), for the user's corrections below.
 - **Store v10**: `speakers(id AUTOINCREMENT, name, name_source user|brain, name_confidence,
   is_me, centroid BLOB f32 LE, speech_secs, mic_secs, created_at, last_heard_at)`,
   `segments.speaker_id` (index `segments_speaker`), added in place by `ensure_speakers_schema`
@@ -960,6 +972,46 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   (row deleted, segments → NULL, WAL checkpoint), `merge_speakers(from, into)` (segments
   repointed, centroids averaged by capped weight, counters summed, `into` keeps its name else
   takes `from`'s).
+- **Store v11** (`store_voices.rs`): `segment_voices(segment_id PK REFERENCES segments ON
+  DELETE CASCADE, embedding BLOB f32 LE, speech_ms, created_at)` — every line's own embedding
+  (~1 KB per line, ~12 MB at the user's rate), added in place by `ensure_voices_schema` (a v10
+  binary refuses v11: `SchemaTooNew`). Foreign keys are on for every connection after `init`,
+  so every segment delete (user delete, `purge_transcripts`, media deletes) takes its row.
+  Kept `VOICE_EMBEDDING_KEEP_DAYS` = 30 (a correction is made soon after the fact):
+  `Store::prune_segment_voices(now)` at every `Store::open` and at each session end.
+- **Correcting a line**: the row menu's "Speaker: <label> ▸" (now on every non-media row,
+  with or without a voice) ends with **"This line was ▸"**: a search field (focused on open,
+  "name…"; a case-insensitive substring of the name or the label, e.g. "them 3"), the matching
+  voices most recently heard first (labels in the clicked line's lane; its current voice
+  greyed; at most `speakers::PICKER_ROWS` 12, then "and N more — type to narrow"; Enter with
+  exactly one match picks it, Escape closes), then "Someone new…" (the row's inline field, an
+  optional name; empty = an unnamed voice) and "Nobody" (clear). With rows selected (see
+  "Selecting rows" under Transcripts) a right-click on a selected row adds **"These N lines
+  were ▸"** at the top level (the same picker for the whole selection, which is cleared
+  after; the voice's own Name… / This is me / Merge / Forget still act on the clicked row's
+  voice). `TranscriptAction::SpeakerReassign { segments, target: SpeakerTarget::{Voice, New
+  { name }, None} }` → one line: `Store::correct_segment_speaker(segment, target, learn,
+  now)`, several: `correct_segments_speaker` — one savepoint: the label moves; when the line's
+  embedding is kept and `learn` (= `PipelineHandle::speakers_enabled()`: recognition on) it is
+  unlearned from the old voice (`(c·w − e·s)/(w − s)`, re-normalised; a voice whose weight
+  would fall to ~0 keeps its centroid) and learned into the new one with `CORRECTION_WEIGHT`
+  3.0 (the user confirmed it: three times an automatic match); `New` enrols a voice from the
+  first kept embedding (`speech_secs` = the line's, `mic_secs` too on the microphone; a name
+  is `user`; with no embedding the voice starts empty and takes the first learned line's).
+  A `segment_speaker` / `segment_speakers` change (`by: user`) records it; `undo_change`
+  restores the LABELS only (a forgotten former voice comes back as none) — the centroid
+  movement is not reverted. Nothing goes on the UI undo stack. The pipeline never
+  re-assigns a stored line, so a correction sticks. Toasts: "Line moved to Priya", "New voice
+  from this line: Dana", "Speaker cleared", "Moved 3 lines to Priya"; relabel-only cases say
+  so ("(relabelled only: no voiceprint kept for this line)" — older than this change or
+  pruned —, "(relabelled only: speaker recognition is off)", "(2 relabelled only: no
+  voiceprint kept)"). **Similar lines**: after a one-line correction,
+  `Store::segments_like(segment, LineScope::Episode(note) | Session(id), from, to,
+  SIMILAR_LINE_THRESHOLD 0.45)` (cosine over the kept embeddings; the line left out; only lines
+  whose voice is the old one or none, not already the new one) — when it finds N ≥ 1, a
+  second toast "N more lines in this note (session) sound like the same person" with a
+  **"Move them too"** button (`ToastState::confirm_action`, up `ACTION_SECS` 10 s;
+  `ToastAction::ReassignLines`) → `correct_segments_speaker`, "Moved N lines to Priya".
 - **Labels** (`oats_core::speaker_label`, shared by UI and brain): `is_me` → "me" (wins over a
   name); a name; else "them N" (system) / "voice N" (mic), N = the voice id (stable); no voice →
   the lane ("me" / "them").
@@ -974,7 +1026,9 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   right-click to correct". Row context menu: "Speaker: <label> ▸" Name… (inline field; empty
   clears), This is me, Merge into… (inline field resolved locally by
   `speakers::resolve_voice`: "them 3" / "voice 3" / "#3" / "3" / exact name / unique prefix /
-  "me"), Forget this voice — each a toast, `speakers_edited` (reload + `pipeline.reload_speakers`).
+  "me"), Forget this voice (those four only on a row with a voice), then "This line was ▸"
+  (see "Correcting a line") — each a toast, `speakers_edited` (reload +
+  `pipeline.reload_speakers`).
   Preferences: "Recognise speakers (keeps a voiceprint per person in the database)"
   (`AppPrefs::speakers`, default OFF — a fresh install enrols nobody until the user opts in;
   greyed when `OATS_SPEAKERS` is set) and the "Speakers"
@@ -1008,8 +1062,8 @@ nested transaction (`Store::with_savepoint`; outermost `BEGIN IMMEDIATE`, inner 
 `SAVEPOINT`, rolled back on error or panic). `episodes.id` is `AUTOINCREMENT` (an older table
 is rebuilt in place on open, same schema version), so a reset or merged episode's id is never
 handed to a later episode that would adopt its events.
-Schema version 10 (`meta.schema_version`; v10 added `speakers` + `segments.speaker_id` — see
-"Speakers" —, v9 removed the Media category — see "Media on the
+Schema version 11 (`meta.schema_version`; v11 added `segment_voices` (each line's own
+speaker embedding, 30 days) and v10 `speakers` + `segments.speaker_id` — see "Speakers" —, v9 removed the Media category — see "Media on the
 system lane" —, v7/v8 added the media tables, v6 re-keyed events; v5 added `episodes.user_edited_at`; a v1 file is migrated on open — `categories` become
 the root `nodes` with the same ids, `segments` is rebuilt — a v2 file gets two columns
 in place, `segments.source TEXT NOT NULL DEFAULT 'mic'` and `segments.echo_of INTEGER NULL`,

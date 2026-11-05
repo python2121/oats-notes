@@ -45,11 +45,101 @@ pub enum TranscriptAction {
     SpeakerForget {
         speaker: i64,
     },
+    /// "This line was ▸" (one line) / "These N lines were ▸" (the selection): who said them.
+    SpeakerReassign {
+        segments: Vec<i64>,
+        target: oats_core::SpeakerTarget,
+    },
     /// Load the page of rows before the first loaded one.
     LoadEarlier,
     /// Load the page of rows after the last loaded one (only after a jump: otherwise the
     /// loaded rows already end at the newest).
     LoadLater,
+}
+
+/// The rows picked for a batch action (⌥-click toggles a row, ⇧-click selects the range from
+/// the anchor; a plain click or Escape clears it), kept in egui's memory: the Transcripts view
+/// and a node's "Show transcript" list draw the same rows. Ids no longer in the list being
+/// drawn are dropped, and the app clears it on every view change.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RowSelection {
+    pub selected: std::collections::BTreeSet<i64>,
+    pub anchor: Option<i64>,
+}
+
+fn selection_id() -> egui::Id {
+    egui::Id::new("oats-row-selection")
+}
+
+/// The current row selection.
+pub fn row_selection(ctx: &egui::Context) -> RowSelection {
+    ctx.data(|d| d.get_temp::<RowSelection>(selection_id()))
+        .unwrap_or_default()
+}
+
+fn set_row_selection(ctx: &egui::Context, sel: RowSelection) {
+    ctx.data_mut(|d| d.insert_temp(selection_id(), sel));
+}
+
+/// Drop the row selection (a view change, a batch action done).
+pub fn clear_row_selection(ctx: &egui::Context) {
+    set_row_selection(ctx, RowSelection::default());
+}
+
+/// The selection after a click on row `id` in `order` (the list's display order): ⌥ toggles
+/// it (and makes it the anchor), ⇧ selects the range from the anchor (from the row itself
+/// without one), a plain click clears. Pure.
+pub fn click_selection(
+    mut sel: RowSelection,
+    id: i64,
+    order: &[i64],
+    alt: bool,
+    shift: bool,
+) -> RowSelection {
+    if shift {
+        let anchor = sel.anchor.unwrap_or(id);
+        let at = |x: i64| order.iter().position(|r| *r == x);
+        match (at(anchor), at(id)) {
+            (Some(a), Some(b)) => {
+                let (lo, hi) = (a.min(b), a.max(b));
+                sel.selected.extend(order[lo..=hi].iter().copied());
+            }
+            _ => {
+                sel.selected.insert(id);
+            }
+        }
+        sel.anchor = Some(anchor);
+    } else if alt {
+        if !sel.selected.remove(&id) {
+            sel.selected.insert(id);
+        }
+        sel.anchor = Some(id);
+    } else {
+        sel = RowSelection::default();
+    }
+    sel
+}
+
+/// Escape (no text field focused) clears a selection; ids not among `rows` are dropped.
+fn tend_selection(ui: &egui::Ui, rows: &[TranscriptRow]) {
+    let mut sel = row_selection(ui.ctx());
+    if sel.selected.is_empty() {
+        return;
+    }
+    let before = sel.clone();
+    if !ui.ctx().egui_wants_keyboard_input()
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        sel = RowSelection::default();
+    }
+    let ids: std::collections::HashSet<i64> = rows.iter().map(|r| r.id).collect();
+    sel.selected.retain(|id| ids.contains(id));
+    if sel.anchor.is_some_and(|a| !ids.contains(&a)) {
+        sel.anchor = None;
+    }
+    if sel != before {
+        set_row_selection(ui.ctx(), sel);
+    }
 }
 
 /// Rows per page of the Transcripts view.
@@ -306,6 +396,7 @@ pub fn transcript_list(
     let mut new_anchor: Option<(i64, f32)> = None;
     let anchor = pages.anchor;
     let rows = &pages.rows;
+    tend_selection(ui, rows);
     let (has_earlier, has_later) = (pages.has_earlier, pages.has_later);
     let breaks = day_breaks(rows, &Local);
     let out = egui::ScrollArea::vertical()
@@ -350,7 +441,7 @@ pub fn transcript_list(
                     });
                     ui.add_space(4.0);
                 }
-                let rect = transcript_row(ui, &t, row, draft, &mut actions);
+                let rect = transcript_row(ui, &t, row, rows, draft, &mut actions);
                 focus_row(ui, &t, focus, row.id, rect);
                 let y = rect.top() - origin;
                 if was_armed {
@@ -445,6 +536,7 @@ pub fn transcript_rows(
 ) -> Vec<TranscriptAction> {
     let t = Tokens::get(ui.ctx());
     let mut actions = Vec::new();
+    tend_selection(ui, rows);
     let breaks = day_breaks(rows, &Local);
     let this_year = Local::now().year();
     let mut next_break = breaks.iter().peekable();
@@ -463,7 +555,7 @@ pub fn transcript_rows(
             });
             ui.add_space(4.0);
         }
-        transcript_row(ui, &t, row, draft, &mut actions);
+        transcript_row(ui, &t, row, rows, draft, &mut actions);
     }
     actions
 }
@@ -486,6 +578,7 @@ fn transcript_row(
     ui: &mut egui::Ui,
     t: &Tokens,
     row: &TranscriptRow,
+    rows: &[TranscriptRow],
     draft: &mut Option<MoveDraft>,
     actions: &mut Vec<TranscriptAction>,
 ) -> Rect {
@@ -575,12 +668,62 @@ fn transcript_row(
         // keeps the row's id (the menu's state) and adds the labels' clicks
         resp = resp.union(labels);
     }
+    // ⌥-click / ⇧-click pick rows for a batch action, a plain click drops the pick (the
+    // modifiers of the click itself: the frame's may already be released)
+    if resp.clicked() {
+        let mods = ui.input(|i| {
+            i.events
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        modifiers,
+                        ..
+                    } => Some(*modifiers),
+                    _ => None,
+                })
+                .unwrap_or(i.modifiers)
+        });
+        let sel = row_selection(ui.ctx());
+        if mods.alt || mods.shift || !sel.selected.is_empty() {
+            let order: Vec<i64> = rows.iter().map(|r| r.id).collect();
+            set_row_selection(
+                ui.ctx(),
+                click_selection(sel, row.id, &order, mods.alt, mods.shift),
+            );
+        }
+        if mods.alt || mods.shift {
+            // a modified click picks the row; it must not leave a text selection behind
+            ui.ctx()
+                .plugin::<egui::text_selection::LabelSelectionState>()
+                .lock()
+                .clear_selection();
+        }
+    }
+    // a right-click outside the selection is about that row alone
+    if resp.secondary_clicked() {
+        let sel = row_selection(ui.ctx());
+        if !sel.selected.is_empty() && !sel.selected.contains(&row.id) {
+            clear_row_selection(ui.ctx());
+        }
+    }
+    let selection = row_selection(ui.ctx());
+    let selected = selection.selected.contains(&row.id);
     // `contains_pointer`, not `hovered`: over the text the label on top is the hovered widget
-    if resp.contains_pointer() || resp.context_menu_opened() {
+    if selected {
         ui.painter().set(
             fill,
-            egui::Shape::rect_filled(rect, 4.0, t.hover.gamma_multiply(0.6)),
+            egui::Shape::rect_filled(rect, 4.0, t.accent_alpha(0.18)),
         );
+    }
+    if resp.contains_pointer() || resp.context_menu_opened() {
+        if !selected {
+            ui.painter().set(
+                fill,
+                egui::Shape::rect_filled(rect, 4.0, t.hover.gamma_multiply(0.6)),
+            );
+        }
         if let Some(c) = row.confidence {
             ui.painter().text(
                 pos2(rect.right() - 8.0, rect.top() + 5.0),
@@ -610,9 +753,17 @@ fn transcript_row(
             ui.ctx().copy_text(row.text.clone());
             ui.close();
         }
-        if row.speaker_id.is_some_and(|id| voices.contains_key(&id)) {
+        if row.echo_of.is_none() && !row.media_kind.is_some_and(|k| k.is_media()) {
             ui.separator();
-            if let Some(a) = crate::speakers::speaker_menu(ui, row, &voices) {
+            let picked: Vec<i64> = selection.selected.iter().copied().collect();
+            // the picked lines' voice when they all share one (greyed in the picker)
+            let mut picked_voices = rows
+                .iter()
+                .filter(|r| selection.selected.contains(&r.id))
+                .map(|r| r.speaker_id);
+            let first = picked_voices.next().flatten();
+            let shared = picked_voices.all(|v| v == first).then_some(first).flatten();
+            if let Some(a) = crate::speakers::speaker_menu(ui, row, &voices, &picked, shared) {
                 actions.push(a);
             }
         }
@@ -638,6 +789,39 @@ fn transcript_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn option_and_shift_clicks_pick_rows_and_a_plain_click_drops_them() {
+        let order = [10, 11, 12, 13, 14];
+        let none = RowSelection::default();
+        let a = click_selection(none.clone(), 11, &order, true, false);
+        assert_eq!(a.selected.iter().copied().collect::<Vec<_>>(), vec![11]);
+        assert_eq!(a.anchor, Some(11));
+        let b = click_selection(a.clone(), 13, &order, true, false);
+        assert_eq!(b.selected.len(), 2);
+        // ⌥ again on a picked row drops it
+        let c = click_selection(b.clone(), 11, &order, true, false);
+        assert_eq!(c.selected.iter().copied().collect::<Vec<_>>(), vec![13]);
+        // ⇧ selects the range from the anchor (both directions)
+        let d = click_selection(a.clone(), 14, &order, false, true);
+        assert_eq!(
+            d.selected.iter().copied().collect::<Vec<_>>(),
+            vec![11, 12, 13, 14]
+        );
+        let e = click_selection(
+            click_selection(none.clone(), 13, &order, true, false),
+            10,
+            &order,
+            false,
+            true,
+        );
+        assert_eq!(
+            e.selected.iter().copied().collect::<Vec<_>>(),
+            vec![10, 11, 12, 13]
+        );
+        // a plain click clears
+        assert_eq!(click_selection(d, 12, &order, false, false), none);
+    }
     use chrono::FixedOffset;
 
     #[test]
