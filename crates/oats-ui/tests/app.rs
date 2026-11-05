@@ -4056,8 +4056,7 @@ fn this_line_was_reassigns_one_line_and_offers_the_lines_that_sound_alike() {
 
     h.get_by_label(VENDOR).click_secondary();
     h.run_steps(2);
-    h.get_by_label("Speaker: them 3 ⏵").click();
-    h.run_steps(2);
+    // the menu's first entry
     h.get_by_label("This line was ⏵").click();
     h.run_steps(3);
     // the search field is focused on open: typing narrows the voices
@@ -4110,8 +4109,7 @@ fn a_line_with_no_voiceprint_is_relabelled_only_and_nobody_clears_it() {
     let priya = voice_named(&s, "Priya");
     h.get_by_label(VENDOR).click_secondary();
     h.run_steps(2);
-    h.get_by_label("Speaker: them 3 ⏵").click();
-    h.run_steps(2);
+    // the menu's first entry
     h.get_by_label("This line was ⏵").click();
     h.run_steps(3);
     h.get_by_label("Priya").click();

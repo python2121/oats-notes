@@ -986,8 +986,8 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   so every segment delete (user delete, `purge_transcripts`, media deletes) takes its row.
   Kept `VOICE_EMBEDDING_KEEP_DAYS` = 30 (a correction is made soon after the fact):
   `Store::prune_segment_voices(now)` at every `Store::open` and at each session end.
-- **Correcting a line**: the row menu's "Speaker: <label> ▸" (now on every non-media row,
-  with or without a voice) ends with **"This line was ▸"**: a search field (focused on open,
+- **Correcting a line**: the row menu's FIRST entry (every non-media row, with or without a
+  voice) is **"This line was ▸"**: a search field (focused on open,
   "name…"; a case-insensitive substring of the name or the label, e.g. "them 3"), the matching
   voices most recently heard first (labels in the clicked line's lane; its current voice
   greyed; at most `speakers::PICKER_ROWS` 12, then "and N more — type to narrow"; Enter with
@@ -1030,11 +1030,13 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   the user's own lines as "me" (`speakers::me_label`, the user's voice's colour); a
   change-only rule (tags as a chat's turn markers) was tried and the user preferred every
   row; a brain-named voice's hover reads "named from the conversation —
-  right-click to correct". Row context menu: "Speaker: <label> ▸" Name… (inline field; empty
-  clears), This is me, Merge into… (inline field resolved locally by
-  `speakers::resolve_voice`: "them 3" / "voice 3" / "#3" / "3" / exact name / unique prefix /
-  "me"), Forget this voice (those four only on a row with a voice), then "This line was ▸"
-  (see "Correcting a line") — each a toast, `speakers_edited` (reload +
+  right-click to correct". Row context menu: "This line was ▸" FIRST (see "Correcting a
+  line"; its list keeps the height of `PICKER_ROWS` rows whatever the search leaves, so the
+  submenu never shrinks and jumps), then Move to… / Unfile / Copy Text, then "Speaker:
+  <label> ▸" with the voice's own actions: Name… (inline field; empty clears), This is me,
+  Merge into… (inline field resolved locally by `speakers::resolve_voice`: "them 3" /
+  "voice 3" / "#3" / "3" / exact name / unique prefix / "me"), Forget this voice (a row
+  without a voice shows a hint instead) — each a toast, `speakers_edited` (reload +
   `pipeline.reload_speakers`).
   Preferences: "Recognise speakers (keeps a voiceprint per person in the database)"
   (`AppPrefs::speakers`, default OFF — a fresh install enrols nobody until the user opts in;

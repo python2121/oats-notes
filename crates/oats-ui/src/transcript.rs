@@ -735,6 +735,21 @@ fn transcript_row(
         }
     }
     resp.context_menu(|ui| {
+        let speakers = row.echo_of.is_none() && !row.media_kind.is_some_and(|k| k.is_media());
+        let picked: Vec<i64> = selection.selected.iter().copied().collect();
+        // the picked lines' voice when they all share one (greyed in the picker)
+        let mut picked_voices = rows
+            .iter()
+            .filter(|r| selection.selected.contains(&r.id))
+            .map(|r| r.speaker_id);
+        let first = picked_voices.next().flatten();
+        let shared = picked_voices.all(|v| v == first).then_some(first).flatten();
+        // who said it comes first: the correction the user makes most
+        if speakers
+            && let Some(a) = crate::speakers::line_was_menu(ui, row, &voices, &picked, shared)
+        {
+            actions.push(a);
+        }
         if ui.button("Move to…").clicked() {
             *draft = Some(MoveDraft::new(MoveTarget::Segment(row.id), row.node_id));
             ui.close();
@@ -753,17 +768,9 @@ fn transcript_row(
             ui.ctx().copy_text(row.text.clone());
             ui.close();
         }
-        if row.echo_of.is_none() && !row.media_kind.is_some_and(|k| k.is_media()) {
+        if speakers {
             ui.separator();
-            let picked: Vec<i64> = selection.selected.iter().copied().collect();
-            // the picked lines' voice when they all share one (greyed in the picker)
-            let mut picked_voices = rows
-                .iter()
-                .filter(|r| selection.selected.contains(&r.id))
-                .map(|r| r.speaker_id);
-            let first = picked_voices.next().flatten();
-            let shared = picked_voices.all(|v| v == first).then_some(first).flatten();
-            if let Some(a) = crate::speakers::speaker_menu(ui, row, &voices, &picked, shared) {
+            if let Some(a) = crate::speakers::speaker_menu(ui, row, &voices) {
                 actions.push(a);
             }
         }

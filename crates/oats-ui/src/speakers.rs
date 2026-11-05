@@ -240,28 +240,35 @@ fn voice_picker(
     if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.close();
     }
+    // The list keeps the height of PICKER_ROWS rows whatever the filter leaves (a submenu
+    // that shrinks is re-anchored by egui and jumps about under the pointer).
+    let mut row_h = None;
     for s in voices.iter().take(PICKER_ROWS) {
         let label = speaker_label(Some(s), row.source);
-        if ui
-            .add_enabled(Some(s.id) != current, egui::Button::new(label))
-            .clicked()
-        {
+        let resp = ui.add_enabled(Some(s.id) != current, egui::Button::new(label));
+        row_h = Some(resp.rect.height());
+        if resp.clicked() {
             action = Some(reassign(SpeakerTarget::Voice(s.id)));
             ui.close();
         }
     }
-    if voices.len() > PICKER_ROWS {
-        ui.label(
-            RichText::new(format!(
-                "and {} more — type to narrow",
-                voices.len() - PICKER_ROWS
-            ))
-            .size(11.0)
-            .weak(),
-        );
-    } else if voices.is_empty() {
-        ui.label(RichText::new("No voice matches").size(11.0).weak());
+    let shown = voices.len().min(PICKER_ROWS);
+    if shown < PICKER_ROWS {
+        let row_h = row_h.unwrap_or_else(|| {
+            let text = ui.text_style_height(&egui::TextStyle::Button);
+            (text + 2.0 * ui.spacing().button_padding.y).max(ui.spacing().interact_size.y)
+        });
+        let gap = ui.spacing().item_spacing.y;
+        ui.add_space((PICKER_ROWS - shown) as f32 * (row_h + gap) - gap);
     }
+    let note = if voices.len() > PICKER_ROWS {
+        format!("and {} more — type to narrow", voices.len() - PICKER_ROWS)
+    } else if voices.is_empty() {
+        "No voice matches".to_owned()
+    } else {
+        " ".to_owned() // the line is kept, so the height is
+    };
+    ui.label(RichText::new(note).size(11.0).weak());
     ui.separator();
     if ui
         .button("Someone new…")
@@ -296,13 +303,11 @@ fn voice_picker(
     action
 }
 
-/// The speaker entries of a row's context menu (rows that aren't media): "Speaker: <label> ▸"
-/// with the voice's own actions (Name… / This is me / Merge into… / Forget, for a row with a
-/// known voice) and "This line was ▸"; with a multi-row `selection` that contains the row,
-/// "These N lines were ▸" at the top level for the whole selection instead (the voice's own
-/// actions still apply to the clicked row's voice). `selection_voice`: the selected lines'
-/// voice when they all share one.
-pub fn speaker_menu(
+/// The FIRST entry of a row's context menu (rows that aren't media): "This line was ▸" (the
+/// voice picker for the row), or, with a multi-row `selection` that contains the row, "These
+/// N lines were ▸" for the whole selection. `selection_voice`: the selected lines' voice when
+/// they all share one.
+pub fn line_was_menu(
     ui: &mut egui::Ui,
     row: &TranscriptRow,
     map: &SpeakerMap,
@@ -312,14 +317,31 @@ pub fn speaker_menu(
     if row_label(row, map).is_some_and(|l| l.text == "media") {
         return None;
     }
-    let voice = row.speaker_id.and_then(|id| map.get(&id));
-    let batch = selection.len() > 1 && selection.contains(&row.id);
     let mut action = None;
-    if batch {
+    if selection.len() > 1 && selection.contains(&row.id) {
         ui.menu_button(format!("These {} lines were", selection.len()), |ui| {
             action = voice_picker(ui, row, selection, selection_voice, map);
         });
+    } else {
+        ui.menu_button("This line was", |ui| {
+            action = voice_picker(ui, row, &[row.id], row.speaker_id, map);
+        });
     }
+    action
+}
+
+/// The voice's own entry of a row's context menu, "Speaker: <label> ▸" (Name… / This is me /
+/// Merge into… / Forget), for a row with a known voice.
+pub fn speaker_menu(
+    ui: &mut egui::Ui,
+    row: &TranscriptRow,
+    map: &SpeakerMap,
+) -> Option<TranscriptAction> {
+    if row_label(row, map).is_some_and(|l| l.text == "media") {
+        return None;
+    }
+    let voice = row.speaker_id.and_then(|id| map.get(&id));
+    let mut action = None;
     let title = format!("Speaker: {}", speaker_label(voice, row.source));
     ui.menu_button(title, |ui| {
         if let Some(s) = voice {
@@ -370,16 +392,12 @@ pub fn speaker_menu(
                 action = Some(TranscriptAction::SpeakerForget { speaker: id });
                 ui.close();
             }
-        }
-        if !batch {
-            if voice.is_some() {
-                ui.separator();
-            }
-            ui.menu_button("This line was", |ui| {
-                if let Some(a) = voice_picker(ui, row, &[row.id], row.speaker_id, map) {
-                    action = Some(a);
-                }
-            });
+        } else {
+            ui.label(
+                RichText::new("No voice on this line — use “This line was”")
+                    .size(11.0)
+                    .weak(),
+            );
         }
     });
     action
