@@ -57,8 +57,9 @@ pub enum TranscriptAction {
     LoadLater,
 }
 
-/// The rows picked for a batch action (⌥-click toggles a row, ⇧-click selects the range from
-/// the anchor; a plain click or Escape clears it), kept in egui's memory: the Transcripts view
+/// The rows picked for a batch action (a click selects a row, ⌥- / ⌘-click toggles another
+/// into the selection, ⇧-click selects the range from the anchor; Escape clears it), kept in
+/// egui's memory: the Transcripts view
 /// and a node's "Show transcript" list draw the same rows. Ids no longer in the list being
 /// drawn are dropped, and the app clears it on every view change.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -86,9 +87,9 @@ pub fn clear_row_selection(ctx: &egui::Context) {
     set_row_selection(ctx, RowSelection::default());
 }
 
-/// The selection after a click on row `id` in `order` (the list's display order): ⌥ toggles
-/// it (and makes it the anchor), ⇧ selects the range from the anchor (from the row itself
-/// without one), a plain click clears. Pure.
+/// The selection after a click on row `id` in `order` (the list's display order): ⌥ / ⌘
+/// toggles it (and makes it the anchor), ⇧ selects the range from the anchor (from the row
+/// itself without one), a plain click selects that row alone (and keeps it selected). Pure.
 pub fn click_selection(
     mut sel: RowSelection,
     id: i64,
@@ -115,7 +116,10 @@ pub fn click_selection(
         }
         sel.anchor = Some(id);
     } else {
-        sel = RowSelection::default();
+        sel = RowSelection {
+            selected: std::iter::once(id).collect(),
+            anchor: Some(id),
+        };
     }
     sel
 }
@@ -688,6 +692,11 @@ fn transcript_row(
         let sel = row_selection(ui.ctx());
         // ⌘ too: the platform's usual multi-select modifier
         let pick = mods.alt || mods.command;
+        let order: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        set_row_selection(
+            ui.ctx(),
+            click_selection(sel.clone(), row.id, &order, pick, mods.shift),
+        );
         log::debug!(
             "row {} clicked: alt {} cmd {} shift {} (picked before: {})",
             row.id,
@@ -696,13 +705,6 @@ fn transcript_row(
             mods.shift,
             sel.selected.len()
         );
-        if pick || mods.shift || !sel.selected.is_empty() {
-            let order: Vec<i64> = rows.iter().map(|r| r.id).collect();
-            set_row_selection(
-                ui.ctx(),
-                click_selection(sel, row.id, &order, pick, mods.shift),
-            );
-        }
         if pick || mods.shift {
             // a modified click picks the row; it must not leave a text selection behind
             ui.ctx()
@@ -711,11 +713,17 @@ fn transcript_row(
                 .clear_selection();
         }
     }
-    // a right-click outside the selection is about that row alone
+    // a right-click outside the selection is about that row alone: it becomes the selection
     if resp.secondary_clicked() {
         let sel = row_selection(ui.ctx());
-        if !sel.selected.is_empty() && !sel.selected.contains(&row.id) {
-            clear_row_selection(ui.ctx());
+        if !sel.selected.contains(&row.id) {
+            set_row_selection(
+                ui.ctx(),
+                RowSelection {
+                    selected: std::iter::once(row.id).collect(),
+                    anchor: Some(row.id),
+                },
+            );
         }
     }
     let selection = row_selection(ui.ctx());
@@ -808,7 +816,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn option_and_shift_clicks_pick_rows_and_a_plain_click_drops_them() {
+    fn a_click_selects_a_row_and_option_and_shift_clicks_add_to_it() {
         let order = [10, 11, 12, 13, 14];
         let none = RowSelection::default();
         let a = click_selection(none.clone(), 11, &order, true, false);
@@ -837,7 +845,11 @@ mod tests {
             vec![10, 11, 12, 13]
         );
         // a plain click clears
-        assert_eq!(click_selection(d, 12, &order, false, false), none);
+        // a plain click selects that row alone
+        let plain = click_selection(d, 12, &order, false, false);
+        assert_eq!(plain.selected.iter().copied().collect::<Vec<_>>(), vec![12]);
+        assert_eq!(plain.anchor, Some(12));
+        let _ = none;
     }
     use chrono::FixedOffset;
 

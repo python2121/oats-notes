@@ -4224,17 +4224,23 @@ fn option_and_shift_clicks_select_rows_and_the_batch_menu_retags_them() {
     h.key_press(egui::Key::Escape);
     h.run_steps(2);
 
-    // a plain click clears a selection
+    // a plain click selects that row alone (and keeps it): the two picked rows give way to it
     h.get_by_label(OKAY).click_modifiers(egui::Modifiers::ALT);
     h.run_steps(2);
-    assert_eq!(picked(&h).len(), 1);
+    h.get_by_label(VENDOR).click_modifiers(egui::Modifiers::ALT);
+    h.run_steps(2);
+    assert_eq!(picked(&h).len(), 2);
     h.get_by_label(FITS).click();
     h.run_steps(2);
-    assert!(picked(&h).is_empty());
-    // and so does Escape
+    let only = picked(&h);
+    assert_eq!(only.len(), 1);
+    h.get_by_label(FITS).click();
+    h.run_steps(2);
+    assert_eq!(picked(&h), only, "clicking it again keeps it");
+    // Escape clears (the kept row plus one more)
     h.get_by_label(OKAY).click_modifiers(egui::Modifiers::ALT);
     h.run_steps(2);
-    assert_eq!(picked(&h).len(), 1);
+    assert_eq!(picked(&h).len(), 2);
     h.key_press(egui::Key::Escape);
     h.run_steps(2);
     assert!(picked(&h).is_empty());

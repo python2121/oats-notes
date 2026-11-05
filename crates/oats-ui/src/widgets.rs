@@ -94,10 +94,9 @@ pub fn check_box(ui: &mut Ui, checked: &mut bool, font: &FontId) -> Response {
     let cs = child
         .style()
         .checkbox_style(&egui::widget_style::Classes::default(), resp.widget_state());
-    let big = Rect::from_center_size(
-        pos2(rect.left() + cs.checkbox_size / 2.0, rect.center().y),
-        egui::Vec2::splat(cs.checkbox_size),
-    );
+    // egui's atom layout centres the icon in the square (a left-to-right layout's main
+    // alignment is Center), so the box sits in the middle of `rect`, not at its left
+    let big = Rect::from_center_size(rect.center(), egui::Vec2::splat(cs.checkbox_size));
     let small = Rect::from_center_size(big.center(), egui::Vec2::splat(cs.check_size));
     child.painter().add(egui::epaint::RectShape::new(
         big.expand(cs.checkbox_frame.inner_margin.left.into()),
