@@ -192,7 +192,15 @@ fn card_frame(t: &Tokens, shadow: egui::epaint::Shadow, light: bool) -> egui::Fr
             shadow
         })
         .inner_margin(if light {
-            egui::Margin::symmetric(12, 8)
+            // The message's line box has ~1.5 pt of leading above the capitals and the
+            // descender's room below: 9 / 7 puts the capitals (and the icon and × centred on
+            // them) on the card's centre line.
+            egui::Margin {
+                left: 12,
+                right: 12,
+                top: 9,
+                bottom: 7,
+            }
         } else {
             // The title's line box has ~3 pt of leading above the capitals, the button row
             // none below: 10 / 13 makes the visible gaps (border → title capitals, Done →
