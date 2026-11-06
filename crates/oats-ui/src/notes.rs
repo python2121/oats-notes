@@ -1409,6 +1409,7 @@ pub(crate) fn episode_card(
                                 egui::Id::new(("card-items", e.id)),
                                 &keys,
                                 &mut state.moves,
+                                crate::motion::Divider::None,
                             );
                             for (i, slot) in entries {
                                 let a = items[i];
@@ -2241,6 +2242,7 @@ fn next_steps(
         egui::Id::new(("next-steps", salt)),
         &keys,
         &mut state.moves,
+        crate::motion::Divider::Some,
     );
     // Collapsed, the list shows the open items up to the cap ([`next_steps_shown`]; an item
     // held in its old place still counts as open); the rest is revealed by "Show all".

@@ -183,6 +183,18 @@ fn drawn<K: Clone + Send + Sync + 'static>(ctx: &Context, list: Id) -> Option<Ve
         .map(|(_, v)| v)
 }
 
+/// What a list draws between its open items and its completed ones — whether a row whose old
+/// and new places are next to each other in the list's order would actually stay put.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Divider {
+    /// Nothing: the blocks run on (a note card's items), so such a row does not move and gets
+    /// no transition (the user's rule: no animation when the row stays where it is).
+    None,
+    /// A heading (the Todos view), a link, or the completed block is hidden (the Next steps):
+    /// the places are different places, so the row holds and moves like any other.
+    Some,
+}
+
 /// Arrange a list for drawing: `keys` = its items in data order with their completed state;
 /// returns (index into `keys`, slot) in drawing order. A transition gets an `Old` copy where
 /// its row sat in what this list drew last frame — only when the list showed the row then
@@ -193,14 +205,19 @@ pub fn arrange<K: Clone + PartialEq + Send + Sync + 'static>(
     list: Id,
     keys: &[(K, bool)],
     moves: &mut Moves<K>,
+    divider: Divider,
 ) -> Vec<(usize, Slot)> {
     let now = ctx.input(|i| i.time);
     let prev = drawn::<K>(ctx, list);
     let mut out = arrange_with(keys, moves, prev.as_deref(), now);
-    // a row whose old and new places are next to each other does not move: no hold, no
-    // retract-and-grow (the user's rule) — it is drawn plainly and its transition ends
-    for i in settle_unmoved(&mut out) {
-        moves.items.retain(|m| m.key != keys[i].0);
+    // with nothing between the blocks, a row whose old and new places are next to each other
+    // does not move: no hold, no retract-and-grow — it is drawn plainly and its transition
+    // ends (the last open item of a Todos list or of the Next steps DOES move: under the
+    // heading, or into the hidden completed part)
+    if divider == Divider::None {
+        for i in settle_unmoved(&mut out) {
+            moves.items.retain(|m| m.key != keys[i].0);
+        }
     }
     let record: Vec<(K, bool)> = out
         .iter()

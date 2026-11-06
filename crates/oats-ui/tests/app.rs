@@ -3853,6 +3853,47 @@ fn unticking_during_the_hold_keeps_the_row_in_place() {
     assert_idle(&mut rig);
 }
 
+/// The LAST open todo ticked moves too (its old and new places are next to each other in the
+/// list's order, but the "Completed" heading sits between them): it holds above the heading,
+/// then moves under it — no instant jump.
+#[test]
+fn ticking_the_last_open_todo_holds_then_moves_under_the_heading() {
+    use egui::accesskit::Role;
+    let dir = TempDir::new("motion-last");
+    let done = add_todo(&dir.db(), "Already done", None);
+    Store::open(&dir.db())
+        .unwrap()
+        .complete_todo(done, now_ms())
+        .unwrap();
+    add_todo(&dir.db(), "Water the plants", None);
+    let mut rig = build(&dir.db(), None, None);
+    with_motion(&mut rig);
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    assert!(label_top(&rig, "Water the plants") < label_top(&rig, "Completed ("));
+    rig.harness
+        .get_all_by_role(Role::CheckBox)
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(2);
+    assert_eq!(
+        rig.harness
+            .query_all_by_label_contains("Water the plants")
+            .count(),
+        1,
+        "one copy during the hold"
+    );
+    assert!(
+        label_top(&rig, "Water the plants") < label_top(&rig, "Completed ("),
+        "held above the heading"
+    );
+    rig.harness.run_steps(6);
+    assert!(label_top(&rig, "Water the plants") > label_top(&rig, "Completed ("));
+    assert!(label_top(&rig, "Water the plants") < label_top(&rig, "Already done"));
+    assert_idle(&mut rig);
+}
+
 /// ⌘Z after a tick is the mirror transition: the row holds its place under "Completed",
 /// unticked, then moves back up among the open todos (not a jump); ⇧⌘Z moves it down again.
 #[test]

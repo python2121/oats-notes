@@ -373,6 +373,7 @@ pub fn todos_view(
                 egui::Id::new("todos-list"),
                 &keys,
                 &mut state.moves,
+                crate::motion::Divider::Some,
             );
             for (i, slot) in entries {
                 let todo = &todos[i];
