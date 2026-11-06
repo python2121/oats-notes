@@ -2607,6 +2607,7 @@ impl OatsApp {
                 if let Some((ep, Some(node))) = entry.moved_to(undo) {
                     self.follow_moved_episode(ep, node);
                 }
+                self.start_undo_motion(&entry.edit, undo);
                 let todo = matches!(entry.edit, crate::undo::Edit::Todo { .. });
                 if undo {
                     self.undo.undone(entry);
@@ -2630,6 +2631,34 @@ impl OatsApp {
             Err(e) => self
                 .pending_toasts
                 .push((format!("Couldn't {}: {e}", verb.to_lowercase()), true)),
+        }
+    }
+
+    /// An undone (or redone) tick is a completion transition like a click's, in the direction
+    /// the step now reads: the row holds its place, ticked or unticked, then moves — the
+    /// mirror of what it did (without this the row jumped, and the mark's fade played in the
+    /// row's new place: a phantom check among the open items). A todo's only while the Todos
+    /// view draws it, as for a click; a step in flight (⌘Z during the hold) is cancelled, so
+    /// the row stays where it is.
+    fn start_undo_motion(&mut self, edit: &crate::undo::Edit, undo: bool) {
+        match edit {
+            crate::undo::Edit::ActionItemDone {
+                episode_id,
+                text,
+                done,
+                ..
+            } => self
+                .notes_state
+                .moves
+                .toggle((*episode_id, text.clone()), *done != undo),
+            crate::undo::Edit::Todo { id, before, after }
+                if self.prefs.view == View::Todos
+                    && before.completed_at.is_some() != after.completed_at.is_some() =>
+            {
+                let now_done = if undo { before } else { after }.completed_at.is_some();
+                self.todos_state.moves.toggle(*id, now_done);
+            }
+            _ => {}
         }
     }
 

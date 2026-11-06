@@ -3853,6 +3853,72 @@ fn unticking_during_the_hold_keeps_the_row_in_place() {
     assert_idle(&mut rig);
 }
 
+/// ⌘Z after a tick is the mirror transition: the row holds its place under "Completed",
+/// unticked, then moves back up among the open todos (not a jump); ⇧⌘Z moves it down again.
+#[test]
+fn undoing_a_tick_holds_the_row_under_completed_then_moves_it_back_up() {
+    use egui::accesskit::Role;
+    let dir = TempDir::new("motion-undo");
+    let id = add_todo(&dir.db(), "Water the plants", None);
+    add_todo(&dir.db(), "Call the landlord", None);
+    let mut rig = build(&dir.db(), None, None);
+    with_motion(&mut rig);
+    rig.app().run(Command::ShowTodos);
+    rig.harness.run_steps(2);
+    rig.harness
+        .get_all_by_role(Role::CheckBox)
+        .next()
+        .unwrap()
+        .click();
+    rig.harness.run_steps(8);
+    assert!(label_top(&rig, "Water the plants") > label_top(&rig, "Completed ("));
+    assert_idle(&mut rig);
+    let done = |_: &mut Rig| {
+        Store::open(&dir.db())
+            .unwrap()
+            .todo(id)
+            .unwrap()
+            .unwrap()
+            .done()
+    };
+    rig.harness
+        .key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    // the key press runs the undo's frame itself; one more (0.25 s, within the 0.3 s hold):
+    // the store has it open, the row still sits below
+    rig.harness.run_steps(1);
+    assert!(!done(&mut rig), "undone");
+    assert_eq!(
+        rig.harness
+            .query_all_by_label_contains("Water the plants")
+            .count(),
+        1,
+        "one copy during the hold"
+    );
+    assert!(
+        label_top(&rig, "Water the plants") > label_top(&rig, "Completed ("),
+        "held in its old place under the heading"
+    );
+    // hold + move: back among the open ones, the heading gone
+    rig.harness.run_steps(6);
+    assert!(label_top(&rig, "Water the plants") < label_top(&rig, "Call the landlord"));
+    assert!(!rig.shows("Completed ("));
+    assert_idle(&mut rig);
+    // redo: down again, holding first
+    rig.harness.key_press_modifiers(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::Z,
+    );
+    rig.harness.run_steps(1);
+    assert!(done(&mut rig), "redone");
+    assert!(
+        label_top(&rig, "Water the plants") < label_top(&rig, "Call the landlord"),
+        "held in its old place among the open ones"
+    );
+    rig.harness.run_steps(6);
+    assert!(label_top(&rig, "Water the plants") > label_top(&rig, "Completed ("));
+    assert_idle(&mut rig);
+}
+
 /// The checkbox (and label) of the action item `text` inside the open note card (the lowest
 /// of its copies: the Next steps list it first).
 fn card_item(rig: &Rig, text: &str) -> (egui::Rect, egui::Rect) {
