@@ -333,14 +333,18 @@ fn voice_picker(
 
 /// The FIRST entry of a row's context menu (rows that aren't media): "This line was ▸" (the
 /// voice picker for the row), or, with a multi-row `selection` that contains the row, "These
-/// N lines were ▸" for the whole selection. `selection_voice`: the selected lines' voice when
-/// they all share one.
+/// N lines were ▸" for the whole selection, followed by "In these lines, <label> was ▸" for
+/// `same_voice` — the selected lines tagged like the clicked row — when that is only some of
+/// them (a whole call selected: everything tagged as someone who wasn't there goes to who it
+/// was; the other voices stay). `selection_voice`: the selected lines' voice when they all
+/// share one.
 pub fn line_was_menu(
     ui: &mut egui::Ui,
     row: &TranscriptRow,
     map: &SpeakerMap,
     selection: &[i64],
     selection_voice: Option<i64>,
+    same_voice: &[i64],
 ) -> Option<TranscriptAction> {
     if row_label(row, map).is_some_and(|l| l.text == "media") {
         return None;
@@ -350,6 +354,22 @@ pub fn line_was_menu(
         ui.menu_button(format!("These {} lines were", selection.len()), |ui| {
             action = voice_picker(ui, row, selection, selection_voice, map);
         });
+        if let Some(voice) = row.speaker_id
+            && !same_voice.is_empty()
+            && same_voice.len() < selection.len()
+        {
+            let label = speaker_label(map.get(&voice), row.source);
+            let title = format!("In these lines, {label} ({}) was", same_voice.len());
+            ui.menu_button(title, |ui| {
+                action = voice_picker(ui, row, same_voice, Some(voice), map);
+            })
+            .response
+            .on_hover_text(format!(
+                "Only the {} of the {} selected lines tagged {label} move; the other voices stay",
+                same_voice.len(),
+                selection.len()
+            ));
+        }
     } else {
         ui.menu_button("This line was", |ui| {
             action = voice_picker(ui, row, &[row.id], row.speaker_id, map);

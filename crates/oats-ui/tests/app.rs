@@ -4282,6 +4282,66 @@ fn a_line_with_no_voiceprint_is_relabelled_only_and_nobody_clears_it() {
     assert!(shows(&h, "Speaker cleared"));
 }
 
+/// A selection with several voices: right-clicking a line tagged X offers "In these lines, X
+/// (N) was ▸" — the picker moves only the selected lines tagged X; the others keep their
+/// voices (a whole call selected, one voice that wasn't there replaced by who it was).
+#[test]
+fn in_these_lines_x_was_retags_only_the_selected_lines_tagged_x() {
+    let dir = TempDir::new("row-select-one-voice");
+    let mut h = speakers_rig(&dir.db());
+    let s = Store::open(&dir.db()).unwrap();
+    let priya = voice_named(&s, "Priya");
+    let me = seg_by_text(&s, OKAY).speaker_id.unwrap();
+    let them = seg_by_text(&s, VENDOR).speaker_id.unwrap();
+    assert_eq!(seg_by_text(&s, BLOCKING).speaker_id, Some(me));
+    assert_eq!(seg_by_text(&s, MORNING).speaker_id, Some(priya));
+    assert_ne!(them, me);
+    // OKAY and BLOCKING are "me", MORNING Priya, VENDOR "them 3"
+    for (t, m) in [
+        (OKAY, egui::Modifiers::ALT),
+        (BLOCKING, egui::Modifiers::ALT),
+        (MORNING, egui::Modifiers::ALT),
+        (VENDOR, egui::Modifiers::ALT),
+    ] {
+        h.get_by_label(t).click_modifiers(m);
+        h.run_steps(2);
+    }
+    assert_eq!(oats_ui::transcript::row_selection(&h.ctx).selected.len(), 4);
+    h.get_by_label(BLOCKING).click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("These 4 lines were ⏵").is_some());
+    h.get_by_label("In these lines, me (2) was ⏵").click();
+    h.run_steps(3);
+    h.get_by_label("Priya").click();
+    h.run_steps(3);
+    assert_eq!(seg_by_text(&s, OKAY).speaker_id, Some(priya));
+    assert_eq!(seg_by_text(&s, BLOCKING).speaker_id, Some(priya));
+    assert_eq!(
+        seg_by_text(&s, MORNING).speaker_id,
+        Some(priya),
+        "untouched"
+    );
+    assert_eq!(seg_by_text(&s, VENDOR).speaker_id, Some(them), "untouched");
+    assert!(shows(&h, "Moved 2 lines to Priya"));
+    assert!(
+        oats_ui::transcript::row_selection(&h.ctx)
+            .selected
+            .is_empty()
+    );
+    // a selection all of one voice offers only the whole-selection entry
+    h.get_by_label(OKAY).click_modifiers(egui::Modifiers::ALT);
+    h.run_steps(2);
+    h.get_by_label(BLOCKING)
+        .click_modifiers(egui::Modifiers::ALT);
+    h.run_steps(2);
+    h.get_by_label(OKAY).click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("These 2 lines were ⏵").is_some());
+    assert!(h.query_by_label_contains("In these lines").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+}
+
 #[test]
 fn option_and_shift_clicks_select_rows_and_the_batch_menu_retags_them() {
     let dir = TempDir::new("row-select");

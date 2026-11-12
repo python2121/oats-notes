@@ -1004,7 +1004,10 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   "Selecting rows" under Transcripts) a right-click on a selected row adds **"These N lines
   were ▸"** at the top level (the same picker for the whole selection, which is cleared
   after; the voice's own Name… / This is me / Merge / Forget still act on the clicked row's
-  voice). `TranscriptAction::SpeakerReassign { segments, target: SpeakerTarget::{Voice, New
+  voice) and, when the clicked row's voice tags only SOME of the selected lines, **"In these
+  lines, <label> (N) was ▸"** — the picker for just those lines (select a whole call,
+  right-click a line tagged as someone who wasn't there, pick who it was: the other voices
+  stay untouched). `TranscriptAction::SpeakerReassign { segments, target: SpeakerTarget::{Voice, New
   { name }, None} }` → one line: `Store::correct_segment_speaker(segment, target, learn,
   now)`, several: `correct_segments_speaker` — one savepoint: the label moves; when the line's
   embedding is kept and `learn` (= `PipelineHandle::speakers_enabled()`: recognition on) it is

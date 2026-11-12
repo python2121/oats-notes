@@ -762,9 +762,19 @@ fn transcript_row(
             .map(|r| r.speaker_id);
         let first = picked_voices.next().flatten();
         let shared = picked_voices.all(|v| v == first).then_some(first).flatten();
+        // the picked lines tagged like this one ("In these lines, X was ▸")
+        let same_voice: Vec<i64> = match row.speaker_id {
+            Some(v) => rows
+                .iter()
+                .filter(|r| r.speaker_id == Some(v) && selection.selected.contains(&r.id))
+                .map(|r| r.id)
+                .collect(),
+            None => Vec::new(),
+        };
         // who said it comes first: the correction the user makes most
         if speakers
-            && let Some(a) = crate::speakers::line_was_menu(ui, row, &voices, &picked, shared)
+            && let Some(a) =
+                crate::speakers::line_was_menu(ui, row, &voices, &picked, shared, &same_voice)
         {
             actions.push(a);
         }
