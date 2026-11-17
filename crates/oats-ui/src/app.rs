@@ -1010,15 +1010,18 @@ impl OatsApp {
                 if n == 1 { "" } else { "s" }
             ),
             PipelineStatus::Idle | PipelineStatus::Listening => "OatsNotes — Idle".to_owned(),
+            // also the first listen's engine load (the capture is already open)
             PipelineStatus::Loading(_) => "OatsNotes — Loading…".to_owned(),
             PipelineStatus::Failed(_) => "OatsNotes — Speech engine failed".to_owned(),
         };
         StatusState {
             listening,
-            enabled: matches!(
-                self.status,
-                PipelineStatus::Idle | PipelineStatus::Listening
-            ),
+            // while the first listen loads the engine the toggle still stops it
+            enabled: listening
+                || matches!(
+                    self.status,
+                    PipelineStatus::Idle | PipelineStatus::Listening
+                ),
             tooltip,
         }
     }
@@ -1584,7 +1587,9 @@ impl OatsApp {
     }
 
     /// Open the microphone and attach it to the pipeline. `false` (with the error in the status
-    /// line) when the engine isn't ready or the microphone can't be opened.
+    /// line) when the pipeline isn't idle or the microphone can't be opened. The engine is
+    /// loaded by the pipeline on the FIRST listen: the status then goes Idle → Loading(..) →
+    /// Listening with the capture open (the pipeline buffers the audio meanwhile).
     fn start_listening(&mut self) -> bool {
         if self.capture.is_some() {
             return true;
@@ -4145,16 +4150,12 @@ impl OatsApp {
         }
     }
 
-    /// The status strip's left text ("engine · on a call · 617 segments today · brain usage …");
+    /// The status strip's left text ("engine · on a call · 617 segments today · brain usage …";
+    /// no engine name before the first listen has loaded it);
     /// listening / idle and the lanes are NOT repeated here (the control bar's pills show them),
     /// only loading… / failed. No "system audio: no signal" and no "▶ <media>" line either: the
     /// no-signal state is the System audio pill's tooltip, what plays is the Media view's.
     pub fn status_text(&self) -> String {
-        let engine = if self.engine_name.is_empty() {
-            "engine"
-        } else {
-            &self.engine_name
-        };
         let n = self.today_count;
         let brain = match (&self.brain, &self.brain_status.running) {
             (None, _) => String::new(),
@@ -4194,10 +4195,17 @@ impl OatsApp {
             }
             PipelineStatus::Idle | PipelineStatus::Listening => String::new(),
         };
-        format!(
-            "{engine}{state}{on_call} · {n} segment{} today{brain}",
+        let text = format!(
+            "{}{state}{on_call} · {n} segment{} today{brain}",
+            self.engine_name,
             if n == 1 { "" } else { "s" }
-        )
+        );
+        // the engine is loaded on the first listen: until then the line starts at the state
+        // (or the count), not at a dangling separator
+        match text.strip_prefix(" · ") {
+            Some(rest) => rest.to_owned(),
+            None => text,
+        }
     }
 
     fn status_line(&self, ui: &egui::Ui, t: &Tokens, rect: Rect) {

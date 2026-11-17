@@ -52,6 +52,8 @@ impl Drop for TempDir {
 struct Faults {
     vad_fails: bool,
     transcribe_fails: bool,
+    /// `load` takes this long (a model download / compile).
+    load_ms: u64,
 }
 
 /// VAD: a frame is speech when its peak exceeds 0.1. Transcription: empty for a segment with
@@ -64,6 +66,7 @@ impl SpeechEngine for Scripted {
     }
     fn load(&mut self, status: &mut dyn FnMut(String)) -> Result<(), EngineError> {
         status("loading scripted".into());
+        std::thread::sleep(Duration::from_millis(self.0.load_ms));
         Ok(())
     }
     fn vad_frame_len(&self) -> Option<usize> {
@@ -218,17 +221,29 @@ fn segments(e: &[PipelineEvent]) -> Vec<&oats_core::TranscriptRow> {
 }
 
 #[test]
-fn startup_reports_loading_engine_and_idle_in_order() {
+fn startup_is_idle_at_once_and_the_first_listen_loads_the_engine() {
     let rig = scripted("startup", Faults::default());
     let mut seen = Vec::new();
     wait_idle(&rig.h, &mut seen);
+    // no engine yet: an app that stays idle holds no models
+    assert_eq!(seen, vec![PipelineEvent::Status(PipelineStatus::Idle)]);
+    // stop while idle (and without an engine) is a no-op
+    rig.h.stop();
+    assert!(rig.h.recv_timeout(Duration::from_millis(200)).is_none());
+    // the first listen loads it, then goes straight into the session
+    let (tx, sid) = start(&rig.h, &mut seen);
+    wait_for(&rig.h, &mut seen, "listening", |e| {
+        matches!(e, PipelineEvent::Status(PipelineStatus::Listening))
+    });
     assert_eq!(
         seen,
         vec![
+            PipelineEvent::Status(PipelineStatus::Idle),
             PipelineEvent::Status(PipelineStatus::Loading("Loading speech engine…".into())),
             PipelineEvent::Status(PipelineStatus::Loading("loading scripted".into())),
             PipelineEvent::Engine("scripted".into()),
-            PipelineEvent::Status(PipelineStatus::Idle),
+            PipelineEvent::SessionStarted(sid),
+            PipelineEvent::Status(PipelineStatus::Listening),
         ]
     );
     // `wake` runs right after each event is queued: one per event
@@ -241,9 +256,85 @@ fn startup_reports_loading_engine_and_idle_in_order() {
         seen.len(),
         "one wake per event"
     );
-    // stop while idle is a no-op
+    drop(tx);
+    wait_for(&rig.h, &mut seen, "session end", |e| {
+        *e == PipelineEvent::SessionEnded(sid)
+    });
+    wait_idle(&rig.h, &mut seen);
+    // the engine stays loaded: the next listen starts without loading again
+    seen.clear();
+    let (_tx, sid) = start(&rig.h, &mut seen);
+    wait_for(&rig.h, &mut seen, "listening", |e| {
+        matches!(e, PipelineEvent::Status(PipelineStatus::Listening))
+    });
+    assert_eq!(
+        seen,
+        vec![
+            PipelineEvent::SessionStarted(sid),
+            PipelineEvent::Status(PipelineStatus::Listening),
+        ]
+    );
+}
+
+#[test]
+fn audio_sent_while_the_engine_loads_keeps_its_times() {
+    let rig = scripted(
+        "lazy-times",
+        Faults {
+            load_ms: 1_500,
+            ..Faults::default()
+        },
+    );
+    let mut seen = Vec::new();
+    wait_idle(&rig.h, &mut seen);
+    let (tx, rx) = channel();
+    let sent = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    rig.h.start(rx);
+    // the capture opens with the Start: 0.5 s of quiet, then 2 s of speech, all of it at
+    // once while the engine is still loading
+    send(&tx, 0.0, 500);
+    send(&tx, SPEECH, 2_000);
+    send(&tx, 0.0, 1_500);
+    let ev = wait_for(&rig.h, &mut seen, "session start", |e| {
+        matches!(e, PipelineEvent::SessionStarted(_))
+    });
+    let PipelineEvent::SessionStarted(sid) = ev else {
+        unreachable!()
+    };
+    wait_for(&rig.h, &mut seen, "the segment", |e| {
+        matches!(e, PipelineEvent::Segment(_))
+    });
     rig.h.stop();
-    assert!(rig.h.recv_timeout(Duration::from_millis(200)).is_none());
+    wait_for(&rig.h, &mut seen, "session end", |e| {
+        *e == PipelineEvent::SessionEnded(sid)
+    });
+    let segs = segments(&seen);
+    assert_eq!(segs.len(), 1, "{seen:?}");
+    let (session_start, _) = session_row(&rig.db, sid);
+    // the session starts when listening was asked for, not when the load ended
+    assert!(
+        (session_start - sent).abs() < 300,
+        "session {} ms after the start",
+        session_start - sent
+    );
+    // nothing was lost, and the speech is dated where it was heard (the lane's clock is
+    // anchored to the first chunk's ARRIVAL), not 1.5 s later when the load finished
+    let row = segs[0];
+    let offset = row.started_at - sent;
+    assert!(
+        (0..700).contains(&offset),
+        "speech dated {offset} ms after the start (heard at ~0 ms: the audio was queued \
+         at once)"
+    );
+    let duration = row.ended_at - row.started_at;
+    // 2 s of speech, plus the pre-roll and the closing silence's hangover
+    assert!(
+        (1_500..=3_600).contains(&duration),
+        "duration {duration} ms"
+    );
 }
 
 #[test]
@@ -464,6 +555,7 @@ fn engine_failures_are_warnings_not_rows() {
         Faults {
             vad_fails: false,
             transcribe_fails: true,
+            ..Faults::default()
         },
     );
     let mut seen = Vec::new();
@@ -490,6 +582,7 @@ fn engine_failures_are_warnings_not_rows() {
         Faults {
             vad_fails: true,
             transcribe_fails: false,
+            ..Faults::default()
         },
     );
     let mut seen = Vec::new();
@@ -518,6 +611,10 @@ fn engine_load_failure_reports_failed_and_ignores_listen() {
         }),
     );
     let mut seen = Vec::new();
+    // the load happens on the first listen, not at spawn
+    wait_idle(&rig.h, &mut seen);
+    let (first_tx, rx) = channel();
+    rig.h.start(rx);
     let ev = wait_for(&rig.h, &mut seen, "failure", |e| {
         matches!(e, PipelineEvent::Status(PipelineStatus::Failed(_)))
     });
@@ -525,6 +622,14 @@ fn engine_load_failure_reports_failed_and_ignores_listen() {
         matches!(&ev, PipelineEvent::Status(PipelineStatus::Failed(m)) if m.contains("no model here")),
         "{ev:?}"
     );
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, PipelineEvent::SessionStarted(_))),
+        "{seen:?}"
+    );
+    // terminal: the failed listen's channel was dropped, a later one starts nothing
+    assert!(first_tx.send(vec![0.0; 160]).is_err());
     let (tx, rx) = channel();
     rig.h.start(rx);
     tx.send(vec![0.3; 1_600]).ok();
