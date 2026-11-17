@@ -429,16 +429,18 @@ in the database; the transcript holds loaded pages only; the system ring 2.9 MB)
    (135 ms). Kept: memory won.
 2. **Speaker pass only for lines ≥ 2 s** (was 1 s): fewer calls, same tags on everything
    that can open or teach a voice.
-3. **Lazy engine load** (first listen, kept after): an idle launch reads 140 MB against
+3. **Lazy engine load** (first listen, kept after) — REVERTED the same day (no memory
+   gain, see below; the commit is in the history as 37b951b if the launch-time load ever
+   matters): an idle launch read 140 MB against
    135 MB with the engine loaded before — the weights live on the ANE outside the process,
    so the saving is the launch-time load / compile work and the GPU buffers, not the
    footprint. Audio arriving during the load is buffered with its arrival times
    (`pipeline::while_buffering`), so nothing is dated late.
 4. **Level events only when the meter would look different** (whole dB, speech flags): a
    steady room no longer repaints the window four times a second while listening.
-5. **Release profile fat LTO, one codegen unit**: a full release build 2 m 23 s, an
-   incremental one (two crates touched) 1 m 41 s — against ~40 s with thin LTO. No runtime
-   gain was measured; revert if the build time hurts more than the few-percent hope.
+5. **Release profile fat LTO, one codegen unit** — REVERTED the same day: a full release
+   build 2 m 23 s, an incremental one (two crates touched) 1 m 41 s — against ~40 s with
+   thin LTO, and no runtime gain measured.
 
 Steady state on this build, fresh process, looped speech at 4×, 3 minutes with speaker
 recognition on: footprint 187–199 MB, heap 70–78 MB, flat; 2 minutes with it off:
