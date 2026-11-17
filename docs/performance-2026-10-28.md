@@ -419,3 +419,28 @@ IOSurface, not heap). Speed unchanged (213 ms per 10 s of audio). What the rest 
 loaded models' working set and GPU buffers; Parakeet's weights live on the Neural Engine
 outside the process. Rust-side state is small (5.9 k segments, 1.3 k kept voice embeddings
 in the database; the transcript holds loaded pages only; the system ring 2.9 MB).
+
+### 2026-11-17, later: the five follow-ups
+
+1. **Speaker models on CPU + Neural Engine** (were `.all`, i.e. the GPU through MPS): the
+   `speakers_wav` example peaks at 81 MB (was 141–146 MB after the leak fix), no IOSurface
+   / MPS graph held for them; a third slower per pass (84 vs 63 ms per 10 s of audio on 7 s
+   pieces, 283 vs 213 on 2 s pieces) — still under the transcription of the same audio
+   (135 ms). Kept: memory won.
+2. **Speaker pass only for lines ≥ 2 s** (was 1 s): fewer calls, same tags on everything
+   that can open or teach a voice.
+3. **Lazy engine load** (first listen, kept after): an idle launch reads 140 MB against
+   135 MB with the engine loaded before — the weights live on the ANE outside the process,
+   so the saving is the launch-time load / compile work and the GPU buffers, not the
+   footprint. Audio arriving during the load is buffered with its arrival times
+   (`pipeline::while_buffering`), so nothing is dated late.
+4. **Level events only when the meter would look different** (whole dB, speech flags): a
+   steady room no longer repaints the window four times a second while listening.
+5. **Release profile fat LTO, one codegen unit**: a full release build 2 m 23 s, an
+   incremental one (two crates touched) 1 m 41 s — against ~40 s with thin LTO. No runtime
+   gain was measured; revert if the build time hurts more than the few-percent hope.
+
+Steady state on this build, fresh process, looped speech at 4×, 3 minutes with speaker
+recognition on: footprint 187–199 MB, heap 70–78 MB, flat; 2 minutes with it off:
+179–204 MB, flat. The first 90 s of a run can still show a climb of ~50 MB (warm-up: ANE
+compile caches, first windows) that does not continue.
