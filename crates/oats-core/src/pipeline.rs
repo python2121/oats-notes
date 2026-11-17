@@ -1,6 +1,5 @@
 //! The listening pipeline: one long-lived worker thread that owns the engine (built on that
-//! thread from an [`EngineFactory`] on the FIRST listen — an app that stays idle holds no
-//! models — then kept loaded across listen start/stop for the life of the process) and,
+//! thread from an [`EngineFactory`], loaded once, kept warm across listen start/stop) and,
 //! while listening, pulls 16 kHz mono chunks from an audio channel, runs VAD → [`Segmenter`] →
 //! transcription, writes each segment to the [`Store`] and reports [`PipelineEvent`]s.
 //!
@@ -278,10 +277,8 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Spawn the worker. It reports `Status(Idle)` once the store is open, WITHOUT an engine:
-    /// the engine is built and loaded on the first [`PipelineHandle::start`] /
-    /// [`PipelineHandle::start_lanes`] (`Loading(..)` lines, then `Engine(name)`, then the
-    /// session's `Listening`) and stays loaded from then on.
+    /// Spawn the worker. The engine is built and loaded immediately (status events follow);
+    /// listening starts only on [`PipelineHandle::start`].
     pub fn spawn(self) -> PipelineHandle {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (event_tx, events) = std::sync::mpsc::channel();
@@ -617,74 +614,6 @@ impl SampleClock {
     }
 }
 
-/// A chunk taken off the audio channel while the engine loaded, with the moment it arrived
-/// (what the lane's [`SampleClock`] is anchored to).
-struct Stamped {
-    chunk: AudioChunk,
-    wall_ms: i64,
-    mono: Instant,
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Run `work` (the engine load) on this thread while a helper thread drains the session's
-/// audio channel, stamping each chunk with its arrival time. The UI opens the captures when
-/// it sends `Listen`, so audio flows during a load that can take minutes (the first-run model
-/// download): left in the channel it would be processed only after the load, and a lane's
-/// clock — anchored to the time its first chunk is PROCESSED — would put the whole session
-/// late by the length of the load. With the stamps, the session anchors each lane where it
-/// really began. Returns the listen (its channel back in place), the buffered chunks in
-/// arrival order, and `work`'s result.
-fn while_buffering<R>(listen: Listen, work: impl FnOnce() -> R) -> (Listen, Vec<Stamped>, R) {
-    let Listen { audio, options } = listen;
-    // the helper borrows the slot (a `Receiver` is `Send` but not `Sync`): if the thread
-    // can't be spawned, the channel stays here and is simply read late
-    let slot = Mutex::new(Some(audio));
-    let stop = AtomicBool::new(false);
-    let (result, backlog) = std::thread::scope(|scope| {
-        let helper = std::thread::Builder::new()
-            .name("oats-pipeline-buffer".to_owned())
-            .spawn_scoped(scope, || {
-                let Some(audio) = lock(&slot).take() else {
-                    return Vec::new();
-                };
-                let mut got = Vec::new();
-                while !stop.load(Ordering::Relaxed) {
-                    match audio.recv_timeout(AUDIO_POLL) {
-                        Ok(chunk) => got.push(Stamped {
-                            chunk,
-                            wall_ms: now_ms(),
-                            mono: Instant::now(),
-                        }),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        // the session sees the disconnect itself after the backlog
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-                *lock(&slot) = Some(audio);
-                got
-            });
-        let result = work();
-        stop.store(true, Ordering::Relaxed);
-        let backlog = match helper {
-            Ok(h) => h.join().unwrap_or_default(),
-            Err(e) => {
-                log::warn!("could not buffer audio while the engine loads: {e}");
-                Vec::new()
-            }
-        };
-        (result, backlog)
-    });
-    let audio = slot
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // only a panicking helper loses the channel: a closed one ends the session at once
-    let audio = audio.unwrap_or_else(|| AudioIn::Lanes(std::sync::mpsc::channel().1));
-    (Listen { audio, options }, backlog, result)
-}
-
 /// After a fatal error: keep draining commands (dropping audio channels) until shutdown, so
 /// the handle's `Drop` never hangs.
 fn idle_until_shutdown(cmd_rx: &Receiver<Command>) {
@@ -720,84 +649,15 @@ fn worker(
         }
     };
 
-    // Idle at once: the engine is loaded by the first `Listen`, not here
-    out.send(PipelineEvent::Status(PipelineStatus::Idle));
-
-    let mut factory = Some(factory);
-    let mut engine: Option<(Box<dyn SpeechEngine>, String)> = None;
-    // `Listen`, `Stop` and `Shutdown` are the only commands; everything else the UI changes
-    // (speaker reload, media policy, echo knobs, on a call) is a shared atomic read by a
-    // running session, so nothing needs an engine before the first listen. `Stop` without
-    // a session (or before any engine) is a no-op.
-    let mut next = cmd_rx.recv().ok();
-    while let Some(cmd) = next.take() {
-        match cmd {
-            Command::Listen(listen) => {
-                let started = (now_ms(), Instant::now());
-                let (listen, backlog) = match (&mut engine, factory.take()) {
-                    (Some(_), _) => (listen, Vec::new()),
-                    (None, Some(factory)) => {
-                        let (listen, backlog, loaded) =
-                            while_buffering(listen, || load_engine(factory, out, &cancelled));
-                        match loaded {
-                            LoadOutcome::Ready(e) => engine = Some(e),
-                            LoadOutcome::Cancelled => return,
-                            LoadOutcome::Failed(msg) => {
-                                // close the capture's channel: no session will read it
-                                drop(listen);
-                                log::error!("{msg}");
-                                out.send(PipelineEvent::Status(PipelineStatus::Failed(msg)));
-                                return idle_until_shutdown(cmd_rx);
-                            }
-                        }
-                        (listen, backlog)
-                    }
-                    // unreachable: the factory is only taken by a load that either set the
-                    // engine or ended the worker
-                    (None, None) => return idle_until_shutdown(cmd_rx),
-                };
-                let Some((engine, engine_name)) = engine.as_mut() else {
-                    return idle_until_shutdown(cmd_rx);
-                };
-                let mut session = Session {
-                    engine: engine.as_mut(),
-                    engine_name,
-                    store: &store,
-                    out,
-                    echo: EchoState::default(),
-                    media: MediaState::new(out.media_feed.clone()),
-                    speakers: SpeakerState::default(),
-                };
-                match session.run(config, &listen, cmd_rx, started, backlog) {
-                    AfterListen::Idle => next = cmd_rx.recv().ok(),
-                    AfterListen::Listen(l) => next = Some(Command::Listen(l)),
-                    AfterListen::Shutdown => return,
-                }
-            }
-            Command::Stop => next = cmd_rx.recv().ok(),
-            Command::Shutdown => return,
-        }
-    }
-}
-
-enum LoadOutcome {
-    Ready((Box<dyn SpeechEngine>, String)),
-    /// The handle was dropped between load steps.
-    Cancelled,
-    Failed(String),
-}
-
-/// Build and load the engine (the first listen): `Loading(..)` lines, then `Engine(name)`.
-fn load_engine(factory: EngineFactory, out: &Outbox, cancelled: &dyn Fn() -> bool) -> LoadOutcome {
     if cancelled() {
-        return LoadOutcome::Cancelled;
+        return;
     }
     out.send(PipelineEvent::Status(PipelineStatus::Loading(
         "Loading speech engine…".to_owned(),
     )));
     let built = factory();
     if cancelled() {
-        return LoadOutcome::Cancelled;
+        return;
     }
     let loaded = built.and_then(|mut engine| {
         engine.load(&mut |line| {
@@ -806,16 +666,44 @@ fn load_engine(factory: EngineFactory, out: &Outbox, cancelled: &dyn Fn() -> boo
         Ok(engine)
     });
     if cancelled() {
-        return LoadOutcome::Cancelled;
+        return;
     }
-    match loaded {
-        Ok(engine) => {
-            let name = engine.name();
-            log::info!("speech engine ready: {name}");
-            out.send(PipelineEvent::Engine(name.clone()));
-            LoadOutcome::Ready((engine, name))
+    let mut engine = match loaded {
+        Ok(e) => e,
+        Err(e) => {
+            let msg = e.to_string();
+            log::error!("{msg}");
+            out.send(PipelineEvent::Status(PipelineStatus::Failed(msg)));
+            return idle_until_shutdown(cmd_rx);
         }
-        Err(e) => LoadOutcome::Failed(e.to_string()),
+    };
+    let engine_name = engine.name();
+    log::info!("speech engine ready: {engine_name}");
+    out.send(PipelineEvent::Engine(engine_name.clone()));
+    out.send(PipelineEvent::Status(PipelineStatus::Idle));
+
+    let mut next = cmd_rx.recv().ok();
+    while let Some(cmd) = next.take() {
+        match cmd {
+            Command::Listen(listen) => {
+                let mut session = Session {
+                    engine: engine.as_mut(),
+                    engine_name: &engine_name,
+                    store: &store,
+                    out,
+                    echo: EchoState::default(),
+                    media: MediaState::new(out.media_feed.clone()),
+                    speakers: SpeakerState::default(),
+                };
+                match session.run(config, &listen, cmd_rx) {
+                    AfterListen::Idle => next = cmd_rx.recv().ok(),
+                    AfterListen::Listen(l) => next = Some(Command::Listen(l)),
+                    AfterListen::Shutdown => return,
+                }
+            }
+            Command::Stop => next = cmd_rx.recv().ok(),
+            Command::Shutdown => return,
+        }
     }
 }
 
@@ -959,11 +847,9 @@ impl Session<'_> {
         config: SegmenterConfig,
         listen: &Listen,
         cmd_rx: &Receiver<Command>,
-        (started_ms, started): (i64, Instant),
-        backlog: Vec<Stamped>,
     ) -> AfterListen {
-        // `started`: when the `Listen` arrived (before an engine load), so the chunks
-        // buffered during the load (`backlog`, with their arrival times) fall inside it
+        let started_ms = now_ms();
+        let started = Instant::now();
         let session_id = match self.store.begin_session(started_ms, self.engine_name) {
             Ok(id) => id,
             Err(e) => {
@@ -1005,23 +891,9 @@ impl Session<'_> {
         let mut mic_lost_reported = false;
         let mut system_since_mic: u32 = 0;
 
-        let mut backlog = std::collections::VecDeque::from(backlog);
         let after = loop {
-            // the audio buffered during the engine load first, at the times it arrived
-            let next = match backlog.pop_front() {
-                Some(s) => Ok(s),
-                None => listen.audio.recv_timeout(AUDIO_POLL).map(|chunk| Stamped {
-                    chunk,
-                    wall_ms: now_ms(),
-                    mono: Instant::now(),
-                }),
-            };
-            match next {
-                Ok(Stamped {
-                    chunk,
-                    wall_ms,
-                    mono,
-                }) => {
+            match listen.audio.recv_timeout(AUDIO_POLL) {
+                Ok(chunk) => {
                     system_since_mic = match chunk.source {
                         AudioSourceKind::Mic => 0,
                         AudioSourceKind::System => system_since_mic.saturating_add(1),
@@ -1039,14 +911,13 @@ impl Session<'_> {
                     if lane.kind == AudioSourceKind::System {
                         if !silent {
                             // the media watcher's "the call's audio goes on"
-                            self.out.media_feed.note_system_signal(wall_ms);
+                            self.out.media_feed.note_system_signal(now_ms());
                         }
                         self.media.skip_system = self.media_skips();
                     }
                     self.feed(
                         lane,
                         &chunk.samples,
-                        (wall_ms, mono),
                         started_ms,
                         session_id,
                         frame_len,
@@ -1109,7 +980,6 @@ impl Session<'_> {
                 ));
             }
             if listen.options.system
-                && backlog.is_empty()
                 && !no_signal_reported
                 && !lanes[1].signal
                 && started.elapsed() >= listen.options.no_signal_after
@@ -1121,11 +991,6 @@ impl Session<'_> {
                     listen.options.no_signal_after
                 );
                 self.out.send(PipelineEvent::SystemAudio { signal: false });
-            }
-            // a Stop / new Listen sent during the engine load waits until the audio heard
-            // meanwhile is worked off (it was heard while listening was on)
-            if !backlog.is_empty() {
-                continue;
             }
             match cmd_rx.try_recv() {
                 Ok(Command::Stop) => break AfterListen::Idle,
@@ -1169,12 +1034,13 @@ impl Session<'_> {
         &mut self,
         lane: &mut Lane,
         samples: &[f32],
-        (wall, mono): (i64, Instant),
         session_started_ms: i64,
         session_id: i64,
         frame_len: usize,
         vad_warned: &mut bool,
     ) {
+        let wall = now_ms();
+        let mono = Instant::now();
         let chunk_ms = samples.len() as i64 * 1000 / i64::from(SAMPLE_RATE);
         let clock = lane.clock.get_or_insert_with(|| {
             // the chunk's first sample was captured about one chunk ago
@@ -2185,14 +2051,13 @@ mod tests {
     fn transcribes_speech_into_store() {
         let path = temp_db("speech");
         let h = spawn_null(&path);
+        wait_for(&h, "engine name", |e| matches!(e, PipelineEvent::Engine(_)));
         wait_for(&h, "idle", |e| {
             matches!(e, PipelineEvent::Status(PipelineStatus::Idle))
         });
 
         let (audio_tx, audio_rx) = std::sync::mpsc::channel();
         h.start(audio_rx);
-        // the first listen loads the engine
-        wait_for(&h, "engine name", |e| matches!(e, PipelineEvent::Engine(_)));
         let started = wait_for(&h, "session start", |e| {
             matches!(e, PipelineEvent::SessionStarted(_))
         });
@@ -2459,12 +2324,6 @@ mod tests {
             wake: Box::new(|| {}),
         }
         .spawn();
-        wait_for(&h, "idle", |e| {
-            matches!(e, PipelineEvent::Status(PipelineStatus::Idle))
-        });
-        // the load starts with the first listen; the capture's sender stays alive
-        let (_audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
-        h.start(audio_rx);
         wait_for(&h, "loading", |e| {
             matches!(e, PipelineEvent::Status(PipelineStatus::Loading(_)))
         });

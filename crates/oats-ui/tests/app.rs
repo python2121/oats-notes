@@ -93,28 +93,9 @@ fn build_stepped(
     system: bool,
     step_dt: Option<f32>,
 ) -> Rig {
-    build_engine(
-        db,
-        item,
-        brain,
-        system,
-        step_dt,
-        Box::new(|| Ok(Box::new(NullEngine) as Box<dyn SpeechEngine>)),
-    )
-}
-
-/// [`build_stepped`] over this engine (loaded by the pipeline on the first listen).
-fn build_engine(
-    db: &Path,
-    item: Option<FakeItem>,
-    brain: Option<BrainHandle>,
-    system: bool,
-    step_dt: Option<f32>,
-    engine: oats_core::EngineFactory,
-) -> Rig {
     let store = Store::open(db).unwrap();
     let pipeline = Pipeline {
-        engine,
+        engine: Box::new(|| Ok(Box::new(NullEngine) as Box<dyn SpeechEngine>)),
         store_path: db.to_path_buf(),
         segmenter: Default::default(),
         wake: Box::new(|| {}),
@@ -157,8 +138,7 @@ fn build_engine(
         mic,
         requests,
     };
-    // idle at once: the engine is loaded by the first listen
-    rig.until("the pipeline is idle", |app| {
+    rig.until("the engine is ready", |app| {
         *app.status() == PipelineStatus::Idle
     });
     rig
@@ -4431,110 +4411,4 @@ fn option_and_shift_clicks_select_rows_and_the_batch_menu_retags_them() {
     h.key_press(egui::Key::Escape);
     h.run_steps(2);
     assert!(picked(&h).is_empty());
-}
-
-/// The null engine with a load that takes a while (a model download, compressed).
-struct SlowNull(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-
-impl SpeechEngine for SlowNull {
-    fn name(&self) -> String {
-        "slow null".to_owned()
-    }
-    fn load(&mut self, status: &mut dyn FnMut(String)) -> Result<(), oats_core::EngineError> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        status("Downloading the model…".to_owned());
-        std::thread::sleep(Duration::from_millis(600));
-        Ok(())
-    }
-    fn vad_frame_len(&self) -> Option<usize> {
-        NullEngine.vad_frame_len()
-    }
-    fn vad(&mut self, s: &[f32]) -> Result<Vec<oats_core::VadFrame>, oats_core::EngineError> {
-        NullEngine.vad(s)
-    }
-    fn transcribe(
-        &mut self,
-        s: &[f32],
-    ) -> Result<oats_core::Transcription, oats_core::EngineError> {
-        NullEngine.transcribe(s)
-    }
-}
-
-/// The app opens idle with no engine loaded and the Listen pill enabled; clicking it opens the
-/// microphone at once, shows the load ("loading…", the load's own line), then listens — and
-/// the speech heard during the load is not lost.
-#[test]
-fn the_engine_loads_on_the_first_listen() {
-    let dir = TempDir::new("lazy-engine");
-    let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let l = loads.clone();
-    let mut rig = build_engine(
-        &dir.db(),
-        None,
-        None,
-        false,
-        None,
-        Box::new(move || Ok(Box::new(SlowNull(l)) as Box<dyn SpeechEngine>)),
-    );
-    rig.harness.run_steps(2);
-    assert_eq!(*rig.app().status(), PipelineStatus::Idle);
-    assert_eq!(
-        loads.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "no engine yet"
-    );
-    assert!(
-        !rig.harness
-            .get_by_label("Mic")
-            .accesskit_node()
-            .is_disabled()
-    );
-    // no engine name yet, and no dangling separator in its place
-    assert_eq!(rig.app().status_text(), "0 segments today");
-    assert_eq!(rig.app().status_item_state().tooltip, "OatsNotes — Idle");
-
-    rig.harness.get_by_label("Mic").click();
-    rig.harness.run_steps(2);
-    assert!(rig.app().is_listening(), "the capture opens with the click");
-    rig.until("loading", |app| {
-        matches!(app.status(), PipelineStatus::Loading(_))
-    });
-    // loading with the capture open: shown as loading, not a failure, the toggle still works
-    assert!(rig.app().is_listening());
-    assert_eq!(rig.app().state_label(), "loading…");
-    assert!(rig.app().status_text().starts_with("loading…"));
-    let state = rig.app().status_item_state();
-    assert_eq!(state.tooltip, "OatsNotes — Loading…");
-    assert!(state.enabled && state.listening);
-    assert!(
-        !rig.harness
-            .get_by_label("Mic")
-            .accesskit_node()
-            .is_disabled()
-    );
-    // speech while the model loads: buffered by the pipeline, transcribed after
-    rig.speak(2);
-    rig.until("listening", |app| {
-        *app.status() == PipelineStatus::Listening
-    });
-    assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(rig.app().is_listening());
-    assert!(rig.app().warning().is_none(), "{:?}", rig.app().warning());
-    rig.until("the segment heard during the load", |app| {
-        app.status_item_state().tooltip.contains("1 segment today")
-    });
-    assert!(
-        rig.app()
-            .status_text()
-            .starts_with("slow null · 1 segment today")
-    );
-
-    // stop and listen again: no second load
-    rig.app().run(Command::ToggleListening);
-    rig.until("idle", |app| *app.status() == PipelineStatus::Idle);
-    rig.app().run(Command::ToggleListening);
-    rig.until("listening again", |app| {
-        *app.status() == PipelineStatus::Listening
-    });
-    assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

@@ -315,7 +315,7 @@ pub fn harness(
             None,
         )
     });
-    // let the pipeline report idle (its store open; the engine loads on the first listen)
+    // let the engine report ready (the null engine loads at once)
     let deadline = Instant::now() + Duration::from_secs(20);
     while !matches!(
         harness.state().status(),

@@ -142,7 +142,7 @@ is hidden, so everything the status item drives lives in `logic`. Without a stat
 
 Data flow: `oats-audio` (cpal callbacks, resample; microphone + system audio) → one mpsc of
 `AudioChunk { source: Mic | System, samples }` → `oats-core::pipeline` worker thread (owns the
-engine, loaded on the first listen and kept; two lanes, VAD every frame per lane, the model only on closed speech segments) →
+engine; two lanes, VAD every frame per lane, the model only on closed speech segments) →
 `Store` (SQLite, WAL) + `PipelineEvent`s → `oats-ui` (repaints only on events) → every stored
 segment is forwarded to the `oats-brain` worker (`BrainCommand::SegmentArrived`), which runs
 the `claude` CLI on its own thread and reports `BrainEvent`s back (the UI reloads on `Changed`).
@@ -298,10 +298,9 @@ video). `oats_core::{AudioSourceKind, AudioChunk}` are the shared types.
 ## UI chrome and preferences
 
 Control bar (34 pt): Listen pill, "System audio" pill, level meter, and the engine loading /
-failure line only (the engine loads on the FIRST listen, with the captures already open: Idle →
-Loading(..) → Listening; the pills stay enabled and the toggle still stops it) (the engine name is in the status strip, not repeated; cut with … in what the
+failure line only (the engine name is in the status strip, not repeated; cut with … in what the
 search icon leaves, never pushing it out). Status strip (18 pt):
-left = engine (absent until the first listen has loaded it) · segment count · brain line (NOT the listening / idle state nor the open lanes —
+left = engine · segment count · brain line (NOT the listening / idle state nor the open lanes —
 the control bar's pills show those; only "loading…" / "failed" and "on a call" are spelled
 out; no "system audio: no signal" — that is the System audio pill's tooltip now — and no
 "▶ <media>" line — the Media view has it; the engine name carries no chip); right = the warning, else the last voice
@@ -830,15 +829,7 @@ through the REAL CLI (a few cents) — the end-to-end check.
 
 ## The engine contract (`crates/oats-core/src/engine.rs`)
 
-`SpeechEngine`: `load(status)` (download/compile models, first run can take a while; the
-pipeline calls it on the FIRST listen, not at spawn — `Pipeline::spawn` reports `Status(Idle)`
-with no engine, so an app that stays idle holds no models; the first `Listen` sends
-`Loading(..)`, `Engine(name)`, then goes straight into the session; once loaded the engine
-stays loaded for the process; a load failure is `Failed`, terminal. The audio that arrives
-during the load is drained by a helper thread with each chunk's arrival time
-(`pipeline::while_buffering`) and worked off first, so the lanes' clocks anchor where the audio
-really began; the session's start is when `Listen` arrived; a `Stop` sent meanwhile waits for
-that backlog),
+`SpeechEngine`: `load(status)` (download/compile models, first run can take a while),
 `vad_frame_len()` / `vad(samples)` (cheap, runs all day; `None` = the core's energy VAD is used),
 `vad_lane(lane, samples)` (per-lane VAD state; the default forwards to `vad`; FluidAudio keeps
 one `VadStream` per lane — the mic's made by `load`, the system's on its first chunk),
@@ -858,7 +849,7 @@ across a listen stop/start (harmless: Silero re-converges within a few chunks). 
 
 ```bash
 ./ci.sh                                   # fmt --check + clippy -D warnings + cargo test --workspace
-cargo run -p oats-notes                   # the app (the first listen of the first run downloads the Parakeet CoreML model, ~600 MB, into ~/Library/Application Support/FluidAudio)
+cargo run -p oats-notes                   # the app (first run downloads the Parakeet CoreML model, ~600 MB, into ~/Library/Application Support/FluidAudio)
 OATS_ENGINE=null cargo run -p oats-notes  # the app without a model (UI work; speech detected, not transcribed)
 cargo run -p oats-audio --example levels  # mic sanity check: prints input level for 5 s
 scripts/aec-spike.sh [--output "MacBook Air Speakers"]   # echo-cancellation spike: plain vs voice-processing mic while `say` plays (plays sound; not during a call)
@@ -870,7 +861,7 @@ OATS_SYSTEM_DEDUP=auto|always|never …      # the mic-echo rule (auto: only whi
 OATS_ECHO_AUDIO=auto|always|never …        # the audio-level echo pre-check (auto: while the echo rule is on; never = transcribe every mic segment)
 scripts/perf.sh [rest|idle|speech|stress]    # CPU/memory/energy profile per scenario (release build); see docs/performance-2026-10-28.md
 cargo run -p oats-notes -- --selftest out.png [--listening|--notes|--calendar|--todos|--toast] [--size WxH]   # (--size in points, default 1100x720; 660x520 = the narrowest content column) whole window rendered offscreen to a PNG (egui_kittest), seeded demo rows / episode / events / todos (--notes: All notes with filed, unfiled, today's and a hidden low-signal note) (--toast: a due reminder + a confirmation) — how the shell is verified without a window
-cargo run -p oats-notes -- --listen      # start listening at launch, which loads the engine (doesn't change the remembered pref)
+cargo run -p oats-notes -- --listen      # start listening as soon as the engine is ready (doesn't change the remembered pref)
 OATS_NO_NATIVE_MENU=1 …                   # in-window egui menu bar instead of the macOS menu bar
 OATS_NO_STATUS_ITEM=1 …                   # no menu bar extra (closing the window then quits)
 OATS_FONT=bundled …                       # Inter instead of the system font

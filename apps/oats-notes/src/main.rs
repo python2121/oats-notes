@@ -11,8 +11,8 @@
 //! microphone (`oats-audio`) and the status item (`oats-status-macos`) wired in here — the UI
 //! crate depends on the platform-neutral contracts (`oats-core`, `oats-status`) only.
 //!
-//! `--listen` starts listening at launch (as if the last session had quit while listening);
-//! the speech engine is loaded by that first listen. `--audio-file <wav> [--audio-speed N] [--audio-loop]` plays a
+//! `--listen` starts listening as soon as the engine is ready (as if the last session had
+//! quit while listening). `--audio-file <wav> [--audio-speed N] [--audio-loop]` plays a
 //! 16 kHz mono 16-bit WAV instead of opening the microphone (benchmarks, reproducible runs;
 //! `scripts/perf.sh`); `--system-audio-file <wav>` plays a second one as the system-audio lane.
 //!
@@ -253,7 +253,7 @@ fn usage() -> ExitCode {
         "usage: oats-notes [--listen] [--audio-file <wav> [--system-audio-file <wav>] [--audio-speed N] [--audio-loop]]\n       oats-notes --selftest <out.png> [--listening|--notes [--busy]|--work|--project [--expanded] [--project-name <name>]|--calendar|--todos|--toast|--media] [--no-sidebar] [--prefs] [--search <text>] [--topic <text>] [--size WxH]\n\n\
          \n\
          Log: <data dir>/oats.log (also on stderr; the last 2 MB are kept; RUST_LOG sets the level)\n\n\
-         --listen       start listening at launch (the speech engine loads then)\n\
+         --listen       start listening as soon as the speech engine is ready\n\
          --audio-file   listen to a WAV file (PCM 16-bit mono 16 kHz) instead of the microphone,\n\
          \x20              paced in real time; listening stops when the file ends\n\
          --system-audio-file  with --audio-file: a second WAV played as the system-audio lane\n\
