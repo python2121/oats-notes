@@ -229,7 +229,15 @@ public func fluidaudio_speaker_embed_samples(
     }
     let spans: [BridgeSpeakerEmbedder.Span]
     do {
-        spans = try embedder.spans(UnsafeBufferPointer(start: samples, count: Int(count)))
+        // This runs synchronously on the caller's thread — the Rust pipeline worker, which has
+        // no autorelease pool (the transcription and VAD paths run inside a Task on a dispatch
+        // thread, whose pool drains per block). CoreML's prediction autoreleases its input
+        // wrappers and outputs; without a pool here they were never released: ~1.9 MB (the
+        // embedding model's 3×160000 input) plus 640 KB (the segmentation input) per call,
+        // hundreds of MB after a few days of listening.
+        spans = try autoreleasepool {
+            try embedder.spans(UnsafeBufferPointer(start: samples, count: Int(count)))
+        }
     } catch {
         print("Speaker embed error: \(error)")
         bridge.lastError = "\(error)"

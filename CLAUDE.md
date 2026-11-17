@@ -1063,7 +1063,7 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   `set_speaker_name` (higher confidence replaces an earlier brain name; a user name is never
   replaced), plus a `speaker_name` change row — undoable (`undo_change` restores the previous
   name only while the voice still carries that brain name). Hotwords unchanged (mic-only).
-- **Cost** (`docs/performance-2026-10-28.md`, 2026-11-03 addendum): ~45 ms per short segment,
+- **Cost** (`docs/performance-2026-10-28.md`, 2026-11-03 and 2026-11-17 addenda): ~45 ms per short segment,
   ~65 ms per 10 s window on the M2 — roughly 0.6–1× the Parakeet time per segment (both
   models take a fixed 10 s input), nothing while silent or for echoes / media.
 
@@ -1122,6 +1122,12 @@ through the VoiceProcessingIO unit, its format read back). Details, evidence and
 the update procedure: `vendor/cpal/VENDORED.md`; attribution: `THIRD_PARTY.md`.
 
 ## Vendored fluidaudio-rs (`vendor/fluidaudio-rs`)
+
+Memory rule: a bridge entry point that runs CoreML synchronously on the caller's (Rust)
+thread must wrap the work in `autoreleasepool { }` — the pipeline worker has no pool, and
+CoreML's autoreleased per-call buffers otherwise leak for the life of the process (the
+speaker pass leaked ~2.5 MB per call until 2026-11-17; VENDORED.md modification 4). Entry
+points that await a `Task` are fine (a dispatch thread's pool drains per block).
 
 Why: upstream's VAD FFI resets Silero's recurrent state on every call, which forced a
 two-chunk context re-feed (3 inferences per 256 ms). We vendor the crate (pinned, under our

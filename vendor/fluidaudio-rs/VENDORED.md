@@ -81,6 +81,16 @@ Everything else (ASR, diarization, TTS, Qwen3, examples, tests, `AGENTS.md`) is 
    Check: `cargo run --release -p oats-engine-fluidaudio --example speakers_wav -- two.wav`.
    On a FluidAudio update, check that `SegmentationProcessor.getSegments`,
    `EmbeddingExtractor.getEmbeddings` and `DiarizerModels.downloadIfNeeded` stay public.
+   **Autorelease pool** (2026-11-17): `fluidaudio_speaker_embed_samples` runs `spans()`
+   synchronously on the CALLER's thread — OatsNotes' Rust pipeline worker, which has no
+   Objective-C autorelease pool (the VAD and transcription entry points run inside a `Task`
+   on a dispatch thread, whose pool drains per block). CoreML's `prediction` autoreleases
+   its input wrappers and outputs, so without a pool each call leaked the embedding
+   model's 3×160000-float input (1.9 MB) and the segmentation input (640 KB): the app
+   reached 674 MB after five days (450 MB of such blocks). The call is wrapped in
+   `autoreleasepool { }`; the identical-pieces `speakers_wav` run went from 474 MB to
+   141 MB peak, and a two-minute listening run stays flat (~200 MB, speakers on or off). Any
+   new synchronous CoreML entry point called from Rust needs the same wrap.
 
 ## Why no FluidAudio version bump
 

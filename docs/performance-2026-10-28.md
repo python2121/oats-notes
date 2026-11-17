@@ -399,3 +399,23 @@ Parakeet on the same pieces, for comparison.
 - Separation on this file: same voice 0.07–0.09 cosine distance (whole turns) / 0.13–0.20
   (3 s pieces); different voices 0.78–0.96; spans under 1 s land in between (0.35–0.45),
   which is why they never open a voice.
+
+## 2026-11-17 addendum: memory footprint
+
+Measured on the live release build after five days up (speaker recognition on, system-audio
+listening): footprint 674 MB (peak 733), of which 451 MB was heap in uniform blocks — 178 of
+1.9 MB and 52 of 640 KB — the per-call input arrays of the speaker models (WeSpeaker's
+3×160000 floats, pyannote's 160000), never released: the speaker FFI ran CoreML on the Rust
+pipeline thread, which has no autorelease pool (the VAD / ASR paths await a `Task`, whose
+dispatch thread drains one per block). Controls, fresh processes on a looped 16 s speech file
+at 4×: speakers off flat at 130–145 MB over 16 transcriptions; speakers on 151 → 338 MB in
+two minutes (17 speaker calls, 48 leaked 1.9 MB blocks); the `speakers_wav` example on
+identical 2 s pieces (shape constant, 171 calls) 474 MB peak — so a per-call leak, not
+CoreML's per-shape cache. Fix: `autoreleasepool { }` around the speaker pass
+(`vendor/fluidaudio-rs/VENDORED.md`, modification 4). After: the example 141 MB (2 s pieces)
+/ 146 MB (7 s); the app flat at ~200–212 MB over two minutes with speakers on, ~200 with
+them off (the difference between runs is window / GPU surfaces, 32 MB CG image + 40 MB
+IOSurface, not heap). Speed unchanged (213 ms per 10 s of audio). What the rest is: the
+loaded models' working set and GPU buffers; Parakeet's weights live on the Neural Engine
+outside the process. Rust-side state is small (5.9 k segments, 1.3 k kept voice embeddings
+in the database; the transcript holds loaded pages only; the system ring 2.9 MB).
