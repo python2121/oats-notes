@@ -91,6 +91,12 @@ Everything else (ASR, diarization, TTS, Qwen3, examples, tests, `AGENTS.md`) is 
    `autoreleasepool { }`; the identical-pieces `speakers_wav` run went from 474 MB to
    141 MB peak, and a two-minute listening run stays flat (~200 MB, speakers on or off). Any
    new synchronous CoreML entry point called from Rust needs the same wrap.
+   **Compute units** (2026-11-17): the models load with `.cpuAndNeuralEngine` (what
+   FluidAudio's CI uses), not FluidAudio's default `.all`, which runs them through Metal
+   Performance Shaders: `speakers_wav` on 7 s pieces peaks at 81 MB on the ANE against 141 MB
+   on the GPU path, no GPU surfaces held; the pass takes about a third longer (84 vs 63 ms
+   per 10 s of audio; 283 vs 213 on 2 s pieces) — still well under the transcription of the
+   same audio (135 ms). The 2026-11-03 note that `.all` was faster stands; memory won.
 
 ## Why no FluidAudio version bump
 

@@ -950,7 +950,7 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   (`SpeakerBook::learn` / `unlearn`, below) are exempt from the margin, the ramp and the
   maturity rate. `dominant` = most speech seconds. Auto-me: with no `is_me` voice, the first with
   ≥ `AUTO_ME_MIC_SECS` 60 s of MIC speech in total (`mic_secs`) becomes "me" (logged).
-- **Pipeline**: after transcription, only for non-echo segments with text, ≥ 1 s, and not
+- **Pipeline**: after transcription, only for non-echo segments with text, ≥ 2 s (`SPEAKER_MIN_SEGMENT_MS`: the embedding model always runs its full 10 s input, and a shorter line could neither open nor teach a voice; such lines read as their lane), and not
   media on the system lane (a video's voices are nobody's voiceprint); on the system lane a
   NEW voice is created only during a call (the stamp's class is `Meeting`: a meeting app /
   page, or "On a call") — other system audio (a film in a non-YouTube browser tab, an unknown
@@ -1063,7 +1063,7 @@ returns embeddings; matching and storage are ours (pure, tested, portable).
   `set_speaker_name` (higher confidence replaces an earlier brain name; a user name is never
   replaced), plus a `speaker_name` change row — undoable (`undo_change` restores the previous
   name only while the voice still carries that brain name). Hotwords unchanged (mic-only).
-- **Cost** (`docs/performance-2026-10-28.md`, 2026-11-03 and 2026-11-17 addenda): ~45 ms per short segment,
+- **Cost** (`docs/performance-2026-10-28.md`, 2026-11-03 and 2026-11-17 addenda; the models run on CPU + Neural Engine since 2026-11-17 — ~60 MB less than the GPU path, a third slower, `VENDORED.md` modification 4): ~45 ms per short segment,
   ~65 ms per 10 s window on the M2 — roughly 0.6–1× the Parakeet time per segment (both
   models take a fixed 10 s input), nothing while silent or for echoes / media.
 
@@ -1162,7 +1162,8 @@ VENDORED.md's list of our modifications current. Attribution: `THIRD_PARTY.md`.
 - Never request continuous repaints; the app must idle at ~0 % CPU. The pipeline's and the
   brain's `wake` callbacks and menu clicks (the shared muda handler) are the only things that
   wake the UI; the brain thread itself blocks until its next due job. `Level` events are
-  rate-limited to 4 Hz and suppressed (`PipelineHandle::set_levels_wanted(false)`) while the
+  rate-limited to 4 Hz, sent only when the meter would look different (whole dB over its
+  60 dB span, or a speech flag: `pipeline::level_step`; a steady room sends nothing) and suppressed (`PipelineHandle::set_levels_wanted(false)`) while the
   window is hidden or minimized.
 - Commit independently as features land; don't add AI co-author lines.
 

@@ -50,6 +50,12 @@ use crate::store::{Store, TranscriptRow};
 const AUDIO_POLL: Duration = Duration::from_millis(100);
 /// Minimum spacing of `Level` events (~4 Hz).
 const LEVEL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// A level as the UI's meter shows it: whole dB over its −60…0 range (one pixel of its 60),
+/// so unchanged readings send no event (a quiet room repaints nothing).
+fn level_step(rms_db: f32) -> i32 {
+    rms_db.clamp(-60.0, 0.0).round() as i32
+}
 /// A failed transcription is retried once after this pause.
 const TRANSCRIBE_RETRY_DELAY: Duration = Duration::from_millis(200);
 
@@ -67,8 +73,11 @@ const MEDIA_PAUSE_CLOSES_MS: i64 = 120_000;
 const MEDIA_FLUSH_MS: i64 = 30_000;
 /// Plays shorter than this (a preview, a tab switch) are not kept.
 const MEDIA_MIN_PLAY_MS: i64 = 3_000;
-/// Speaker recognition runs only on segments at least this long.
-const SPEAKER_MIN_SEGMENT_MS: u32 = 1_000;
+/// Speaker recognition runs only on segments at least this long: the embedding model always
+/// runs its full fixed 10 s input, so a short line costs as much as a long turn, and a line
+/// under [`speakers::LEARN_RAMP_FROM`] (2 s) can neither open a voice nor teach one — it
+/// would only be tagged, at a 45 ms price. Shorter lines read as their lane ("me" / "them").
+const SPEAKER_MIN_SEGMENT_MS: u32 = 2_000;
 /// Changed voiceprints are written back at most this often (and at session end).
 const SPEAKER_FLUSH_EVERY: Duration = Duration::from_secs(60);
 /// "On a call" turns itself off after this long of silence on the system lane.
@@ -876,6 +885,7 @@ impl Session<'_> {
             Lane::new(AudioSourceKind::System, config, energy),
         ];
         let mut last_level: Option<Instant> = None;
+        let mut last_shown: Option<(i32, i32, bool, bool)> = None;
         let mut vad_warned = false;
         let mut no_signal_reported = false;
         let mut mic_lost_reported = false;
@@ -936,12 +946,23 @@ impl Session<'_> {
                         last_level = Some(Instant::now());
                         let (rms_db_mic, in_speech_mic) = lanes[0].level();
                         let (rms_db_system, in_speech_system) = lanes[1].level();
-                        self.out.send(PipelineEvent::Level {
-                            rms_db_mic,
-                            rms_db_system,
+                        // every event wakes the UI for a full repaint: send one only when
+                        // the meter would look different (its 60 px span 60 dB: 1 dB each)
+                        let shown = (
+                            level_step(rms_db_mic),
+                            level_step(rms_db_system),
                             in_speech_mic,
                             in_speech_system,
-                        });
+                        );
+                        if last_shown != Some(shown) {
+                            last_shown = Some(shown);
+                            self.out.send(PipelineEvent::Level {
+                                rms_db_mic,
+                                rms_db_system,
+                                in_speech_mic,
+                                in_speech_system,
+                            });
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}

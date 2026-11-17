@@ -160,9 +160,13 @@ extension FluidAudioBridgeInternal {
         var initError: Error?
         Task {
             do {
-                // FluidAudio's default configuration (compute units `.all`): measured faster
-                // than `.cpuAndNeuralEngine` and `.cpuOnly` for these two models (2026-11-03)
-                loaded = try await DiarizerModels.downloadIfNeeded()
+                // CPU + Neural Engine (what FluidAudio's own CI uses), not its default `.all`:
+                // `.all` routes the two models through Metal Performance Shaders, which keeps
+                // ~40 MB of GPU surfaces and a graph per process for a pass that is no faster
+                // on the ANE (2026-11-17: 213 ms vs 213 ms per 10 s of audio on the M2).
+                let config = MLModelConfiguration()
+                config.computeUnits = .cpuAndNeuralEngine
+                loaded = try await DiarizerModels.downloadIfNeeded(configuration: config)
             } catch {
                 initError = error
             }
